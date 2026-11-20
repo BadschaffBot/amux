@@ -720,6 +720,31 @@ fn claim_windows(
     wins
 }
 
+/// Keep only the windows that contain at least one unattributed ledger row.
+///
+/// READ-ONLY, so it runs on the snapshot off the writer. Each probe is an
+/// EXISTS over `idx_ledger_session (session, ts)`. A window that cannot match
+/// a row cannot change one, so dropping it here loses nothing: windows are
+/// re-derived every cycle, and a row that arrives later is picked up then. If
+/// a probe errors the window is kept, so the old behaviour is the fallback.
+fn windows_with_unattributed(
+    conn: &rusqlite::Connection,
+    wins: Vec<(String, String, i64, i64)>,
+) -> Vec<(String, String, i64, i64)> {
+    let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM token_ledger \
+           WHERE session=?1 AND task='' AND ts>=?2 AND ts<=?3)",
+    ) else {
+        return wins;
+    };
+    wins.into_iter()
+        .filter(|(_, session, from, to)| {
+            stmt.query_row(rusqlite::params![session, from, to], |r| r.get::<_, bool>(0))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
 pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
     let now = chrono::Utc::now().timestamp();
     // READ PHASE, off the writer. The snapshot can be a moment stale relative
@@ -774,7 +799,17 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
                 )
                 .ok()
                 .and_then(|(lo, hi)| Some((lo?, hi?)));
-            Ok((claim_windows(attempts, claims, now), bounds))
+            let wins = claim_windows(attempts, claims, now);
+            // Only windows that still have an unattributed row inside them are
+            // worth a writer acquisition. Most windows on a steady-state tree
+            // match nothing, and each one used to cost an UPDATE under the lock
+            // every cycle (AMUX-4750 follow-up, HT-1648).
+            let wins = if bounds.is_some() {
+                windows_with_unattributed(conn, wins)
+            } else {
+                wins
+            };
+            Ok((wins, bounds))
         })
         .await?;
 
@@ -1223,6 +1258,43 @@ mod tests {
         // 0 would silently park the turn in 1970 and drop it out of every
         // since-cutoff query — a row that exists and can never be counted.
         assert_eq!(turns[0].ts, 1_786_000_000);
+    }
+
+    /// HT-1648: a window whose range holds no unattributed row must not reach
+    /// the writer. Only the window that overlaps unattributed rows on its own
+    /// lane is kept.
+    #[tokio::test]
+    async fn only_windows_with_unattributed_rows_survive_the_read_phase() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        st.write(move |conn| {
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
+                 cache_write, output, cost_usd, task) VALUES \
+                 (?1,'lane-a','conv-a','m',10,0,0,1,0.5,''), \
+                 (?2,'lane-b','conv-b','m',10,0,0,1,0.5,'AMUX-9')",
+                rusqlite::params![now - 100, now - 5000],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+        let wins = vec![
+            ("AMUX-1".to_string(), "lane-a".to_string(), now - 200, now),
+            ("AMUX-2".to_string(), "lane-b".to_string(), now - 6000, now - 4000),
+            ("AMUX-3".to_string(), "lane-a".to_string(), now - 50, now - 10),
+            ("AMUX-4".to_string(), "lane-c".to_string(), now - 200, now),
+        ];
+        let guard = st.read().unwrap();
+        let kept: Vec<String> = windows_with_unattributed(&guard, wins)
+            .into_iter()
+            .map(|(task, _, _, _)| task)
+            .collect();
+        assert_eq!(
+            kept,
+            vec!["AMUX-1".to_string()],
+            "only the lane-a window spanning an unattributed row may reach the writer"
+        );
     }
 
     fn store() -> SharedStore {
