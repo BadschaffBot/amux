@@ -3025,15 +3025,22 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // next read (out-of-band path), instead of hiding inside the snapshot.
     // Never reserve one of the request pool's readers while external probes
     // run. Cheap board/status requests remain independent of fleet discovery.
+    let __ts = std::time::Instant::now();
     let conn = store.dedicated_read()?;
+    tracing::info!(target: "amux::sessions", verdict = "sessions_phase", phase = "outer_dedicated_read", ms = __ts.elapsed().as_millis() as u64, "sessions phase");
     let (smp, disp) = build_settled(|| {
         // Snapshot both guards BEFORE the build (see above).
         let epoch_start = SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
         let runtime_epoch_start =
             SESSIONS_RUNTIME_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
         let registry_start = registry_fingerprint();
+        let __t0 = std::time::Instant::now();
+        static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let __n = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::info!(target: "amux::sessions", verdict = "sessions_phase", phase = "build_start", attempt = __n, ms = 0u64, "sessions phase");
         let arr = build_array(&conn, store)?;
         let json = serde_json::to_string(&arr)?;
+        tracing::info!(target: "amux::sessions", verdict = "sessions_phase", phase = "build_total", attempt = __n, ms = __t0.elapsed().as_millis() as u64, "sessions phase");
         Ok(BuildSample {
             json,
             epoch_start,
@@ -4155,12 +4162,22 @@ fn branch_from_head_file(dir: &str) -> Option<String> {
     }
 }
 
+/// Live diagnosis: ms since the previous mark, one INFO line per phase.
+fn phase_mark(t: &mut std::time::Instant, name: &str) {
+    let now = std::time::Instant::now();
+    tracing::info!(target: "amux::sessions", verdict = "sessions_phase", phase = name, ms = (now - *t).as_millis() as u64, "sessions phase");
+    *t = now;
+}
+
 fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> rusqlite::Result<Vec<serde_json::Value>> {
+    let mut __t = std::time::Instant::now();
     let mut signals = FleetSignals::load(conn);
+    phase_mark(&mut __t, "load_signals");
     // Before any status is derived: the pane is the only signal that can
     // contradict a self-report, and a report that nothing can contradict is
     // what shipped a working lane as `idle` for 1076s (AMUX-2646).
     signals.capture_panes();
+    phase_mark(&mut __t, "capture_panes");
     let signals = signals;
     let mut stmt = conn.prepare(
         "SELECT w.display_name, w.state, w.provider, w.model, w.cwd,
@@ -4218,6 +4235,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
             "steering_queue": [],
         }))
     })?;
+    phase_mark(&mut __t, "worker_rows");
     let mut out: Vec<serde_json::Value> = rows.collect::<Result<_, _>>()?;
     // The Python fleet rides alongside Rust-managed workers, deduped by
     // name (a name registered in BOTH belongs to the Rust row — it carries
@@ -4226,6 +4244,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         .iter()
         .filter_map(|v| v["name"].as_str().map(|s| s.to_lowercase()))
         .collect();
+    phase_mark(&mut __t, "rust_rows_dedup");
     for s in python_fleet_sessions(&signals) {
         if let Some(n) = s["name"].as_str() {
             if !rust_names.contains(&n.to_lowercase()) {
@@ -4233,6 +4252,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
             }
         }
     }
+    phase_mark(&mut __t, "python_fleet");
     // Board linkage per card, Python's exact query + precedence
     // (py:20187-20197, 20348-20365): ORDER BY updated ASC with dict
     // overwrite so the NEWEST-touched doing card wins (the 2026-07-22
@@ -4282,6 +4302,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         // atomically through cmd_history.card_id; manual/automatic pickup emits
         // task.claimed. Keep the whole causal timeline: a newer cardless
         // control prompt is not a release of a still-live claimed card.
+    phase_mark(&mut __t, "doing_issues");
         let mut task_markers: BTreeMap<String, Vec<TaskMarker>> = BTreeMap::new();
 
         // Collected once rather than consumed as a cursor, so the SAME rows
@@ -4310,6 +4331,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         } else {
             vec![]
         };
+    phase_mark(&mut __t, "cmd_history_user_msgs");
         let last_human_ts = last_human_ts_from_user_messages(&user_msgs);
         {
             for (session, text, card_id, ts_ms) in user_msgs {
@@ -4330,9 +4352,11 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
                 }
             }
         }
+    phase_mark(&mut __t, "task_markers_from_msgs");
         for (session, events) in cached_claim_events(store) {
             task_markers.entry(session).or_default().extend(events.into_iter().map(|(_, marker)| marker));
         }
+    phase_mark(&mut __t, "session_events_claims");
         let now = signals.now as i64;
         for v in out.iter_mut() {
             let Some(name) = v["name"].as_str().map(String::from) else {
@@ -4496,6 +4520,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         }
     }
 
+    phase_mark(&mut __t, "board_linkage_loop");
     if let Some(report) = crate::runtime_jobs::board_drive::last_report() {
         let traces: BTreeMap<&str, &crate::runtime_jobs::board_drive::LaneTrace> =
             report.lanes.iter().map(|trace| (trace.session.as_str(), trace)).collect();
@@ -4515,6 +4540,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         }
     }
 
+    phase_mark(&mut __t, "last_report");
     // Schedule counts per session — Python's exact aggregation
     // (amux-server.py:20179).
     {
@@ -4657,6 +4683,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         }
     }
 
+    phase_mark(&mut __t, "schedule_transcript");
     // branch: bounded parallel git lookups, deduped by directory (many
     // sessions share a checkout — one git call per DISTINCT dir).
     // Cached with a 30s TTL: branches change on the scale of minutes.
@@ -4731,6 +4758,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         }
     }
 
+    phase_mark(&mut __t, "branch");
     // Previews: RUNNING sessions get a bounded parallel tmux capture (30
     // lines like Python's batch, py:20137); STOPPED sessions get the saved
     // log tail (py:20218-20223). Both feed Python's preview pair: scalar +
@@ -4826,6 +4854,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         }
     }
 
+    phase_mark(&mut __t, "previews");
     // Python's exact sort (py:20456-20457): pinned first, running next,
     // active/waiting before idle/blank, then most-recent human activity.
     let status_rank = |s: &str| -> i64 {
@@ -4845,6 +4874,7 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
         };
         key(a).cmp(&key(b))
     });
+    phase_mark(&mut __t, "sort");
     Ok(out)
 }
 
