@@ -166,13 +166,19 @@ fn tune_writer_connection(c: &Connection) -> rusqlite::Result<()> {
 pub(crate) fn session_events_retention(conn: &Connection, now: f64, retain_days: f64, batch: i64)
     -> rusqlite::Result<usize>
 {
+    // Bounded: the inner SELECT walks the rowid in order and stops after `batch`
+    // candidates (no global sort, no per-row MAX); only those <= batch rows then
+    // pay the "has a newer row in its session" probe. ponytail: a session's
+    // old newest row is re-picked each sweep and uses one slot; fine while
+    // sessions << batch.
     conn.execute(
         "DELETE FROM session_events WHERE id IN (
-            SELECT id FROM session_events e
-             WHERE ts < ?1
-               AND NOT (type IN ('task.claimed','task.cardless') AND ts > ?2)
-               AND id < (SELECT MAX(id) FROM session_events m WHERE m.session = e.session)
-             ORDER BY id LIMIT ?3)",
+            SELECT c.id FROM (
+                SELECT id, session FROM session_events
+                 WHERE ts < ?1
+                   AND NOT (type IN ('task.claimed','task.cardless') AND ts > ?2)
+                 ORDER BY id LIMIT ?3) c
+             WHERE EXISTS (SELECT 1 FROM session_events m WHERE m.session = c.session AND m.id > c.id))",
         rusqlite::params![now - retain_days * 86400.0, now - 30.0 * 86400.0, batch],
     )
 }

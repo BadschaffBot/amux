@@ -3023,58 +3023,47 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // Snapshot both guards BEFORE the build: a create/delete racing the build
     // then fails the epoch check (API path) or the fingerprint check on the
     // next read (out-of-band path), instead of hiding inside the snapshot.
-    let epoch_start = SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
-    // Snapshot runtime evidence before the SQL read too. If a report lands
-    // during the build, tagging pre-report JSON with the post-report epoch
-    // would make stale status look current until some later report happened.
-    let runtime_epoch_start =
-        SESSIONS_RUNTIME_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
-    let registry_start = registry_fingerprint();
     // Never reserve one of the request pool's readers while external probes
     // run. Cheap board/status requests remain independent of fleet discovery.
     let conn = store.dedicated_read()?;
-    let arr = build_array(&conn, store)?;
-    let json = serde_json::to_string(&arr)?;
-    match race_verdict(
-        epoch_start,
-        SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
-        registry_start,
-        registry_fingerprint(),
-    ) {
-        RaceVerdict::Fresh => {
-            // `Fresh` is only reachable with both samples measured, so this
-            // binding always takes. It is written as a conditional rather than
-            // an unwrap because an unwrap here would be a panic in the request
-            // path if the verdict ever gained a fourth state.
-            if let (Ok(mut c), Some(registry)) = (build_array_cache().lock(), registry_start) {
+    let (smp, disp) = build_settled(|| {
+        // Snapshot both guards BEFORE the build (see above).
+        let epoch_start = SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+        let runtime_epoch_start =
+            SESSIONS_RUNTIME_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+        let registry_start = registry_fingerprint();
+        let arr = build_array(&conn, store)?;
+        let json = serde_json::to_string(&arr)?;
+        Ok(BuildSample {
+            json,
+            epoch_start,
+            runtime_epoch_start,
+            registry_start,
+            epoch_end: SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+            registry_end: registry_fingerprint(),
+        })
+    })?;
+    match disp {
+        Disposition::Fresh | Disposition::EpochOnlyExhausted => {
+            // `registry_start` is Some here (Fresh requires both samples). An
+            // exhausted build is stamped 0.0 so the TTL fast path never reuses it:
+            // the next GET rebuilds.
+            if let (Ok(mut c), Some(registry)) =
+                (build_array_cache().lock(), smp.registry_start)
+            {
                 *c = ListSnapshot {
                     store: store_key,
-                    stamp: now,
-                    json: json.clone(),
-                    epoch: epoch_start,
-                    runtime_epoch: runtime_epoch_start,
+                    stamp: if matches!(disp, Disposition::Fresh) { now } else { 0.0 },
+                    json: smp.json.clone(),
+                    epoch: smp.epoch_start,
+                    runtime_epoch: smp.runtime_epoch_start,
                     registry,
                 };
             }
         }
-        RaceVerdict::Raced => {
-            // Fail closed as well as refusing the cache write. Returning JSON that
-            // predates an isolation/delete/config change would leak the old fleet
-            // shape to the one request that happened to race the change.
-            tracing::warn!(
-                target: "amux::sessions",
-                verdict = "sessions_build_raced", measured = true, n_considered = 1,
-                "session-list build raced a structural change — refusing the stale response"
-            );
-            return Err(DiscoveryRaced.into());
-        }
-        RaceVerdict::Unverifiable => {
-            // SERVE, BUT DO NOT CACHE (AMUX-4838). The registry could not be
-            // read, so "did anything move" has no answer; the old code called
-            // that a race and 503'd, which is a positive asserted from a probe
-            // that never fired. `measured = false` is the field a sweep reads,
-            // and it is the same contract every /api/debug route already keeps:
-            // publish whether the measurement ran, beside the thing it decided.
+        Disposition::Unverifiable => {
+            // SERVE, BUT DO NOT CACHE (AMUX-4838): registry unreadable, so whether
+            // the build raced has no answer.
             tracing::warn!(
                 target: "amux::sessions",
                 verdict = "sessions_registry_unmeasured", measured = false, n_considered = 0,
@@ -3083,7 +3072,69 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
             );
         }
     }
-    Ok(json)
+    Ok(smp.json)
+}
+
+struct BuildSample {
+    json: String,
+    epoch_start: u64,
+    runtime_epoch_start: u64,
+    registry_start: Option<u64>,
+    epoch_end: u64,
+    registry_end: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Disposition {
+    Fresh,
+    /// Only the config epoch moved on every attempt (never the worker set).
+    EpochOnlyExhausted,
+    Unverifiable,
+}
+
+const MAX_RACED_BUILDS: usize = 3;
+
+/// Retry a raced build immediately (up to [`MAX_RACED_BUILDS`]) inside the one
+/// single-flight. With ~90 lanes writing config all day and multi-second builds,
+/// the process-global epoch moved during nearly every build, so nothing was ever
+/// published and GET /api/sessions 503'd forever.
+///
+/// Isolation guarantee kept: a changed REGISTRY fingerprint (a worker added or
+/// deleted) still fails closed with `DiscoveryRaced`, at once, no retry. If only
+/// the config epoch moved on all attempts, the newest build is served and
+/// stored with stamp 0 (never TTL-fresh, and its epoch is already stale), so
+/// the very next GET rebuilds; at worst one response is one config write old,
+/// which a poller cannot distinguish from having asked a moment earlier.
+fn build_settled(
+    mut build: impl FnMut() -> anyhow::Result<BuildSample>,
+) -> anyhow::Result<(BuildSample, Disposition)> {
+    let mut attempt = 1;
+    loop {
+        let s = build()?;
+        match race_verdict(s.epoch_start, s.epoch_end, s.registry_start, s.registry_end) {
+            RaceVerdict::Fresh => return Ok((s, Disposition::Fresh)),
+            RaceVerdict::Unverifiable => return Ok((s, Disposition::Unverifiable)),
+            RaceVerdict::Raced => {
+                if matches!((s.registry_start, s.registry_end), (Some(a), Some(b)) if a != b) {
+                    tracing::warn!(
+                        target: "amux::sessions",
+                        verdict = "sessions_build_raced", measured = true, n_considered = 1,
+                        "session-list build raced a worker add/delete - refusing the stale response"
+                    );
+                    return Err(DiscoveryRaced.into());
+                }
+                tracing::warn!(
+                    target: "amux::sessions",
+                    verdict = "sessions_build_epoch_moved", attempt,
+                    "config epoch moved during build"
+                );
+                if attempt >= MAX_RACED_BUILDS {
+                    return Ok((s, Disposition::EpochOnlyExhausted));
+                }
+                attempt += 1;
+            }
+        }
+    }
 }
 
 /// The session-list build raced a structural change and refused to serve it.
@@ -7272,6 +7323,53 @@ mod status_chaos_tests;
 #[cfg(test)]
 mod discovery_race_tests {
     use super::*;
+
+    fn smp(es: u64, ee: u64, rs: u64, re: u64) -> anyhow::Result<BuildSample> {
+        Ok(BuildSample {
+            json: format!("{es}-{ee}"),
+            epoch_start: es,
+            runtime_epoch_start: 0,
+            registry_start: Some(rs),
+            epoch_end: ee,
+            registry_end: Some(re),
+        })
+    }
+
+    #[test]
+    fn raced_once_then_fresh_is_published() {
+        let mut n = 0;
+        let (s, d) = build_settled(|| {
+            n += 1;
+            if n == 1 { smp(1, 2, 7, 7) } else { smp(2, 2, 7, 7) }
+        })
+        .unwrap();
+        assert_eq!((n, d, s.json.as_str()), (2, Disposition::Fresh, "2-2"));
+    }
+
+    #[test]
+    fn epoch_always_moving_publishes_after_three_tries_uncached_stamp() {
+        let mut n = 0u64;
+        let (s, d) = build_settled(|| {
+            n += 1;
+            smp(n, n + 1, 7, 7)
+        })
+        .unwrap();
+        assert_eq!((n, d), (3, Disposition::EpochOnlyExhausted));
+        assert_eq!(s.json, "3-4");
+    }
+
+    #[test]
+    fn registry_change_still_fails_closed_without_retry() {
+        let mut n = 0;
+        let e = build_settled(|| {
+            n += 1;
+            smp(1, 2, 7, 8)
+        })
+        .err()
+        .unwrap();
+        assert!(e.downcast_ref::<DiscoveryRaced>().is_some());
+        assert_eq!(n, 1);
+    }
 
     /// AMUX-4637: the race is 503 with Retry-After and keeps its message; any
     /// other build failure stays 500.
