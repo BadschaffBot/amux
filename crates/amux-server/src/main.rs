@@ -2,5 +2,6 @@
 //! across phases per docs/rust-rebuild-plan.md.
 
 fn main() {
+    amux_server::disable_sqlite_memstatus();
     amux_server::run();
 }

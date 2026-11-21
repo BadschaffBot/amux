@@ -27,7 +27,7 @@
 //! python proxy already buffers whole responses, so buffering a 4xx/5xx
 //! here adds no new cost). `user_agent`/`req_meta` are char-capped.
 //!
-//! Retention: rows older than `AMUX_REQLOG_RETAIN_DAYS` (default 14; env >
+//! Retention: rows older than `AMUX_REQLOG_RETAIN_DAYS` (default 3; env >
 //! server.env > default) are deleted opportunistically — every
 //! [`SWEEP_EVERY`] inserted rows — and the delete COUNT is logged, so a
 //! sweep that fires is visible and one that never fires is absent from the
@@ -69,7 +69,7 @@ const QUEUE_CAP: usize = 10_000;
 const BATCH_MAX: usize = 512;
 /// Retention sweep cadence: once per this many inserted rows.
 const SWEEP_EVERY: u64 = 1000;
-const DEFAULT_RETAIN_DAYS: f64 = 14.0;
+const DEFAULT_RETAIN_DAYS: f64 = 3.0;
 
 // ---------------------------------------------------------------------------
 // Row + logger (the substrate)
@@ -286,7 +286,7 @@ impl RequestLogger {
     }
 }
 
-/// `AMUX_REQLOG_RETAIN_DAYS`: process env wins, then server.env, then 14 —
+/// `AMUX_REQLOG_RETAIN_DAYS`: process env wins, then server.env, then 3 —
 /// the same precedence config.rs gives every other knob.
 fn retain_days_config() -> f64 {
     if let Some(d) = std::env::var("AMUX_REQLOG_RETAIN_DAYS")

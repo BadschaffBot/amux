@@ -43,7 +43,7 @@ pub type ReadPool = r2d2::Pool<SqliteConnectionManager>;
 
 pub(crate) enum ProjectionRead {
     Dedicated(Connection),
-    Pooled(r2d2::PooledConnection<SqliteConnectionManager>),
+    Pooled(GatedConn),
 }
 
 impl std::ops::Deref for ProjectionRead {
@@ -109,6 +109,108 @@ pub struct WriteReply {
     pub events: Vec<StateEvent>,
 }
 
+/// A pooled read connection that also holds a slot of the FIFO read gate for
+/// as long as it lives (change: orderly queue in front of the pool).
+pub struct GatedConn {
+    conn: r2d2::PooledConnection<SqliteConnectionManager>,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+impl std::ops::Deref for GatedConn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection { &self.conn }
+}
+impl std::ops::DerefMut for GatedConn {
+    fn deref_mut(&mut self) -> &mut Connection { &mut self.conn }
+}
+
+/// Block the calling thread on a tokio (FIFO) semaphore without needing a
+/// runtime: poll the future, park until woken or the deadline passes.
+fn block_acquire(sem: &Arc<tokio::sync::Semaphore>, timeout: std::time::Duration)
+    -> Option<tokio::sync::OwnedSemaphorePermit>
+{
+    use std::future::Future;
+    struct W(std::thread::Thread);
+    impl std::task::Wake for W { fn wake(self: Arc<Self>) { self.0.unpark(); } }
+    let waker = std::task::Waker::from(Arc::new(W(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut fut = Box::pin(sem.clone().acquire_owned());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) { return r.ok(); }
+        let left = deadline.checked_duration_since(std::time::Instant::now())?;
+        std::thread::park_timeout(left);
+    }
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// Read connections: map the file and keep a big page cache so page reads stop
+/// being read() syscalls. Kept out of `configure_connection` (see its doc).
+fn tune_read_connection(c: &Connection) -> rusqlite::Result<()> {
+    c.pragma_update(None, "mmap_size", env_i64("AMUX_DB_MMAP_BYTES", 4 << 30))?;
+    c.pragma_update(None, "cache_size", env_i64("AMUX_DB_CACHE_KIB", -262144))?;
+    Ok(())
+}
+
+/// Writer connection: bound the WAL file and its auto-checkpoint.
+fn tune_writer_connection(c: &Connection) -> rusqlite::Result<()> {
+    c.pragma_update(None, "journal_size_limit", 268_435_456_i64)?;
+    c.pragma_update(None, "wal_autocheckpoint", 1000)?;
+    Ok(())
+}
+
+/// Delete up to `batch` old `session_events` rows. Never touches the newest row
+/// of a session, nor `task.claimed`/`task.cardless` younger than 30 days.
+pub(crate) fn session_events_retention(conn: &Connection, now: f64, retain_days: f64, batch: i64)
+    -> rusqlite::Result<usize>
+{
+    conn.execute(
+        "DELETE FROM session_events WHERE id IN (
+            SELECT id FROM session_events e
+             WHERE ts < ?1
+               AND NOT (type IN ('task.claimed','task.cardless') AND ts > ?2)
+               AND id < (SELECT MAX(id) FROM session_events m WHERE m.session = e.session)
+             ORDER BY id LIMIT ?3)",
+        rusqlite::params![now - retain_days * 86400.0, now - 30.0 * 86400.0, batch],
+    )
+}
+
+/// Writer-thread upkeep: PASSIVE checkpoint every 30 s, TRUNCATE attempt and
+/// session_events retention every 10 min. Runs between requests, one attempt.
+struct Maint { passive: std::time::Instant, slow: std::time::Instant }
+impl Maint {
+    fn new() -> Self { Self { passive: std::time::Instant::now(), slow: std::time::Instant::now() } }
+    fn wal_bytes(conn: &Connection) -> u64 {
+        conn.path().and_then(|p| std::fs::metadata(format!("{p}-wal")).ok()).map(|m| m.len()).unwrap_or(0)
+    }
+    fn ckpt(conn: &Connection, mode: &str) -> Option<(i64, i64, i64)> {
+        conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()
+    }
+    fn tick(&mut self, conn: &Connection) {
+        if self.passive.elapsed() >= std::time::Duration::from_secs(30) {
+            self.passive = std::time::Instant::now();
+            let r = Self::ckpt(conn, "PASSIVE");
+            tracing::info!(verdict = "wal_selfclean", mode = "PASSIVE", result = ?r, wal_bytes = Self::wal_bytes(conn), "wal checkpoint");
+        }
+        if self.slow.elapsed() >= std::time::Duration::from_secs(600) {
+            self.slow = std::time::Instant::now();
+            // One attempt, no wait: a busy TRUNCATE is logged and skipped.
+            let _ = conn.busy_timeout(std::time::Duration::ZERO);
+            let r = Self::ckpt(conn, "TRUNCATE");
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+            tracing::info!(verdict = "wal_selfclean", mode = "TRUNCATE", busy = r.map(|x| x.0 != 0), result = ?r, wal_bytes = Self::wal_bytes(conn), "wal checkpoint");
+            let days = std::env::var("AMUX_SESSION_EVENTS_RETAIN_DAYS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0);
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            match session_events_retention(conn, now, days, 5000) {
+                Ok(deleted) => tracing::info!(verdict = "session_events_retention", deleted, retain_days = days, "session_events retention sweep"),
+                Err(e) => tracing::warn!(verdict = "session_events_retention", error = %e, "session_events retention failed"),
+            }
+        }
+    }
+}
+
 /// Handle to the store: cheap to clone, shared across the router and
 /// background jobs.
 #[derive(Clone)]
@@ -119,6 +221,8 @@ pub struct Store {
     /// only testable by holding every connection, and the paths that must hold
     /// it (`api::policy::enforce`) live in other modules.
     pub(crate) read_pool: ReadPool,
+    /// FIFO gate: at most N concurrent pooled reads (AMUX_DB_READ_PERMITS, 16).
+    read_gate: Arc<tokio::sync::Semaphore>,
     /// AF-937: held only for its lifetime -- an RAII guard, not state. An
     /// flock on a sidecar file next to `db_path`, acquired in
     /// [`claim_sole_writer`] at open time. The OS releases it automatically
@@ -310,6 +414,7 @@ impl Store {
         // touch the DB. Health returns 503 until `open` completes.
         let mut conn = Connection::open(db_path)?;
         configure_connection(&conn)?;
+        tune_writer_connection(&conn)?;
         migrate::apply_all_guarded(&mut conn, db_path)?;
 
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>();
@@ -326,6 +431,7 @@ impl Store {
 
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
             configure_connection(c)?;
+            tune_read_connection(c)?;
             // Readers never write; enforce it so a bug cannot sneak a write
             // past the single-writer discipline.
             c.pragma_update(None, "query_only", "ON")?;
@@ -383,6 +489,7 @@ impl Store {
         Ok(Store {
             write_tx,
             read_pool,
+            read_gate: Arc::new(tokio::sync::Semaphore::new(env_i64("AMUX_DB_READ_PERMITS", 16).max(1) as usize)),
             writer_lock,
             db_path: Arc::new(db_path.to_path_buf()),
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -571,8 +678,13 @@ impl Store {
     /// Silent on the happy path: a healthy acquire is microseconds, so the
     /// threshold below is never reached in normal operation and this stays off
     /// a hot path rather than logging 200k times a day.
-    pub fn read(&self) -> anyhow::Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+    pub fn read(&self) -> anyhow::Result<GatedConn> {
         let t0 = std::time::Instant::now();
+        let Some(permit) = block_acquire(&self.read_gate, std::time::Duration::from_secs(5)) else {
+            tracing::warn!(verdict = "read_pool_exhausted", waited_ms = t0.elapsed().as_millis() as u64,
+                "read gate wait exceeded 5s; callers are getting busy errors");
+            anyhow::bail!("read gate busy: waited over 5s for a read slot");
+        };
         let got = self.read_pool.get();
         let waited = t0.elapsed();
         match got {
@@ -588,7 +700,7 @@ impl Store {
                         "read pool acquire was slow; the pool is saturated and every waiter                          is pinning a thread (AF-640)"
                     );
                 }
-                Ok(conn)
+                Ok(GatedConn { conn, _permit: Some(permit) })
             }
             Err(e) => {
                 let st = self.read_pool.state();
@@ -633,6 +745,7 @@ impl Store {
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        tune_read_connection(&conn)?;
         conn.pragma_update(None, "query_only", "ON")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(ProjectionRead::Dedicated(conn))
@@ -768,7 +881,14 @@ fn writer_loop(
     rx: mpsc::Receiver<WriteRequest>,
     events_tx: tokio::sync::broadcast::Sender<StateEvent>,
 ) {
-    while let Ok(req) = rx.recv() {
+    let mut maint = Maint::new();
+    loop {
+        let req = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => { maint.tick(&conn); continue; }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        maint.tick(&conn);
         let queued_ms = req.queued_at.elapsed().as_millis() as u64;
         let started = std::time::Instant::now();
         // Reset first: a mutation that fails before committing must not report
@@ -1140,7 +1260,7 @@ mod amux4744_write_queue_tests {
         // moment the expression was split across lines, and a landmark that
         // breaks on formatting gets deleted as flaky rather than trusted.
         assert!(
-            body.contains("rx.recv()") && body.contains("catch_unwind"),
+            body.contains("rx.recv_timeout(") && body.contains("catch_unwind"),
             "the scan is not reading writer_loop; it has {} chars of something else",
             body.len()
         );
@@ -1477,7 +1597,7 @@ mod af640_read_pool_tests {
         assert!(max >= 1, "a pool with no connections cannot be exhausted");
 
         // Hold every connection, so the next acquire has nowhere to go.
-        let held: Vec<_> = (0..max).map(|_| store.read().expect("initial fill")).collect();
+        let held: Vec<_> = (0..max).map(|_| store.read_pool.get().expect("initial fill")).collect();
         assert_eq!(store.read_pool.state().idle_connections, 0, "the pool must be empty");
 
         let t0 = std::time::Instant::now();
@@ -1708,5 +1828,57 @@ mod pragma_decision_tests {
                  reads as an oversight and gets 'fixed'"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dbgate_tests {
+    use super::*;
+
+    #[test]
+    fn read_connections_get_mmap_and_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("g.db")).unwrap();
+        let c = store.read().unwrap();
+        let cache: i64 = c.query_row("PRAGMA cache_size", [], |r| r.get(0)).unwrap();
+        assert_eq!(cache, -262144);
+        let mm: i64 = c.query_row("PRAGMA mmap_size", [], |r| r.get(0)).unwrap();
+        assert!(mm > 0);
+    }
+
+    #[test]
+    fn read_gate_is_bounded_and_fifo_released() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let p = block_acquire(&sem, std::time::Duration::from_millis(50)).expect("first");
+        assert!(block_acquire(&sem, std::time::Duration::from_millis(100)).is_none(), "second must time out");
+        drop(p);
+        assert!(block_acquire(&sem, std::time::Duration::from_millis(50)).is_some());
+    }
+
+    #[test]
+    fn wal_checkpoint_helpers_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("w.db")).unwrap();
+        configure_connection(&c).unwrap();
+        tune_writer_connection(&c).unwrap();
+        c.execute_batch("CREATE TABLE t(x)").unwrap();
+        assert!(Maint::ckpt(&c, "PASSIVE").is_some());
+        assert_eq!(Maint::ckpt(&c, "TRUNCATE").unwrap().0, 0);
+    }
+
+    #[test]
+    fn session_events_retention_keeps_protected_rows() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, session TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, data TEXT, idem TEXT);").unwrap();
+        let now = 100.0 * 86400.0;
+        let day = 86400.0;
+        // s1: old plain(1), old claimed 40d(2, deletable), claimed 10d(3, protected under 5d retention), newest(4)
+        for (ts, ty) in [(now - 50.0 * day, "x"), (now - 40.0 * day, "task.claimed"), (now - 10.0 * day, "task.claimed"), (now - 45.0 * day, "x")] {
+            c.execute("INSERT INTO session_events(ts,session,type) VALUES(?1,'s1',?2)", rusqlite::params![ts, ty]).unwrap();
+        }
+        // s2: single old row is its newest -> kept
+        c.execute("INSERT INTO session_events(ts,session,type) VALUES(?1,'s2','x')", [now - 60.0 * day]).unwrap();
+        let n = session_events_retention(&c, now, 5.0, 5000).unwrap();
+        assert_eq!(n, 2, "ids 1,2 go; 3 protected, 4 newest of s1, s2 newest");
     }
 }

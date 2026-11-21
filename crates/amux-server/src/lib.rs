@@ -942,3 +942,15 @@ async fn async_main() {
         .await
         .expect("server run");
 }
+
+/// Turn off SQLite's global memory statistics (its mem0 mutex is taken on every
+/// malloc/free). Must run before the first Connection is opened in the process;
+/// returns the SQLite result code (SQLITE_OK = 0, SQLITE_MISUSE if too late).
+pub fn disable_sqlite_memstatus() -> i32 {
+    // SAFETY: sqlite3_config is only valid before initialisation; callers run it first.
+    let rc = unsafe { rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0 as std::os::raw::c_int) };
+    if rc != rusqlite::ffi::SQLITE_OK {
+        eprintln!("sqlite3_config(MEMSTATUS,0) failed rc={rc}; memstatus stays on");
+    }
+    rc
+}
