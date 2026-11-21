@@ -4661,12 +4661,19 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
     //
     // Never invents: absent transcript, unreadable file, or records carrying
     // neither field all leave the honest empty in place.
+    // Whole-phase budget: lanes past it keep the honest empty this pass (the
+    // 15 s evidence cache fills them on later passes). Never block the builder.
+    let fallback_deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
     for v in out.iter_mut() {
         let Some(name) = v["name"].as_str().map(str::to_string) else { continue };
         let need_model = v["active_model"].as_str().unwrap_or("").is_empty();
         let need_tokens = v["tokens"]["total"].as_u64().unwrap_or(0) == 0;
         if !need_model && !need_tokens {
             continue;
+        }
+        if std::time::Instant::now() >= fallback_deadline {
+            tracing::warn!(target:"amux::sessions", "transcript fallback budget spent; remaining lanes skipped this pass");
+            break;
         }
         let (m, t) = crate::api::session_verbs::transcript_evidence(&name);
         if need_model {

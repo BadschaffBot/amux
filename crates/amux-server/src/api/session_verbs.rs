@@ -2700,6 +2700,8 @@ pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
 
 /// Newest JSONL for a session (py:5590 _session_jsonl_path_uncached): meta
 /// conv-id first, then title match, then the single unclaimed candidate.
+pub(crate) const TITLE_SCAN_MAX: usize = 24;
+
 pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
     let cfg = parse_env(name);
     let wd = cfg.get_or("CC_DIR", "").trim().to_string();
@@ -2764,7 +2766,10 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
             }
         }
     }
-    for (_, jf) in &files {
+    // Each title probe reads a 256 KB tail; a shared workdir can hold thousands
+    // of transcripts and ~90 lanes ask per build, which hung /api/sessions.
+    // Only the newest TITLE_SCAN_MAX are probed (files is newest-first).
+    for (_, jf) in files.iter().take(TITLE_SCAN_MAX) {
         if jf.file_stem().and_then(|s| s.to_str()).map(|s| owned.contains(s)).unwrap_or(false) {
             continue;
         }
@@ -27713,6 +27718,26 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(cmd.contains("--name amux"), "the splice dropped the name: {cmd}");
         assert_eq!(cmd.matches("--name").count(), 1, "duplicated --name: {cmd}");
         assert_eq!(cmd.matches("--resume").count(), 1, "duplicated --resume: {cmd}");
+    }
+
+    #[test]
+    fn title_scan_is_bounded_to_newest_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::env::set_var("HOME", dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let wd = dir.path().join("work");
+        std::fs::create_dir_all(&wd).unwrap();
+        std::fs::write(env_path("tbound"), format!("CC_DIR={}\n", wd.display())).unwrap();
+        let project = claude_home().join("projects").join(project_name(&wd.to_string_lossy()));
+        std::fs::create_dir_all(&project).unwrap();
+        // The match is the OLDEST file, past the cap: must not be probed.
+        std::fs::write(project.join("old.jsonl"), "{\"customTitle\":\"tbound\"}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        for i in 0..TITLE_SCAN_MAX {
+            std::fs::write(project.join(format!("n{i}.jsonl")), "{\"type\":\"user\"}\n").unwrap();
+        }
+        assert_eq!(session_jsonl_path("tbound"), None);
     }
 
     #[test]
