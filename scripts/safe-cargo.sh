@@ -91,6 +91,59 @@ export CARGO_PROFILE_TEST_DEBUG="${CARGO_PROFILE_TEST_DEBUG:-0}"
 # exists to contain) -- unlike flock, the kernel does not clean it up. Each
 # slot records its holder's pid; a blocked acquirer that finds a dead pid
 # reclaims the slot instead of queuing behind a lock nobody will ever release.
+# --- SIZED TO THE HOST (2026-10-27) -------------------------------------------
+# The defaults below were sized for the 64 GB Mac: two builds at once, each
+# allowed 12 GB. On a 7.7 GB amux Cloud server that budget is larger than the
+# machine. Measured on the sandbox: the builder's deploy build, a worker's
+# clippy and a cargo test ran together, the box hit memory pressure level 4
+# with load 54 and 18 MB free, the kernel OOM-killed three compilers, and
+# amux-server stopped answering so nobody could reach their workers.
+#
+# So a host under 16 GB runs one build at a time, and every build is capped at
+# 70% of the host's RAM (never above 12 GB), with swap up to half the cap. The
+# sandbox's deploy build of amux-server peaks at 4.3-5.8 GB (budget log), so
+# 5.4 GB of RAM plus 2.7 GB of swap fits it and still leaves 2.3 GB of RAM for
+# the server and workers.
+#
+# On systemd the kernel enforces it on the build's own scope, at 85% of the
+# host rather than the 70% budget. At 70% (MemoryMax until 2026-10-28) the
+# sandbox's deploy build failed every time for a day: the final link of
+# amux-server is ONE rustc process at 5.5 GB anon RSS, the cgroup OOM-killed it
+# at 5.4 GB (kernel log, task=rustc), and the box stayed on an old build.
+# MemoryHigh was tried instead and is wrong here: it throttles rather than
+# kills, so a runaway build crawls until the hour-long timeout. Above the
+# line the build is killed, and it is the kernel's first choice under host
+# pressure anyway (cargo-budget.py sets its oom_score_adj to 900). AMUX_CARGO_HOST_MB
+# stands in for the measured size (tests, and hosts that cannot report one).
+_host_mb="${AMUX_CARGO_HOST_MB:-}"
+if [ -z "$_host_mb" ]; then
+  if [ -r /proc/meminfo ]; then
+    _host_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || true)
+  else
+    _host_mb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1048576 ))
+  fi
+fi
+case "$_host_mb" in ''|*[!0-9]*) _host_mb=0 ;; esac
+if [ "$_host_mb" -gt 0 ]; then
+  # The ceiling scales with the host: 12 GB is right for the 16 GB sandbox, and
+  # on a 96 GB Mac a warm-cache `cargo check --workspace --all-targets` peaked at
+  # 12.9 GB and was killed (pre-commit, 2026-11-17), refusing three commits as
+  # an unattributable "clippy failure". A sixth of the host, two builds at a
+  # time, is a third of RAM at most.
+  _ceil=$(( _host_mb / 6 )); [ "$_ceil" -ge 12288 ] || _ceil=12288
+  _host_cap=$(( _host_mb * 70 / 100 ))
+  [ "$_host_cap" -le "$_ceil" ] || _host_cap=$_ceil
+  export AMUX_CARGO_MAX_RSS_MB="${AMUX_CARGO_MAX_RSS_MB:-$_host_cap}"
+  if [ "$_host_mb" -lt 16384 ]; then
+    export AMUX_CARGO_MAX_CONCURRENT="${AMUX_CARGO_MAX_CONCURRENT:-1}"
+  fi
+  echo "safe-cargo.sh: host ${_host_mb} MB: ${AMUX_CARGO_MAX_CONCURRENT:-2} build(s) at a time," \
+       "each capped at ${AMUX_CARGO_MAX_RSS_MB} MB (verdict=cargo_host_sized measured=true)" >&2
+else
+  echo "safe-cargo.sh: host memory unreadable; using the fixed defaults" \
+       "(verdict=cargo_host_sized measured=false)" >&2
+fi
+
 _throttle_max="${AMUX_CARGO_MAX_CONCURRENT:-2}"
 case "$_throttle_max" in
   ''|*[!0-9]*|0) echo 'cargo_budget_refused: AMUX_CARGO_MAX_CONCURRENT must be positive' >&2; exit 75 ;;
@@ -138,19 +191,25 @@ done
 # silent no-op forever -- confirmed live in testing before this shipped, the
 # exact bug this comment is here to stop someone re-introducing.
 echo $$ > "$_throttle_slot.pid" 2>/dev/null || true
-_throttle_release() { rmdir "$_throttle_slot" 2>/dev/null || true; rm -f "$_throttle_slot.pid" 2>/dev/null || true; }
+_throttle_release() { rm -f "${_SC_SOURCE_SNAPSHOT:-}"; rmdir "$_throttle_slot" 2>/dev/null || true; rm -f "$_throttle_slot.pid" 2>/dev/null || true; }
 trap '_throttle_release' EXIT
 
 _receipt=""
 if [ "${1:-}" = "test" ] && [ -z "${_TC_RECEIPT:-}" ]; then
   _receipt="$(cd "$(dirname "$0")" && pwd)/write-test-receipt.sh"
   [ -x "$_receipt" ] || _receipt=""
+  if [ -n "$_receipt" ]; then
+    _SC_SOURCE_SNAPSHOT=$(mktemp) || _SC_SOURCE_SNAPSHOT=""
+    if [ -n "$_SC_SOURCE_SNAPSHOT" ]; then "$_receipt" --snapshot "$_SC_SOURCE_SNAPSHOT"; fi
+    export AMUX_TEST_SOURCE_SNAPSHOT="$_SC_SOURCE_SNAPSHOT"
+  fi
 fi
 
 _target_guard="$(cd "$(dirname "$0")" && pwd)/cargo-target-guard.py"
 _budget="$(cd "$(dirname "$0")" && pwd)/cargo-budget.py"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 _guard_cmd=(python3 "$_target_guard" run --target "$CARGO_TARGET_DIR")
+if [ "${1:-}" = "clean" ]; then _guard_cmd+=(--exclusive-run); fi
 # Cargo's explicit --target-dir wins over the environment. Lease both roots.
 _next_target=0
 for _arg in "$@"; do
@@ -167,7 +226,24 @@ if [ -d /run/systemd/system ]; then
          "Offload remotely instead, or run systemd-run --user --scope by hand." >&2
     exit 1
   fi
-  CMD=(systemd-run --user --scope --quiet
+  _scope_limits=()
+  if [ -n "${AMUX_CARGO_MAX_RSS_MB:-}" ]; then
+    # The budget's sampled RSS check can overshoot between probes; the cgroup
+    # cannot. Swap is held to half the cap: room for a deploy build's peak,
+    # bounded so a capped build cannot thrash the disk everyone pages from.
+    _scope_max=$(( _host_mb > 0 ? _host_mb * 85 / 100 : AMUX_CARGO_MAX_RSS_MB ))
+    [ "$_scope_max" -ge "$AMUX_CARGO_MAX_RSS_MB" ] || _scope_max=$AMUX_CARGO_MAX_RSS_MB
+    _scope_limits=(-p "MemoryMax=${_scope_max}M"
+                   -p "MemorySwapMax=$(( AMUX_CARGO_MAX_RSS_MB / 2 ))M")
+    # With the kernel holding RAM to the cap, the budget's sampled check is
+    # only a backstop. It sums RSS over the build's processes, which counts
+    # shared pages twice (the deploy build has read 5.8 GB that way), so at
+    # the same number it would stop builds the cgroup lets finish.
+    echo "safe-cargo.sh: kernel stops the build at ${_scope_max} MB RAM + $(( AMUX_CARGO_MAX_RSS_MB / 2 )) MB swap" \
+         "(verdict=cargo_scope_capped)" >&2
+    export AMUX_CARGO_MAX_RSS_MB=$(( AMUX_CARGO_MAX_RSS_MB * 3 / 2 ))
+  fi
+  CMD=(systemd-run --user --scope --quiet ${_scope_limits[@]+"${_scope_limits[@]}"}
        --working-directory="$(pwd)"
        --setenv=CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
        --setenv=PATH="$PATH"

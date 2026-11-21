@@ -55,10 +55,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/quarantine/{id}", axum::routing::delete(purge_quarantine))
         .route("/snapshots", axum::routing::get(list_snapshots))
-        .route(
-            "/skipped",
-            axum::routing::get(list_skipped).delete(unskip),
-        )
+        .route("/skipped", axum::routing::get(list_skipped).delete(unskip))
 }
 
 /// Mark scans left `running` by a previous process as interrupted.
@@ -90,7 +87,10 @@ pub(crate) fn reap_orphaned_scans(store: &crate::db::SharedStore) {
               WHERE status='running'",
             rusqlite::params![now_secs()],
         )?;
-        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        Ok(crate::db::WriteOutcome {
+            applied: n > 0,
+            events: vec![],
+        })
     });
     match res {
         Ok(r) if r.applied => {
@@ -245,7 +245,10 @@ fn load_skips(store: &crate::db::SharedStore) -> std::collections::HashSet<PathB
                 ],
             )?;
         }
-        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        Ok(crate::db::WriteOutcome {
+            applied: true,
+            events: vec![],
+        })
     });
 
     let mut out = std::collections::HashSet::new();
@@ -284,7 +287,10 @@ fn record_stalled_dir(store: &crate::db::SharedStore, path: String, detail: Stri
                last_seen=excluded.last_seen, hits=hits+1",
             rusqlite::params![path, detail, now],
         )?;
-        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        Ok(crate::db::WriteOutcome {
+            applied: n > 0,
+            events: vec![],
+        })
     });
     if let Err(e) = res {
         tracing::error!(error = %e, "failed to record a stalled reclaim directory");
@@ -351,7 +357,10 @@ fn touch_skips(store: &crate::db::SharedStore, paths: Vec<String>) {
                 rusqlite::params![p, now],
             )?;
         }
-        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        Ok(crate::db::WriteOutcome {
+            applied: true,
+            events: vec![],
+        })
     });
     if let Err(e) = res {
         tracing::error!(error = %e, "failed to refresh reclaim skip last_seen");
@@ -421,7 +430,7 @@ fn snapshot_payload(snaps: Option<Vec<String>>, free: u64, total: u64) -> serde_
 
 /// Directory names that are build output or vendored dependencies: large,
 /// regenerable, and safe to reclaim at the cost of a rebuild.
-const BUILD_DIRS: &[&str] = &[
+pub(crate) const BUILD_DIRS: &[&str] = &[
     "node_modules",
     "target",
     ".venv",
@@ -450,8 +459,16 @@ fn devtool_roots() -> Vec<(PathBuf, &'static str, &'static str)> {
     vec![
         (home.join(".ollama/models"), "devtool", "Ollama model blobs"),
         (home.join(".docker"), "devtool", "Docker data"),
-        (home.join(".cargo/registry"), "devtool", "Cargo registry cache"),
-        (home.join(".rustup/toolchains"), "devtool", "Rust toolchains"),
+        (
+            home.join(".cargo/registry"),
+            "devtool",
+            "Cargo registry cache",
+        ),
+        (
+            home.join(".rustup/toolchains"),
+            "devtool",
+            "Rust toolchains",
+        ),
         (home.join(".npm"), "devtool", "npm cache"),
         (home.join(".cache"), "cache", "Generic tool cache"),
         (home.join("Library/Caches"), "cache", "Application caches"),
@@ -548,8 +565,10 @@ fn kind_of(name: &str) -> &'static str {
             "archive"
         }
         Some("db" | "sqlite" | "sqlite3" | "raw" | "vmdk" | "qcow2") => "data",
-        Some("rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "c" | "h" | "cpp" | "java"
-        | "rb" | "sh" | "json" | "toml" | "yaml" | "yml" | "md" | "html" | "css") => "code",
+        Some(
+            "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "c" | "h" | "cpp" | "java" | "rb"
+            | "sh" | "json" | "toml" | "yaml" | "yml" | "md" | "html" | "css",
+        ) => "code",
         Some("o" | "a" | "so" | "dylib" | "rlib" | "class" | "pyc" | "d" | "rmeta") => "build",
         Some("pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "key" | "pages") => "doc",
         _ => "other",
@@ -564,7 +583,7 @@ fn kind_of(name: &str) -> &'static str {
 /// wrongly refusing to clean something costs disk space, wrongly moving
 /// something costs the user's data or a broken machine. Everything here is a
 /// path a size-ranking heuristic would otherwise happily nominate.
-fn guard_path(p: &FsPath) -> Result<(), String> {
+pub(crate) fn guard_path(p: &FsPath) -> Result<(), String> {
     let home = home_dir();
     if !p.is_absolute() {
         return Err("path is not absolute".into());
@@ -576,8 +595,15 @@ fn guard_path(p: &FsPath) -> Result<(), String> {
 
     // System trees: never.
     for sys in [
-        "/System", "/usr", "/bin", "/sbin", "/Library/Apple", "/Applications", "/private/var/db",
-        "/dev", "/Volumes",
+        "/System",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/Library/Apple",
+        "/Applications",
+        "/private/var/db",
+        "/dev",
+        "/Volumes",
     ] {
         if s == sys || s.starts_with(&format!("{sys}/")) {
             return Err(format!("system path ({sys})"));
@@ -589,7 +615,11 @@ fn guard_path(p: &FsPath) -> Result<(), String> {
         return Err("home directory itself".into());
     }
     if p.parent() == Some(home.as_path()) {
-        let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         // The few depth-1 dirs that ARE pure caches stay eligible.
         if !matches!(name.as_str(), ".cache" | ".npm") {
             return Err(format!("top-level home directory (~/{name})"));
@@ -597,7 +627,13 @@ fn guard_path(p: &FsPath) -> Result<(), String> {
     }
     // amux's own state. rust-build-target is regenerable and stays eligible;
     // the store, sessions, memory and logs are not.
-    for protected in [".amux/amux.db", ".amux/sessions", ".amux/memory", ".amux/logs", ".amux/quarantine"] {
+    for protected in [
+        ".amux/amux.db",
+        ".amux/sessions",
+        ".amux/memory",
+        ".amux/logs",
+        ".amux/quarantine",
+    ] {
         let full = home.join(protected);
         if p == full || s.starts_with(&format!("{}/", full.to_string_lossy())) {
             return Err(format!("amux state (~/{protected})"));
@@ -688,8 +724,11 @@ struct ScanCfg {
 fn set_background_io() {
     // IOPOL_TYPE_DISK = 0, IOPOL_SCOPE_THREAD = 1, IOPOL_THROTTLE = 3
     unsafe extern "C" {
-        fn setiopolicy_np(iotype: libc::c_int, scope: libc::c_int, policy: libc::c_int)
-            -> libc::c_int;
+        fn setiopolicy_np(
+            iotype: libc::c_int,
+            scope: libc::c_int,
+            policy: libc::c_int,
+        ) -> libc::c_int;
     }
     unsafe {
         setiopolicy_np(0, 1, 3);
@@ -709,6 +748,135 @@ struct WalkOut {
     /// Directories the skip list kept us out of, so the scan can say what it
     /// did not look at instead of silently under-reporting a home directory.
     skipped: Vec<PathBuf>,
+    /// Directories whose listing went quiet for READDIR_QUIET and were stepped
+    /// over this scan (see [`DirLister`]). Recorded as stalled after the walk.
+    timed_out: Vec<PathBuf>,
+}
+
+// ── one directory listing, on a thread the walk can walk away from ──────────
+
+/// How long a directory listing may send nothing before the walk steps over it.
+///
+/// Until 2026-10-20 the listing ran on the walk thread itself, so one folder
+/// macOS would not answer (~/Library/Containers/com.apple.DeskCam/Data,
+/// ~/Downloads, ~/Documents) froze the whole scan until the 300s watchdog
+/// ended it: 9 of the 10 scans since 2026-09-11 stopped that way and the Disk
+/// tab showed a 6-day-old result. A listing that keeps sending entries, however
+/// slowly, is never cut off; only silence is. `AMUX_RECLAIM_READDIR_QUIET_S`.
+fn readdir_quiet() -> std::time::Duration {
+    let s = std::env::var("AMUX_RECLAIM_READDIR_QUIET_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(60);
+    std::time::Duration::from_secs(s)
+}
+
+type DirEntryInfo = (PathBuf, String, std::io::Result<std::fs::Metadata>);
+
+enum ListMsg {
+    Chunk(Vec<DirEntryInfo>),
+    Done,
+    Failed,
+}
+
+/// Outcome of listing one directory.
+pub(crate) enum Listing {
+    /// Every entry, with its metadata.
+    Entries(Vec<DirEntryInfo>),
+    /// `read_dir` refused (permission denied and the like): skip, as before.
+    Unreadable,
+    /// Nothing arrived for the quiet window. The reader thread is abandoned
+    /// (a thread blocked in the kernel cannot be cancelled) and a fresh one
+    /// serves the next directory.
+    TimedOut,
+}
+
+/// A reader thread that lists directories on request and streams the entries
+/// back in chunks, so the walk can wait with a timeout instead of blocking.
+pub(crate) struct DirLister {
+    tx: std::sync::mpsc::Sender<PathBuf>,
+    rx: std::sync::mpsc::Receiver<ListMsg>,
+    quiet: std::time::Duration,
+    pub(crate) abandoned: usize,
+}
+
+impl DirLister {
+    pub(crate) fn new(quiet: std::time::Duration) -> Self {
+        let (tx, rx) = Self::spawn();
+        DirLister { tx, rx, quiet, abandoned: 0 }
+    }
+
+    fn spawn() -> (std::sync::mpsc::Sender<PathBuf>, std::sync::mpsc::Receiver<ListMsg>) {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<PathBuf>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<ListMsg>();
+        let spawned = std::thread::Builder::new()
+            .name("reclaim-readdir".into())
+            .spawn(move || {
+                set_background_io();
+                for dir in req_rx {
+                    // Test hook: a directory that never answers, like the
+                    // macOS-protected folders that hung real scans.
+                    #[cfg(test)]
+                    if dir.file_name().is_some_and(|n| n == "NEVER_ANSWERS_FOR_TEST") {
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                    }
+                    let it = match std::fs::read_dir(&dir) {
+                        Ok(it) => it,
+                        Err(_) => {
+                            if res_tx.send(ListMsg::Failed).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                    };
+                    let mut chunk = Vec::with_capacity(256);
+                    for e in it.flatten() {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        chunk.push((e.path(), name, e.metadata()));
+                        if chunk.len() >= 256
+                            && res_tx.send(ListMsg::Chunk(std::mem::take(&mut chunk))).is_err()
+                        {
+                            return;
+                        }
+                    }
+                    if !chunk.is_empty() && res_tx.send(ListMsg::Chunk(chunk)).is_err() {
+                        return;
+                    }
+                    if res_tx.send(ListMsg::Done).is_err() {
+                        return;
+                    }
+                }
+            });
+        if spawned.is_err() {
+            tracing::error!(verdict = "reclaim_readdir_thread_failed", "could not start the reclaim directory reader");
+        }
+        (req_tx, res_rx)
+    }
+
+    pub(crate) fn list(&mut self, dir: &FsPath) -> Listing {
+        if self.tx.send(dir.to_path_buf()).is_err() {
+            let (tx, rx) = Self::spawn();
+            self.tx = tx;
+            self.rx = rx;
+            return Listing::Unreadable;
+        }
+        let mut out = Vec::new();
+        loop {
+            match self.rx.recv_timeout(self.quiet) {
+                Ok(ListMsg::Chunk(mut c)) => out.append(&mut c),
+                Ok(ListMsg::Done) => return Listing::Entries(out),
+                Ok(ListMsg::Failed) => return Listing::Unreadable,
+                Err(_) => {
+                    let (tx, rx) = Self::spawn();
+                    self.tx = tx;
+                    self.rx = rx;
+                    self.abandoned += 1;
+                    return Listing::TimedOut;
+                }
+            }
+        }
+    }
 }
 
 struct Finding {
@@ -752,8 +920,14 @@ fn walk(
         files: 0,
         bytes: 0,
         skipped: Vec::new(),
+        timed_out: Vec::new(),
     };
-    let devtools = if cfg.include_devtools { devtool_roots() } else { vec![] };
+    let mut lister = DirLister::new(readdir_quiet());
+    let devtools = if cfg.include_devtools {
+        devtool_roots()
+    } else {
+        vec![]
+    };
     let now = now_secs();
     // size -> paths, for the duplicate fingerprint pass
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
@@ -804,16 +978,24 @@ fn walk(
             // up to 64 directories behind it.
             progress(out.dirs, out.files, out.bytes, &dir, &mut out.findings);
 
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue, // permission denied etc — skip, do not fail the scan
+            let entries = match lister.list(&dir) {
+                Listing::Entries(e) => e,
+                Listing::Unreadable => continue, // permission denied etc — skip, do not fail the scan
+                Listing::TimedOut => {
+                    tracing::warn!(path = %dir.display(), quiet_s = lister.quiet.as_secs(),
+                        verdict = "reclaim_readdir_stepped_over",
+                        "a directory sent nothing; the scan steps over it and carries on");
+                    out.timed_out.push(dir.clone());
+                    pos.set(&dir, "entries");
+                    continue;
+                }
             };
             pos.set(&dir, "entries");
             out.dirs += 1;
             let mut local = Acc::default();
 
             let mut n_entries = 0u32;
-            for entry in entries.flatten() {
+            for (path, name, md) in entries {
                 n_entries += 1;
                 // Statting 200k entries under background I/O priority is slow
                 // work, not stuck work. The clock has to advance through it or
@@ -823,8 +1005,7 @@ fn walk(
                 if n_entries.is_multiple_of(512) {
                     pos.set(&dir, "entries");
                 }
-                let path = entry.path();
-                let md = match entry.metadata() {
+                let md = match md {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
@@ -835,8 +1016,6 @@ fn walk(
                 if md.dev() != root_dev {
                     continue; // different filesystem — `du -x` semantics
                 }
-                let name = entry.file_name().to_string_lossy().to_string();
-
                 if md.is_dir() {
                     // Prune at a known build/dep dir: record it whole.
                     if BUILD_DIRS.contains(&name.as_str()) {
@@ -1029,7 +1208,9 @@ fn walk(
             // position has to advance here too or the watchdog reads the
             // duplicate pass as a wedge on whatever directory came last.
             pos.set(p, "fingerprint");
-            let Some(fp) = fingerprint(p, *sz) else { continue };
+            let Some(fp) = fingerprint(p, *sz) else {
+                continue;
+            };
             if let Some(first) = seen.get(&fp) {
                 out.findings.push(Finding {
                     category: "duplicate",
@@ -1073,7 +1254,9 @@ fn subtree_totals(root: &FsPath, dev_filter: u64, cancel: &AtomicBool, pos: &Sca
         // watchdog would read a legitimately-working scan as wedged, which is
         // the false positive that turns a detector into noise.
         pos.set(&dir, "prune");
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let Ok(md) = entry.metadata() else { continue };
             if md.is_symlink() {
@@ -1146,15 +1329,19 @@ fn default_roots() -> Vec<PathBuf> {
 /// either changed, and the drift would be invisible because both still work.
 /// So the handler is a thin wrapper over this.
 pub(crate) async fn start_background_scan(state: &AppState) -> Result<String, String> {
-    begin_scan(state, StartScan { roots: vec![], large_file_mb: None, stale_days: None }, "disk-watch")
-        .await
+    begin_scan(
+        state,
+        StartScan {
+            roots: vec![],
+            large_file_mb: None,
+            stale_days: None,
+        },
+        "disk-watch",
+    )
+    .await
 }
 
-async fn begin_scan(
-    state: &AppState,
-    body: StartScan,
-    session: &str,
-) -> Result<String, String> {
+async fn begin_scan(state: &AppState, body: StartScan, session: &str) -> Result<String, String> {
     // One scan at a time: two concurrent walkers on a loaded disk is exactly
     // the disruption this feature is supposed to avoid.
     if let Ok(conn) = state.store.read() {
@@ -1190,7 +1377,10 @@ async fn begin_scan(
     let (free, total) = df_bytes(&home_dir()).unwrap_or((0, 0));
     let snaps = read_snapshots().await.map(|v| v.len() as i64);
     let roots_json = serde_json::to_string(
-        &roots.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>(),
+        &roots
+            .iter()
+            .map(|p| p.to_string_lossy())
+            .collect::<Vec<_>>(),
     )
     .unwrap_or_else(|_| "[]".into());
 
@@ -1245,8 +1435,9 @@ async fn start_scan(
         .to_string();
 
     match begin_scan(&state, body, &session).await {
-        Ok(scan_id) => Json(json!({"ok": true, "scan_id": scan_id, "status": "running"}))
-            .into_response(),
+        Ok(scan_id) => {
+            Json(json!({"ok": true, "scan_id": scan_id, "status": "running"})).into_response()
+        }
         Err(e) if e.contains("already running") => (
             StatusCode::CONFLICT,
             Json(json!({
@@ -1353,7 +1544,10 @@ fn spawn_stall_watchdog(
                            WHERE id=?1 AND status='running'",
                         rusqlite::params![sid, now_secs()],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: n > 0,
+                        events: vec![],
+                    })
                 });
                 return;
             }
@@ -1398,7 +1592,10 @@ fn spawn_stall_watchdog(
                       WHERE id=?1 AND status='running'",
                     rusqlite::params![sid, now_secs(), err, p, phase],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: n > 0,
+                    events: vec![],
+                })
             });
             if let Err(e) = res {
                 tracing::error!(scan = %scan_id, error = %e, "could not mark a stalled scan");
@@ -1428,21 +1625,24 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
     let mut flushed_findings = 0usize;
     let out = {
         let pos_p = pos.clone();
-        let mut progress =
-            |dirs: u64, files: u64, bytes: u64, cur: &FsPath, pending: &mut Vec<Finding>| {
-                if last_flush.elapsed() < std::time::Duration::from_millis(700) {
-                    return;
-                }
-                last_flush = std::time::Instant::now();
-                let (sid, cur_s) = (sid_p.clone(), cur.to_string_lossy().into_owned());
-                let batch: Vec<Finding> = std::mem::take(pending);
-                flushed_findings += batch.len();
-                // The phase flip is what separates "the disk is not answering"
-                // from "the write lock is not answering" when this never
-                // returns. Both freeze dirs_walked identically.
-                pos_p.phase("flush");
-                let phase_s = "flush";
-                let _ = store_p.write(move |c| {
+        let mut progress = |dirs: u64,
+                            files: u64,
+                            bytes: u64,
+                            cur: &FsPath,
+                            pending: &mut Vec<Finding>| {
+            if last_flush.elapsed() < std::time::Duration::from_millis(700) {
+                return;
+            }
+            last_flush = std::time::Instant::now();
+            let (sid, cur_s) = (sid_p.clone(), cur.to_string_lossy().into_owned());
+            let batch: Vec<Finding> = std::mem::take(pending);
+            flushed_findings += batch.len();
+            // The phase flip is what separates "the disk is not answering"
+            // from "the write lock is not answering" when this never
+            // returns. Both freeze dirs_walked identically.
+            pos_p.phase("flush");
+            let phase_s = "flush";
+            let _ = store_p.write(move |c| {
                     c.execute(
                         "UPDATE reclaim_scans SET dirs_walked=?2, files_walked=?3, bytes_seen=?4, current_path=?5, current_phase=?6 WHERE id=?1",
                         rusqlite::params![sid, dirs as i64, files as i64, bytes as i64, cur_s, phase_s],
@@ -1452,8 +1652,8 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
                     }
                     Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                 });
-                pos_p.set(cur, "readdir");
-            };
+            pos_p.set(cur, "readdir");
+        };
         walk(&cfg, &cancel, &pos, &skip, &mut progress)
     };
     // Before the finalize write, so a slow rollup is not mistaken for a wedge.
@@ -1474,6 +1674,26 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
         .collect();
     let n_skipped = hit_skips.len();
     touch_skips(&store, hit_skips);
+    // Stepped-over directories count toward the skip list the same way a
+    // watchdog stall did, so a folder that never answers stops costing a
+    // quiet window on every scan once it has done so twice.
+    let n_timed_out = out.timed_out.len();
+    for d in &out.timed_out {
+        record_stalled_dir(
+            &store,
+            d.to_string_lossy().into_owned(),
+            format!(
+                "sent nothing for {}s; stepped over and the scan carried on (skipped after \
+                 {STALL_HITS_TO_SKIP} such scans)",
+                readdir_quiet().as_secs()
+            ),
+        );
+    }
+    if n_timed_out > 0 {
+        tracing::warn!(scan = %scan_id, n_timed_out, measured = true,
+            verdict = "reclaim_scan_stepped_over_dirs",
+            "the scan stepped over directories that sent nothing and finished anyway");
+    }
 
     // Snapshot-held space as a first-class finding. Without this the UI shows
     // a big reclaimable total that the disk will not actually hand back.
@@ -1548,7 +1768,10 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
     });
 
-    cancel_registry().lock().map(|mut m| m.remove(&scan_id)).ok();
+    cancel_registry()
+        .lock()
+        .map(|mut m| m.remove(&scan_id))
+        .ok();
 
     match res {
         Ok(_) => tracing::info!(
@@ -1610,9 +1833,134 @@ async fn get_scan(
     Path(id): Path<String>,
     Query(q): Query<FindingsQuery>,
 ) -> Response {
+    // Read synchronously and drop the pooled connection before the ownership
+    // probes await (a live connection across an await is not Send).
+    let (scan, mut findings, totals, skipped) = match read_scan(&state, id, &q) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let ownership = annotate_protected(&mut findings).await;
+    Json(json!({
+        "scan": scan, "findings": findings, "totals": totals, "skipped": skipped,
+        "ownership": ownership, "volume_now": volume_now(&state),
+    }))
+    .into_response()
+}
+
+/// Free space NOW, and what quarantine still holds. The scan row's df_free is
+/// from when the scan ran, and the header showed it as current: "4.67 GB free,
+/// 0.3%" on 2026-10-20 while the disk had 284 GB free, from a 6-day-old scan.
+/// Staged quarantine bytes ride along because a move frees nothing until purge
+/// (105 GB sat staged that day with nothing on screen saying so).
+fn volume_now(state: &AppState) -> serde_json::Value {
+    let (free, total) = df_bytes(&home_dir()).unwrap_or((0, 0));
+    let (staged_bytes, staged_batches): (i64, i64) = state
+        .store
+        .read()
+        .ok()
+        .and_then(|c| {
+            c.query_row(
+                "SELECT COALESCE(SUM(bytes),0), COUNT(*) FROM reclaim_quarantine
+                  WHERE status='staged' AND item_count > 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
+        })
+        .unwrap_or((0, 0));
+    json!({
+        "measured": total > 0,
+        "df_free": free, "df_total": total, "at": now_secs(),
+        "staged_bytes": staged_bytes, "staged_batches": staged_batches,
+    })
+}
+
+/// Total wall-clock the findings annotation may spend on ownership probes.
+/// A finding not reached in time is marked protected as unmeasured.
+const OWNERSHIP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Set `protected` on every returned finding: null when nothing owns the path,
+/// otherwise `{class, reason}`. Only the rows this response returns are
+/// checked, eight at a time, under one overall budget. Returns the summary
+/// the UI shows beside the list, with `measured` and `n_considered`.
+async fn annotate_protected(findings: &mut [serde_json::Value]) -> serde_json::Value {
+    use futures::StreamExt;
+    let owners = super::reclaim_owner::Owners::probe().await;
+    let deadline = tokio::time::Instant::now() + OWNERSHIP_BUDGET;
+    let paths: Vec<(usize, Option<String>)> = findings
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let path = f["path"].as_str().map(str::to_string);
+            // A snapshot row names an APFS snapshot, not a path.
+            let is_path = f["category"].as_str() != Some("snapshot");
+            (i, path.filter(|_| is_path))
+        })
+        .collect();
+    let owners_ref = &owners;
+    let verdicts: Vec<(usize, Option<super::reclaim_owner::Refusal>)> =
+        futures::stream::iter(paths)
+            .map(|(i, path)| async move {
+                let Some(path) = path else { return (i, None) };
+                let p = PathBuf::from(&path);
+                let r = match tokio::time::timeout_at(
+                    deadline,
+                    super::reclaim_owner::refusal(&p, owners_ref),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Some(super::reclaim_owner::Refusal::unmeasured(format!(
+                        "ownership check budget ({}s) ran out before this path",
+                        OWNERSHIP_BUDGET.as_secs()
+                    ))),
+                };
+                (i, r)
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+    let mut by_class: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for (i, r) in verdicts {
+        findings[i]["protected"] = match r {
+            Some(r) => {
+                *by_class.entry(r.class).or_default() += 1;
+                json!({"class": r.class, "reason": r.reason})
+            }
+            None => serde_json::Value::Null,
+        };
+    }
+    let n_protected: usize = by_class.values().sum();
+    if n_protected > 0 {
+        tracing::info!(
+            verdict = "reclaim_findings_protected", protected = n_protected,
+            considered = findings.len(), classes = ?by_class,
+            fleet_measured = owners.live.is_ok(),
+            "reclaim findings marked protected by ownership"
+        );
+    }
+    json!({
+        "measured": true,
+        "n_considered": findings.len(),
+        "protected": n_protected,
+        "by_class": by_class,
+        "fleet_measured": owners.live.is_ok(),
+        "fleet_why_unmeasured": owners.live.as_ref().err(),
+    })
+}
+
+type ScanParts = (
+    serde_json::Value,
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+);
+
+#[allow(clippy::result_large_err)]
+fn read_scan(state: &AppState, id: String, q: &FindingsQuery) -> Result<ScanParts, Response> {
     let conn = match state.store.read() {
         Ok(c) => c,
-        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+        Err(e) => return Err((StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()),
     };
     // `latest` resolves to the newest scan so the UI has a stable entry point.
     let id = if id == "latest" {
@@ -1655,25 +2003,31 @@ async fn get_scan(
         },
     );
     let Ok(scan) = scan else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "no such scan"}))).into_response();
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no such scan"})),
+        )
+            .into_response());
     };
 
     let limit = q.limit.unwrap_or(300).clamp(1, 2000);
     let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = match &q.category {
         Some(c) => (
             "SELECT category, path, bytes, file_count, mtime, regenerable, detail
-             FROM reclaim_findings WHERE scan_id=?1 AND category=?2 ORDER BY bytes DESC LIMIT ?3",
+             FROM reclaim_findings WHERE scan_id=?1 AND category=?2
+               AND path NOT IN (SELECT original_path FROM reclaim_quarantine_items WHERE status IN ('staged','purged')) ORDER BY bytes DESC LIMIT ?3",
             vec![&id, c, &limit],
         ),
         None => (
             "SELECT category, path, bytes, file_count, mtime, regenerable, detail
-             FROM reclaim_findings WHERE scan_id=?1 ORDER BY bytes DESC LIMIT ?2",
+             FROM reclaim_findings WHERE scan_id=?1
+               AND path NOT IN (SELECT original_path FROM reclaim_quarantine_items WHERE status IN ('staged','purged')) ORDER BY bytes DESC LIMIT ?2",
             vec![&id, &limit],
         ),
     };
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     };
     let rows = stmt.query_map(params.as_slice(), |r| {
         Ok(json!({
@@ -1692,7 +2046,7 @@ async fn get_scan(
     let mut cstmt = conn
         .prepare(
             "SELECT category, COUNT(*), COALESCE(SUM(bytes),0) FROM reclaim_findings
-             WHERE scan_id=?1 GROUP BY category ORDER BY 3 DESC",
+             WHERE scan_id=?1 AND path NOT IN (SELECT original_path FROM reclaim_quarantine_items WHERE status IN ('staged','purged')) GROUP BY category ORDER BY 3 DESC",
         )
         .ok();
     let totals: Vec<_> = cstmt
@@ -1715,8 +2069,7 @@ async fn get_scan(
     // total that silently omits a subtree is a confident wrong answer.
     let skipped = read_skips(&conn);
 
-    Json(json!({"scan": scan, "findings": findings, "totals": totals, "skipped": skipped}))
-        .into_response()
+    Ok((scan, findings, totals, skipped))
 }
 
 fn read_skips(conn: &rusqlite::Connection) -> Vec<serde_json::Value> {
@@ -1770,7 +2123,10 @@ async fn unskip(State(state): State<AppState>, Query(q): Query<SkipPath>) -> Res
     let path = q.path.clone();
     match state.store.write(move |c| {
         let n = c.execute("DELETE FROM reclaim_skipped WHERE path=?1", [&path])?;
-        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+        Ok(crate::db::WriteOutcome {
+            applied: n > 0,
+            events: vec![],
+        })
     }) {
         Ok(r) if r.applied => {
             tracing::info!(path = %q.path, "reclaim skip cleared; next scan will try it again");
@@ -1940,25 +2296,39 @@ async fn create_quarantine(
     let mut moved = Vec::new();
     let mut refused = Vec::new();
     let mut total: u64 = 0;
+    // Probed once per request: which workers are running right now.
+    let owners = super::reclaim_owner::Owners::probe().await;
 
     for raw in &body.paths {
         let p = PathBuf::from(shellexpand_home(raw));
         if let Err(reason) = guard_path(&p) {
             // Refusals are returned, not silently dropped: a caller that asked
             // for 10 paths and got 7 moved must be able to see which 3 and why.
-            tracing::warn!(path = %p.display(), reason = %reason, "quarantine refused by guard");
-            refused.push(json!({"path": raw, "reason": reason}));
+            tracing::warn!(path = %p.display(), reason = %reason, verdict = "reclaim_refused_guard", "quarantine refused by guard");
+            refused.push(json!({"path": raw, "reason": reason, "class": "guard"}));
             continue;
         }
         if !p.exists() {
-            refused.push(json!({"path": raw, "reason": "does not exist"}));
+            refused.push(json!({"path": raw, "reason": "does not exist", "class": "missing"}));
+            continue;
+        }
+        // The ownership gate (2026-10-20 incidents, see reclaim_owner.rs): a
+        // running worker's scratch, git-tracked files, a worktree holding
+        // uncommitted or unpushed work. A check that could not run refuses.
+        if let Some(r) = super::reclaim_owner::refusal(&p, &owners).await {
+            tracing::warn!(
+                path = %p.display(), class = r.class, reason = %r.reason,
+                session = %session, verdict = "reclaim_refused_owned",
+                "quarantine refused: path is owned"
+            );
+            refused.push(json!({"path": raw, "reason": r.reason, "class": r.class}));
             continue;
         }
         // Sizing one quarantine candidate, not a scan: no watchdog is reading
         // this position, so it gets its own throwaway.
-        let sz = subtree_totals(&p, 0, &cancel, &ScanPos::new()).bytes.max(
-            std::fs::symlink_metadata(&p).map(|m| m.len()).unwrap_or(0),
-        );
+        let sz = subtree_totals(&p, 0, &cancel, &ScanPos::new())
+            .bytes
+            .max(std::fs::symlink_metadata(&p).map(|m| m.len()).unwrap_or(0));
         // Preserve the original path shape under the batch dir so restore is
         // unambiguous and a human can read the staging area directly.
         let rel = p.strip_prefix("/").unwrap_or(&p);
@@ -1969,7 +2339,11 @@ async fn create_quarantine(
         match crate::cargo_target_guard::rename(&p, &dest) {
             Ok(_) => {
                 total += sz;
-                moved.push((p.to_string_lossy().into_owned(), dest.to_string_lossy().into_owned(), sz));
+                moved.push((
+                    p.to_string_lossy().into_owned(),
+                    dest.to_string_lossy().into_owned(),
+                    sz,
+                ));
             }
             Err(e) => {
                 tracing::warn!(path = %p.display(), error = %e, "quarantine move failed");
@@ -2077,8 +2451,69 @@ async fn list_quarantine(State(state): State<AppState>) -> Response {
         })
         .unwrap_or_default();
 
-    Json(json!({"batches": batches, "items": items, "root": quarantine_root().to_string_lossy()}))
+    let scheduled = scheduled_summary(&scheduled_status_path(), &conn);
+    Json(json!({"batches": batches, "items": items, "root": quarantine_root().to_string_lossy(),
+        "volume_now": volume_now(&state), "scheduled": scheduled}))
         .into_response()
+}
+
+/// Where scripts/disk-reclaim-tick.sh records its last run.
+fn scheduled_status_path() -> PathBuf {
+    home_dir().join(".amux/logs/disk-reclaim-tick.json")
+}
+
+/// The scheduled cleanup, for Metrics > Disk Cleanup (Ethan 2026-10-21: "regular
+/// cleanups of data that has not been accessed in a while ... baked into the
+/// metrics"). The tick's last run, plus what each class still holds RIGHT NOW:
+/// staged bytes and when the oldest batch is purged. Those totals come from the
+/// table over every staged batch rather than the 50-row list above, because a
+/// 30-day stale window outgrows that list.
+///
+/// `measured: false` with `why_unmeasured` when the tick has never written its
+/// status, so an empty panel cannot read as "nothing to clean".
+pub(crate) fn scheduled_summary(status_file: &FsPath, conn: &rusqlite::Connection) -> serde_json::Value {
+    let run: serde_json::Value = match std::fs::read_to_string(status_file) {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(path = %status_file.display(), error = %e, measured = false,
+                    verdict = "reclaim_schedule_status_unreadable", "disk-reclaim-tick status is not JSON");
+                return json!({"measured": false, "why_unmeasured": format!("status file is not JSON: {e}")});
+            }
+        },
+        Err(_) => {
+            return json!({"measured": false,
+                "why_unmeasured": "the scheduled disk reclaim has not run yet (scripts/disk-reclaim-tick.sh)"})
+        }
+    };
+    let now = now_secs();
+    let mut classes = Vec::new();
+    for c in run.get("classes").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let session = c.get("session").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let retain = c.get("retain_s").and_then(|v| v.as_i64()).unwrap_or(0);
+        let (n, bytes, oldest): (i64, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(bytes),0), MIN(created_at) FROM reclaim_quarantine
+                 WHERE session = ?1 AND status = 'staged'",
+                [&session],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap_or((0, 0, None));
+        let mut c = c;
+        if let Some(o) = c.as_object_mut() {
+            o.insert("staged_batches".into(), json!(n));
+            o.insert("staged_bytes".into(), json!(bytes));
+            o.insert("next_purge_at".into(), json!(oldest.map(|t| t + retain)));
+        }
+        classes.push(c);
+    }
+    let at = run.get("at").and_then(|v| v.as_i64()).unwrap_or(0);
+    json!({"measured": true, "last_run_at": at, "age_s": now - at,
+        "dry": run.get("dry").cloned().unwrap_or(json!(false)),
+        "purged": run.get("purged").cloned().unwrap_or(json!(0)),
+        "free_kb_before": run.get("free_kb_before").cloned().unwrap_or(json!(null)),
+        "free_kb_after": run.get("free_kb_after").cloned().unwrap_or(json!(null)),
+        "classes": classes})
 }
 
 async fn restore_quarantine(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -2107,7 +2542,9 @@ async fn restore_quarantine(State(state): State<AppState>, Path(id): Path<String
     for (orig, staged) in &pairs {
         let op = PathBuf::from(orig);
         if op.exists() {
-            failed.push(json!({"path": orig, "reason": "something already exists at the original path"}));
+            failed.push(
+                json!({"path": orig, "reason": "something already exists at the original path"}),
+            );
             continue;
         }
         if let Some(parent) = op.parent() {
@@ -2173,7 +2610,11 @@ async fn purge_quarantine(
     }
     let dir = quarantine_root().join(&id);
     if !dir.starts_with(quarantine_root()) {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad batch id"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "bad batch id"})),
+        )
+            .into_response();
     }
     let (free_before, _) = df_bytes(&home_dir()).unwrap_or((0, 0));
     // Older versions could stage a live Cargo target. Keep the original paths
@@ -2184,7 +2625,8 @@ async fn purge_quarantine(
             Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
         };
         let result = (|| -> rusqlite::Result<Vec<String>> {
-            let mut stmt = conn.prepare("SELECT original_path FROM reclaim_quarantine_items WHERE batch_id=?1")?;
+            let mut stmt = conn
+                .prepare("SELECT original_path FROM reclaim_quarantine_items WHERE batch_id=?1")?;
             let rows = stmt.query_map([&id], |row| row.get(0))?;
             rows.collect()
         })();
@@ -2194,7 +2636,11 @@ async fn purge_quarantine(
         }
     };
     if let Err(e) = crate::cargo_target_guard::purge(&dir, &originals) {
-        return (StatusCode::CONFLICT, Json(json!({"error": e, "verdict": "cargo_reclaim_deferred"}))).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": e, "verdict": "cargo_reclaim_deferred"})),
+        )
+            .into_response();
     }
     let (free_after, _) = df_bytes(&home_dir()).unwrap_or((0, 0));
     let snaps = read_snapshots().await.map(|v| v.len());
@@ -2204,7 +2650,9 @@ async fn purge_quarantine(
         .store
         .write_async(move |c| {
             c.execute(
-                "UPDATE reclaim_quarantine_items SET status='purged' WHERE batch_id=?1",
+                // Only items still staged: a restored item is back in place
+                // and was not purged (implicit state machines inventory, tier 5).
+                "UPDATE reclaim_quarantine_items SET status='purged' WHERE batch_id=?1 AND status='staged'",
                 [&bid],
             )?;
             c.execute(
@@ -2243,6 +2691,51 @@ async fn purge_quarantine(
 mod tests {
     use super::*;
 
+    /// The Metrics panel reads this: per class, what is staged NOW and when the
+    /// oldest batch goes, counted over every staged batch of that class's own
+    /// session. A purged batch, another class's batch and a person's batch do
+    /// not count. No status file is unmeasured, never an empty success.
+    #[test]
+    fn scheduled_summary_counts_each_class_from_its_own_staged_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("status.json");
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE reclaim_quarantine (id TEXT, created_at INTEGER, status TEXT, bytes INTEGER, session TEXT);
+             INSERT INTO reclaim_quarantine VALUES
+               ('a', 1000, 'staged', 10, 'disk-reclaim-stale'),
+               ('b', 2000, 'staged', 5,  'disk-reclaim-stale'),
+               ('c', 500,  'purged', 99, 'disk-reclaim-stale'),
+               ('d', 700,  'staged', 7,  'disk-reclaim-tick'),
+               ('e', 100,  'staged', 50, 'amux');",
+        )
+        .unwrap();
+
+        let none = scheduled_summary(&f, &conn);
+        assert_eq!(none["measured"], json!(false));
+        assert!(none["why_unmeasured"].as_str().unwrap().contains("not run"));
+
+        std::fs::write(&f, "{not json").unwrap();
+        assert_eq!(scheduled_summary(&f, &conn)["measured"], json!(false));
+
+        std::fs::write(
+            &f,
+            r#"{"at": 1, "classes": [
+                {"key":"build","session":"disk-reclaim-tick","retain_s":259200},
+                {"key":"stale","session":"disk-reclaim-stale","retain_s":2592000}]}"#,
+        )
+        .unwrap();
+        let s = scheduled_summary(&f, &conn);
+        assert_eq!(s["measured"], json!(true));
+        let stale = &s["classes"][1];
+        assert_eq!(stale["staged_batches"], json!(2));
+        assert_eq!(stale["staged_bytes"], json!(15));
+        assert_eq!(stale["next_purge_at"], json!(1000 + 2_592_000));
+        let build = &s["classes"][0];
+        assert_eq!(build["staged_bytes"], json!(7));
+        assert_eq!(build["next_purge_at"], json!(700 + 259_200));
+    }
+
     #[test]
     fn snapshot_response_never_turns_failed_measurement_into_zero() {
         let unknown = snapshot_payload(None, 100, 200);
@@ -2250,7 +2743,10 @@ mod tests {
         assert!(unknown["count"].is_null());
         assert!(unknown["snapshots"].is_null());
         assert_eq!(unknown["n_considered"], 0);
-        assert!(unknown["why_unmeasured"].as_str().unwrap().contains("unmeasured"));
+        assert!(unknown["why_unmeasured"]
+            .as_str()
+            .unwrap()
+            .contains("unmeasured"));
         let zero = snapshot_payload(Some(vec![]), 100, 200);
         assert_eq!(zero["measured"], true);
         assert_eq!(zero["count"], 0);
@@ -2289,7 +2785,9 @@ mod tests {
             PathBuf::from("relative/path"),
             PathBuf::from("/Users/ethan/Dev/../../etc"),
             PathBuf::from("/private/tmp/claude-501"),
-            PathBuf::from("/private/tmp/claude-501/-Users-ethan-Dev/some-session/scratchpad/file.txt"),
+            PathBuf::from(
+                "/private/tmp/claude-501/-Users-ethan-Dev/some-session/scratchpad/file.txt",
+            ),
         ];
         for p in must_refuse {
             assert!(
@@ -2334,7 +2832,9 @@ mod tests {
     fn ephemeral_tmp_root_matches_only_the_roots_themselves() {
         assert!(is_ephemeral_tmp_root(FsPath::new("/private/tmp")));
         assert!(is_ephemeral_tmp_root(&std::env::temp_dir()));
-        assert!(!is_ephemeral_tmp_root(FsPath::new("/private/tmp/some-orphan-dir")));
+        assert!(!is_ephemeral_tmp_root(FsPath::new(
+            "/private/tmp/some-orphan-dir"
+        )));
         assert!(!is_ephemeral_tmp_root(FsPath::new("/private")));
         assert!(!is_ephemeral_tmp_root(&home_dir()));
     }
@@ -2391,7 +2891,10 @@ mod tests {
         let ma = std::fs::symlink_metadata(&a).expect("stat a");
         let mb = std::fs::symlink_metadata(&b).expect("stat b");
         assert!(seen.count(&ma), "first sighting of a hardlink must count");
-        assert!(!seen.count(&mb), "second path to the same inode must NOT count");
+        assert!(
+            !seen.count(&mb),
+            "second path to the same inode must NOT count"
+        );
 
         // A plain file with nlink == 1 must always count, even twice-seen
         // metadata objects, or ordinary files would go missing from totals.
@@ -2451,7 +2954,10 @@ mod tests {
         // Non-vacuity: a walk that produced nothing would satisfy the stray
         // check trivially, and an empty filter result is indistinguishable from
         // a correct one on the rows alone.
-        assert!(!out.tree.is_empty(), "the walk must have recorded something");
+        assert!(
+            !out.tree.is_empty(),
+            "the walk must have recorded something"
+        );
 
         let root = dir.path();
         let strays: Vec<String> = out
@@ -2491,21 +2997,23 @@ mod tests {
         let mut mismatches: Vec<String> = Vec::new();
         let mut calls = 0usize;
         {
-            let mut progress =
-                |_d: u64, _f: u64, _b: u64, cur: &FsPath, _p: &mut Vec<Finding>| {
-                    calls += 1;
-                    let (path, phase, _) = pos.read();
-                    if path != cur.to_string_lossy() || phase != "readdir" {
-                        mismatches.push(format!("at {cur:?}: published {phase} at {path}"));
-                    }
-                };
+            let mut progress = |_d: u64, _f: u64, _b: u64, cur: &FsPath, _p: &mut Vec<Finding>| {
+                calls += 1;
+                let (path, phase, _) = pos.read();
+                if path != cur.to_string_lossy() || phase != "readdir" {
+                    mismatches.push(format!("at {cur:?}: published {phase} at {path}"));
+                }
+            };
             walk(&cfg_for(dir.path()), &cancel, &pos, &skip, &mut progress);
         }
 
         // The 700ms throttle lives in run_scan's callback, not here, so every
         // directory reports — 13 of them (root + 12 subdirectories).
         assert!(calls >= 13, "progress must fire per directory, saw {calls}");
-        assert!(mismatches.is_empty(), "position lagged the walk: {mismatches:?}");
+        assert!(
+            mismatches.is_empty(),
+            "position lagged the walk: {mismatches:?}"
+        );
     }
 
     /// A directory on the skip list is stepped over, and SAID to be stepped
@@ -2531,7 +3039,11 @@ mod tests {
         let mut noop = |_: u64, _: u64, _: u64, _: &FsPath, _: &mut Vec<Finding>| {};
         let out = walk(&cfg_for(dir.path()), &cancel, &pos, &skip, &mut noop);
 
-        assert_eq!(out.skipped, vec![hazard.clone()], "the skip must be reported");
+        assert_eq!(
+            out.skipped,
+            vec![hazard.clone()],
+            "the skip must be reported"
+        );
         assert!(
             out.bytes >= 4_000 && out.bytes < 40_000,
             "sibling walked, hazard not: got {} bytes",
@@ -2570,7 +3082,10 @@ mod tests {
                              '/Users/ethan/Library/Mobile Documents', 'readdir')",
                     [],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .expect("seed");
 
@@ -2585,7 +3100,10 @@ mod tests {
             )
             .expect("row");
         assert_eq!(status, "interrupted");
-        assert_eq!(path.as_deref(), Some("/Users/ethan/Library/Mobile Documents"));
+        assert_eq!(
+            path.as_deref(),
+            Some("/Users/ethan/Library/Mobile Documents")
+        );
         assert!(
             err.contains("readdir at /Users/ethan/Library/Mobile Documents"),
             "the error must name where it died, got: {err}"
@@ -2604,7 +3122,10 @@ mod tests {
 
         let skips = load_skips(&store);
         let icloud = home_dir().join("Library/Mobile Documents");
-        assert!(skips.contains(&icloud), "iCloud provider root must be skipped by default");
+        assert!(
+            skips.contains(&icloud),
+            "iCloud provider root must be skipped by default"
+        );
 
         // Seeding twice must not duplicate or resurrect a cleared row.
         let again = load_skips(&store);
@@ -2614,14 +3135,21 @@ mod tests {
         store
             .write(move |c| {
                 let n = c.execute("DELETE FROM reclaim_skipped WHERE path=?1", [&p])?;
-                Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: n > 0,
+                    events: vec![],
+                })
             })
             .expect("delete");
         let conn = store.read().expect("read");
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM reclaim_skipped", [], |r| r.get(0))
             .expect("count");
-        assert_eq!(n as usize, skips.len() - 1, "clearing a skip must remove exactly one");
+        assert_eq!(
+            n as usize,
+            skips.len() - 1,
+            "clearing a skip must remove exactly one"
+        );
     }
 
     /// A learned skip records WHY, so a future reader can tell an intentional
@@ -2674,8 +3202,16 @@ mod tests {
         let store: crate::db::SharedStore =
             Arc::new(crate::db::Store::open(&dir.path().join("t.db")).expect("open"));
 
-        record_stalled_dir(&store, "/mnt/dead-nfs".into(), "readdir did not return after 45s".into());
-        record_stalled_dir(&store, "/mnt/dead-nfs".into(), "readdir did not return after 45s".into());
+        record_stalled_dir(
+            &store,
+            "/mnt/dead-nfs".into(),
+            "readdir did not return after 45s".into(),
+        );
+        record_stalled_dir(
+            &store,
+            "/mnt/dead-nfs".into(),
+            "readdir did not return after 45s".into(),
+        );
 
         let conn = store.read().expect("read");
         let (reason, detail, hits): (String, String, i64) = conn
@@ -2686,8 +3222,14 @@ mod tests {
             )
             .expect("row");
         assert_eq!(reason, "stalled");
-        assert!(detail.contains("45s"), "detail must carry the stall duration: {detail}");
-        assert_eq!(hits, 2, "a repeat stall must increment rather than insert a second row");
+        assert!(
+            detail.contains("45s"),
+            "detail must carry the stall duration: {detail}"
+        );
+        assert_eq!(
+            hits, 2,
+            "a repeat stall must increment rather than insert a second row"
+        );
     }
 
     /// Being routed around must not COUNT as evidence for being routed around.
@@ -2726,9 +3268,16 @@ mod tests {
         let hits: i64 = store
             .read()
             .expect("read")
-            .query_row("SELECT hits FROM reclaim_skipped WHERE path=?1", [victim], |r| r.get(0))
+            .query_row(
+                "SELECT hits FROM reclaim_skipped WHERE path=?1",
+                [victim],
+                |r| r.get(0),
+            )
             .expect("row");
-        assert_eq!(hits, 1, "hits counts stalls only; ten skips must add none, got {hits}");
+        assert_eq!(
+            hits, 1,
+            "hits counts stalls only; ten skips must add none, got {hits}"
+        );
         assert!(
             !load_skips(&store).contains(&victim_path),
             "a directory must not become permanently exempt by being skipped"
@@ -2761,7 +3310,10 @@ mod tests {
                      VALUES (?1,'stalled','seeded',100,100,1)",
                     [p],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .expect("seed");
 
@@ -2779,4 +3331,45 @@ mod tests {
         assert!(last_seen > 100, "last_seen must advance, got {last_seen}");
         assert_eq!(hits, 1, "hits must be untouched by a refresh");
     }
+    /// 2026-10-20: one folder macOS would not answer froze the scan until the
+    /// 300s watchdog ended it, so 9 of 10 scans never finished. The walk now
+    /// steps over a silent directory and covers everything else.
+    #[test]
+    fn a_directory_that_never_answers_is_stepped_over_and_the_scan_finishes() {
+        std::env::set_var("AMUX_RECLAIM_READDIR_QUIET_S", "1");
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in ["before", "NEVER_ANSWERS_FOR_TEST", "after"] {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).expect("mkdir");
+            std::fs::write(sub.join("f.bin"), vec![1u8; 4096]).expect("write");
+        }
+        let cancel = AtomicBool::new(false);
+        let pos = ScanPos::new();
+        let skip = std::collections::HashSet::new();
+        let mut noop = |_: u64, _: u64, _: u64, _: &FsPath, _: &mut Vec<Finding>| {};
+        let t0 = std::time::Instant::now();
+        let out = walk(&cfg_for(dir.path()), &cancel, &pos, &skip, &mut noop);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the walk waited on the silent folder");
+        assert_eq!(out.timed_out, vec![dir.path().join("NEVER_ANSWERS_FOR_TEST")]);
+        assert_eq!(out.files, 2, "both answering folders were still counted");
+    }
+
+    #[test]
+    fn the_lister_serves_the_next_directory_after_abandoning_a_silent_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let silent = dir.path().join("NEVER_ANSWERS_FOR_TEST");
+        let ok = dir.path().join("ok");
+        std::fs::create_dir(&silent).expect("mkdir");
+        std::fs::create_dir(&ok).expect("mkdir");
+        std::fs::write(ok.join("a"), b"x").expect("write");
+        let mut l = DirLister::new(std::time::Duration::from_secs(1));
+        assert!(matches!(l.list(&silent), Listing::TimedOut));
+        assert_eq!(l.abandoned, 1);
+        match l.list(&ok) {
+            Listing::Entries(e) => assert_eq!(e.len(), 1),
+            _ => panic!("a fresh reader must serve the next directory"),
+        }
+        assert!(matches!(l.list(&dir.path().join("missing")), Listing::Unreadable));
+    }
+
 }

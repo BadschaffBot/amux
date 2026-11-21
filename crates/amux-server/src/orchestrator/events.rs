@@ -23,14 +23,12 @@
 //! the stream — per Invariant 34 the correct move after a gap is to re-read
 //! current state from the store, which the next full event write does.
 
-use crate::db::{PendingEvent, SharedStore, WriteOutcome};
 use crate::db::{commands, queries};
+use crate::db::{PendingEvent, SharedStore, WriteOutcome};
 use crate::opencode::AgentProtocol;
 use amux_core::ids::{TaskId, WorkerId};
 use amux_core::limits::AttemptRecord;
-use amux_core::protocol::{
-    CommandState, CommandTransition, WorkerCommand, WorkerEvent,
-};
+use amux_core::protocol::{CommandState, CommandTransition, WorkerCommand, WorkerEvent};
 use amux_core::revision::{EntityType, MutationKind};
 use amux_core::session::ExitReason;
 use amux_core::worker::WorkerState;
@@ -123,8 +121,11 @@ pub fn apply_event(
             // record it with a NULL session_id rather than dropping it.
             let ses_id = queries::live_session_for(conn, wid)?.map(|s| s.id);
             if ses_id.is_none() {
-                tracing::warn!(worker = wid, turn = turn_id.as_str(),
-                    "turn started with no live session row; recorded with NULL session_id");
+                tracing::warn!(
+                    worker = wid,
+                    turn = turn_id.as_str(),
+                    "turn started with no live session row; recorded with NULL session_id"
+                );
             }
             let task_id = commands::in_flight(conn, worker)?.and_then(|cmd| match cmd.command {
                 WorkerCommand::ExecuteTask(task) => Some(task.to_string()),
@@ -137,11 +138,17 @@ pub fn apply_event(
                 params![turn_id.as_str(), ses_id, wid, task_id, now_s],
             )?;
             if n > 0 {
-                events.push(ev(EntityType::Turn, turn_id.as_str(), MutationKind::Created));
+                events.push(ev(
+                    EntityType::Turn,
+                    turn_id.as_str(),
+                    MutationKind::Created,
+                ));
             } else {
                 tracing::warn!(turn = turn_id.as_str(), "duplicate TurnStarted ignored");
             }
-            let state = WorkerState::Active { turn: Some(turn_id.clone()) };
+            let state = WorkerState::Active {
+                turn: Some(turn_id.clone()),
+            };
             write_state(conn, prior_state.as_ref(), wid, &state, &now_s, &mut events)?;
         }
 
@@ -183,10 +190,16 @@ pub fn apply_event(
                 params![res.turn_id.as_str(), now_s, outcome_json],
             )?;
             if n > 0 {
-                events.push(ev(EntityType::Turn, res.turn_id.as_str(), MutationKind::Updated));
+                events.push(ev(
+                    EntityType::Turn,
+                    res.turn_id.as_str(),
+                    MutationKind::Updated,
+                ));
             } else {
-                tracing::warn!(turn = res.turn_id.as_str(),
-                    "TurnCompleted for a turn with no open ledger row (missed TurnStarted?)");
+                tracing::warn!(
+                    turn = res.turn_id.as_str(),
+                    "TurnCompleted for a turn with no open ledger row (missed TurnStarted?)"
+                );
             }
             let state = WorkerState::Idle { since: now };
             write_state(conn, prior_state.as_ref(), wid, &state, &now_s, &mut events)?;
@@ -230,17 +243,18 @@ pub fn apply_event(
                                 .as_ref()
                                 .map(|checkpoint| checkpoint.completed_steps.clone())
                                 .unwrap_or_default();
-                            completed_steps.push(format!(
-                                "turn {} completed: {}",
-                                res.turn_id, res.outcome
-                            ));
-                            let artifacts = crate::db::artifact_store::list_for_task(conn, &row.id)?
-                                .into_iter()
-                                .filter(|artifact| {
-                                    !crate::db::artifact_store::is_retired_state(&artifact.state)
-                                })
-                                .map(|artifact| artifact.ref_value)
-                                .collect();
+                            completed_steps
+                                .push(format!("turn {} completed: {}", res.turn_id, res.outcome));
+                            let artifacts =
+                                crate::db::artifact_store::list_for_task(conn, &row.id)?
+                                    .into_iter()
+                                    .filter(|artifact| {
+                                        !crate::db::artifact_store::is_retired_state(
+                                            &artifact.state,
+                                        )
+                                    })
+                                    .map(|artifact| artifact.ref_value)
+                                    .collect();
                             let next_action = row
                                 .next_action
                                 .clone()
@@ -296,13 +310,17 @@ pub fn apply_event(
                 }
                 WorkerState::Idle { since }
             } else {
-                WorkerState::Waiting { reason: w.reason.clone() }
+                WorkerState::Waiting {
+                    reason: w.reason.clone(),
+                }
             };
             write_state(conn, prior_state.as_ref(), wid, &state, &now_s, &mut events)?;
         }
 
         WorkerEvent::RateLimited(rl) => {
-            let state = WorkerState::RateLimited { reset_at: rl.reset_at };
+            let state = WorkerState::RateLimited {
+                reset_at: rl.reset_at,
+            };
             write_state(conn, prior_state.as_ref(), wid, &state, &now_s, &mut events)?;
         }
 
@@ -315,24 +333,112 @@ pub fn apply_event(
                 commands::transition(
                     conn,
                     &cmd.id,
-                    CommandTransition::Fail { reason: f.reason.clone() },
+                    CommandTransition::Fail {
+                        reason: f.reason.clone(),
+                    },
                     MAX_ATTEMPTS,
                 )?;
                 events.push(ev(
                     EntityType::Other("command".into()),
                     cmd.id.as_str(),
-                    MutationKind::StatusChanged { from: from.into(), to: "failed".into() },
+                    MutationKind::StatusChanged {
+                        from: from.into(),
+                        to: "failed".into(),
+                    },
                 ));
                 if let WorkerCommand::ExecuteTask(t) = &cmd.command {
                     task_for_attempt = Some(t.clone());
                 }
             }
 
+            // A DELIVERY failure has nothing in flight: the transport marks
+            // the command `failed` BEFORE it reports the failure, so
+            // `commands::in_flight` is empty by construction. Without this
+            // fallback the ledger records nothing, the assignment key
+            // (`{card}:{worker}:{attempt}:{act}`) never advances past that
+            // attempt, and `already_dispatched` then retires the card for good
+            // — one bad handshake and the card is undispatchable forever.
+            // Measured 2026-10-26: `M2ACP-1` died exactly this way after a
+            // single `session/new returned no sessionId`.
+            //
+            // Bounded: only the most recent failed `execute_task` for THIS
+            // worker in the last 10 minutes, and only when its task has no
+            // attempt row at or after that command was created (so a retry that
+            // fails again is not counted twice).
+            if task_for_attempt.is_none() {
+                let since = (now - chrono::Duration::minutes(10)).to_rfc3339();
+                let recent: Vec<(String, String)> = {
+                    let mut stmt = conn.prepare(
+                        "SELECT id, command FROM _amux_commands
+                         WHERE worker_id = ?1 AND state LIKE '%\"failed\"%'
+                           AND queued_at >= ?2
+                         ORDER BY queued_at DESC LIMIT 5",
+                    )?;
+                    let rows = stmt.query_map(params![wid, since], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                for (cmd_id, command) in recent {
+                    let Ok(WorkerCommand::ExecuteTask(task)) =
+                        serde_json::from_str::<WorkerCommand>(&command)
+                    else {
+                        continue;
+                    };
+                    let recorded: bool = conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM _amux_attempts
+                                       WHERE task_id = ?1 AND worker_id = ?2 AND at >= (
+                                         SELECT queued_at FROM _amux_commands WHERE id = ?3))",
+                        params![task.as_str(), wid, cmd_id],
+                        |r| r.get(0),
+                    )?;
+                    if !recorded {
+                        task_for_attempt = Some(task);
+                        break;
+                    }
+                }
+            }
+
+            // A TURN failure is a THIRD shape: the delivery succeeded (the
+            // command is `confirmed`), so nothing is in flight and nothing is
+            // `failed` — but the turn ledger records both the task and that the
+            // turn failed. Measured 2026-10-26: a provider quota wall arrived
+            // exactly here and retired the card just like a delivery failure
+            // did (AMUX-71/72/73). The outcome column holds a JSON object
+            // (`{"outcome":"failed"}` / `{"outcome":"failed: <reason>"}`), so
+            // the LIKE names the JSON spelling — matching on a bare `failed`
+            // prefix silently matches NOTHING. And it is what keeps a
+            // SUCCESSFUL turn (`{"outcome":"success"}`) from being counted as a
+            // failed attempt.
+            if task_for_attempt.is_none() {
+                let since = (now - chrono::Duration::minutes(10)).to_rfc3339();
+                let failed_turn: Option<String> = conn
+                    .query_row(
+                        "SELECT task_id FROM _amux_turns t
+                         WHERE t.worker_id = ?1 AND t.task_id IS NOT NULL
+                           AND t.started_at >= ?2
+                           AND t.outcome LIKE '%\"failed%' 
+                           AND NOT EXISTS (SELECT 1 FROM _amux_attempts a
+                                           WHERE a.worker_id = t.worker_id
+                                             AND a.task_id = t.task_id
+                                             AND a.at >= t.started_at)
+                         ORDER BY t.started_at DESC LIMIT 1",
+                        params![wid, since],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(turn_task) = failed_turn.and_then(|t| TaskId::parse(&t).ok()) {
+                    task_for_attempt = Some(turn_task);
+                }
+            }
+
             // Attempt ledger (Invariant 49): the record rides into the next
             // attempt's context. `_amux_attempts` is keyed by task, so a
-            // failure with no identifiable task (no in-flight ExecuteTask)
-            // cannot honestly produce a row — it is logged and lands on the
-            // worker state instead of being pinned to an invented task.
+            // failure with no identifiable task cannot honestly produce a row —
+            // it is logged and lands on the worker state instead of being
+            // pinned to an invented task. With the three fallbacks above, that
+            // now means "no command, recent or in flight, and no recently
+            // failed turn names a task".
             if let Some(task) = task_for_attempt {
                 let open: Option<(String, String)> = conn
                     .query_row(
@@ -362,8 +468,9 @@ pub fn apply_event(
                     params![task.as_str(), wid],
                     |r| r.get(0),
                 )?;
-                let semantic_task = crate::orchestrator::context::issue_by_internal_id(conn, &task)?
-                    .map(|row| row.id);
+                let semantic_task =
+                    crate::orchestrator::context::issue_by_internal_id(conn, &task)?
+                        .map(|row| row.id);
                 let rejected_evidence = semantic_task
                     .as_deref()
                     .map(|id| {
@@ -390,7 +497,11 @@ pub fn apply_event(
                     "SELECT COUNT(*) FROM _amux_tool_events
                      WHERE task_id=?1 AND worker_id=?2
                        AND created_at >= COALESCE(?3, created_at)",
-                    params![task.as_str(), wid, open.as_ref().map(|(started, _)| started)],
+                    params![
+                        task.as_str(),
+                        wid,
+                        open.as_ref().map(|(started, _)| started)
+                    ],
                     |r| r.get(0),
                 )?;
                 let cost_microusd = semantic_task
@@ -455,7 +566,9 @@ pub fn apply_event(
                     "worker failure with no in-flight ExecuteTask; no attempt row written");
             }
 
-            let state = WorkerState::Error { detail: f.reason.clone() };
+            let state = WorkerState::Error {
+                detail: f.reason.clone(),
+            };
             write_state(conn, prior_state.as_ref(), wid, &state, &now_s, &mut events)?;
         }
 
@@ -467,18 +580,30 @@ pub fn apply_event(
                 let reason = if status.code == Some(0) {
                     ExitReason::Completed
                 } else {
-                    ExitReason::Crashed { signal: status.signal }
+                    ExitReason::Crashed {
+                        signal: status.signal,
+                    }
                 };
                 let n = queries::end_session(conn, &ses.id, &reason, &now_s)?;
                 if n > 0 {
                     events.push(ev(
                         EntityType::Session,
                         &ses.id,
-                        MutationKind::StatusChanged { from: "running".into(), to: "ended".into() },
+                        MutationKind::StatusChanged {
+                            from: "running".into(),
+                            to: "ended".into(),
+                        },
                     ));
                 }
             }
-            write_state(conn, prior_state.as_ref(), wid, &WorkerState::Stopped, &now_s, &mut events)?;
+            write_state(
+                conn,
+                prior_state.as_ref(),
+                wid,
+                &WorkerState::Stopped,
+                &now_s,
+                &mut events,
+            )?;
         }
 
         // Started: liveness, no durable consequence yet (the session row is
@@ -518,12 +643,56 @@ pub fn apply_event(
                 payload: None,
             });
         }
-        WorkerEvent::Started | WorkerEvent::TaskUpdated(_) | WorkerEvent::ContextLow(_) => {}
+        WorkerEvent::Started => {
+            // Fresh agent start (#73): with no persisted conversation ref
+            // the next turn opens a new provider conversation, so queue one
+            // bounded memory re-supply. A reconnect (ref present) continues
+            // its own conversation and needs nothing.
+            if !crate::orchestrator::memory_resupply::has_conversation_ref(conn, worker)
+                && crate::orchestrator::memory_resupply::enqueue_resupply(
+                    conn,
+                    worker,
+                    amux_core::protocol::MemoryResupplyReason::SessionStart,
+                    now,
+                )?
+            {
+                events.push(ev(
+                    EntityType::Other("memory_resupply".into()),
+                    wid,
+                    MutationKind::Created,
+                ));
+            }
+        }
+        WorkerEvent::ContextLow(_) => {
+            // Post-compaction re-supply (#73): native compaction is
+            // provider-managed and unobservable from here, so a low reading
+            // queues one bounded re-assertion for the next turn boundary,
+            // the earliest point durable facts can be restored after the
+            // provider summarized them away. `AtTurnBoundary` timing plus
+            // same-key dedup keep a low persistent reading from stacking
+            // turns.
+            if crate::orchestrator::memory_resupply::enqueue_resupply(
+                conn,
+                worker,
+                amux_core::protocol::MemoryResupplyReason::PostCompaction,
+                now,
+            )? {
+                events.push(ev(
+                    EntityType::Other("memory_resupply".into()),
+                    wid,
+                    MutationKind::Created,
+                ));
+            }
+        }
+        WorkerEvent::TaskUpdated(_) => {}
     }
 
     // `applied` mirrors the events: every real write above pushes one, so an
     // event that changed nothing does not bump the revision (Invariant 37).
-    Ok(WriteOutcome { applied: !events.is_empty(), events })
+    Ok(WriteOutcome {
+        applied: !events.is_empty(),
+        events,
+    })
 }
 
 /// If an ExecuteTask turn completed WITHOUT the worker writing its board
@@ -633,9 +802,12 @@ pub fn spawn_event_processor(
                     // is reconstructed from the stream — after a gap the
                     // truth is the store, not inference (Invariant 34's
                     // gap-detection rule).
-                    tracing::warn!(worker = worker.as_str(), missed,
+                    tracing::warn!(
+                        worker = worker.as_str(),
+                        missed,
                         "worker event channel lagged: {missed} events dropped; \
-                         event-derived state has a hole — trust the store, not the stream");
+                         event-derived state has a hole — trust the store, not the stream"
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -668,7 +840,10 @@ pub async fn supervise_once(
         if live.contains(w) {
             true
         } else {
-            tracing::info!(worker = w.as_str(), "session ended; stopping event processor");
+            tracing::info!(
+                worker = w.as_str(),
+                "session ended; stopping event processor"
+            );
             h.abort();
             false
         }
@@ -737,7 +912,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         let s = Arc::new(Store::open(&path).unwrap());
-        std::mem::forget(dir); // keep the DB alive for the test body
+        crate::test_tempdirs::keep(dir); // keep the DB alive for the test body
         s
     }
 
@@ -751,6 +926,7 @@ mod tests {
 
     fn cfg() -> WorkerConfig {
         WorkerConfig {
+            worker_type: Default::default(),
             display_name: "w".into(),
             name_aliases: vec![],
             cwd: "/tmp/w".into(),
@@ -784,7 +960,10 @@ mod tests {
                         exit_reason: None,
                     },
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         ses_ret
@@ -798,7 +977,10 @@ mod tests {
 
     fn worker_state(store: &SharedStore) -> WorkerState {
         let conn = store.read().unwrap();
-        queries::get_worker(&conn, wid().as_str()).unwrap().unwrap().state
+        queries::get_worker(&conn, wid().as_str())
+            .unwrap()
+            .unwrap()
+            .state
     }
 
     fn enqueue_and_deliver(store: &SharedStore, cmd: WorkerCommand) -> CommandId {
@@ -807,12 +989,21 @@ mod tests {
         store
             .write(move |conn| {
                 commands::enqueue(
-                    conn, id_w.clone(), &wid(), &cmd, id_w.as_str(),
-                    &DeliveryTiming::AtTurnBoundary, None, Utc::now(),
+                    conn,
+                    id_w.clone(),
+                    &wid(),
+                    &cmd,
+                    id_w.as_str(),
+                    &DeliveryTiming::AtTurnBoundary,
+                    None,
+                    Utc::now(),
                 )?;
                 commands::transition(conn, &id_w, CommandTransition::Dispatch, 3)?;
                 commands::transition(conn, &id_w, CommandTransition::Deliver, 3)?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         id
@@ -923,12 +1114,19 @@ mod tests {
         apply(&store, WorkerEvent::TurnStarted { turn_id: trn(2) });
         apply(
             &store,
-            WorkerEvent::TurnCompleted(TurnResult { turn_id: trn(2), outcome: "done".into() }),
+            WorkerEvent::TurnCompleted(TurnResult {
+                turn_id: trn(2),
+                outcome: "done".into(),
+            }),
         );
 
         let conn = store.read().unwrap();
         let cmd = commands::by_id(&conn, &cmd_id).unwrap().unwrap();
-        assert_eq!(cmd.state, CommandState::Confirmed, "Invariant 34: TurnCompleted confirms");
+        assert_eq!(
+            cmd.state,
+            CommandState::Confirmed,
+            "Invariant 34: TurnCompleted confirms"
+        );
     }
 
     #[test]
@@ -941,7 +1139,10 @@ mod tests {
         apply(&store, WorkerEvent::TurnStarted { turn_id: trn(3) });
         apply(
             &store,
-            WorkerEvent::Progress(ProgressReport { summary: "s".into(), tokens_used: Some(500) }),
+            WorkerEvent::Progress(ProgressReport {
+                summary: "s".into(),
+                tokens_used: Some(500),
+            }),
         );
         apply(
             &store,
@@ -952,7 +1153,10 @@ mod tests {
         );
         apply(
             &store,
-            WorkerEvent::Failed(Failure { reason: "api blew up".into(), retryable: true }),
+            WorkerEvent::Failed(Failure {
+                reason: "api blew up".into(),
+                retryable: true,
+            }),
         );
 
         let conn = store.read().unwrap();
@@ -974,11 +1178,205 @@ mod tests {
         assert_eq!(attempt, 1);
         let record: AttemptRecord = serde_json::from_str(&record_json).unwrap();
         assert_eq!(record.failure_reason, "api blew up");
-        assert_eq!(record.tokens_spent, 500, "tokens from the open turn's report");
-        assert_eq!(record.tool_calls, 1, "tool calls come from the event ledger");
+        assert_eq!(
+            record.tokens_spent, 500,
+            "tokens from the open turn's report"
+        );
+        assert_eq!(
+            record.tool_calls, 1,
+            "tool calls come from the event ledger"
+        );
         drop(conn);
         // Worker landed in Error.
         assert!(matches!(worker_state(&store), WorkerState::Error { .. }));
+    }
+
+    /// MEASURED DEFECT (2026-10-26): a TURN failure is a third shape — the
+    /// delivery succeeded, so the command is `confirmed` and nothing is in
+    /// flight; the only record is the closed turn row. Without this the attempt
+    /// ledger stayed empty, the assignment key never advanced, and the card was
+    /// retired after ONE provider error (a quota wall retired AMUX-71/72/73
+    /// this way).
+    #[test]
+    fn a_turn_that_fails_after_a_good_delivery_still_records_an_attempt() {
+        let store = store();
+        seed(&store);
+        let task = TaskId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 11));
+        let cmd_id = enqueue_and_deliver(&store, WorkerCommand::ExecuteTask(task.clone()));
+        // The ACP transport confirms the delivery as soon as the agent accepts
+        // the prompt — which is why nothing is in flight when the turn fails.
+        {
+            let id = cmd_id.clone();
+            store
+                .write(move |conn| {
+                    commands::transition(
+                        conn,
+                        &id,
+                        CommandTransition::Confirm,
+                        MAX_ATTEMPTS,
+                    )?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
+                })
+                .unwrap();
+        }
+        // The turn itself ran and failed (the measured rows read
+        // `{"outcome":"failed"}`), and it names the task it was working on.
+        {
+            let (task_s, wid_s) = (task.to_string(), wid().to_string());
+            store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_turns (id, worker_id, task_id, started_at, ended_at, outcome)
+                         VALUES ('trn_failed', ?1, ?2, ?3, ?3, '{\"outcome\":\"failed\"}')",
+                        params![wid_s, task_s, (Utc::now() - chrono::Duration::seconds(5)).to_rfc3339()],
+                    )?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
+                })
+                .unwrap();
+        }
+        assert!(
+            {
+                let conn = store.read().unwrap();
+                commands::in_flight(&conn, &wid()).unwrap().is_none()
+            },
+            "precondition: the delivery was confirmed, so nothing is in flight"
+        );
+
+        apply(
+            &store,
+            WorkerEvent::Failed(Failure {
+                reason: "acp turn failed: Free usage limit reached".into(),
+                retryable: true,
+            }),
+        );
+
+        let conn = store.read().unwrap();
+        let (attempt, record_json): (u32, String) = conn
+            .query_row(
+                "SELECT attempt, record FROM _amux_attempts WHERE task_id = ?1 AND worker_id = ?2",
+                params![task.as_str(), wid().as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("a turn that failed is an attempt: without a row the card is retired");
+        assert_eq!(attempt, 1);
+        let record: AttemptRecord = serde_json::from_str(&record_json).unwrap();
+        assert_eq!(
+            record.failure_reason,
+            "acp turn failed: Free usage limit reached"
+        );
+    }
+
+    /// The other half of the guard: a turn that SUCCEEDED must never be
+    /// counted as a failed attempt.
+    #[test]
+    fn a_successful_turn_is_not_mistaken_for_a_failed_attempt() {
+        let store = store();
+        seed(&store);
+        let task = TaskId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 12));
+        let cmd_id = enqueue_and_deliver(&store, WorkerCommand::ExecuteTask(task.clone()));
+        {
+            let id = cmd_id.clone();
+            let (task_s, wid_s) = (task.to_string(), wid().to_string());
+            store
+                .write(move |conn| {
+                    commands::transition(conn, &id, CommandTransition::Confirm, MAX_ATTEMPTS)?;
+                    conn.execute(
+                        "INSERT INTO _amux_turns (id, worker_id, task_id, started_at, ended_at, outcome)
+                         VALUES ('trn_ok', ?1, ?2, ?3, ?3, '{\"outcome\":\"success\"}')",
+                        params![wid_s, task_s, (Utc::now() - chrono::Duration::seconds(5)).to_rfc3339()],
+                    )?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
+                })
+                .unwrap();
+        }
+        apply(
+            &store,
+            WorkerEvent::Failed(Failure {
+                reason: "a different provider call failed".into(),
+                retryable: true,
+            }),
+        );
+        let conn = store.read().unwrap();
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _amux_attempts WHERE task_id = ?1",
+                params![task.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "a successful turn is not a failed attempt");
+    }
+
+    /// MEASURED DEFECT (2026-10-26): a DELIVERY failure has nothing in flight —
+    /// `runtime::pump_commands` marks the command `failed` and only then reports
+    /// `WorkerEvent::Failed`. The ledger therefore recorded no attempt, the
+    /// assignment key never advanced, and `already_dispatched` retired the card
+    /// permanently after ONE bad handshake (`M2ACP-1`).
+    #[test]
+    fn a_delivery_failure_still_records_an_attempt_so_the_card_can_be_retried() {
+        let store = store();
+        seed(&store);
+        let task = TaskId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 9));
+        let cmd_id = enqueue_and_deliver(&store, WorkerCommand::ExecuteTask(task.clone()));
+
+        // The transport fails the command first (the order the pump uses on a
+        // delivery error), so by the time the event arrives nothing is in
+        // flight.
+        {
+            let id = cmd_id.clone();
+            store
+                .write(move |conn| {
+                    commands::transition(
+                        conn,
+                        &id,
+                        CommandTransition::Fail {
+                            reason: "transport: session/new returned no sessionId".into(),
+                        },
+                        MAX_ATTEMPTS,
+                    )?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
+                })
+                .unwrap();
+        }
+        assert!(
+            {
+                let conn = store.read().unwrap();
+                commands::in_flight(&conn, &wid()).unwrap().is_none()
+            },
+            "precondition: the command is already failed, so nothing is in flight"
+        );
+
+        apply(
+            &store,
+            WorkerEvent::Failed(Failure {
+                reason: "acp session unavailable".into(),
+                retryable: true,
+            }),
+        );
+
+        let conn = store.read().unwrap();
+        let (attempt, record_json): (u32, String) = conn
+            .query_row(
+                "SELECT attempt, record FROM _amux_attempts WHERE task_id = ?1 AND worker_id = ?2",
+                params![task.as_str(), wid().as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("a failed delivery is an attempt: without a row the next plan reuses the same key and the card is retired");
+        assert_eq!(attempt, 1);
+        let record: AttemptRecord = serde_json::from_str(&record_json).unwrap();
+        assert_eq!(record.failure_reason, "acp session unavailable");
     }
 
     #[test]
@@ -1049,7 +1447,10 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.context_hash.as_deref(), Some("ctx-abc"));
         assert_eq!(checkpoint.input_hash, "ctx-abc");
-        assert_eq!(checkpoint.last_result.as_deref(), Some("implemented and tested"));
+        assert_eq!(
+            checkpoint.last_result.as_deref(),
+            Some("implemented and tested")
+        );
         assert_eq!(checkpoint.next_action, "Run independent verification");
     }
 
@@ -1058,7 +1459,13 @@ mod tests {
         let store = store();
         let ses = seed(&store);
 
-        apply(&store, WorkerEvent::Exited(ExitStatus { code: Some(0), signal: None }));
+        apply(
+            &store,
+            WorkerEvent::Exited(ExitStatus {
+                code: Some(0),
+                signal: None,
+            }),
+        );
 
         let conn = store.read().unwrap();
         let (ended, reason): (Option<String>, Option<String>) = conn
@@ -1079,7 +1486,13 @@ mod tests {
 
         // A second Exited finds no live session, so the ORIGINAL exit
         // reason survives (end exactly once — the record is the record).
-        apply(&store, WorkerEvent::Exited(ExitStatus { code: None, signal: Some(9) }));
+        apply(
+            &store,
+            WorkerEvent::Exited(ExitStatus {
+                code: None,
+                signal: Some(9),
+            }),
+        );
         let conn = store.read().unwrap();
         let reason: String = conn
             .query_row(
@@ -1091,6 +1504,90 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ExitReason>(&reason).unwrap(),
             ExitReason::Completed
+        );
+    }
+
+    /// #73: a fresh agent start (no persisted conversation ref) queues one
+    /// session-start memory re-supply.
+    #[test]
+    fn started_without_conversation_ref_queues_start_resupply() {
+        use amux_core::protocol::MemoryResupplyReason;
+        let store = store();
+        seed(&store);
+        let reply = apply(&store, WorkerEvent::Started);
+        assert!(reply.applied, "queueing the resupply is a real write");
+        let conn = store.read().unwrap();
+        let key = crate::orchestrator::memory_resupply::resupply_key(
+            &wid(),
+            MemoryResupplyReason::SessionStart,
+        );
+        let cmd = commands::by_idempotency_key(&conn, &wid(), &key)
+            .unwrap()
+            .expect("start resupply must be queued");
+        assert!(
+            matches!(
+                cmd.command,
+                WorkerCommand::MemoryResupply { reason: MemoryResupplyReason::SessionStart }
+            ),
+            "{:?}",
+            cmd.command
+        );
+    }
+
+    /// #73: a start that continues a persisted conversation queues nothing:
+    /// the agent's history is intact, so a re-supply turn adds nothing.
+    #[test]
+    fn started_with_conversation_ref_queues_nothing() {
+        let store = store();
+        seed(&store);
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO _amux_conversations (worker_id, provider, conversation_ref, updated_at)
+                     VALUES (?1, 'claude', 'conv-live-1', '2026-08-09T00:00:00+00:00')",
+                    params![wid().as_str()],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let reply = apply(&store, WorkerEvent::Started);
+        assert!(!reply.applied, "a reconnect is a no-op for memory re-supply");
+        let conn = store.read().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _amux_commands WHERE worker_id = ?1",
+                params![wid().as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "no command may be queued");
+    }
+
+    /// #73: a low-context reading queues one post-compaction re-supply for
+    /// the next turn boundary, the earliest point durable facts can be
+    /// re-asserted after provider-managed compaction.
+    #[test]
+    fn context_low_queues_post_compaction_resupply() {
+        use amux_core::protocol::MemoryResupplyReason;
+        let store = store();
+        seed(&store);
+        let reply = apply(&store, WorkerEvent::ContextLow(5));
+        assert!(reply.applied, "queueing the resupply is a real write");
+        let conn = store.read().unwrap();
+        let key = crate::orchestrator::memory_resupply::resupply_key(
+            &wid(),
+            MemoryResupplyReason::PostCompaction,
+        );
+        let cmd = commands::by_idempotency_key(&conn, &wid(), &key)
+            .unwrap()
+            .expect("post-compaction resupply must be queued");
+        assert!(
+            matches!(
+                cmd.command,
+                WorkerCommand::MemoryResupply { reason: MemoryResupplyReason::PostCompaction }
+            ),
+            "{:?}",
+            cmd.command
         );
     }
 
@@ -1133,7 +1630,10 @@ mod tests {
                     1_700_000_000, // 2023: well before "now"
                 )?;
                 *out_w.lock().unwrap() = row.id;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         let sem = out.lock().unwrap().clone();
@@ -1177,7 +1677,11 @@ mod tests {
 
         let conn = store.read().unwrap();
         let cmd = commands::by_id(&conn, &cmd_id).unwrap().unwrap();
-        assert_eq!(cmd.state, CommandState::Confirmed, "confirmation still happens");
+        assert_eq!(
+            cmd.state,
+            CommandState::Confirmed,
+            "confirmation still happens"
+        );
         drop(conn);
         let log = issue_col(&store, &sem, "log");
         assert!(
@@ -1209,7 +1713,10 @@ mod tests {
                     "UPDATE issues SET updated = ?1 WHERE id = ?2",
                     params![Utc::now().timestamp() + 5, sem_w],
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         apply(
@@ -1231,7 +1738,13 @@ mod tests {
         let store = store();
         seed(&store);
         let protocol = Arc::new(MockProtocol::new());
-        protocol.register(wid(), AgentState::Working { turn: None, progress: None });
+        protocol.register(
+            wid(),
+            AgentState::Working {
+                turn: None,
+                progress: None,
+            },
+        );
 
         let handle = spawn_event_processor(store.clone(), protocol.clone(), wid());
 
@@ -1252,7 +1765,10 @@ mod tests {
         }
         protocol.emit(
             &wid(),
-            WorkerEvent::TurnCompleted(TurnResult { turn_id: trn(9), outcome: "done".into() }),
+            WorkerEvent::TurnCompleted(TurnResult {
+                turn_id: trn(9),
+                outcome: "done".into(),
+            }),
         );
         {
             let s = store.clone();
@@ -1260,7 +1776,10 @@ mod tests {
                 matches!(
                     {
                         let conn = s.read().unwrap();
-                        queries::get_worker(&conn, wid().as_str()).unwrap().unwrap().state
+                        queries::get_worker(&conn, wid().as_str())
+                            .unwrap()
+                            .unwrap()
+                            .state
                     },
                     WorkerState::Idle { .. }
                 )
@@ -1289,7 +1808,10 @@ mod tests {
         store
             .write(move |conn| {
                 queries::end_session(conn, &ses, &ExitReason::Killed, "2026-08-09T01:00:00+00:00")?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         supervise_once(&store, &protocol, &mut procs).await.unwrap();
@@ -1324,10 +1846,12 @@ mod tests {
                 assert!(matches!(worker_state(&store), WorkerState::Idle {..}), "{provider} recovered question: {:?}", worker_state(&store));
             }
         }
-        let store = store(); seed(&store);
+        let store = store();
+        seed(&store);
         let adapter = TerminalAdapter::new(ProviderId::new("claude"));
-        for event in adapter.scan("⏺ API Error: 529 Overloaded\n❯\n? for shortcuts") { apply(&store, event); }
-        assert!(matches!(worker_state(&store), WorkerState::Error {..}));
+        for event in adapter.scan("⏺ API Error: 529 Overloaded\n❯\n? for shortcuts") {
+            apply(&store, event);
+        }
+        assert!(matches!(worker_state(&store), WorkerState::Error { .. }));
     }
-
 }

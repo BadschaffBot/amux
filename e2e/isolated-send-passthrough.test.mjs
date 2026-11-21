@@ -1,0 +1,47 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const source=fs.readFileSync('crates/amux-dashboard/static/app.js','utf8');
+const code=source.slice(source.indexOf('function _hasSendTimeStamp('),source.indexOf('async function doKeys('));
+for (const isolated of [true,false]) test(`real composer send: isolated=${isolated}`,async()=>{
+  const sent=[];
+  const ctx=vm.createContext({sessions:[{name:'worker',isolated}], API:'',_cloudEmail:null,_localMemberEmail:null,
+    crypto:{randomUUID:()=> 'one-send'},AbortSignal, amuxTrack:()=>{},_sendContext:()=>({source:'worker'}),
+    _authHeaders:()=>({}),_ownerMentionHeaders:(u,b,h)=>h,_isLocallyQueued:()=>false,showSendingIndicator:()=>{},
+    // doSend asks whether the target is a chat before choosing the path; this
+    // worker is a terminal worker.
+    _workerRenderer:()=>'terminal',_chatCompanionOf:()=>null,
+    fetch:async(url,opts)=>{sent.push({url,...JSON.parse(opts.body)});return {ok:true,status:200};}});
+  vm.runInContext(code,ctx);
+  const literal='[no-board] literal user text\n  preserve spacing and Unicode →';
+  assert.equal(await ctx.doSend('worker',literal),'sent');
+  assert.equal(sent.length,1);assert.equal(sent[0].record_history,true);
+  if(isolated) assert.equal(sent[0].text,literal,'no timestamp, attribution or harness prefix');
+  else assert.ok(sent[0].text.endsWith(literal) && sent[0].text!==literal,'managed behavior is unchanged');
+  assert.equal(await ctx.doSend('worker','/compact'),'sent');
+  assert.equal(sent[1].text,'/compact');
+});
+test('isolated status never presents an old board claim as current work',()=>{
+ const code=source.slice(source.indexOf('function _runtimeBoardPresentation('),source.indexOf('function _runtimeBoardSyncBadge('));
+ const ctx=vm.createContext({});vm.runInContext(code,ctx);
+ assert.equal(ctx._runtimeBoardPresentation({isolated:true,status:'active',runtime_board:{measured:true,status:'linked',card_id:'OLD-1'}}).cardId,'');
+ assert.equal(ctx._runtimeBoardPresentation({isolated:false,status:'active',runtime_board:{measured:true,status:'linked',card_id:'CURRENT-1'}}).cardId,'CURRENT-1');
+});
+
+test('isolated idle labels never imply board inactivity',()=>{
+ const code=source.slice(source.indexOf('function _idleMovedAt('),source.indexOf('function timeAgo('));
+ const ctx=vm.createContext({esc:s=>s,timeAgo:()=> '2h ago'});vm.runInContext(code,ctx);
+ assert.equal(ctx._idleMovedSuffix({isolated:true,last_board_change_ts:123}), '');
+ assert.equal(ctx._idleMovedTitle({isolated:true}), ' title="Idle — ready for your next message."');
+ assert.equal(ctx._idleMovedSuffix({isolated:false,last_board_change_ts:123}), ' · 2h');
+});
+
+test('isolated configuration scope exposes only environment and presentation',()=>{
+ const code=source.slice(source.indexOf('function _visibleScopeCapabilities('),source.indexOf('function _workerPrimaryConfigurationsHTML('));
+ const ctx=vm.createContext({});vm.runInContext(code,ctx);
+ const caps=['memory','rules','env','gates','skin','status_mode','connectors'].map(key=>({key}));
+ assert.deepEqual(Array.from(ctx._visibleScopeCapabilities('worker',true,caps),c=>c.key),['env','skin']);
+ assert.equal(ctx._visibleScopeCapabilities('worker',false,caps),caps);
+ assert.deepEqual(Array.from(ctx._visibleScopeCapabilities('global',false,caps),c=>c.key),['memory','env','gates']);
+});

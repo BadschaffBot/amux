@@ -174,6 +174,18 @@ fn latency_min_samples() -> i64 {
 /// on these routes that IS wrong.
 const LONG_BY_DESIGN: &[(&str, f64)] = &[
     ("/api/files/mdai/run", 150_000.0),
+    // GET /api/sessions/{name}/peek (AF-1167). The full peek (history) reads
+    // the pane with a 10s capture-pane bound, then geometry and the transcript,
+    // and the dashboard gives it 15s before aborting (`refreshPeek`). So 15s
+    // is this route's own deadline. A live=1 peek has its own 2.5s budget and
+    // answers 503 past it (AF-1165), so this entry hides nothing on that path.
+    //
+    // Measured 2026-11-02: every full peek past 10s finished beside saved
+    // tmux-stall evidence while the tmux server sat idle in select (534 of 612
+    // samples), at load 45-80 on 28 cores. The wait is spawning tmux clients
+    // on a loaded host. The control-mode client that removes the spawn
+    // (backend/tmux_ctl.rs) has been off since it crashed the fleet (AF-1056).
+    ("/api/sessions/{name}/peek", 15_000.0),
     // POST /api/browser/navigate (AMUX-3835). The duration is a REMOTE PAGE
     // LOAD plus a settle, so the wait belongs to the site, not to amux. The
     // budget is this endpoint's OWN bound, added up rather than guessed:
@@ -208,6 +220,19 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // (unlike navigate) has nothing running AFTER the CDP wait that a wider
     // budget would need to cover.
     ("/api/browser/start", 30_000.0),
+    // POST /api/browser/routing/request (AF-1143). One call can start a real
+    // browser or walk the ladder to the next backend, so the wait is the
+    // driver's. The handler bounds the driver at 240s
+    // (api/browser_routing.rs `deadline_s`), and this budget is that bound.
+    // A goal or a CUA route gets 2700s for a cold image build; this table is
+    // per route, so such a run past 240s still files, which is right for a
+    // call that rare and that long.
+    //
+    // Measured over 7 days: 12,207 requests, p50 118ms, p90 1763ms, p99
+    // 13.9s, worst 106s, 177 past the 10s floor, and nothing past 120s. All
+    // of the slowest answered 200, so the 10s floor sits inside this route's
+    // normal tail.
+    ("/api/browser/routing/request", 240_000.0),
     // GET /api/email/inbox (AMUX-3519, third filing in one day on the same
     // residual): a count=480 metadata fetch is quota-bound at ~12-15s — the
     // 8-wide concurrency sits deliberately under Gmail's 250 units/s budget
@@ -476,6 +501,35 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // to pin even one capture at its limit clears this budget and still files,
     // which is the one latency story on this route that IS wrong.
     ("/api/workers/{id}/resume", 22_350.0),
+    // POST /api/sessions/{name}/steer (AMUX-5024). The filed row was 10,104 ms
+    // against a 10,000 ms floor — BELOW this route's own p95. Measured over the
+    // whole retained request log, n=226:
+    //
+    //     p50 114 ms | p90 7006 | p95 11091 | p99 14480 | max 17094
+    //     15 requests (6.64%) already exceed 10s; 32 (14.16%) exceed 5s
+    //
+    // So the flat floor sits between this route's normal (114 ms) and its design
+    // bound, which is exactly the threshold-below-baseline defect the detector's
+    // own verdict text names.
+    //
+    // THE BUDGET IS ADDED UP FROM THIS ROUTE'S OWN TIMEOUTS, not guessed:
+    //   - `verify_submitted` polls the pane `for _ in 0..5 { sleep_ms(300) }`,
+    //     and the retry path runs a second such loop -> 3,000 ms
+    //   - the delivered prompt is auto-captured as a ledger card, which calls
+    //     `board_intake::plan` -> the semantic classifier, whose own deadline is
+    //     `intake_model_timeout_ms()`, default 20,000 ms. That is the dominant
+    //     term and it is a MODEL CALL on the request path
+    //   - `board_intake::lock(&cap_session, "agent")` serialises concurrent
+    //     captures for the same session behind each other
+    // 20,000 + 3,000 = 23,000. Observed max is 17,094 ms, inside it.
+    //
+    // Still reportable: past 23s the classifier's own 20s deadline has failed to
+    // bound the call, which is the one latency story on this route that IS
+    // wrong. Raising the classifier's timeout without raising this entry would
+    // silently re-arm the same false filing, so the two numbers are tied by the
+    // comment rather than by code — `intake_model_timeout_ms` reads an env var
+    // this table cannot see.
+    ("/api/sessions/{name}/steer", 23_000.0),
 ];
 
 /// WARN/ERROR lines the server logged INSIDE one request's own window.
@@ -505,6 +559,56 @@ struct WindowScan {
     covered: bool,
     /// How many matches were dropped by the cap.
     dropped: u64,
+    /// AMUX-4857. How often each pattern fires across the WHOLE generation,
+    /// not just inside the window — the denominator that turns a line from a
+    /// fact into evidence.
+    ///
+    /// Accumulated in the SAME pass that finds the hits. The card proposed a
+    /// second pass; the scan already touches every line, so a second read of
+    /// the same bytes would cost twice for nothing.
+    base_counts: std::collections::BTreeMap<String, u64>,
+    /// First and last timestamp seen anywhere in the generation, which is the
+    /// period the counts above are OVER. Published rather than assumed: a
+    /// pattern looks rare when the log is young, and "occurrences in the
+    /// generation" and "occurrences in 24h" are different populations.
+    span: Option<(f64, f64)>,
+}
+
+/// Collapse a log line to a pattern key for base-rate counting (AMUX-4857).
+///
+/// Drops the leading timestamp and then every digit run, so
+/// `subagent lifecycle event did not change the live set (n=3)` and the same
+/// line with `n=17` count as one pattern. Truncated, because the tail of a
+/// long line is usually the variable part and two lines agreeing for 80
+/// characters are the same warn for this purpose.
+///
+/// Deliberately crude. A normaliser that is too clever merges two DIFFERENT
+/// warns and reports a base rate that belongs to neither, which is worse than
+/// the missing denominator this exists to supply.
+fn log_pattern_key(line: &str) -> String {
+    let body = line
+        .split_once(" INFO ")
+        .or_else(|| line.split_once(" WARN "))
+        .or_else(|| line.split_once(" ERROR "))
+        .map(|(_, rest)| rest)
+        .unwrap_or(line);
+    let mut out = String::with_capacity(80);
+    let mut last_was_digit = false;
+    for ch in body.chars() {
+        if out.len() >= 80 {
+            break;
+        }
+        if ch.is_ascii_digit() {
+            if !last_was_digit {
+                out.push('#');
+            }
+            last_was_digit = true;
+        } else {
+            out.push(ch);
+            last_was_digit = false;
+        }
+    }
+    out.trim().to_string()
 }
 
 /// At most this many lines reach a card, and at most this many bytes each.
@@ -524,7 +628,9 @@ fn log_line_ts(line: &[u8]) -> Option<f64> {
     }
     let end = line.iter().position(|b| *b == b' ')?;
     let s = std::str::from_utf8(&line[..end]).ok()?;
-    chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.timestamp() as f64 + f64::from(t.timestamp_subsec_millis()) / 1000.0)
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|t| t.timestamp() as f64 + f64::from(t.timestamp_subsec_millis()) / 1000.0)
 }
 
 /// Is this a line a reader would act on? WARN and ERROR only: INFO during a
@@ -554,9 +660,27 @@ where
     let mut dropped = 0u64;
     let mut saw_at_or_before_start = false;
     let mut saw_at_or_after_end = false;
+    let mut base_counts: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut span: Option<(f64, f64)> = None;
     for line in lines {
         let line = line.as_ref();
-        let Some(ts) = log_line_ts(line) else { continue };
+        let Some(ts) = log_line_ts(line) else {
+            continue;
+        };
+        // AMUX-4857: the denominator, gathered in this same pass. The span is
+        // taken over EVERY timestamped line, not just actionable ones, because
+        // it measures how long the generation covers — which is the period the
+        // counts below are over.
+        span = Some(match span {
+            None => (ts, ts),
+            Some((lo, hi)) => (lo.min(ts), hi.max(ts)),
+        });
+        if is_actionable_log_line(line) {
+            let key = log_pattern_key(&String::from_utf8_lossy(line));
+            if !key.is_empty() {
+                *base_counts.entry(key).or_insert(0) += 1;
+            }
+        }
         if ts <= start {
             saw_at_or_before_start = true;
         }
@@ -566,14 +690,71 @@ where
         if ts >= start && ts <= end && is_actionable_log_line(line) {
             if hits.len() < WINDOW_SCAN_CAP {
                 let s = String::from_utf8_lossy(line);
-                let cut = s.char_indices().nth(WINDOW_SCAN_LINE_BYTES).map(|(i, _)| i).unwrap_or(s.len());
+                let cut = s
+                    .char_indices()
+                    .nth(WINDOW_SCAN_LINE_BYTES)
+                    .map(|(i, _)| i)
+                    .unwrap_or(s.len());
                 hits.push(s[..cut].trim_end().to_string());
             } else {
                 dropped += 1;
             }
         }
     }
-    WindowScan { hits, covered: saw_at_or_before_start && saw_at_or_after_end, dropped }
+    WindowScan {
+        hits,
+        covered: saw_at_or_before_start && saw_at_or_after_end,
+        dropped,
+        base_counts,
+        span,
+    }
+}
+
+/// How a single window line compares to its own background rate (AMUX-4857).
+///
+/// `None` when the generation is too short to give a rate at all, which is a
+/// real state and not a quiet zero: a young log makes every pattern look rare.
+fn base_rate_verdict(scan: &WindowScan, line: &str, window_s: f64) -> Option<String> {
+    let (lo, hi) = scan.span?;
+    let span_s = hi - lo;
+    if span_s <= 0.0 || window_s <= 0.0 {
+        return None;
+    }
+    let key = log_pattern_key(line);
+    let total = *scan.base_counts.get(&key)?;
+    let per_min = total as f64 * 60.0 / span_s;
+    let observed = scan
+        .hits
+        .iter()
+        .filter(|h| log_pattern_key(h) == key)
+        .count() as f64;
+    let expected = total as f64 * window_s / span_s;
+    // The comparison is the point, and the verdict is BINARY on purpose.
+    //
+    // A three-way split with a "slightly above" middle was the first version
+    // and its own test rejected it: a line sitting exactly at background
+    // reported "slightly above" because the generation span is never exactly
+    // the round number the fixture implies (3630s, not 3600s), so
+    // observed=1 > expected=0.9917. That middle category is the defect this
+    // field exists to remove — it makes noise read as a mild finding, which is
+    // how eight background warns looked like eight leads on AMUX-4852.
+    //
+    // So: either a line clears its own background by a margin, or it is noise
+    // and says so. `LEAD_FACTOR` is the margin, and it is deliberately loose
+    // because a bursty log at its own rate must not trip it.
+    const LEAD_FACTOR: f64 = 1.5;
+    let verdict = if expected > 0.0 && observed > expected * LEAD_FACTOR {
+        format!(
+            "{:.1}x ABOVE background — this is the lead",
+            observed / expected.max(0.0001)
+        )
+    } else {
+        "at or below background — noise, not a finding".to_string()
+    };
+    Some(format!(
+        "[{observed:.0} here vs {expected:.1} expected; {per_min:.1}/min over {:.1}h of log; {verdict}]",
+        span_s / 3600.0
+    ))
 }
 
 /// Read the server log generations and scan them for `[start, end]`.
@@ -590,13 +771,34 @@ where
 fn warns_during_request(start: f64, end: f64) -> WindowScan {
     use std::io::BufRead;
     let dir = crate::config::amux_home().join("logs");
-    let mut out = WindowScan { hits: Vec::new(), covered: false, dropped: 0 };
+    let mut out = WindowScan {
+        hits: Vec::new(),
+        covered: false,
+        dropped: 0,
+        base_counts: Default::default(),
+        span: None,
+    };
     for name in ["server-rs.log.1", "server-rs.log"] {
-        let Ok(f) = std::fs::File::open(dir.join(name)) else { continue };
-        let lines = std::io::BufReader::new(f).split(b'\n').filter_map(Result::ok);
+        let Ok(f) = std::fs::File::open(dir.join(name)) else {
+            continue;
+        };
+        let lines = std::io::BufReader::new(f)
+            .split(b'\n')
+            .filter_map(Result::ok);
         let scan = scan_lines_for_window(lines, start, end);
         out.covered |= scan.covered;
         out.dropped += scan.dropped;
+        // AMUX-4857. BOTH generations are the corpus, so counts sum and the
+        // span is their union. Using one file's span against both files' counts
+        // would inflate every rate by roughly the rotation factor, which is the
+        // denominator error this field exists to prevent.
+        for (k, n) in scan.base_counts {
+            *out.base_counts.entry(k).or_insert(0) += n;
+        }
+        out.span = match (out.span, scan.span) {
+            (None, s) | (s, None) => s,
+            (Some((a_lo, a_hi)), Some((b_lo, b_hi))) => Some((a_lo.min(b_lo), a_hi.max(b_hi))),
+        };
         for h in scan.hits {
             if out.hits.len() < WINDOW_SCAN_CAP {
                 out.hits.push(h);
@@ -637,12 +839,38 @@ fn logged_during_worst_request(scan: &WindowScan, start: f64, end: f64) -> Strin
     } else {
         String::new()
     };
+    // AMUX-4857. THE HEDGE WAS NOT ENOUGH. "This is correlation, not cause" is
+    // true and does not help: a reader still cannot tell a warn that fires 40
+    // times a minute anyway from one that fired only here. The first is
+    // background, the second is a lead, and without a denominator they print
+    // identically. Measured on AMUX-4852: 8 lines in a 14.4s window looked like
+    // eight findings, while the background rate predicted 9.3 — the window was
+    // QUIETER than usual and the lines said nothing about that request.
+    //
+    // So each line now carries its own base rate, and the corpus is named:
+    // an absent line is not evidence of silence, because the scan is
+    // WARN/ERROR only (AMUX-4848) and an INFO line explaining the latency
+    // would never appear here.
+    let window_s = (end - start).max(0.0);
+    let lines = scan
+        .hits
+        .iter()
+        .map(|h| match base_rate_verdict(scan, h, window_s) {
+            Some(rate) => format!("  {h}\n      {rate}"),
+            None => {
+                format!("  {h}\n      [no base rate: the log generation is too short to give one]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "{} line(s) logged DURING this request{more}, window {window}. This is \
          correlation, not cause: these lines were emitted while the request was open, \
-         which is evidence a reader can act on and not a verdict.\n{}",
+         which is evidence a reader can act on and not a verdict. Each line carries how \
+         often that same pattern fires across the whole retained generation, so a common \
+         warn cannot read as a finding. CORPUS IS WARN/ERROR ONLY: a quiet base-rate \
+         verdict means those levels were quiet, not that nothing was logged.\n{lines}",
         scan.hits.len(),
-        scan.hits.iter().map(|h| format!("  {h}")).collect::<Vec<_>>().join("\n")
     )
 }
 
@@ -821,6 +1049,20 @@ fn ci_backfill_max() -> usize {
     env_i64("AMUX_CI_BACKFILL_MAX", 3).clamp(0, 10) as usize
 }
 
+/// How long a JUDGED CI card keeps a still-red workflow quiet (AMUX-5371).
+///
+/// The streak anchor alone latched: a workflow red since before the fetch
+/// window keys on the constant `since-beyond-window`, and one whose streak
+/// never ends keeps its first failure's run id, so after its card was
+/// discarded or closed nothing ever filed again. Measured 2026-09-30: `rust`
+/// red for its last 100 runs and `rust-nightly-deep` red since 09-01, both
+/// with only discarded cards, while done cards across the fleet could not
+/// reach verified behind them. The signature now also carries this bucket;
+/// an OPEN card still suppresses every bucket (`fault_identity`), and a judged
+/// one is followed by a fresh card once the bucket turns over.
+fn ci_refile_h() -> f64 {
+    env_f64("AMUX_CI_REFILE_H", 48.0).clamp(1.0, 24.0 * 90.0)
+}
 fn ci_run_limit() -> i64 {
     env_i64("AMUX_CI_RUN_LIMIT", 200).clamp(10, 600)
 }
@@ -1110,7 +1352,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
     let mut suppressed = Vec::new();
     let q = conn.prepare(
         "SELECT ts, method, path, family, status, latency_ms, client_ip, amux_session, \
-                worker, error_body \
+                worker, error_body, boot_at \
          FROM _amux_request_log WHERE status >= 500 AND ts >= ?1 ORDER BY ts ASC LIMIT 200000",
     );
     let mut stmt = match q {
@@ -1134,6 +1376,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             r.get::<_, Option<String>>(7)?.unwrap_or_default(),
             r.get::<_, Option<String>>(8)?.unwrap_or_default(),
             r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            r.get::<_, Option<f64>>(10)?,
         ))
     });
     let rows = match rows {
@@ -1146,7 +1389,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
         }
     };
     for row in rows.flatten() {
-        let (ts, method, path, family, status, latency, ip, session, worker, body) = row;
+        let (ts, method, path, family, status, latency, ip, session, worker, body, boot_at) = row;
         // The honest-degradation gate, applied BEFORE grouping so a suppressed
         // code cannot dilute a real group's sample.
         if status == 501 || status == 503 {
@@ -1184,8 +1427,16 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             sample_body: String::new(),
             max_latency: 0.0,
             targets: Default::default(),
+            boots: Default::default(),
         });
         g.targets.insert(target.clone());
+        // AMUX-4851. A NULL predates migration 0030 and cannot name a process,
+        // so it is skipped rather than folded in as a distinct one.
+        if let Some(b) = boot_at {
+            if b.is_finite() && b > 0.0 {
+                g.boots.insert(b as i64);
+            }
+        }
         g.count += 1;
         g.last_ts = ts;
         g.max_latency = g.max_latency.max(latency);
@@ -1290,6 +1541,34 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             ("first_seen".into(), rl::local_when(g.first_ts)),
             ("last_seen".into(), rl::local_when(g.last_ts)),
             ("count".into(), g.count.to_string()),
+            // AMUX-4851. THE FIELD THAT SAYS WHETHER THE SERVER WAS DYING.
+            // This grouping is per-endpoint with no process dimension, so
+            // without this a crash loop and a single sick handler produce
+            // identical-looking cards: every boot re-files the same endpoint,
+            // and the restart count is the thing that separates them. Measured
+            // 2026-09-19 over 3,568 5xx in 7 days, the largest incident carried
+            // 42 distinct boot_at across 1,900 responses.
+            //
+            // The count is stated even when it is 1, because "confined to one
+            // process" is a real finding and an absent field reads as unchecked
+            // rather than as checked-and-single.
+            (
+                "distinct_processes".into(),
+                if g.boots.is_empty() {
+                    "unknown: these rows predate the boot_at column (migration 0030)".into()
+                } else if g.boots.len() == 1 {
+                    "1 — confined to a single server process, so this is the handler, not a restart loop".into()
+                } else {
+                    format!(
+                        "{} — these responses span {} SERVER RESTARTS, so read this as a process \
+                         that kept dying rather than one endpoint misbehaving; the endpoint named \
+                         above may be a victim. Look at what restarted the server before looking \
+                         at the handler.",
+                        g.boots.len(),
+                        g.boots.len()
+                    )
+                },
+            ),
             (
                 "distinct_clients".into(),
                 format!(
@@ -1351,6 +1630,20 @@ struct Group {
     /// (AMUX-3840): the card has to name who was hit without being one card
     /// per victim.
     targets: std::collections::BTreeSet<String>,
+    /// Distinct `boot_at` values seen in this group (AMUX-4851).
+    ///
+    /// THE FIELD THAT SEPARATES A SICK ENDPOINT FROM A DYING SERVER. A group
+    /// confined to one process is a handler fault; a group spanning many is a
+    /// crash loop, and the per-endpoint card cannot say which because every
+    /// boot re-files the same endpoint and the RESTART COUNT is what a reader
+    /// needs. Measured 2026-09-19 over 3,568 5xx in 7 days: the largest
+    /// incident carried 42 distinct boot_at across 1,900 responses, and
+    /// 09-17 13:56 carried 23 across 206.
+    ///
+    /// A NULL `boot_at` is a legacy row predating migration 0030, so it is
+    /// skipped rather than counted as a distinct process; counting it would
+    /// inflate the restart count with rows that simply cannot answer.
+    boots: std::collections::BTreeSet<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1583,6 +1876,16 @@ fn describe_window_load(loads: &mut [f64]) -> String {
 ///
 /// Extracted so the SENTENCE is pinned by a test rather than only the evidence
 /// block that reads it, the same reason `race_verdict` is its own function.
+/// Why a p95 comparison was not filed when the row cap left too little baseline.
+fn baseline_too_short(span_h: f64, window_h: f64, cap: usize, base_n: usize) -> String {
+    format!(
+        "the {cap}-row scan cap left a baseline of {:.1}h ({base_n} rows), shorter than the \
+         {window_h:.1}h window: a multiple against it compares the window with a sliver of itself, \
+         so it is not filed (AF-1040)",
+        span_h.max(0.0)
+    )
+}
+
 fn p95_position(win_n: usize, multiple: f64) -> String {
     let n = win_n.max(1);
     // Mirrors `request_log::percentile_sorted`: sorted[ceil(0.95n) - 1].
@@ -1685,7 +1988,10 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
             // from win_n, and the thin-window clause only appears when it is
             // true, so neither half can be a constant wearing a variable's
             // clothes.
-            ("p95_position".into(), p95_position(h.win_n, h.p95_w / h.p95_b)),
+            (
+                "p95_position".into(),
+                p95_position(h.win_n, h.p95_w / h.p95_b),
+            ),
             // WHETHER THE SCAN SAW THE WHOLE PERIOD (AMUX-3910, ethos rule 4).
             // The row cap used to truncate the NEWEST rows — the window itself —
             // and say nothing on the card: one filed "p95 7173ms over 30
@@ -1795,17 +2101,15 @@ fn detect_latency_with_scan_cap(
            AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') \
          ORDER BY ts DESC LIMIT ?2",
     ) {
-        if let Ok(rows) =
-            stmt.query_map(rusqlite::params![b_start, scan_cap as i64], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, f64>(1)?,
-                    r.get::<_, f64>(2)?,
-                    r.get::<_, Option<f64>>(3)?,
-                    r.get::<_, Option<f64>>(4)?,
-                ))
-            })
-        {
+        // ONE ALLOCATION PER FAMILY, NOT PER ROW (AMUX-5565). This reads up to
+        // 400k rows every tick. It used to take each row's family as an owned
+        // String, allocated and freed 400k times while the sample vectors grew
+        // between them, and the heap fragmentation that left behind is what the
+        // weekly soak measured: steady RSS growth of 14.7 MB/h that tracked the
+        // request log's size, 1.6 MB/h with this detector skipped
+        // (AMUX_AUTOFIX_SKIP=latency, run 37239594211). The name is now read in
+        // place and copied only the first time a family is seen.
+        if let Ok(mut rows) = stmt.query(rusqlite::params![b_start, scan_cap as i64]) {
             // A REQUEST WHOSE CLOCK SPANS A RESTART IS NOT A SLOW REQUEST
             // (AF-175). `latency_ms` is wall time from arrival to completion,
             // so a request that arrived before this process started and
@@ -1826,7 +2130,12 @@ fn detect_latency_with_scan_cap(
             // drop everything and look exactly like a filter that worked.
             let mut spanned_restart = 0usize;
             let mut considered = 0usize;
-            for (fam, ms, ts, row_boot, row_load) in rows.flatten() {
+            while let Ok(Some(r)) = rows.next() {
+                // A row that does not convert is skipped, as `rows.flatten()` did.
+                let (Ok(ms), Ok(ts)) = (r.get::<_, f64>(1), r.get::<_, f64>(2)) else { continue };
+                let Some(fam) = r.get_ref(0).ok().and_then(|v| v.as_str().ok()) else { continue };
+                let row_boot = r.get::<_, Option<f64>>(3).unwrap_or(None);
+                let row_load = r.get::<_, Option<f64>>(4).unwrap_or(None);
                 considered += 1;
                 if ts < oldest_seen {
                     oldest_seen = ts;
@@ -1850,7 +2159,10 @@ fn detect_latency_with_scan_cap(
                 if spanned {
                     spanned_restart += 1;
                 }
-                let e = per_family.entry(fam).or_default();
+                if !per_family.contains_key(fam) {
+                    per_family.insert(fam.to_string(), FamilySamples::default());
+                }
+                let Some(e) = per_family.get_mut(fam) else { continue };
                 if ts >= w_start {
                     e.win_raw += 1;
                     if !spanned {
@@ -1977,6 +2289,22 @@ fn detect_latency_with_scan_cap(
         if p95_w < latency_floor_ms() {
             continue;
         }
+        // A CAPPED SCAN THAT LEFT NO BASELINE IS NOT A REGRESSION (AF-1040).
+        // The scan is newest-first, so the cap eats the baseline: on
+        // 2026-10-30 /api/presence filed at 5.7x against "a 72h p95 of 158ms"
+        // that was 78 rows from the 0.1h just before the window, while the real
+        // 66h before it held 12,270 rows with a p95 of 2,628ms, SLOWER than the
+        // window. When the baseline covers less than one window's length the
+        // multiple compares the window with a sliver of itself.
+        let baseline_span_h = (now - oldest_seen) / 3600.0 - window_h();
+        if scan_capped && baseline_span_h < window_h() {
+            suppressed.push(sup(
+                DetectorKind::Latency,
+                &format!("latency|p95|{fam}"),
+                &baseline_too_short(baseline_span_h, window_h(), scan_cap, base.len()),
+            ));
+            continue;
+        }
         // ACCUMULATE, DO NOT FILE YET (AMUX-3646). See the fan-in below.
         p95_hits.push(P95Hit {
             fam: fam.clone(),
@@ -2017,10 +2345,36 @@ fn detect_latency_with_scan_cap(
     if p95_hits.len() >= outlier_rollup_at() {
         let n_f = p95_hits.len();
         let fams: Vec<String> = p95_hits.iter().map(|h| h.fam.clone()).collect();
-        let worst = p95_hits
+        // A RATIO NEEDS A DENOMINATOR THAT MEANS SOMETHING (AMUX-4930).
+        //
+        // `worst` was max(p95_w / p95_b) over every hit, and it becomes the
+        // card TITLE. A family whose trailing p95 is 1ms turns a 1217ms window
+        // into "worst 938.0x": a real regression wearing a catastrophic
+        // headline. Measured on the specimen: that family averages 180ms
+        // across 10,086 requests over 7 days, so 1ms was never its normal, it
+        // was a window that happened to serve only trivial responses.
+        //
+        // AMUX-3471's floor is on the WINDOW p95 and correctly allowed this,
+        // because 1217ms IS a regression worth filing. What it does not bound
+        // is the DENOMINATOR, which is the half the title is built from. This
+        // is the same threshold-below-baseline defect this file documents
+        // twice already, in its ratio form.
+        //
+        // So: headline the worst ABSOLUTE p95, which is the number a reader
+        // can act on and needs no denominator, and rate only against baselines
+        // big enough to carry a multiple.
+        const RATABLE_BASELINE_MS: f64 = 50.0;
+        let worst_ratio = p95_hits
             .iter()
+            .filter(|h| h.p95_b >= RATABLE_BASELINE_MS)
             .map(|h| h.p95_w / h.p95_b)
             .fold(0.0f64, f64::max);
+        let worst_ms = p95_hits.iter().map(|h| h.p95_w).fold(0.0f64, f64::max);
+        let headline = if worst_ratio > 0.0 {
+            format!("worst {worst_ms:.0}ms, {worst_ratio:.1}x")
+        } else {
+            format!("worst {worst_ms:.0}ms, no baseline large enough to rate")
+        };
         out.push(Finding {
             kind: DetectorKind::Latency,
             // Keyed on the FAMILY SET, matching the outlier rollup: a different
@@ -2029,7 +2383,7 @@ fn detect_latency_with_scan_cap(
             // condition rather than one request.
             signature: format!("latency|p95|ROLLUP|{}", fams.join(",")),
             title: format!(
-                "{n_f} families regressed at once — one event, not {n_f} tasks (worst {worst:.1}x)"
+                "{n_f} families regressed at once — one event, not {n_f} tasks ({headline})"
             ),
             evidence: vec![
                 (
@@ -2047,11 +2401,20 @@ fn detect_latency_with_scan_cap(
                         .iter()
                         .map(|h| {
                             format!(
-                                "\n  {} {:.0}ms vs {:.0}ms ({:.1}x)",
+                                // Same rule per line as in the headline: a
+                                // multiple against a near-zero baseline is
+                                // noise wearing a number (AMUX-4930).
+                                "\n  {} {:.0}ms vs {:.0}ms{}",
                                 h.fam,
                                 h.p95_w,
                                 h.p95_b,
-                                h.p95_w / h.p95_b
+                                if h.p95_b >= RATABLE_BASELINE_MS {
+                                    format!(" ({:.1}x)", h.p95_w / h.p95_b)
+                                } else {
+                                    format!(
+                                        " (baseline under {RATABLE_BASELINE_MS:.0}ms, too small to rate)"
+                                    )
+                                }
                             )
                         })
                         .collect::<String>(),
@@ -2242,7 +2605,27 @@ fn detect_latency_with_scan_cap(
         /// threshold from cards that carry this line, not from this sample.
         local_n: u64,
         remote_n: u64,
+        /// AMUX-4918: when each offending row ARRIVED, capped.
+        ///
+        /// The rollup groups N slow targets and asserts one fault, and its
+        /// client_split evidence then argued the opposite, throwing out 5 of 6
+        /// endpoints. Both cannot be right. client_split aggregates over the
+        /// WHOLE window and answers "which client population sees this target
+        /// slow more often", which is not the question "did these targets go
+        /// slow TOGETHER". An off-box client that polls one path harder during
+        /// a stall skews that ratio toward "client network" for a path that was
+        /// genuinely server-stalled.
+        ///
+        /// Temporal co-occurrence across DISTINCT paths is the discriminator,
+        /// and it needs arrival times rather than counts. Two clients' networks
+        /// cannot go slow on different paths in the same few seconds.
+        ///
+        /// Capped: a busy window carries hundreds of rows per target, and this
+        /// lives only for the length of one rollup.
+        ts_samples: Vec<f64>,
     }
+    /// Enough to find bursts without holding a window's worth of rows.
+    const OUTLIER_TS_SAMPLE_CAP: usize = 256;
     /// Outlier RATE per client population, which is the statistic that
     /// separates a server fault from a reporting client's bad network.
     ///
@@ -2264,29 +2647,117 @@ fn detect_latency_with_scan_cap(
             return "not measured: no rows in this window carried a client_ip (AMUX-4818)."
                 .to_string();
         }
-        let pct = |o: u64, t: u64| if t == 0 { None } else { Some(o as f64 * 100.0 / t as f64) };
-        match (pct(lo, lt), pct(ro, rt)) {
-            (Some(l), Some(r)) if l > 0.0 => format!(
-                "on-box {l:.2}% of requests slow ({lo}/{lt}) | off-box {r:.2}% ({ro}/{rt}) | \
-                 off-box is {:.1}x more likely. Near 1x means the endpoint is slow for EVERYONE, \
-                 which is a server fault. Well above 1x means the time is the reporting client's \
-                 network rather than this server's work (AMUX-4818).",
-                r / l
-            ),
-            (Some(l), Some(r)) => format!(
-                "on-box {l:.2}% of requests slow ({lo}/{lt}) | off-box {r:.2}% ({ro}/{rt}). No \
-                 on-box outliers, so the ratio is undefined rather than infinite (AMUX-4818)."
-            ),
-            (Some(l), None) => format!(
-                "on-box {l:.2}% of requests slow ({lo}/{lt}) | no off-box requests in this \
-                 window, so there is nothing to compare against (AMUX-4818)."
-            ),
-            (None, Some(r)) => format!(
-                "off-box {r:.2}% of requests slow ({ro}/{rt}) | no on-box requests in this \
-                 window, so there is no local baseline (AMUX-4818)."
-            ),
-            (None, None) => "not measured (AMUX-4818).".to_string(),
+        // A RATE FROM A HANDFUL OF ROWS READS LIKE A VERDICT AND CARRIES NONE
+        // (AMUX-4918). This printed "/api/lookup/bulk: on-box 100.00% of
+        // requests slow (1/1)", which looks like a total outage and is one
+        // request. Below this denominator the raw count is printed and no rate
+        // is computed.
+        // Deliberately LOW. The reported case was "(1/1)", a percentage from a
+        // single request that reads like a total outage. Five is the smallest
+        // denominator where a rate is not simply an artifact of one or two
+        // rows, and it is chosen not to silently gut this split on the modest
+        // traffic real cards carry. This file already declines to guess a
+        // suppression threshold from one sample (AMUX-4818); the same applies
+        // here, so raise it from cards that carry this line rather than now.
+        const MIN_SPLIT_DENOM: u64 = 5;
+        let share = |o: u64, t: u64| -> String {
+            if t == 0 {
+                "no requests".to_string()
+            } else if t < MIN_SPLIT_DENOM {
+                format!("{o}/{t} (too few to rate, under {MIN_SPLIT_DENOM})")
+            } else {
+                format!("{:.2}% ({o}/{t})", o as f64 * 100.0 / t as f64)
+            }
+        };
+        let head = format!("on-box {} | off-box {}", share(lo, lt), share(ro, rt));
+        let rateable = lt >= MIN_SPLIT_DENOM && rt >= MIN_SPLIT_DENOM;
+        let l = if lt == 0 {
+            0.0
+        } else {
+            lo as f64 * 100.0 / lt as f64
+        };
+        let r = if rt == 0 {
+            0.0
+        } else {
+            ro as f64 * 100.0 / rt as f64
+        };
+        if !rateable {
+            return format!(
+                "{head}. Not rated: a ratio needs at least {MIN_SPLIT_DENOM} requests on each \
+                 side (AMUX-4918)."
+            );
         }
+        if l <= 0.0 {
+            return format!(
+                "{head}. No on-box outliers, so the ratio is undefined rather than infinite \
+                 (AMUX-4818)."
+            );
+        }
+        // SCOPED TO THE QUESTION IT CAN ANSWER (AMUX-4918). This used to close
+        // with "Near 1x means the endpoint is slow for EVERYONE ... Well above
+        // 1x means the time is the reporting client's network", and a reader
+        // applying that rule to a rollup's own numbers throws out most of the
+        // targets it just grouped. The rule is not wrong about one endpoint
+        // over a whole window; it is answering a DIFFERENT question from the
+        // one the grouping asks, and it cannot see time at all.
+        format!(
+            "{head} | off-box is {:.1}x more likely. That compares how OFTEN each client \
+             population sees THIS target slow across the whole window. It cannot say whether \
+             targets went slow TOGETHER, which is what the grouping claims, and an off-box \
+             client polling one path harder during a stall skews it toward \"client network\" \
+             for a path that was genuinely server-stalled. Read co_occurrence for that \
+             (AMUX-4818, AMUX-4918).",
+            r / l
+        )
+    }
+
+    /// AMUX-4918. DID THESE TARGETS GO SLOW TOGETHER?
+    ///
+    /// The rollup's claim is "one fault, not N tasks", and until now its only
+    /// evidence argued against that claim. This is the evidence FOR it: sort
+    /// every offending row across all targets by arrival, cut bursts wherever
+    /// the gap exceeds `gap_s`, and count the bursts that touched MORE THAN ONE
+    /// distinct target. Two clients' networks cannot go slow on different paths
+    /// within seconds of each other, so a burst spanning distinct paths is a
+    /// server-side stall.
+    ///
+    /// Measured by hand over 24h when this was written: 315 rows at or over
+    /// 10s out of 307,983 (0.10%), 150 bursts at a 90s gap, and 51 of those 150
+    /// touched more than one path, overwhelmingly /api/board and /api/sessions
+    /// within seconds of each other.
+    ///
+    /// Same table, same window, no new collection.
+    fn describe_co_occurrence(rows: &[(&str, f64)], gap_s: f64) -> String {
+        if rows.is_empty() {
+            return "not measured: no offending row carried an arrival time (AMUX-4918)."
+                .to_string();
+        }
+        let mut rows: Vec<(&str, f64)> = rows.to_vec();
+        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let targets: std::collections::BTreeSet<&str> = rows.iter().map(|(t, _)| *t).collect();
+        let (mut bursts, mut shared, mut i) = (0usize, 0usize, 0usize);
+        while i < rows.len() {
+            let mut j = i + 1;
+            while j < rows.len() && rows[j].1 - rows[j - 1].1 <= gap_s {
+                j += 1;
+            }
+            let distinct: std::collections::BTreeSet<&str> =
+                rows[i..j].iter().map(|(t, _)| *t).collect();
+            bursts += 1;
+            if distinct.len() > 1 {
+                shared += 1;
+            }
+            i = j;
+        }
+        format!(
+            "{shared} of {bursts} burst(s) at a {gap_s:.0}s gap touched MORE THAN ONE distinct \
+             target, over {} offending row(s) across {} target(s). Two clients' networks cannot \
+             go slow on different paths within seconds, so a shared burst is a server-side stall \
+             and supports grouping these as one fault. Zero shared bursts would argue the \
+             opposite, and this line says so either way (AMUX-4918).",
+            rows.len(),
+            targets.len()
+        )
     }
     let mut seen: BTreeMap<(String, String), OutlierGroup> = BTreeMap::new();
     // AF-175: THIS shape is where the reported incident came from, and it had no
@@ -2302,6 +2773,19 @@ fn detect_latency_with_scan_cap(
     let mut outliers_spanned = 0usize;
     let mut outliers_considered = 0usize;
     let mut outliers_failed = 0usize;
+    // THE SAME THREE COUNTS, PER TARGET (AMUX-4859). The three above are over
+    // EVERY route in the window, because the scan below has no path predicate.
+    // The card they are published on names ONE route and puts them beside `n`,
+    // which is per-route, so a reader subtracts two numbers from different
+    // populations and finds rows missing that were never on this route.
+    //
+    // Specimen: AMUX-4852 published "11 row(s) matched ... 0 dropped ... 0
+    // dropped" beside `n_over_floor: 1`. All four numbers were correct. 8 of
+    // the 11 were /api/email/inbox, which carries its own 30s budget and was
+    // never eligible to file. Keeping the fleet-wide figure is deliberate (it
+    // is what tells a reader another route is having a bad window), so the fix
+    // is to publish BOTH and label which is which.
+    let mut per_target: BTreeMap<(String, String), (usize, usize, usize)> = BTreeMap::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT method, path, latency_ms, ts, status, boot_at, load1, client_ip FROM _amux_request_log \
          WHERE ts >= ?1 AND latency_ms >= ?2 \
@@ -2321,9 +2805,20 @@ fn detect_latency_with_scan_cap(
             ))
         }) {
             for (method, path, ms, ts, status, row_boot, row_load, row_ip) in rows.flatten() {
+                // Resolved HERE, above both exclusions, so the per-target tally
+                // can count the rows they drop (AMUX-4859). The grouping below
+                // reuses this exact value, so the two cannot disagree about
+                // which target a row belongs to. See the AMUX-3869 note at the
+                // `seen` entry for why this is the per-VERB target.
+                let row_target = rl::normalize_target_verb(&path);
+                let tally = per_target
+                    .entry((method.clone(), row_target.clone()))
+                    .or_insert((0usize, 0usize, 0usize));
+                tally.0 += 1;
                 outliers_considered += 1;
                 if spans_own_restart(ts, ms, row_boot, boot) {
                     outliers_spanned += 1;
+                    tally.1 += 1;
                     continue;
                 }
                 // A REQUEST THAT FAILED IS NOT A LATENCY MEASUREMENT (AMUX-3709).
@@ -2354,6 +2849,7 @@ fn detect_latency_with_scan_cap(
                 // breadth rule cannot see.
                 if status >= 500 {
                     outliers_failed += 1;
+                    tally.2 += 1;
                     continue;
                 }
                 // PER-VERB, not per-route-pattern (AMUX-3869). `normalize_target`
@@ -2378,7 +2874,10 @@ fn detect_latency_with_scan_cap(
                 // Only the LATENCY axis moves. The 5xx detector above keeps the
                 // coarse target deliberately: a 500 is a 500 whatever the verb,
                 // and its rollup wants the route shape.
-                let target = rl::normalize_target_verb(&path);
+                // Resolved at the top of the loop now (AMUX-4859), so the
+                // per-target tally and this grouping key are the SAME string by
+                // construction rather than by two calls agreeing.
+                let target = row_target;
                 // Computed BEFORE the entry call, which moves `target`.
                 let row_budget = design_budget_ms(&target);
                 let e = seen
@@ -2397,8 +2896,14 @@ fn detect_latency_with_scan_cap(
                         worst_load1: None,
                         local_n: 0,
                         remote_n: 0,
+                        ts_samples: Vec::new(),
                     });
                 e.n += 1;
+                // AMUX-4918: arrival times, so the rollup can show whether its
+                // targets went slow TOGETHER rather than merely often.
+                if e.ts_samples.len() < OUTLIER_TS_SAMPLE_CAP {
+                    e.ts_samples.push(ts);
+                }
                 if ms > row_budget {
                     e.n_over_budget += 1;
                 }
@@ -2510,7 +3015,11 @@ fn detect_latency_with_scan_cap(
                 COUNT(*) FROM _amux_request_log WHERE ts >= ?1 GROUP BY path, is_local",
     ) {
         if let Ok(trows) = tstmt.query_map(rusqlite::params![w_start], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         }) {
             for (tpath, is_local, cnt) in trows.flatten() {
                 let e = totals
@@ -2645,11 +3154,26 @@ fn detect_latency_with_scan_cap(
                         })
                         .collect();
                     format!(
-                        "{}\n  A target whose off-box multiple is near 1x is slow for everyone and \
-                         belongs to this fault. One well above 1x is probably a reporting client's \
-                         network and not part of it (AMUX-4818).",
+                        "{}\n  These are per-target rates over the whole window. They cannot \
+                         confirm or refute the grouping on their own, which is what they were \
+                         previously read as doing; co_occurrence answers that (AMUX-4918).",
                         rows.join("\n  ")
                     )
+                }),
+                // AMUX-4918. THE EVIDENCE THAT ACTUALLY SUPPORTS THE GROUPING.
+                // The card says "one fault, not N tasks" and then printed only
+                // client_split, whose published rule, applied to its own
+                // numbers, threw out 5 of 6 endpoints. A reader following the
+                // rule reached the wrong answer. This line answers the question
+                // the grouping actually asks.
+                ("co_occurrence".into(), {
+                    let rows: Vec<(&str, f64)> = candidates
+                        .iter()
+                        .flat_map(|((_, t), g)| {
+                            g.ts_samples.iter().map(move |ts| (t.as_str(), *ts))
+                        })
+                        .collect();
+                    describe_co_occurrence(&rows, 90.0)
                 }),
                 ("host_load".into(), describe_window_load(&mut window_load)),
                 ("rollup_threshold".into(), format!(
@@ -2694,6 +3218,12 @@ fn detect_latency_with_scan_cap(
             worst_load1,
             local_n,
             remote_n,
+            // AMUX-4918: co-occurrence is a question about MULTIPLE targets
+            // going slow together, and this is the single-endpoint path, which
+            // has one target by construction. Bound and dropped deliberately
+            // rather than hidden behind `..`, so the next field added still
+            // forces a decision here instead of being silently ignored.
+            ts_samples: _,
         },
     ) in seen
     {
@@ -2831,15 +3361,39 @@ fn detect_latency_with_scan_cap(
                 // Published unconditionally, including as zeros: "3 slow, 0
                 // excluded" and "3 slow, 1052 excluded" are different facts and
                 // must not render identically (ethos rule 4).
-                ("outliers_excluded".into(), format!(
-                    "{outliers_considered} row(s) matched the threshold in this window; \
-                     {outliers_spanned} dropped as spanning a server restart (AF-175: wall time \
-                     across a boot is not service time) and {outliers_failed} dropped as failed \
-                     requests (AMUX-3709: a timeout's duration is the timeout, not a \
-                     measurement). `n` and `worst_ms` above describe only what survived. If \
-                     `excluded` dwarfs the survivors, size the incident from the re-check query \
-                     below, not from this card."
-                )),
+                //
+                // SAY WHICH POPULATION EACH COUNT IS OVER (AMUX-4859). This
+                // line used to open with the FLEET-WIDE total and then refer to
+                // `n`, which is per-target, so on a card titled with one route
+                // the two read as one population and the difference looked like
+                // rows vanishing into an unnamed filter. AMUX-4852 published
+                // "11 matched; 0 dropped; 0 dropped" beside `n_over_floor: 1`,
+                // all four numbers correct, 8 of the 11 belonging to
+                // /api/email/inbox. This target's own figures come first now
+                // because they are the ones that reconcile with `n`, and the
+                // fleet-wide figures are kept and LABELLED because they are how
+                // a reader learns another route is having a bad window.
+                ("outliers_excluded".into(), {
+                    let (t_considered, t_spanned, t_failed) = per_target
+                        .get(&(method.clone(), target.clone()))
+                        .copied()
+                        .unwrap_or((0, 0, 0));
+                    format!(
+                        "ON THIS TARGET ({method} {target}): {t_considered} row(s) matched the \
+                         threshold in this window; {t_spanned} dropped as spanning a server \
+                         restart (AF-175: wall time across a boot is not service time) and \
+                         {t_failed} dropped as failed requests (AMUX-3709: a timeout's duration \
+                         is the timeout, not a measurement). `n` and `worst_ms` above describe \
+                         only what survived, so {t_considered} - {t_spanned} - {t_failed} = {n}. \
+                         If the dropped rows dwarf the survivors, size the incident from the \
+                         re-check query below, not from this card.\n  \
+                         ACROSS ALL TARGETS in the same window: {outliers_considered} matched, \
+                         {outliers_spanned} restart-spanning, {outliers_failed} failed. That is a \
+                         DIFFERENT population from `n` and from the per-target counts above, and \
+                         it is published so a quiet route can still show you that the window \
+                         itself was bad (AMUX-4859)."
+                    )
+                }),
                 // AMUX-3647. Until 2026-08-24 a row that arrived within
                 // `latency` seconds of a boot was DROPPED here, so this card
                 // did not exist for that request and nobody could weigh it.
@@ -3403,7 +3957,11 @@ fn schedule_error_pattern(note: &str) -> String {
         }
     }
     let out = out.trim();
-    if out.is_empty() { "(empty error note)".into() } else { out.into() }
+    if out.is_empty() {
+        "(empty error note)".into()
+    } else {
+        out.into()
+    }
 }
 
 /// `server_downtime` rows that could explain a missing-Messages run in this
@@ -3427,7 +3985,12 @@ fn known_downtime_windows(conn: &Connection, since: i64) -> Vec<(i64, f64, f64, 
         }
     };
     let rows = stmt.query_map([since as f64 - pad], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, String>(3)?))
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, f64>(1)?,
+            r.get::<_, f64>(2)?,
+            r.get::<_, String>(3)?,
+        ))
     });
     match rows {
         Ok(rows) => rows.filter_map(Result::ok).collect(),
@@ -3444,7 +4007,11 @@ fn known_downtime_windows(conn: &Connection, since: i64) -> Vec<(i64, f64, f64, 
 
 /// The `id` of the first known downtime window whose padded span covers
 /// `ran_at`, or `None` if no recorded restart explains it.
-fn downtime_window_covering(ran_at: f64, windows: &[(i64, f64, f64, String)], pad: f64) -> Option<i64> {
+fn downtime_window_covering(
+    ran_at: f64,
+    windows: &[(i64, f64, f64, String)],
+    pad: f64,
+) -> Option<i64> {
     windows
         .iter()
         .find(|(_, down_from, up_at, _)| ran_at >= down_from - pad && ran_at <= up_at + pad)
@@ -3463,10 +4030,7 @@ fn schedule_id_from_origin(origin: &str) -> Option<String> {
 /// Repeated run errors and the cross-surface invariant for a delivered tmux
 /// run: there must be a corresponding row in Messages. These are scheduler
 /// failures even when the firing loop itself is ticking normally.
-fn detect_schedule_run_health(
-    conn: &Connection,
-    now: f64,
-) -> (Vec<Finding>, Vec<Suppressed>) {
+fn detect_schedule_run_health(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut findings = Vec::new();
     let mut suppressed = Vec::new();
     let cutoff = (now - window_h() * 3600.0) as i64;
@@ -3518,14 +4082,19 @@ fn detect_schedule_run_health(
         by_schedule.entry(&row.id).or_default().push(row);
     }
     for (id, runs) in by_schedule {
-        let streak: Vec<&ScheduleRunObservation> =
-            runs.iter().copied().take_while(|r| r.status == "error").collect();
+        let streak: Vec<&ScheduleRunObservation> = runs
+            .iter()
+            .copied()
+            .take_while(|r| r.status == "error")
+            .collect();
         if streak.len() >= schedule_error_streak() {
             let newest = streak[0];
             let oldest = streak[streak.len() - 1];
             let mut patterns: BTreeMap<String, usize> = BTreeMap::new();
             for run in &streak {
-                *patterns.entry(schedule_error_pattern(&run.note)).or_default() += 1;
+                *patterns
+                    .entry(schedule_error_pattern(&run.note))
+                    .or_default() += 1;
             }
             let pattern_text = patterns
                 .into_iter()
@@ -3540,7 +4109,29 @@ fn detect_schedule_run_health(
             );
             findings.push(Finding {
                 kind: DetectorKind::SilentSubsystem,
-                signature: format!("silent|schedule-errors|{id}"),
+                // THE EPISODE'S TIMESTAMP IS PART OF THE IDENTITY (AMUX-5034).
+                //
+                // Without it this signature never varies, so `already_filed`
+                // latches on the FIRST filing and the schedule can never file
+                // again — for any future failure, with any cause, forever.
+                //
+                // Measured 2026-09-23. `session_events` holds exactly one row
+                // with idem `autofix:silent|schedule-errors|SCHED-410`, from
+                // 2026-09-02 21:21. Its card COACH-3 was filed for a urllib
+                // connection error, resolved, and marked `verified` 30 minutes
+                // later. Three weeks on the same schedule broke again with a
+                // completely different cause (a KeyError on a transcript
+                // segment) and failed on every 30-minute fire for days with
+                // NOTHING filed. Three schedules are latched this way today
+                // (SCHED-410, -440, -443) and all three cards are terminal.
+                //
+                // The `5xx|` detector already solved this: carry the newest
+                // offending row's epoch so a new EPISODE is a new signature,
+                // and let `fault_identity` strip it so an OPEN card still
+                // suppresses the fan-out. This is that, and the docstring on
+                // `open_card_for_fault` already describes it as the intent:
+                // "a genuinely new occurrence after that still files".
+                signature: format!("silent|schedule-errors|{id}|{}", newest.ran_at),
                 title: format!("Schedule {id} has failed {} times in a row", streak.len()),
                 evidence: vec![
                     ("schedule".into(), format!("{} ({id})", newest.title)),
@@ -3572,7 +4163,11 @@ fn detect_schedule_run_health(
         .filter(|r| r.status == "delivered" && (r.ran_at as f64) <= grace_before)
     {
         let expected_id = format!("%[{}]%", run.id);
-        let legacy_title = if run.title.is_empty() { run.id.as_str() } else { run.title.as_str() };
+        let legacy_title = if run.title.is_empty() {
+            run.id.as_str()
+        } else {
+            run.title.as_str()
+        };
         let from_ms = run.ran_at.saturating_sub(60) * 1000;
         let to_ms = run.ran_at.saturating_add(120) * 1000;
         let message_exists = conn
@@ -3592,6 +4187,26 @@ fn detect_schedule_run_health(
             )
             .unwrap_or(false);
         if message_exists {
+            continue;
+        }
+        // DELIVERED THROUGH STEERING (gs12-gates, SCHED-616 / GG-95,
+        // 2026-10-08): a run queued to a lane mid-turn is delivered at its
+        // next boundary through the steering queue, which writes no
+        // cmd_history 'schedule' row and carries no [SCHED-id] tag; 19 of 19
+        // such runs were filed as missing. The link is the queue time: the
+        // run queued a steering row for its session within the window, and
+        // that row was delivered (however late: SCHED-616's came 4.6 min on).
+        let steered = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM steering_history \
+                 WHERE session=?1 AND queued_at BETWEEN ?2 AND ?3 AND delivered_at IS NOT NULL)",
+                rusqlite::params![run.session, run.ran_at as f64 - 60.0, run.ran_at as f64 + 120.0],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if steered {
+            tracing::debug!(schedule = %run.id, session = %run.session, measured = true, n_considered = 1,
+                verdict = "schedule_message_steered", "a schedule run was delivered through the steering queue");
             continue;
         }
         match downtime_window_covering(run.ran_at as f64, &downtime_windows, downtime_pad) {
@@ -3649,28 +4264,37 @@ fn detect_schedule_run_health(
     // Finding per outage naming every schedule it touched — still visible,
     // never suppressed, just not miscounted as N unrelated faults.
     for (window_id, missing) in missing_by_outage {
-        let Some((_, down_from, up_at, cause)) =
-            downtime_windows.iter().find(|w| w.0 == window_id)
+        let Some((_, down_from, up_at, cause)) = downtime_windows.iter().find(|w| w.0 == window_id)
         else {
             continue;
         };
         let mut by_schedule: BTreeMap<&str, (u64, &str, &str)> = BTreeMap::new();
         for run in &missing {
-            let entry = by_schedule
-                .entry(run.id.as_str())
-                .or_insert((0, run.title.as_str(), run.session.as_str()));
+            let entry = by_schedule.entry(run.id.as_str()).or_insert((
+                0,
+                run.title.as_str(),
+                run.session.as_str(),
+            ));
             entry.0 += 1;
         }
-        let mut breakdown: Vec<(&str, u64, &str, &str)> =
-            by_schedule.into_iter().map(|(id, (n, title, session))| (id, n, title, session)).collect();
+        let mut breakdown: Vec<(&str, u64, &str, &str)> = by_schedule
+            .into_iter()
+            .map(|(id, (n, title, session))| (id, n, title, session))
+            .collect();
         breakdown.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         let schedules_text = breakdown
             .iter()
             .map(|(id, n, title, session)| format!("{id} x{n} ({title}, {session})"))
             .collect::<Vec<_>>()
             .join("; ");
-        let newest = missing.iter().max_by_key(|r| r.ran_at).expect("non-empty group");
-        let oldest = missing.iter().min_by_key(|r| r.ran_at).expect("non-empty group");
+        let newest = missing
+            .iter()
+            .max_by_key(|r| r.ran_at)
+            .expect("non-empty group");
+        let oldest = missing
+            .iter()
+            .min_by_key(|r| r.ran_at)
+            .expect("non-empty group");
         tracing::warn!(
             downtime_id = window_id,
             schedules_affected = breakdown.len(),
@@ -3936,8 +4560,8 @@ pub fn detect_silent(
     // already surfaces suppressions and that is where somebody reading "why did
     // the detector find nothing" will actually look.
     let steer_stmt = conn.prepare(
-        "SELECT session, COUNT(*), MIN(queued_at), COALESCE(GROUP_CONCAT(DISTINCT sender),'') \
-         FROM steering_queue GROUP BY session",
+        "SELECT session, COUNT(*), MIN(MAX(queued_at, COALESCE(deliver_at,0))), COALESCE(GROUP_CONCAT(DISTINCT sender),'') \
+         FROM steering_queue WHERE COALESCE(deliver_at,0) <= (julianday('now') - 2440587.5) * 86400.0 GROUP BY session",
     );
     if let Err(e) = &steer_stmt {
         suppressed.push(sup(
@@ -4401,6 +5025,111 @@ pub fn detect_silent(
     (out, suppressed)
 }
 
+/// ONE card for a pool-wide stall, built from the jobs that were unhealthy in
+/// the SAME evaluation pass.
+///
+/// The verdict line is COMPUTED, not written: it reports the observed spread of
+/// `last_tick_age_s` across the group. A tight spread means every job stopped
+/// at the same moment, which is a runtime-pool fault; a wide one means the jobs
+/// failed independently and the reader should not be sent looking for one
+/// cause. A sentence that said "they stalled together" unconditionally could
+/// not be wrong, so it would not be evidence.
+fn system_job_rollup(
+    issues: &[crate::runtime_jobs::registry::HealthIssue],
+    now: f64,
+) -> Finding {
+    let n = issues.len();
+    let mut ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
+    ids.sort();
+
+    let ages: Vec<f64> = issues.iter().filter_map(|i| i.last_tick_age_s).collect();
+    let worst = ages.iter().copied().fold(0.0f64, f64::max);
+    let spread = match (
+        ages.iter().copied().fold(f64::INFINITY, f64::min),
+        ages.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    ) {
+        (lo, hi) if lo.is_finite() && hi.is_finite() => Some(hi - lo),
+        _ => None,
+    };
+    let together = match spread {
+        Some(sp) if ages.len() >= 2 => format!(
+            "{n} job(s) with a last-tick age spread of {sp:.1}s across {} measured age(s). \
+             A spread far SMALLER than the ages themselves (worst {worst:.1}s) means every \
+             job stopped ticking in the same window, which is a runtime-pool fault rather \
+             than N independent jobs; a spread comparable to the ages means they failed \
+             separately and there is no single cause to look for.",
+            ages.len()
+        ),
+        _ => format!(
+            "{n} job(s) unhealthy, but fewer than 2 reported a last-tick age, so whether \
+             they stopped together is UNMEASURED here. Read GET /api/system-jobs directly."
+        ),
+    };
+
+    tracing::warn!(
+        jobs = %ids.join(","),
+        n,
+        worst_age_s = worst,
+        spread_s = spread.unwrap_or(f64::NAN),
+        measured = !ages.is_empty(),
+        n_considered = n,
+        verdict = "system_jobs_stalled_together",
+        "several system jobs are unhealthy in one pass; filed as ONE card (AMUX-5031)"
+    );
+
+    let rows: Vec<String> = issues
+        .iter()
+        .map(|i| {
+            format!(
+                "{} ({}) status={} interval={} last_tick_age_s={}",
+                i.id,
+                i.name,
+                i.status,
+                i.interval_s
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "unmeasured".into()),
+                i.last_tick_age_s
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "never".into()),
+            )
+        })
+        .collect();
+
+    Finding {
+        kind: DetectorKind::SilentSubsystem,
+        signature: format!("silent|system-job|ROLLUP|{}", ids.join(",")),
+        title: format!("{n} system jobs unhealthy at once — one fault, not {n} tasks"),
+        evidence: vec![
+            ("verdict".into(), format!(
+                "{n} DIFFERENT system jobs were unhealthy in the SAME evaluation pass. \
+                 Filed as ONE card on purpose: per-job cards each name a job that is \
+                 probably not the fault, and of the 23 such cards ever filed, 20 were \
+                 discarded as noise. These jobs share the runtime's threads, so one job \
+                 holding a thread without yielding stops all of them. Check \
+                 `runtime_job_blocking_poll` and `tick_section_slow` in \
+                 ~/.amux/logs/server-rs.log, and GET /api/debug/invariants, BEFORE \
+                 investigating any single job."
+            )),
+            ("stopped_together".into(), together),
+            ("jobs".into(), format!("\n  {}", rows.join("\n  "))),
+            ("worst_last_tick_age_s".into(), format!("{worst:.1}")),
+            ("last_seen".into(), rl::local_when(now)),
+            (
+                "verdict_source".into(),
+                "The same runtime registry facts and classify_observed predicate shown by \
+                 GET /api/system-jobs; autofix does not re-derive health. The GROUPING is \
+                 autofix's: these rows arrived in one pass."
+                    .into(),
+            ),
+        ],
+        recheck: "curl -sk \"$AMUX_URL/api/system-jobs\" | jq '[.jobs[] | select(.status!=\"ok\")] | map({id,status,interval_s,last_tick_age_s})'".into(),
+        owner: None,
+        count: n as u64,
+        last_ts: now,
+        parked_until: None,
+    }
+}
+
 /// Turn the System Jobs registry's own unhealthy rows into durable, deduped
 /// work. This function deliberately does not classify jobs itself: the
 /// Scheduler UI and autofix must consume the same verdict, including `slow`.
@@ -4408,6 +5137,36 @@ fn system_job_findings(
     issues: &[crate::runtime_jobs::registry::HealthIssue],
     now: f64,
 ) -> Vec<Finding> {
+    // SEVERAL JOBS UNHEALTHY AT ONCE IS ONE FAULT, NOT N TASKS (AMUX-5031).
+    //
+    // Every job in this pool shares the runtime's threads, so one job that
+    // holds a thread without yielding stops all of them. Measured in the
+    // server log at 23:28:00.679, a SINGLE instant:
+    //
+    //   steer-deliver        age 34.7s  (interval 5s)
+    //   project-execution    age 42.6s  (interval 10s)
+    //   cdc-poller           age 34.0s  (interval 0.2s)
+    //   orchestrator-runtime age 36.2s  (interval 3s)
+    //   event-processors     age 34.2s  (interval 2s)
+    //   session-bootstrap    age 34.1s  (interval 2s)
+    //
+    // Six jobs, six intervals spanning 0.2s to 10s, and every age inside one
+    // 34-to-43 second band. That is not six stalls. It is one ~34-second
+    // window in which nothing ticked, and `runtime_job_blocking_poll` fired
+    // 14145 times over this log with orchestrator-runtime (6148) and
+    // board-drive (5715) at the top, which is the shape that produces it.
+    //
+    // Filing one card per job names the VICTIM. The board's own history says
+    // so louder than any argument here: of 23 `System job ... is ...` cards
+    // ever filed, 20 are `discarded`. People have been throwing these away as
+    // noise for three weeks.
+    //
+    // Same rollup the latency detector already uses, and the same keying: on
+    // the JOB SET, so a different collapse is different news while the same
+    // one stays idempotent.
+    if issues.len() > 1 {
+        return vec![system_job_rollup(issues, now)];
+    }
     issues
         .iter()
         .map(|issue| {
@@ -4503,6 +5262,77 @@ fn episode_sig(episode: i64) -> String {
     }
 }
 
+/// How far a still-failing invariant must grow, over the largest magnitude a
+/// card was already filed at in the same episode, before it files again.
+///
+/// AF-1045. An episode only ends when the invariant passes, and `already_filed`
+/// holds a filed signature for the whole episode, so a discard sticks until
+/// then. That is right for a flapping fault and wrong for one that never heals
+/// while it grows: board.todo_is_reachable_by_dispatch had its card discarded
+/// at "1 of 179 live todo cards" and then reported 49 of 133 for weeks with
+/// every card for it discarded, so 49 stranded cards had no live owner.
+///
+/// A factor, not "any change": each refile needs the fault to double over the
+/// largest filed magnitude, so one episode can file at most log2(max) cards,
+/// a shrink never refiles, and an OPEN card still suppresses every one of them
+/// (`open_card_for_fault`).
+pub(crate) const INVARIANT_REGROWTH_FACTOR: f64 = 2.0;
+
+/// The largest magnitude a card was filed at for `base` (a signature without
+/// its `|m<N>` suffix), with the signature that card was filed under.
+///
+/// A card filed under `base` itself predates magnitudes: its size was never
+/// recorded, so it counts as 1, the smallest a declared magnitude can be. That
+/// files each such invariant once more when it is at least the factor large,
+/// which is the migration this fix exists to make.
+fn filed_magnitude(conn: &Connection, base: &str) -> Option<(i64, String)> {
+    let mut best = already_filed(conn, base).then(|| (1, base.to_string()));
+    let sized = format!("{base}|m");
+    // A range on the idem index rather than LIKE: invariant ids carry `_`,
+    // which LIKE reads as a wildcard. `|n` is the next string after `|m…`.
+    let rows: Vec<String> = conn
+        .prepare("SELECT idem FROM session_events WHERE idem > ?1 AND idem < ?2")
+        .and_then(|mut st| {
+            st.query_map(
+                rusqlite::params![idem_of(&sized), idem_of(&format!("{base}|n"))],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|it| it.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    for idem in rows {
+        let Some(sig) = idem.strip_prefix("autofix:") else { continue };
+        let Some(m) = sig.strip_prefix(&sized).and_then(|t| t.parse::<i64>().ok()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(p, _)| m > *p) {
+            best = Some((m, sig.to_string()));
+        }
+    }
+    best
+}
+
+/// The signature an invariant with a declared magnitude files under, and,
+/// when that is a regrowth past an earlier card, the earlier magnitude and
+/// signature.
+///
+/// Unchanged or smaller than the factor: the earlier signature, so
+/// `already_filed` keeps it quiet exactly as before.
+fn regrowth_signature(
+    conn: &Connection,
+    base: &str,
+    magnitude: i64,
+) -> (String, Option<(i64, String)>) {
+    let sized = format!("{base}|m{magnitude}");
+    match filed_magnitude(conn, base) {
+        None => (sized, None),
+        Some((p, sig)) if magnitude as f64 >= INVARIANT_REGROWTH_FACTOR * p.max(1) as f64 => {
+            (sized, Some((p, sig)))
+        }
+        Some((_, sig)) => (sig, None),
+    }
+}
+
 /// How many distinct entities one invariant must be failing for before it is
 /// filed as a SINGLE rollup card instead of one card per entity.
 ///
@@ -4583,11 +5413,17 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
         // its self-heal epoch in there (InvariantResult::heals_at), and that is
         // what separates "held red on purpose until Tuesday" from "a fault that
         // is getting worse". Without it the two file identical cards.
-        "SELECT invariant_id, entity_key, status, first_seen, last_seen, occurrences, \
+        //
+        // The count is the CURRENT failing run (AF-1126), not `occurrences`,
+        // which totals every failure since first_seen: an incident with 117
+        // lifetime failures filed on one blip an hour after it had healed. A
+        // row written before that column existed reads 0 and falls back.
+        "SELECT invariant_id, entity_key, status, first_seen, last_seen, \
+                CASE WHEN COALESCE(episode_occurrences, 0) > 0 THEN episode_occurrences ELSE occurrences END AS run, \
                 expected, observed, COALESCE(evidence, ''), COALESCE(episode, 1) \
          FROM _amux_invariant_incident WHERE resolved_at IS NULL AND status = 'fail' \
          AND last_seen >= ?1 \
-         ORDER BY occurrences DESC LIMIT 200",
+         ORDER BY run DESC LIMIT 200",
     ) else {
         return (out, suppressed);
     };
@@ -4687,7 +5523,7 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             // now the fact, written by the statement that actually performs the
             // reopen, so the two components cannot disagree again.
             signature: format!(
-                "invariant|{id}|ROLLUP|{}{}",
+                "invariant|{id}|{ROLLUP_ENTITY}|{}{}",
                 first_seen as i64,
                 episode_sig(episode)
             ),
@@ -4754,8 +5590,49 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             entity.clone()
         };
         // Episode identity, same reason as the ROLLUP arm above (AMUX-3633).
-        let signature =
-            format!("invariant|{id}|{sig_entity}|{}{}", first as i64, episode_sig(episode));
+        let base = format!(
+            "invariant|{id}|{sig_entity}|{}{}",
+            first as i64,
+            episode_sig(episode)
+        );
+        let evidence_json = serde_json::from_str::<serde_json::Value>(&evidence).ok();
+        // REGROWTH (AF-1045): a check that declares its magnitude files again
+        // once that doubles over what its last card was filed at.
+        let magnitude = evidence_json.as_ref().and_then(crate::invariants::magnitude_of);
+        let (signature, regrown) = match magnitude {
+            Some(m) => regrowth_signature(conn, &base, m),
+            None => (base.clone(), None),
+        };
+        let regrown_line = regrown.map(|(was, prior_sig)| {
+            let m = magnitude.unwrap_or(was);
+            let prior = conn
+                .query_row(
+                    "SELECT id, CASE WHEN archived = 1 THEN 'archived' ELSE status END \
+                       FROM issues WHERE source_ref = ?1 \
+                      ORDER BY COALESCE(updated, 0) DESC, rowid DESC LIMIT 1",
+                    rusqlite::params![idem_of(&prior_sig)],
+                    |r| Ok(format!("{} ({})", r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .unwrap_or_else(|_| "an earlier card (not found on the board)".into());
+            // Sized only if the old signature is this base plus `|m<N>`: an
+            // entity like `mixpeek-studio` also contains "|m".
+            let was_note = if prior_sig.strip_prefix(base.as_str()).is_some_and(|t| t.starts_with("|m")) {
+                format!("magnitude {was}")
+            } else {
+                "a size that was not recorded (counted as 1)".to_string()
+            };
+            tracing::info!(
+                target: "amux::autofix", invariant = %id, entity = %sig_entity,
+                prior = %prior, was, now = m, factor = INVARIANT_REGROWTH_FACTOR,
+                verdict = "invariant_regrown",
+                "invariant grew past the card that judged it; filing it again"
+            );
+            format!(
+                "{prior} judged this same unbroken failure at {was_note}. It is now {m}, at \
+                 least {INVARIANT_REGROWTH_FACTOR}x that, so this is a new card for a larger \
+                 condition rather than a repeat of the judged one (AF-1045)."
+            )
+        });
         if occ < min_occ {
             suppressed.push(sup(
                 DetectorKind::InvariantBreach,
@@ -4771,8 +5648,7 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
         // that has already lapsed means the invariant should have passed by now
         // and has not, which is a real fault and the loudest kind, so it must
         // not be filed as "parked until a date that is behind us".
-        let parked_until = serde_json::from_str::<serde_json::Value>(&evidence)
-            .ok()
+        let parked_until = evidence_json
             .as_ref()
             .and_then(crate::invariants::heals_at_of)
             .filter(|t| *t > now);
@@ -4805,14 +5681,23 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             } else {
                 format!("invariant {id} failing ({occ}x) — {sig_entity}")
             },
-            evidence: vec![
-                ("verdict".into(), verdict),
-                ("expected".into(), truncate(&expected, 500)),
-                ("observed".into(), truncate(&observed, 500)),
-                ("first_seen".into(), rl::local_when(first)),
-                ("last_seen".into(), rl::local_when(last)),
-                ("occurrences".into(), occ.to_string()),
-            ],
+            evidence: {
+                let mut ev = vec![("verdict".into(), verdict)];
+                if let Some(line) = regrown_line {
+                    ev.push(("regrown".into(), line));
+                }
+                ev.extend([
+                    ("expected".into(), truncate(&expected, 500)),
+                    ("observed".into(), truncate(&observed, 500)),
+                    ("first_seen".into(), rl::local_when(first)),
+                    ("last_seen".into(), rl::local_when(last)),
+                    ("occurrences".into(), occ.to_string()),
+                ]);
+                if let Some(m) = magnitude {
+                    ev.push(("magnitude".into(), m.to_string()));
+                }
+                ev
+            },
             // READS `failures` AND `invariant_id` — the shape the endpoint
             // actually returns. This said `.get('results',[])` and `r.get('id')`
             // and the endpoint has NEITHER key, so it printed `[]` no matter
@@ -5037,6 +5922,15 @@ enum DuOutcome {
 /// everything it did read. Treating that as unreadable would discard a
 /// mostly-correct figure for the common case of a few protected subdirs.
 fn du_one(p: &std::path::Path, deadline: std::time::Instant) -> DuOutcome {
+    // A deadline already past means no time to measure: do not start a walk.
+    // Checked only inside the poll loop, a fast `du` on a small path could
+    // finish before the first check and report Sized past its deadline (the
+    // CI flake in an_expired_deadline_is_a_timeout_not_an_unreadable_path,
+    // run 37057066552).
+    if std::time::Instant::now() >= deadline {
+        tracing::debug!(path = %p.display(), "disk: du deadline already expired — path skipped in the size ranking");
+        return DuOutcome::TimedOut;
+    }
     let mut child = match std::process::Command::new("/usr/bin/du")
         .args(["-skx"])
         .arg(p)
@@ -5449,6 +6343,44 @@ fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
 // Keep the original deadline/parser regressions on the shared implementation
 // used by both the detector and reclaim; count alone does not prove causality.
 #[cfg(test)]
+mod closed_predecessor_tests {
+    /// AF-1034: an occurrence no newer than the predecessor's close is the one
+    /// it covered; a newer one, or a detector with no row time, files.
+    #[test]
+    fn a_closed_card_covers_occurrences_up_to_its_close() {
+        let closed = 1_793_335_814;
+        assert!(super::covered_by_closed_predecessor(1_793_334_175.0, closed), "AF-1034's own case");
+        assert!(super::covered_by_closed_predecessor(closed as f64, closed), "the same second is covered");
+        assert!(!super::covered_by_closed_predecessor(closed as f64 + 1.0, closed), "a newer occurrence files");
+        assert!(!super::covered_by_closed_predecessor(0.0, closed), "no row time: files as before");
+        assert!(!super::covered_by_closed_predecessor(1_793_334_175.0, 0), "an unknown close time: files as before");
+    }
+
+    /// AF-1038: the predecessor is the card closed MOST RECENTLY, not the one
+    /// whose id sorts last as a string ("AMUX-6539" > "AF-1035").
+    #[test]
+    fn the_predecessor_is_the_most_recently_closed_card() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, archived INTEGER DEFAULT 0, deleted TEXT, updated INTEGER);",
+        )
+        .unwrap();
+        let sig = "latency|outlier|ROLLUP|/api/board,/api/sessions|1793334175";
+        let ident = super::fault_identity(sig).expect("a rollup has a fault identity");
+        for (id, updated) in [("AMUX-6539", 1_793_305_512_i64), ("AF-1035", 1_793_340_771)] {
+            conn.execute(
+                "INSERT INTO issues (id, source_ref, status, archived, deleted, updated) VALUES (?1, ?2, 'done', 0, NULL, ?3)",
+                rusqlite::params![id, format!("autofix:{ident}|1"), updated],
+            )
+            .unwrap();
+        }
+        let (id, _, closed_at) = super::released_predecessor(&conn, sig).expect("a predecessor");
+        assert_eq!((id.as_str(), closed_at), ("AF-1035", 1_793_340_771));
+        assert!(super::covered_by_closed_predecessor(1_793_334_175.0, closed_at), "AF-1038's stale occurrence is covered");
+    }
+}
+
+#[cfg(test)]
 use super::storage::bounded_output;
 
 #[cfg(test)]
@@ -5476,7 +6408,10 @@ fn disk_snapshot_evidence(snaps: Option<usize>) -> Vec<(String, String)> {
         "disk_snapshot_context"
     );
     let mut evidence = vec![
-        ("apfs_local_snapshots_measured".into(), snaps.is_some().to_string()),
+        (
+            "apfs_local_snapshots_measured".into(),
+            snaps.is_some().to_string(),
+        ),
         (
             "apfs_local_snapshots_n_considered".into(),
             snaps.unwrap_or(0).to_string(),
@@ -5484,10 +6419,13 @@ fn disk_snapshot_evidence(snaps: Option<usize>) -> Vec<(String, String)> {
         ("apfs_retention".into(), retention.into()),
         (
             "apfs_local_snapshots".into(),
-            snaps.map(super::storage::apfs_snapshot_note).unwrap_or_else(|| {
-                "Local snapshot retention is unmeasured. Do not infer that snapshots \
-                 are absent or that deleting them is necessary.".into()
-            }),
+            snaps
+                .map(super::storage::apfs_snapshot_note)
+                .unwrap_or_else(|| {
+                    "Local snapshot retention is unmeasured. Do not infer that snapshots \
+                 are absent or that deleting them is necessary."
+                        .into()
+                }),
         ),
     ];
     if snaps.is_none() {
@@ -5726,48 +6664,54 @@ fn fd_trigger(
     None
 }
 
-#[cfg(test)]
+/// How long a composer may hold unsubmitted text before this files a card.
+/// `AMUX_STUCK_COMPOSER_CARD_MIN`, default 60 minutes, clamped to [1 min, 1 day]
+/// at both ends: 0 would file on every tick and a week would re-create the
+/// silence this detector exists to end.
+///
+/// Was `#[cfg(test)]` between 15b72193 and AMUX-5057, hidden alongside the
+/// detector body it configures.
 fn stuck_composer_card_after_s() -> f64 {
     env_f64("AMUX_STUCK_COMPOSER_CARD_MIN", 60.0).clamp(1.0, 60.0 * 24.0) * 60.0
 }
 
 /// A composer holding an UNSUBMITTED COLLAPSED PASTE past the threshold.
 ///
-/// The narrow, real gap left by `ghost_rescue` (AMUX-3885). That sweep rescues
-/// any pending text it can PROVE is amux's — every message amux sends carries a
-/// client-side `[H:MM AM]` prefix — takes the send lock, re-checks the frame, and
-/// submits. What it cannot claim is a collapsed paste: Claude Code renders a large
-/// paste as `[Pasted text #N +M lines]` and keeps the content off screen, so the
-/// prefix is unreadable and ownership is unprovable. It refuses, correctly, and
-/// says so: submitting on a guess could send a human's half-typed text, and
-/// choosing for them is ethos rule 8.
+/// amux does not submit this text for you, and that refusal is deliberate: it
+/// cannot always read whose text it is (Claude Code renders a large paste as
+/// `[Pasted text #N +M lines]` and hides the content), and pressing Enter on a
+/// guess could send a human's half-typed message. Choosing for them is ethos
+/// rule 8. So this files a card and a person decides.
 ///
-/// THIS DETECTOR DOES NOT OVERTURN THAT REFUSAL. It files a card so a person
-/// decides, which is exactly what the sweep's own comment asks for ("make it loud
-/// and let a person or the sender decide"). Before this, "loud" ended at one WARN
-/// and a dashboard badge, and nothing filed — `autofix` had no composer path at
-/// all. That is how eight lanes came to be holding unsubmitted text at 1d, 1d, 1d,
-/// 2d, 3d, 5d, 5d and 6d when Ethan screenshotted the dashboard on 2026-08-29. Six
-/// days is not an alert that was insufficiently urgent; it is one that reached
-/// nobody.
+/// Before it existed, "loud" ended at one WARN and a dashboard badge, and
+/// nothing filed. That is how eight lanes came to be holding unsubmitted text at
+/// 1d, 1d, 1d, 2d, 3d, 5d, 5d and 6d when Ethan screenshotted the dashboard on
+/// 2026-08-29. Six days is not an alert that was insufficiently urgent; it is
+/// one that reached nobody.
 ///
-/// The AGE comes from `composer_stuck_since` rather than from the sweep, because
-/// the sweep is stateless across passes: it can say a lane holds a chip NOW and
-/// not for how long, and the duration is the entire difference between a card and
-/// noise.
-pub fn detect_stuck_composer(_now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
-    (
-        vec![],
-        vec![sup(
-            DetectorKind::StuckComposer,
-            "stuck-composer|removed",
-            "ghost-rescue was removed (KISS simplification); stuck composer detection \
-             is no longer active",
-        )],
-    )
+/// THEN IT WAS DELETED AS COLLATERAL AND THE SIX DAYS CAME BACK AS EIGHT.
+/// `15b72193` ("KISS audit, delete 4 ceiling modules") removed `ghost_rescue`,
+/// correctly: that sweep SUBMITTED text on amux's behalf, which is exactly the
+/// weak-model crutch the audit was clearing out. This detector only ever
+/// REPORTED, and it went with it — reduced to a stub returning no findings,
+/// while its real body stayed compiled behind `#[cfg(test)]` where five tests
+/// went on passing against code that shipped in no binary (ethos rule 7: a
+/// check pinning the wrong layer is exactly as green as one pinning the right
+/// layer). Measured when it was restored: one lane had been holding unsubmitted
+/// text for 199 hours with nothing filed.
+///
+/// The rescue is still gone and should be. The alarm is not the rescue.
+///
+/// It never needed `ghost_rescue` for its data either, which is why restoring it
+/// took no resurrection: the age comes from `composer_stuck_since`, stamped by
+/// `rate_limit_sweep`, and `composer_stuck_lanes()` is the shared reader.
+pub fn detect_stuck_composer(
+    lanes: &[(String, i64)],
+    now: f64,
+) -> (Vec<Finding>, Vec<Suppressed>) {
+    stuck_composer_findings(lanes, now)
 }
 
-#[cfg(test)]
 fn stuck_composer_findings(lanes: &[(String, i64)], now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
@@ -5775,14 +6719,17 @@ fn stuck_composer_findings(lanes: &[(String, i64)], now: f64) -> (Vec<Finding>, 
     for (lane, since) in lanes {
         let (lane, since) = (lane.as_str(), *since);
         if since <= 0 {
-            // The two instruments disagree: the sweep sees a chip on screen and
-            // rate_limit_sweep never stamped it. Report rather than guess an age.
+            // UNREACHABLE VIA `detect_stuck_composer`, which filters `since > 0`
+            // before calling, and kept anyway because this fn is callable with
+            // any list. An age of 0 means the caller found a lane some other
+            // way than the stamp, so the honest answer is that it cannot be
+            // aged rather than that it is freshly stuck.
             suppressed.push(sup(
                 DetectorKind::StuckComposer,
                 &format!("stuck-composer|{lane}|unstamped"),
-                "ghost-rescue reports a collapsed paste in this lane but composer_stuck_since \
-                 is 0, so it cannot be aged — rate_limit_sweep stamps that field and the two \
-                 instruments disagree about the same lane",
+                "this lane was offered as stuck with composer_stuck_since = 0, so it cannot be \
+                 aged — rate_limit_sweep is what stamps that field, and a caller that did not \
+                 read it is asking a different question",
             ));
             continue;
         }
@@ -5804,13 +6751,12 @@ fn stuck_composer_findings(lanes: &[(String, i64)], now: f64) -> (Vec<Finding>, 
                 (
                     "verdict".into(),
                     format!(
-                        "This lane's composer has held an UNSUBMITTED collapsed paste for \
-                         {held_h:.1}h. amux delivered a message and it was never submitted, so \
-                         whoever sent it believes it landed. ghost-rescue examined this lane and \
-                         declined it on purpose: Claude Code renders a large paste as `[Pasted \
-                         text #N +M lines]` and hides the content, so the `[H:MM AM]` prefix that \
-                         would prove the text is amux's cannot be read, and submitting on a guess \
-                         could send someone's half-typed message."
+                        "This lane's composer has held UNSUBMITTED text for {held_h:.1}h with no \
+                         live turn and no live agents. If amux delivered it, whoever sent it \
+                         believes it landed. amux does not submit it for you: it cannot always \
+                         read whose text it is (Claude Code renders a large paste as `[Pasted \
+                         text #N +M lines]` and hides the content), and pressing Enter on a \
+                         guess could send a human's half-typed message."
                     ),
                 ),
                 ("lane".into(), lane.to_string()),
@@ -5832,23 +6778,22 @@ fn stuck_composer_findings(lanes: &[(String, i64)], now: f64) -> (Vec<Finding>, 
                     "Whether amux may press Enter on content it cannot read is an open decision \
                      on AMUX-3885, not an oversight. It is doable — amux knows what it delivered \
                      (cmd_history holds the text and the delivery verdict), so an unconfirmed \
-                     recent delivery plus an idle lane holding a chip is strong provenance \
-                     without reading the chip — but the failure mode is sending a human's \
-                     unfinished text in any of ~57 lanes."
+                     recent delivery plus an idle lane holding text is strong provenance without \
+                     reading it — but the failure mode is sending a human's unfinished text, and \
+                     this fleet has 233 lanes."
                         .to_string(),
                 ),
             ],
             recheck: "curl -sk \"$AMUX_URL/api/sessions\" | python3 -c \"import json,sys,time; \
                  d=json.load(sys.stdin); [print(x['name'], round((time.time()-x['composer_stuck_since'])/3600,1), \
-                 'h', repr(x.get('composer_preview'))) for x in d if x.get('composer_stuck_since')]\"; \
-                 curl -sk \"$AMUX_URL/api/debug/jobs\" | grep -i ghost"
+                 'h', repr(x.get('composer_preview'))) for x in d if x.get('composer_stuck_since')]\""
                 .to_string(),
             // NOT the stuck lane, and that is load-bearing rather than
             // stylistic. `board_drive` nudges the owner of a queued card, a
             // nudge is a send, and `send_text_inner` answers a CollapsedPaste
             // frame with Escape+Enter (AMUX-3880) — so owning this card with
             // the stuck lane would make the escalation SUBMIT the very content
-            // ghost-rescue refused to submit, by side effect. Whether amux may
+            // amux deliberately does not submit, by side effect. Whether amux may
             // press Enter on content it cannot read is the open half of
             // AMUX-3885 and Ethan's call; arriving there through a nudge is
             // taking it without asking. `None` routes to AMUX_AUTOFIX_SESSION,
@@ -6035,6 +6980,24 @@ pub struct CiRun {
     /// Populated only for the newest failing run of a failing workflow — it
     /// costs one extra API call each, so it is not fetched for history.
     pub failing_step: Option<String>,
+    /// Test files that failed in that same newest failing run, read from its
+    /// failed-job log (e2e spec headers, Rust panic locations). Same one-run
+    /// budget as `failing_step`; empty when the log named none.
+    pub failing_tests: Vec<String>,
+    /// The sessions that wrote those files (`Amux-Session` trailers), most
+    /// commits first. The finding routes to the first one: a flaky spec is
+    /// fixed fastest by whoever wrote it (velocity audit 2026-10-22).
+    pub test_owners: Vec<String>,
+    /// The commit the run tested.
+    pub head_sha: String,
+    /// For a failing run: the `Amux-Session` trailer on that commit, and
+    /// whether that lane is isolated. Read from the local checkout at fetch
+    /// time (no API call) so the card can say who turned the workflow red and
+    /// whether `amux send` can reach them. Main's `checks` was red 10 h on
+    /// 2026-11-10 with nobody told: its author and the card's route were both
+    /// lanes nobody could message.
+    pub head_lane: Option<String>,
+    pub head_lane_isolated: bool,
 }
 
 /// A workflow whose redness means MERGED AND DEPLOYED HAVE DIVERGED.
@@ -6238,6 +7201,14 @@ pub fn connector_findings_from_rollup(rollup: &serde_json::Value, now: f64) -> V
                 continue;
             }
             let http_st = leg.get("http").and_then(|v| v.as_u64()).unwrap_or(0);
+            // A 5xx is the PROVIDER failing, not it rejecting the token, so it
+            // files nothing, like `unreachable` (AF-1085: Google Calendar
+            // answered 503 "Backend Error" for esteininger21@gmail.com, the card
+            // said the token was rejected, and the next canary read 200). A 4xx
+            // is the API refusing this credential or grant, which is the rot.
+            if http_st >= 500 {
+                continue;
+            }
             out.push(Finding {
                 kind: DetectorKind::ConnectorAuth,
                 signature: format!("connector-canary|{account}|{svc}"),
@@ -6428,7 +7399,9 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
             // key cannot drift as runs age out; the evidence says so out loud.
             None => "since-beyond-window".to_string(),
         };
-        let signature = format!("ci|{repo}|{workflow}|{anchor}");
+        let bucket_s = ci_refile_h() * 3600.0;
+        let bucket = ((now / bucket_s).floor() * bucket_s) as i64;
+        let signature = format!("ci|{repo}|{workflow}|{anchor}|{bucket}");
         let first_seen = oldest.created_at;
         let step = newest
             .failing_step
@@ -6453,6 +7426,7 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
                 format!("{} (run {})", ci_when(first_seen), oldest.run_id),
             ),
             ("first_failure_url".into(), oldest.url.clone()),
+            ("first_red_commit".into(), ci_first_red_commit(oldest)),
             (
                 "failing_for".into(),
                 format!("{:.1}h", ((now - first_seen) / 3600.0).max(0.0)),
@@ -6463,6 +7437,22 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
             ),
             ("latest_run_url".into(), newest.url.clone()),
             ("failing_step".into(), step),
+            (
+                "failing_tests".into(),
+                if newest.failing_tests.is_empty() {
+                    "<none named in the failed-job log>".into()
+                } else {
+                    newest.failing_tests.join(", ")
+                },
+            ),
+            (
+                "test_owners".into(),
+                if newest.test_owners.is_empty() {
+                    "<unknown: routed to AMUX_AUTOFIX_SESSION>".into()
+                } else {
+                    newest.test_owners.join(", ")
+                },
+            ),
             (
                 "trigger".into(),
                 format!("{} on {}", newest.event, newest.branch),
@@ -6487,17 +7477,25 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
         out.push(Finding {
             kind: DetectorKind::CiFailure,
             signature,
-            title: format!(
-                "CI red: {workflow} — {count}x consecutive since {}",
-                ci_when(first_seen)
-            ),
+            // The signature, not the title, is the dedupe key, so naming the
+            // newest failing test here costs no refile.
+            title: match newest.failing_tests.first() {
+                Some(t) => format!(
+                    "CI red: {workflow} — {count}x consecutive since {} ({t})",
+                    ci_when(first_seen)
+                ),
+                None => format!(
+                    "CI red: {workflow} — {count}x consecutive since {}",
+                    ci_when(first_seen)
+                ),
+            },
             evidence,
             recheck: format!(
                 "gh run list --repo {repo} --workflow '{workflow}' --limit 10; \
                  gh run view {} --repo {repo} --log-failed",
                 newest.run_id
             ),
-            owner: None,
+            owner: newest.test_owners.first().cloned(),
             count: count as u64,
             last_ts: newest.created_at,
             parked_until: None,
@@ -6651,7 +7649,7 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 "--limit".into(),
                 ci_run_limit().to_string(),
                 "--json".into(),
-                "databaseId,conclusion,createdAt,event,headBranch,url,workflowName,status".into(),
+                "databaseId,conclusion,createdAt,event,headBranch,headSha,url,workflowName,status".into(),
             ],
             timeout_s,
         )
@@ -6698,6 +7696,11 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 created_at: ci_parse_ts(&s("createdAt")),
                 url: s("url"),
                 failing_step: None,
+                failing_tests: Vec::new(),
+                test_owners: Vec::new(),
+                head_sha: s("headSha"),
+                head_lane: None,
+                head_lane_isolated: false,
             });
         }
     }
@@ -6736,7 +7739,7 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 "--limit".into(),
                 ci_run_limit().to_string(),
                 "--json".into(),
-                "databaseId,conclusion,createdAt,event,headBranch,url,workflowName,status".into(),
+                "databaseId,conclusion,createdAt,event,headBranch,headSha,url,workflowName,status".into(),
             ],
             timeout_s,
         )
@@ -6777,6 +7780,11 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 created_at: ci_parse_ts(&s("createdAt")),
                 url: s("url"),
                 failing_step: None,
+                failing_tests: Vec::new(),
+                test_owners: Vec::new(),
+                head_sha: s("headSha"),
+                head_lane: None,
+                head_lane_isolated: false,
             });
             added += 1;
         }
@@ -6824,12 +7832,167 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
                 r.failing_step = Some(step.clone());
             }
         }
+        let tests = gh(
+            &[
+                "run".into(),
+                "view".into(),
+                run_id.to_string(),
+                "--repo".into(),
+                repo.clone(),
+                "--log-failed".into(),
+            ],
+            timeout_s,
+        )
+        .await
+        .map(|log| ci_failing_test_paths(&log))
+        .unwrap_or_default();
+        let owners = ci_test_owners(&repo, &tests).await;
+        for r in runs.iter_mut().filter(|r| r.run_id == run_id) {
+            r.failing_tests = tests.clone();
+            r.test_owners = owners.clone();
+        }
     }
+
+    ci_head_lanes(&mut runs).await;
 
     if let Ok(mut g) = ci_cache().write() {
         *g = Some((now, runs.clone(), suppressed.clone()));
     }
     (runs, suppressed)
+}
+
+/// Fill `head_lane` and `head_lane_isolated` for failing default-branch runs,
+/// from the `Amux-Session` trailer of each run's commit in the checkout this
+/// server was built from (the same history `ci_test_owners` reads). One
+/// `git log -1` per distinct sha; a sha the checkout does not have stays None.
+async fn ci_head_lanes(runs: &mut [CiRun]) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut seen: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for r in runs.iter_mut() {
+        if !r.on_default_branch || !ci_is_failure(&r.conclusion) || r.head_sha.is_empty() {
+            continue;
+        }
+        if !seen.contains_key(&r.head_sha) {
+            let lane = tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["log", "-1", "--format=%(trailers:key=Amux-Session,valueonly,separator=,)", &r.head_sha])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| ci_rank_owners(&String::from_utf8_lossy(&o.stdout)).into_iter().next());
+            seen.insert(r.head_sha.clone(), lane);
+        }
+        r.head_lane = seen.get(&r.head_sha).cloned().flatten();
+        r.head_lane_isolated = r.head_lane.as_deref().is_some_and(crate::api::session_verbs::session_is_isolated);
+    }
+}
+
+/// The card's `first_red_commit` line: the commit the streak's oldest failing
+/// run tested, the lane its trailer names, and whether that lane can be told.
+pub fn ci_first_red_commit(r: &CiRun) -> String {
+    if r.head_sha.is_empty() {
+        return "<not recorded>".into();
+    }
+    let sha = &r.head_sha[..r.head_sha.len().min(9)];
+    match (&r.head_lane, r.head_lane_isolated) {
+        (Some(l), true) => format!("{sha} by {l}, which is ISOLATED: `amux send` cannot reach it, so fix it here or ask the owner"),
+        (Some(l), false) => format!("{sha} by {l}"),
+        (None, _) => format!("{sha} (no Amux-Session trailer: a hand commit or a pull request merge)"),
+    }
+}
+
+/// The test FILES a failed-job log names as failing, in first-seen order.
+///
+/// Two shapes, both from this repo's own CI: a Playwright failure header
+/// (`  1) [desktop] › e2e/map-manage.spec.ts:121:5 › title`) and a Rust panic
+/// location (`panicked at crates/amux-server/tests/x.rs:102:5`). Playwright's
+/// trailing list of flaky and skipped specs has no `N)` before its `[project]`,
+/// so it never matches `) [` and is not read as a failure. A third shape, from
+/// the `checks` catalogue: `node --test` names a failing test as
+/// `test at tests/site-header.test.mjs:13:1`. Main's `checks` was red for 15 h
+/// on 2026-11-09 with `failing_tests: <none named>`, because only the first
+/// two shapes were read.
+pub fn ci_failing_test_paths(log: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in log.lines() {
+        let path = if let Some(i) = line.find(") [") {
+            let rest = &line[i..];
+            rest.find("› ")
+                .and_then(|j| rest[j + "› ".len()..].split(':').next())
+        } else if let Some(i) = line.find("panicked at ") {
+            line[i + "panicked at ".len()..].split(':').next()
+        } else if let Some(i) = line.find("test at ") {
+            line[i + "test at ".len()..].split(':').next()
+        } else {
+            None
+        };
+        if let Some(p) = path.map(str::trim) {
+            let test_file =
+                p.ends_with(".spec.ts") || p.ends_with(".test.mjs") || p.ends_with(".rs");
+            if test_file && !p.contains(' ') && !out.iter().any(|o| o == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Rank the sessions in `Amux-Session` trailer values, most commits first;
+/// ties by name so the routing cannot flip between ticks. Hand commits carry
+/// no trailer and are not an owner.
+pub fn ci_rank_owners(trailers: &str) -> Vec<String> {
+    let mut n: BTreeMap<String, usize> = BTreeMap::new();
+    for v in trailers.lines().flat_map(|l| l.split(',')) {
+        let v = v.trim();
+        if !v.is_empty() && !v.starts_with('(') {
+            *n.entry(v.to_string()).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(String, usize)> = n.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.into_iter().map(|(s, _)| s).collect()
+}
+
+/// Who wrote these test files, read from the checkout this server was BUILT
+/// from: the builder compiles a clean worktree of the repo's main, so its
+/// history is the repo's. Only used when that checkout's origin is `repo`;
+/// any other repo routes as before, to `AMUX_AUTOFIX_SESSION`.
+async fn ci_test_owners(repo: &str, paths: &[String]) -> Vec<String> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let git = |args: Vec<String>| {
+        let root = root.clone();
+        async move {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+    };
+    let origin = git(vec!["remote".into(), "get-url".into(), "origin".into()])
+        .await
+        .unwrap_or_default();
+    let origin = origin.trim().trim_end_matches(".git");
+    if !origin.ends_with(&format!("/{repo}")) && !origin.ends_with(&format!(":{repo}")) {
+        return Vec::new();
+    }
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "--format=%(trailers:key=Amux-Session,valueonly,separator=,)".into(),
+        "HEAD".into(),
+        "--".into(),
+    ];
+    args.extend(paths.iter().cloned());
+    ci_rank_owners(&git(args).await.unwrap_or_default())
 }
 
 fn sup(kind: DetectorKind, signature: &str, reason: &str) -> Suppressed {
@@ -6932,9 +8095,21 @@ fn fault_identity(signature: &str) -> Option<&str> {
     // another card: 121 p95 rollup cards by 2026-09-15, eight hand-folded into
     // AMUX-4620 in one day. A single-family `latency|p95|<family>` signature has
     // no trailing epoch, so it still gets no identity below and behaves as before.
+    // AMUX-5034: `silent|schedule-errors|<id>|<epoch>` joins the list for the
+    // same reason the two latency rollups did. Its identity is the SCHEDULE,
+    // so one open card suppresses the next fire's refile; the epoch exists only
+    // so a NEW episode after that card is judged is a new signature rather than
+    // being swallowed by `already_filed` forever.
+    // AF-992: the system-job rollup (`silent|system-job|ROLLUP|<job ids>`) is
+    // keyed on its job set like the two latency rollups and was never listed,
+    // so each change in which jobs were unhealthy filed another card: 88 open
+    // "N system jobs unhealthy at once" cards by 2026-10-29, all one fault.
     if !(signature.starts_with("5xx|")
         || signature.starts_with("latency|outlier|")
-        || signature.starts_with("latency|p95|"))
+        || signature.starts_with("latency|p95|")
+        || signature.starts_with("silent|system-job|ROLLUP|")
+        || signature.starts_with("silent|schedule-errors|")
+        || signature.starts_with("ci|"))
     {
         return None;
     }
@@ -7008,13 +8183,13 @@ fn open_rollup_coverage(conn: &Connection) -> Vec<(std::collections::BTreeSet<St
     )) else {
         return out;
     };
-    let Ok(rows) = stmt.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-    }) else {
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) else {
         return out;
     };
     for (source_ref, created) in rows.flatten() {
-        let Some(i) = source_ref.find(PREFIX) else { continue };
+        let Some(i) = source_ref.find(PREFIX) else {
+            continue;
+        };
         let targets: std::collections::BTreeSet<String> = source_ref[i + PREFIX.len()..]
             .split(',')
             .filter(|t| !t.is_empty())
@@ -7050,7 +8225,9 @@ fn covered_by_open_rollup(
         .iter()
         .filter(|(targets, through)| targets.contains(target) && last_ts <= *through)
         .map(|(_, through)| *through)
-        .fold(None, |acc: Option<f64>, t| Some(acc.map_or(t, |a| a.max(t))))
+        .fold(None, |acc: Option<f64>, t| {
+            Some(acc.map_or(t, |a| a.max(t)))
+        })
 }
 
 fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
@@ -7058,13 +8235,15 @@ fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
     conn.query_row(
         &format!(
             "SELECT id FROM issues \
-              WHERE source_ref LIKE ?1 \
+              WHERE (source_ref LIKE ?1 OR source_ref = ?2) \
                 AND status IN ({live}) \
                 AND archived = 0 AND deleted IS NULL \
               ORDER BY id DESC LIMIT 1",
             live = crate::db::board_store::live_work_status_list()
         ),
-        rusqlite::params![format!("autofix:{ident}|%")],
+        // `= ?2` covers a card filed before its signature grew a trailing
+        // epoch (the CI bucket, AMUX-5371): its source_ref IS the identity.
+        rusqlite::params![format!("autofix:{ident}|%"), format!("autofix:{ident}")],
         |r| r.get::<_, String>(0),
     )
     .ok()
@@ -7093,24 +8272,36 @@ fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
 /// Ordered by id DESC so the most recent predecessor wins, and returns the
 /// disposition rather than just the id, because "archived" and "discarded" mean
 /// different things to the reader: one was hidden, the other was judged.
-fn released_predecessor(conn: &Connection, signature: &str) -> Option<(String, String)> {
+/// The MOST RECENTLY CLOSED card for this fault, by `updated` (AF-1038). It
+/// was `ORDER BY id DESC`, a string sort: "AMUX-6539" sorts after "AF-1035",
+/// so a card closed nine hours earlier was the predecessor, its old close time
+/// made every occurrence look new, and the rollup refiled after each close.
+fn released_predecessor(conn: &Connection, signature: &str) -> Option<(String, String, i64)> {
     let ident = fault_identity(signature)?;
     conn.query_row(
         // The COMPLEMENT of the four "still open" sites, from the same source,
         // so the two directions cannot drift apart (AMUX-4801).
         &format!(
-            "SELECT id, CASE WHEN archived = 1 THEN 'archived' ELSE status END \
+            "SELECT id, CASE WHEN archived = 1 THEN 'archived' ELSE status END, COALESCE(updated, 0) \
                FROM issues \
               WHERE source_ref LIKE ?1 \
                 AND deleted IS NULL \
                 AND (archived = 1 OR status NOT IN ({live})) \
-              ORDER BY id DESC LIMIT 1",
+              ORDER BY COALESCE(updated, 0) DESC, rowid DESC LIMIT 1",
             live = crate::db::board_store::live_work_status_list()
         ),
         rusqlite::params![format!("autofix:{ident}|%")],
-        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)),
     )
     .ok()
+}
+
+/// The predecessor already covered this occurrence: it was closed (or last
+/// touched) at or after the finding's newest offending row (AF-1034). Only
+/// detectors that stamp `last_ts` from the rows themselves can say so; ones
+/// that stamp `now` are always newer and file as before.
+fn covered_by_closed_predecessor(last_ts: f64, closed_at: i64) -> bool {
+    last_ts > 0.0 && closed_at > 0 && last_ts <= closed_at as f64
 }
 
 /// One tick: run every detector, file what is new, note what went quiet.
@@ -7288,51 +8479,77 @@ async fn autofix_tick_with_inputs(
     // costs one probe per account per 300s, not per tick).
     let (mut connector_f, mut connector_s) = connector_auth_probe(now, home).await;
 
-    let (findings, suppressed, on) = {
-        let conn = match state.store.read() {
-            Ok(c) => c,
-            Err(e) => {
-                rep.errors.push(format!("store read: {e}"));
-                rep.took_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                *last_report_cell().write().unwrap() = Some(rep.clone());
-                return rep;
-            }
-        };
-        let on = enabled(&conn);
-        let mut findings = system_job_findings(system_issues, now);
+    // Stuck composers: the running check is async (it asks tmux), so this is
+    // computed OFF the store lock like disk/CI/connectors rather than inside
+    // the detector match. Cheap either way: 233 lanes, 3.0 MB of meta, 12 ms.
+    let stuck_lanes = crate::api::session_verbs::composer_stuck_lanes().await;
+
+    // The measured detector pass scans hundreds of thousands of request rows.
+    // Keep its SQLite/CPU work off the async runtime just like the disk probe.
+    let detector_home = home.to_path_buf();
+    let detector_runs = ci_runs.to_vec();
+    let system_findings = system_job_findings(system_issues, now);
+    // `AMUX_AUTOFIX_SKIP=latency,5xx` leaves the named detectors out of the
+    // tick (slugs from DetectorKind::slug). For isolating one detector's cost,
+    // as the rust-soak A/B for AMUX-5565 does; unset runs them all.
+    let skip: Vec<String> = std::env::var("AMUX_AUTOFIX_SKIP")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !skip.is_empty() {
+        tracing::info!(target: "amux::autofix", verdict = "autofix_detectors_skipped", skipped = ?skip,
+            "autofix: detectors left out of this tick by AMUX_AUTOFIX_SKIP");
+    }
+    let detected = state.store.read_async(move |conn| {
+        let on = enabled(conn);
+        let mut findings = system_findings;
         let mut suppressed = ci_sup;
         for kind in DetectorKind::all() {
+            if skip.iter().any(|s| s == kind.slug()) {
+                continue;
+            }
             let (f, s) = match kind {
-                DetectorKind::Http5xx => detect_5xx(&conn, now),
-                DetectorKind::Latency => detect_latency(&conn, now),
-                DetectorKind::DeadRoute => detect_dead_routes(&conn, now),
+                DetectorKind::Http5xx => detect_5xx(conn, now),
+                DetectorKind::Latency => detect_latency(conn, now),
+                DetectorKind::DeadRoute => detect_dead_routes(conn, now),
                 DetectorKind::SilentSubsystem => detect_silent(
-                    &conn,
+                    conn,
                     now,
                     &steer_blocked,
                     &steer_resets,
                     &steer_kinds,
                     &steer_skips_snap,
                 ),
-                DetectorKind::InvariantBreach => detect_invariants(&conn, now),
-                DetectorKind::BuildDeploy => detect_build(&conn, now, home),
+                DetectorKind::InvariantBreach => detect_invariants(conn, now),
+                DetectorKind::BuildDeploy => detect_build(conn, now, &detector_home),
                 // Computed above, off-runtime and outside this lock (AF-97).
                 DetectorKind::DiskPressure => {
                     (std::mem::take(&mut disk_f), std::mem::take(&mut disk_s))
                 }
-                DetectorKind::CiFailure => ci_findings(ci_runs, now),
+                DetectorKind::CiFailure => ci_findings(&detector_runs, now),
                 DetectorKind::FdPressure => detect_fd(now),
                 // Computed above, off-runtime and outside this lock, like disk.
                 DetectorKind::ConnectorAuth => (
                     std::mem::take(&mut connector_f),
                     std::mem::take(&mut connector_s),
                 ),
-                DetectorKind::StuckComposer => detect_stuck_composer(now),
+                DetectorKind::StuckComposer => detect_stuck_composer(&stuck_lanes, now),
             };
             findings.extend(f);
             suppressed.extend(s);
         }
-        (findings, suppressed, on)
+        Ok((findings, suppressed, on))
+    }).await;
+    let (findings, suppressed, on) = match detected {
+        Ok(result) => result,
+        Err(error) => {
+            rep.errors.push(format!("detector read: {error}"));
+            rep.took_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            *last_report_cell().write().unwrap() = Some(rep.clone());
+            return rep;
+        }
     };
     rep.enabled = on;
 
@@ -7513,7 +8730,28 @@ async fn autofix_tick_with_inputs(
             .ok()
             .and_then(|c| released_predecessor(&c, &f.signature));
         let mut f = f;
-        if let Some((card, disp)) = released {
+        // A CLOSED CARD ALREADY SAW THIS (AF-1034). The latency rollup re-reads
+        // a trailing window, so closing its card released rows the card had
+        // already covered: AF-1011, 1019, 1029, 1032, 1033 and 1034 were six
+        // cards for one fault, the last filed 14 minutes after AF-1033 closed
+        // from a newest row 27 minutes older than that close, with nothing slow
+        // since. Only an occurrence newer than the close is a new one.
+        if let Some((card, disp, closed_at)) = released
+            .as_ref()
+            .filter(|(_, _, closed_at)| covered_by_closed_predecessor(f.last_ts, *closed_at))
+        {
+            rep.suppressed.push((
+                f.kind.slug().into(),
+                f.signature.clone(),
+                format!(
+                    "{card} (`{disp}`) was closed at {closed_at}, after this finding's newest occurrence \
+                     ({}): it already covered it. Only an occurrence after the close files again (AF-1034).",
+                    f.last_ts as i64
+                ),
+            ));
+            continue;
+        }
+        if let Some((card, disp, _)) = released {
             f.evidence.push((
                 "why_now".into(),
                 format!(
@@ -7707,6 +8945,14 @@ async fn autofix_tick_with_inputs(
 /// its own row, and only a genuine miss falls through. The signature spelling
 /// is deliberately NOT changed — it is a live dedupe key, and moving it re-files
 /// every open invariant card (measured the hard way, AMUX-3633).
+/// The entity slot a ROLLUP invariant card carries.
+///
+/// A DISPLAY TOKEN, NOT A STORAGE KEY, and that is exactly the distinction
+/// AMUX-3664 recorded for "fleet" one bug earlier. It is shared between the
+/// signature that mints it and the linker that has to recognise it, so the two
+/// cannot drift apart silently the way the last pair did.
+pub(crate) const ROLLUP_ENTITY: &str = "ROLLUP";
+
 fn link_incident_to_card(
     conn: &Connection,
     card: &str,
@@ -7722,6 +8968,26 @@ fn link_incident_to_card(
         conn.execute(
             "UPDATE _amux_invariant_incident SET board_issue=?1 \
              WHERE invariant_id=?2 AND entity_key=''",
+            rusqlite::params![card, invariant],
+        )?
+    } else if n == 0 && entity == ROLLUP_ENTITY {
+        // A ROLLUP CARD COVERS EVERY ENTITY OF ITS INVARIANT (AMUX-4920), so
+        // it claims the rows that have no card of their own. The exact match
+        // above can never hit for one: `ROLLUP` names a grouping, and no
+        // incident row is ever keyed to it. Same class as the `fleet` miss
+        // directly above, found the same way, by a resolved incident with no
+        // card to tell.
+        //
+        // Measured 2026-09-22: session.registered_lane_is_running carried 100
+        // incident rows with 88 unlinked, while its rollup card sat open over a
+        // fault that had already cleared. Zero rows on disk key to "ROLLUP".
+        //
+        // `board_issue=''` is the whole guard: an entity-specific card that
+        // already linked its own row KEEPS it, so the rollup can never steal a
+        // narrower card's incident. Exact match still wins, as above.
+        conn.execute(
+            "UPDATE _amux_invariant_incident SET board_issue=?1 \
+             WHERE invariant_id=?2 AND board_issue=''",
             rusqlite::params![card, invariant],
         )?
     } else {
@@ -7758,6 +9024,26 @@ fn invariant_signature_parts(sig: &str) -> Option<(String, String)> {
             // whose last `|`-part happens to be numeric is not a thing today,
             // and if it ever is, this mis-links one card rather than dropping
             // the timestamp into every one.
+            //
+            // THE TAGS AFTER THE EPOCH GO FIRST: `|m<N>` (magnitude, AF-1045)
+            // then `|e<N>` (episode, AMUX-4798). Only the epoch was stripped,
+            // so `fleet|1793300324|e10` was taken as the entity and no card from
+            // episode 2 on ever linked to its incident: the log carried the
+            // "could not link it to any incident row" warning for exactly these.
+            fn tagged(s: &str, tag: char) -> &str {
+                match s.rsplit_once('|') {
+                    Some((head, tail))
+                        if !head.is_empty()
+                            && tail.strip_prefix(tag).is_some_and(|n| {
+                                !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+                            }) =>
+                    {
+                        head
+                    }
+                    _ => s,
+                }
+            }
+            let rest = tagged(tagged(rest, 'm'), 'e');
             let ent = match rest.rsplit_once('|') {
                 Some((head, tail)) if !head.is_empty() && tail.parse::<i64>().is_ok() => head,
                 _ => rest,
@@ -7863,6 +9149,44 @@ pub(crate) fn should_refresh_with_counts(
     escalating || now - updated_at >= min_secs
 }
 
+/// Why `worker` cannot read its own board, or `None` when it can.
+///
+/// An isolated worker has no board (CLAUDE.md "Isolated workers"; the board
+/// API answers it 403 `isolated_no_board`), and a worker with every Board tab
+/// switch off has none either. An admin-group isolated worker keeps its board.
+fn board_absence(worker: &str) -> Option<&'static str> {
+    use crate::api::session_verbs::{is_admin_worker, session_is_isolated};
+    if session_is_isolated(worker) && !is_admin_worker(worker) {
+        return Some("is isolated and has no board");
+    }
+    if crate::api::board_lifecycle::board_unused(worker) {
+        return Some("has every board switch off");
+    }
+    None
+}
+
+/// NEVER FILE ON A BOARD ITS OWNER CANNOT SEE (gs12 review, 2026-10-18).
+/// Autofix filed MG-2063, MG-2092 and MG-2123 on mxp-gs12's board after the
+/// board started refusing that isolated worker; it could not read them, and
+/// MG-2063 was auto-discarded after 74 h unread. Such a finding goes to the
+/// fixer lane (`AMUX_AUTOFIX_SESSION`), or unowned on the shared board when
+/// that lane is unset or boardless too. Nothing is sent to the worker:
+/// isolation forbids injected prompts. Returns the owner to file under and,
+/// when rerouted, the worker it came from and why.
+fn boardless_reroute(
+    owner: &str,
+    absence: impl Fn(&str) -> Option<&'static str>,
+    fixer: &str,
+) -> (String, Option<(String, &'static str)>) {
+    let owner = owner.trim();
+    let Some(why) = (!owner.is_empty()).then(|| absence(owner)).flatten() else {
+        return (owner.to_string(), None);
+    };
+    let fixer = fixer.trim();
+    let to = if fixer.is_empty() || fixer == owner || absence(fixer).is_some() { "" } else { fixer };
+    (to.to_string(), Some((owner.to_string(), why)))
+}
+
 async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<String>> {
     // PER-TENANT CLOUD: do not drop the server's own health/ops findings onto a
     // customer's board (AMUX-3014). Off by env in the cloud image; on locally
@@ -7929,13 +9253,26 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
         }
     }
     let owner = f.owner.clone().unwrap_or_else(fixer_session);
+    let (owner, rerouted) = boardless_reroute(&owner, board_absence, &fixer_session());
+    if let Some((from, why)) = &rerouted {
+        tracing::warn!(detector = %f.signature, from = %from, to = %owner, why, measured = true, n_considered = 1,
+            verdict = "autofix_owner_has_no_board",
+            "autofix: the finding names a worker with no board; filed where it can be read instead");
+    }
     let owner = if owner.trim().is_empty() {
         None
     } else {
         Some(owner)
     };
     let title = truncate(&f.title, 160);
-    let desc = render_desc(f);
+    let desc = match &rerouted {
+        Some((from, why)) => format!(
+            "Routed here from {from}: that worker {why}, so a card on its board is one it can never read. \
+             Nothing was sent to {from}.\n\n{}",
+            render_desc(f)
+        ),
+        None => render_desc(f),
+    };
     let item_type = f.kind.item_type();
     let signature = f.signature.clone();
     let idem = idem_of(&signature);
@@ -8376,14 +9713,8 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             // `AMUX_CI_POLL_MIN`, so a 120s tick is not 720 API calls a day.
             let (ci_runs, ci_sup) = fetch_ci_runs(unix_now()).await;
             let system_issues = crate::runtime_jobs::registry::health_issues(unix_now());
-            let r = autofix_tick_with_inputs(
-                &state,
-                &home,
-                &ci_runs,
-                ci_sup,
-                &system_issues,
-            )
-            .await;
+            let r = autofix_tick_with_inputs(&state, &home, &ci_runs, ci_sup, &system_issues).await;
+            release_freed_heap();
             if !r.filed.is_empty() || !r.errors.is_empty() {
                 tracing::info!(
                     filed = r.filed.len(),
@@ -8403,6 +9734,27 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
             // duplicate is what let the broken one look alive for a week.
         }
     }))
+}
+
+/// Hand the memory a tick freed back to the OS (AMUX-5565).
+///
+/// Each tick's detectors scan up to 400k request-log rows on blocking-pool
+/// threads, and glibc keeps what they free in per-thread arenas instead of
+/// returning it. The weekly soak measured the cost on a fresh server under
+/// load, 240 minutes per arm, steady-state RSS slope:
+///   autofix on, arenas default   14.7 MB/h  (peak 224 MB)
+///   autofix on, MALLOC_ARENA_MAX=2  8.3 MB/h  (peak 105 MB)
+///   autofix off (AMUX_AUTOFIX_SECS=0)  0.7 MB/h, SOAK PASSED
+/// The gate is 2 MB/h. `malloc_trim` releases free pages from every arena; it
+/// is glibc-only and a no-op elsewhere (macOS's allocator returns memory).
+fn release_freed_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: malloc_trim only walks the allocator's own free lists.
+        let released = unsafe { libc::malloc_trim(0) };
+        tracing::debug!(target: "amux::autofix", verdict = "heap_trimmed", released = released != 0,
+            "autofix: freed heap returned to the OS after the tick");
+    }
 }
 
 pub use crate::config::amux_home;
@@ -8443,6 +9795,7 @@ async fn debug_autofix(
             "ci_repos": ci_repos(),
             "ci_poll_min": ci_poll_min(),
             "ci_min_failures": ci_min_failures(),
+            "ci_refile_h": ci_refile_h(),
             "ci_run_limit": ci_run_limit(),
             "ci_timeout_s": ci_cmd_timeout_s(),
         },
@@ -8538,15 +9891,48 @@ fn parse_ts(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    /// A finding naming a worker with no board is filed where it can be read
+    /// (gs12 review: MG-2063/2092/2123 sat on an isolated worker's board).
+    #[test]
+    fn a_finding_for_a_boardless_worker_is_filed_where_it_can_be_read() {
+        let absence = |w: &str| match w {
+            "raw" => Some("is isolated and has no board"),
+            "off" => Some("has every board switch off"),
+            _ => None,
+        };
+        assert_eq!(super::boardless_reroute("lane", absence, "amux"), ("lane".to_string(), None), "a worker with a board keeps its card");
+        assert_eq!(super::boardless_reroute("", absence, "amux"), (String::new(), None), "unowned stays unowned");
+        let (to, from) = super::boardless_reroute("raw", absence, "amux");
+        assert_eq!(to, "amux");
+        assert_eq!(from, Some(("raw".to_string(), "is isolated and has no board")));
+        assert_eq!(super::boardless_reroute("off", absence, "amux").0, "amux");
+        assert_eq!(super::boardless_reroute("raw", absence, "").0, "", "no fixer lane: unowned on the shared board, never the boardless worker");
+        assert_eq!(super::boardless_reroute("raw", absence, "off").0, "", "a boardless fixer is no better");
+        assert_eq!(super::boardless_reroute("raw", absence, "raw").0, "");
+    }
+
     #[test]
     fn snapshot_listing_requires_a_measured_listing_before_counting_zero() {
         let header = "Snapshots for volume group containing disk /:\n";
         assert_eq!(parse_local_snapshot_count(header.as_bytes()), Some(0));
         assert_eq!(parse_local_snapshot_count(format!("{header}com.apple.TimeMachine.2026-09-13-010000.local\ncom.apple.TimeMachine.2026-09-13-020000.local\n").as_bytes()), Some(2));
-        for output in ["", "\n", "backupd unavailable", "error com.apple.TimeMachine.failure", "Snapshots for /"] {
-            assert_eq!(parse_local_snapshot_count(output.as_bytes()), None, "{output:?}");
+        for output in [
+            "",
+            "\n",
+            "backupd unavailable",
+            "error com.apple.TimeMachine.failure",
+            "Snapshots for /",
+        ] {
+            assert_eq!(
+                parse_local_snapshot_count(output.as_bytes()),
+                None,
+                "{output:?}"
+            );
         }
-        assert_eq!(parse_local_snapshot_count(format!("{header}permission denied\n").as_bytes()), None);
+        assert_eq!(
+            parse_local_snapshot_count(format!("{header}permission denied\n").as_bytes()),
+            None
+        );
         assert_eq!(parse_local_snapshot_count(b"\xff"), None);
     }
 
@@ -8560,21 +9946,45 @@ mod tests {
                 self.0.lock().unwrap().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        for (count, verdict) in [(Some(0), "absent"), (Some(24), "possible"), (None, "unknown")] {
+        for (count, verdict) in [
+            (Some(0), "absent"),
+            (Some(24), "possible"),
+            (None, "unknown"),
+        ] {
             let bytes = Arc::new(Mutex::new(Vec::new()));
             let writer = Writer(bytes.clone());
-            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
-                .with_writer(move || writer.clone()).finish();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
             let evidence: std::collections::BTreeMap<_, _> =
                 tracing::subscriber::with_default(subscriber, || disk_snapshot_evidence(count))
-                    .into_iter().collect();
-            let note = evidence.get("apfs_local_snapshots").expect("missing measurement is explicit");
-            assert!(!note.contains("Thin them first"), "a snapshot count cannot justify backup deletion: {note}");
-            assert!(!note.contains("deleting files frees NOTHING"), "count is not retained bytes: {note}");
-            assert_eq!(evidence["apfs_local_snapshots_measured"], count.is_some().to_string());
-            assert_eq!(evidence["apfs_local_snapshots_n_considered"], count.unwrap_or(0).to_string());
+                    .into_iter()
+                    .collect();
+            let note = evidence
+                .get("apfs_local_snapshots")
+                .expect("missing measurement is explicit");
+            assert!(
+                !note.contains("Thin them first"),
+                "a snapshot count cannot justify backup deletion: {note}"
+            );
+            assert!(
+                !note.contains("deleting files frees NOTHING"),
+                "count is not retained bytes: {note}"
+            );
+            assert_eq!(
+                evidence["apfs_local_snapshots_measured"],
+                count.is_some().to_string()
+            );
+            assert_eq!(
+                evidence["apfs_local_snapshots_n_considered"],
+                count.unwrap_or(0).to_string()
+            );
             assert_eq!(evidence["apfs_retention"], verdict);
             if count.is_none() {
                 assert!(!evidence["apfs_local_snapshots_why_unmeasured"].is_empty());
@@ -8583,8 +9993,14 @@ mod tests {
             }
             let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
             assert!(logs.contains("disk_snapshot_context"), "{logs}");
-            assert!(logs.contains(&format!("measured={}", count.is_some())), "{logs}");
-            assert!(logs.contains(&format!("n_considered={}", count.unwrap_or(0))), "{logs}");
+            assert!(
+                logs.contains(&format!("measured={}", count.is_some())),
+                "{logs}"
+            );
+            assert!(
+                logs.contains(&format!("n_considered={}", count.unwrap_or(0))),
+                "{logs}"
+            );
             assert!(logs.contains(&format!("retention=\"{verdict}\"")), "{logs}");
         }
     }
@@ -8640,7 +10056,9 @@ mod tests {
             .unwrap();
         }
         let (two, _) = super::detect_schedule_run_health(&conn, now as f64);
-        assert!(!two.iter().any(|f| f.signature == "silent|schedule-errors|SCHED-9"));
+        assert!(!two
+            .iter()
+            .any(|f| f.signature.starts_with("silent|schedule-errors|SCHED-9|")));
 
         conn.execute(
             "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,'error','Traceback line 43','cron-rs')",
@@ -8650,10 +10068,13 @@ mod tests {
         let (three, _) = super::detect_schedule_run_health(&conn, now as f64);
         let f = three
             .iter()
-            .find(|f| f.signature == "silent|schedule-errors|SCHED-9")
+            .find(|f| f.signature.starts_with("silent|schedule-errors|SCHED-9|"))
             .expect("third consecutive error must become one stable incident");
         assert_eq!(f.count, 3);
-        assert!(f.evidence.iter().any(|(k, v)| k == "patterns" && v.contains("#")));
+        assert!(f
+            .evidence
+            .iter()
+            .any(|(k, v)| k == "patterns" && v.contains("#")));
 
         conn.execute(
             "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,'refused','account reserve','cron-rs')",
@@ -8662,9 +10083,97 @@ mod tests {
         .unwrap();
         let (broken, _) = super::detect_schedule_run_health(&conn, now as f64);
         assert!(
-            !broken.iter().any(|f| f.signature == "silent|schedule-errors|SCHED-9"),
+            !broken
+                .iter()
+                .any(|f| f.signature.starts_with("silent|schedule-errors|SCHED-9|")),
             "an honest refused outcome is not an error and must break the streak"
         );
+    }
+
+    /// AMUX-5034. A schedule that is fixed, closed, and later breaks AGAIN must
+    /// be able to file again.
+    ///
+    /// `already_filed` keys on the exact signature and is durable forever. With
+    /// `silent|schedule-errors|<id>` the first filing latched the schedule for
+    /// good. Measured: one `session_events` row with idem
+    /// `autofix:silent|schedule-errors|SCHED-410` from 2026-09-02, its card
+    /// COACH-3 filed for a urllib error and `verified` 30 minutes later; three
+    /// weeks on the same schedule broke with a KeyError and failed every
+    /// 30-minute fire for days with nothing filed.
+    ///
+    /// Two properties, and they pull in opposite directions, so both are here:
+    /// a NEW episode must mint a NEW signature, and `fault_identity` must strip
+    /// the episode so an OPEN card still suppresses the fan-out.
+    #[test]
+    fn a_second_failure_episode_can_file_after_the_first_card_is_closed() {
+        let conn = schedule_health_conn();
+        let now = 1_788_000_000i64;
+        let err = |at: i64, note: &str| {
+            conn.execute(
+                "INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) \
+                 VALUES('SCHED-9',?1,'error',?2,'cron-rs')",
+                rusqlite::params![at, note],
+            )
+            .unwrap();
+        };
+        for (at, note) in [(now - 300, "urllib timeout"), (now - 240, "urllib timeout"), (now - 180, "urllib timeout")] {
+            err(at, note);
+        }
+        let (first, _) = super::detect_schedule_run_health(&conn, now as f64);
+        let a = first
+            .iter()
+            .find(|f| f.signature.starts_with("silent|schedule-errors|SCHED-9|"))
+            .expect("the first episode files");
+
+        // A LATER failure is a DIFFERENT signature, so `already_filed` on the
+        // first one cannot swallow it.
+        err(now - 60, "KeyError: speaker");
+        let (second, _) = super::detect_schedule_run_health(&conn, now as f64);
+        let b = second
+            .iter()
+            .find(|f| f.signature.starts_with("silent|schedule-errors|SCHED-9|"))
+            .expect("the second episode files");
+        assert_ne!(
+            a.signature, b.signature,
+            "a newer failure must mint a new signature, or already_filed latches \
+             this schedule forever"
+        );
+
+        // ...AND BOTH COLLAPSE TO ONE IDENTITY, so an open card suppresses the
+        // refile instead of producing a card per fire. Without this the fix
+        // trades a permanent silence for the 8-cards-in-50-minutes fan-out
+        // AMUX-3673 removed.
+        let ia = super::fault_identity(&a.signature).expect("schedule errors have an identity");
+        let ib = super::fault_identity(&b.signature).expect("schedule errors have an identity");
+        assert_eq!(ia, ib);
+        assert_eq!(ia, "silent|schedule-errors|SCHED-9");
+
+        // A DIFFERENT schedule is a different identity, or one noisy schedule
+        // would suppress every other one.
+        assert_ne!(
+            super::fault_identity("silent|schedule-errors|SCHED-9|1").unwrap(),
+            super::fault_identity("silent|schedule-errors|SCHED-8|1").unwrap()
+        );
+    }
+
+    /// gs12-gates, SCHED-616 / GG-95, 2026-10-08: a run delivered through the
+    /// steering queue (no cmd_history row, no [SCHED-id] tag, delivered
+    /// minutes later) is not "missing"; an undelivered steering row still is.
+    #[test]
+    fn a_schedule_run_delivered_through_steering_is_not_missing() {
+        let conn = schedule_health_conn();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS steering_history (id TEXT PRIMARY KEY, session TEXT NOT NULL, text TEXT NOT NULL, \
+                            queued_at REAL, delivered_at REAL NOT NULL, outcome TEXT, guard TEXT, sender TEXT);").unwrap();
+        let now = 1_788_000_000i64;
+        let ran = now - 900;
+        conn.execute("INSERT INTO schedule_runs(schedule_id,ran_at,status,note,source) VALUES('SCHED-9',?1,'delivered','queued (steering)','cron-rs')", [ran]).unwrap();
+        let session: String = conn.query_row("SELECT session FROM schedules WHERE id='SCHED-9'", [], |r| r.get(0)).unwrap_or_else(|_| "worker-a".into());
+        let missing = |c: &rusqlite::Connection| super::detect_schedule_run_health(c, now as f64).0
+            .iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9");
+        assert!(missing(&conn), "precondition: no artifact at all is missing");
+        conn.execute("INSERT INTO steering_history(id,session,text,queued_at,delivered_at,sender) VALUES('steer-1',?1,'run it',?2,?3,'')",
+            rusqlite::params![session, ran as f64 + 1.0, ran as f64 + 276.0]).unwrap();
+        assert!(!missing(&conn), "a steering row queued at run time and delivered is the artifact");
     }
 
     #[test]
@@ -8735,7 +10244,8 @@ mod tests {
             .unwrap();
             let (f, _) = super::detect_schedule_run_health(&conn, now as f64);
             assert!(
-                !f.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
+                !f.iter()
+                    .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
                 "source={source}: the writer's own origin must satisfy the detector"
             );
         }
@@ -8762,7 +10272,9 @@ mod tests {
         .unwrap();
         let (renamed, _) = super::detect_schedule_run_health(&conn, now as f64);
         assert!(
-            !renamed.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
+            !renamed
+                .iter()
+                .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
             "a schedule renamed after its run must still link by id — this is ts-gke's \
              false report, and the title arms cannot see it"
         );
@@ -8776,8 +10288,11 @@ mod tests {
         // their confirmation near the SAME recorded restart, must produce ONE
         // finding naming both, not two per-schedule findings.
         let conn = schedule_health_conn();
-        conn.execute("INSERT INTO schedules VALUES ('SCHED-10','Other sync','worker-b',1,NULL)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO schedules VALUES ('SCHED-10','Other sync','worker-b',1,NULL)",
+            [],
+        )
+        .unwrap();
         let now = 1_788_000_000i64;
         let crash_at = now - 900;
         let restart_at = now - 800;
@@ -8797,21 +10312,44 @@ mod tests {
         }
         let (findings, _) = super::detect_schedule_run_health(&conn, now as f64);
         assert!(
-            !findings.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
+            !findings
+                .iter()
+                .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
             "a run inside a known restart window must not also file its own per-schedule finding"
         );
-        assert!(!findings.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-10"));
+        assert!(!findings
+            .iter()
+            .any(|f| f.signature == "silent|schedule-message-missing|SCHED-10"));
         let combined: Vec<_> = findings
             .iter()
-            .filter(|f| f.signature.starts_with("silent|schedule-message-missing-outage|"))
+            .filter(|f| {
+                f.signature
+                    .starts_with("silent|schedule-message-missing-outage|")
+            })
             .collect();
-        assert_eq!(combined.len(), 1, "one outage must produce exactly one combined finding");
+        assert_eq!(
+            combined.len(),
+            1,
+            "one outage must produce exactly one combined finding"
+        );
         let f = combined[0];
         assert_eq!(f.count, 2);
-        let schedules = f.evidence.iter().find(|(k, _)| k == "schedules").unwrap().1.clone();
+        let schedules = f
+            .evidence
+            .iter()
+            .find(|(k, _)| k == "schedules")
+            .unwrap()
+            .1
+            .clone();
         assert!(schedules.contains("SCHED-9"), "{schedules}");
         assert!(schedules.contains("SCHED-10"), "{schedules}");
-        let affected = f.evidence.iter().find(|(k, _)| k == "schedules_affected").unwrap().1.clone();
+        let affected = f
+            .evidence
+            .iter()
+            .find(|(k, _)| k == "schedules_affected")
+            .unwrap()
+            .1
+            .clone();
         assert_eq!(affected, "2");
     }
 
@@ -8834,12 +10372,14 @@ mod tests {
         .unwrap();
         let (findings, _) = super::detect_schedule_run_health(&conn, now as f64);
         assert!(
-            findings.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
+            findings
+                .iter()
+                .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"),
             "an unrelated downtime window must not suppress a genuinely unexplained miss"
         );
-        assert!(!findings
-            .iter()
-            .any(|f| f.signature.starts_with("silent|schedule-message-missing-outage|")));
+        assert!(!findings.iter().any(|f| f
+            .signature
+            .starts_with("silent|schedule-message-missing-outage|")));
     }
 
     #[test]
@@ -8861,10 +10401,12 @@ mod tests {
         )
         .unwrap();
         let (inside, _) = super::detect_schedule_run_health(&conn, now as f64);
-        assert!(inside
+        assert!(inside.iter().any(|f| f
+            .signature
+            .starts_with("silent|schedule-message-missing-outage|")));
+        assert!(!inside
             .iter()
-            .any(|f| f.signature.starts_with("silent|schedule-message-missing-outage|")));
-        assert!(!inside.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"));
+            .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"));
 
         let conn2 = schedule_health_conn();
         conn2.execute(
@@ -8879,17 +10421,27 @@ mod tests {
         )
         .unwrap();
         let (outside, _) = super::detect_schedule_run_health(&conn2, now as f64);
-        assert!(!outside
+        assert!(!outside.iter().any(|f| f
+            .signature
+            .starts_with("silent|schedule-message-missing-outage|")));
+        assert!(outside
             .iter()
-            .any(|f| f.signature.starts_with("silent|schedule-message-missing-outage|")));
-        assert!(outside.iter().any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"));
+            .any(|f| f.signature == "silent|schedule-message-missing|SCHED-9"));
     }
 
     #[test]
     fn the_combined_finding_orders_schedules_worst_offender_first() {
         let conn = schedule_health_conn();
-        conn.execute("INSERT INTO schedules VALUES ('SCHED-1','A','worker-a',1,NULL)", []).unwrap();
-        conn.execute("INSERT INTO schedules VALUES ('SCHED-2','B','worker-b',1,NULL)", []).unwrap();
+        conn.execute(
+            "INSERT INTO schedules VALUES ('SCHED-1','A','worker-a',1,NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schedules VALUES ('SCHED-2','B','worker-b',1,NULL)",
+            [],
+        )
+        .unwrap();
         let now = 1_788_000_000i64;
         let down_from = now - 500;
         let up_at = now - 480;
@@ -8913,9 +10465,18 @@ mod tests {
         let (findings, _) = super::detect_schedule_run_health(&conn, now as f64);
         let f = findings
             .iter()
-            .find(|f| f.signature.starts_with("silent|schedule-message-missing-outage|"))
+            .find(|f| {
+                f.signature
+                    .starts_with("silent|schedule-message-missing-outage|")
+            })
             .expect("combined finding must exist");
-        let schedules = f.evidence.iter().find(|(k, _)| k == "schedules").unwrap().1.clone();
+        let schedules = f
+            .evidence
+            .iter()
+            .find(|(k, _)| k == "schedules")
+            .unwrap()
+            .1
+            .clone();
         let sched2_pos = schedules.find("SCHED-2").expect("SCHED-2 named");
         let sched1_pos = schedules.find("SCHED-1").expect("SCHED-1 named");
         assert!(
@@ -8991,6 +10552,123 @@ mod tests {
         assert!(f[0].recheck.contains("/api/system-jobs"));
     }
 
+    /// AMUX-5031. Several jobs unhealthy in ONE pass is ONE fault.
+    ///
+    /// The real specimen, from the server log at a single instant 23:28:00.679:
+    /// six jobs whose intervals span 0.2s to 10s, every last-tick age inside one
+    /// 34-to-43 second band. They share the runtime's threads, so one job holding
+    /// a thread stops all of them. Per-job cards name the victim: of 23 such
+    /// cards ever filed, 20 were discarded as noise.
+    #[test]
+    fn several_unhealthy_jobs_in_one_pass_become_one_card_not_n() {
+        let mk = |id: &str, interval: f64, age: f64| {
+            crate::runtime_jobs::registry::HealthIssue {
+                id: id.into(),
+                name: id.into(),
+                status: "stalled",
+                interval_s: Some(interval),
+                ticks: 10,
+                last_tick_age_s: Some(age),
+                last_tick_ms: Some(0.4),
+                in_flight_age_s: None,
+                documented: true,
+            }
+        };
+        // The measured specimen's own numbers.
+        let issues = vec![
+            mk("steer-deliver", 5.0, 34.7),
+            mk("project-execution", 10.0, 42.6),
+            mk("cdc-poller", 0.2, 34.0),
+            mk("orchestrator-runtime", 3.0, 36.2),
+            mk("event-processors", 2.0, 34.2),
+            mk("session-bootstrap", 2.0, 34.1),
+        ];
+        let f = super::system_job_findings(&issues, 1_788_000_000.0);
+        assert_eq!(f.len(), 1, "six unhealthy jobs must not become six cards");
+        assert_eq!(f[0].count, 6);
+        assert_eq!(
+            f[0].title,
+            "6 system jobs unhealthy at once — one fault, not 6 tasks"
+        );
+
+        // Keyed on the SORTED job set, so the same collapse is idempotent and a
+        // different one is different news. Order of the input must not matter.
+        let mut shuffled = issues.clone();
+        shuffled.reverse();
+        assert_eq!(
+            f[0].signature,
+            super::system_job_findings(&shuffled, 1_788_000_000.0)[0].signature,
+            "the signature must not depend on the order the registry returned them"
+        );
+        assert!(f[0].signature.starts_with("silent|system-job|ROLLUP|"));
+
+        let ev = |k: &str| {
+            f[0].evidence
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        // Every job is still NAMED. A rollup that hides which jobs were affected
+        // trades noise for a card nobody can act on.
+        for id in ["steer-deliver", "project-execution", "cdc-poller"] {
+            assert!(ev("jobs").contains(id), "{id} missing from the rollup: {}", ev("jobs"));
+        }
+        // THE SPREAD IS COMPUTED. 42.6 - 34.0 = 8.6 against a worst of 42.6.
+        let together = ev("stopped_together");
+        assert!(together.contains("8.6s"), "spread not computed: {together}");
+        assert!(together.contains("42.6"), "worst age not carried: {together}");
+    }
+
+    /// The rollup must not fire on ONE job, or a genuine single-job stall loses
+    /// the job's name from its own title.
+    #[test]
+    fn one_unhealthy_job_still_gets_its_own_named_card() {
+        let issue = crate::runtime_jobs::registry::HealthIssue {
+            id: "task-titles".into(),
+            name: "Task titles".into(),
+            status: "stalled",
+            interval_s: Some(10.0),
+            ticks: 23,
+            last_tick_age_s: Some(42.6),
+            last_tick_ms: Some(0.4),
+            in_flight_age_s: None,
+            documented: true,
+        };
+        let f = super::system_job_findings(&[issue], 1_788_000_000.0);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].signature, "silent|system-job|task-titles");
+        assert_eq!(f[0].title, "System job task-titles is stalled");
+    }
+
+    /// A group where nothing reported an age must SAY the togetherness is
+    /// unmeasured rather than printing a spread of zero, which would read as
+    /// "they all stopped at the same instant" — the strongest possible claim,
+    /// from no data at all.
+    #[test]
+    fn a_rollup_with_no_measured_ages_says_unmeasured_not_zero_spread() {
+        let mk = |id: &str| crate::runtime_jobs::registry::HealthIssue {
+            id: id.into(),
+            name: id.into(),
+            status: "not_spawned",
+            interval_s: None,
+            ticks: 0,
+            last_tick_age_s: None,
+            last_tick_ms: None,
+            in_flight_age_s: None,
+            documented: true,
+        };
+        let f = super::system_job_findings(&[mk("a"), mk("b")], 1_788_000_000.0);
+        let together = f[0]
+            .evidence
+            .iter()
+            .find(|(n, _)| n == "stopped_together")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        assert!(together.contains("UNMEASURED"), "{together}");
+        assert!(!together.contains("0.0s"), "a zero spread from no ages: {together}");
+    }
+
     // ── AMUX-3885: the stuck-composer detector ──────────────────────────────
     //
     // These drive `detect_stuck_composer` through its real decision points. The
@@ -9000,20 +10678,106 @@ mod tests {
     // which is exactly where the bug would be. A detector that files at 0h is
     // noise; one that never files is the six-day badge this replaced.
 
-    /// ABSENCE IS NOT EVIDENCE. With no published sweep the detector must file
-    /// nothing AND say why, rather than returning a clean empty result that reads
-    /// as "no lane is stuck". A wrong implementation returns `(vec![], vec![])`
-    /// here and looks identical to a healthy fleet.
+    /// THE SHIPPED ENTRY POINT MUST REACH THE REAL LOGIC, which is the exact
+    /// thing that broke: `15b72193` reduced `detect_stuck_composer` to a stub
+    /// returning no findings and left the body behind `#[cfg(test)]`, so every
+    /// other test here went on passing against code that shipped in no binary.
+    /// A test that calls `stuck_composer_findings` directly cannot catch that.
+    /// This one drives `detect_stuck_composer`, over a real sessions dir, so
+    /// re-stubbing it reddens here (ethos rule 7).
     #[test]
-    fn no_published_sweep_is_reported_as_unmeasured_not_as_none_stuck() {
-        let (findings, suppressed) = super::detect_stuck_composer(1_788_000_000.0);
-        assert!(
-            findings.is_empty(),
-            "must not file a card from an unmeasured state"
+    fn the_shipped_detector_reads_the_fleet_and_files_rather_than_returning_a_stub() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let now = 1_788_000_000.0;
+        // Three lanes, one per decision, so neither answer can be right by
+        // coincidence: long past the threshold, freshly stuck, and not stuck.
+        for (lane, since) in [
+            ("held", now as i64 - 8 * 3600),
+            ("fresh", now as i64 - 60),
+            ("clear", 0),
+        ] {
+            std::fs::write(
+                sessions.join(format!("{lane}.meta.json")),
+                serde_json::json!({ "composer_stuck_since": since }).to_string(),
+            )
+            .unwrap();
+        }
+        // A file that is not a meta file at all must not become a lane.
+        std::fs::write(sessions.join("held.env"), "CC_TAGS=x\n").unwrap();
+
+        // The fleet read now happens in `composer_stuck_lanes()`, which also
+        // drops lanes that are not running; that half is pinned by
+        // `a_stamped_lane_that_is_not_running_is_not_stuck` below. Here the
+        // lanes are supplied, so this pins the threshold and the naming.
+        let lanes: Vec<(String, i64)> = vec![
+            ("held".to_string(), now as i64 - 8 * 3600),
+            ("fresh".to_string(), now as i64 - 60),
+        ];
+        let (findings, _) = super::detect_stuck_composer(&lanes, now);
+        let named: Vec<&str> = findings.iter().map(|f| f.signature.as_str()).collect();
+        assert_eq!(
+            named,
+            vec!["stuck-composer|held"],
+            "exactly the lane past the threshold: {named:?}"
         );
         assert!(
-            suppressed.iter().any(|s| s.signature == "stuck-composer|removed"),
-            "the removal must be DISCLOSED as a suppression: {suppressed:?}"
+            findings[0].title.contains("8h"),
+            "the age belongs in the title, since the duration is the whole \
+             difference between a card and noise: {}",
+            findings[0].title
+        );
+    }
+
+    /// AND IT MUST NOT FILE INTO A VOID. An empty or unreadable sessions dir is
+    /// a legitimate "nothing is stuck", not a fault, and it must stay quiet
+    /// rather than manufacture a finding.
+    #[test]
+    fn an_empty_fleet_files_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        let (findings, _) = super::detect_stuck_composer(&[], 1_788_000_000.0);
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// A STAMP IS NOT A STUCK COMPOSER ONCE THE LANE IS GONE.
+    ///
+    /// `rate_limit_sweep` is the only writer of `composer_stuck_since` and it
+    /// skips lanes that are not running, so a lane stamped once and then
+    /// stopped keeps that stamp forever with nothing able to clear it.
+    /// Measured 2026-09-24 on the live fleet: lifecycle-haiku-r3-0915 read
+    /// 206.5h "stuck" with `running: false`, no tmux session at all, and a
+    /// preview of `[1]+Stopped claude --model ...`, which is bash job control
+    /// rather than anything a person typed. The first version of this detector
+    /// filed a card for it.
+    ///
+    /// The reader now shares the predicate the fleet list already applies to
+    /// this same field, so the detector and the status display cannot disagree
+    /// about which lanes count.
+    #[tokio::test]
+    async fn a_stamped_lane_that_is_not_running_is_not_stuck() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // Stamped nine days ago, and no tmux session exists for it here.
+        std::fs::write(
+            sessions.join("ghost.meta.json"),
+            serde_json::json!({
+                "composer_stuck_since": 1_788_000_000i64 - 9 * 86_400,
+                "composer_preview": "[1]+Stopped claude --model claude-haiku-4-5"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let lanes = crate::api::session_verbs::composer_stuck_lanes().await;
+        assert!(
+            lanes.is_empty(),
+            "a stamped lane with no running session must not be offered as stuck: {lanes:?}"
         );
     }
 
@@ -9187,7 +10951,15 @@ mod tests {
     #[test]
     fn an_unchanged_measurement_writes_nothing_however_old() {
         let t = "disk: 4.2 GB free, below the 50 GB floor";
-        assert!(!super::should_refresh_with_counts(t, t, 0, 365 * 86_400, 6 * 3600, None, 0));
+        assert!(!super::should_refresh_with_counts(
+            t,
+            t,
+            0,
+            365 * 86_400,
+            6 * 3600,
+            None,
+            0
+        ));
     }
 
     /// The rate gate. A value oscillating across a rounding boundary would
@@ -9196,7 +10968,15 @@ mod tests {
     #[test]
     fn a_moved_measurement_still_waits_out_the_rate_gate() {
         let now = 1_000_000;
-        assert!(!super::should_refresh_with_counts("a", "b", now - 60, now, 6 * 3600, None, 0));
+        assert!(!super::should_refresh_with_counts(
+            "a",
+            "b",
+            now - 60,
+            now,
+            6 * 3600,
+            None,
+            0
+        ));
         assert!(super::should_refresh_with_counts(
             "a",
             "b",
@@ -9220,7 +11000,10 @@ mod tests {
     fn an_escalating_fault_refreshes_before_the_cooldown_but_a_steady_one_does_not() {
         let now = 1_000_000;
         let fresh = now - 60; // well inside the 6h cooldown
-        let (old_t, new_t) = ("… 4 request(s) across 3 route(s) …", "… 43 request(s) across 5 route(s) …");
+        let (old_t, new_t) = (
+            "… 4 request(s) across 3 route(s) …",
+            "… 43 request(s) across 5 route(s) …",
+        );
 
         // THE SPECIMEN: 4 -> 43 is more than a doubling, inside the cooldown.
         assert!(
@@ -9234,8 +11017,24 @@ mod tests {
             "a fault ticking along must wait for the cooldown, or every tick rewrites the card"
         );
         // EXACTLY 2x is the boundary the doubling rule names.
-        assert!(super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, Some(4), 8));
-        assert!(!super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, Some(4), 7));
+        assert!(super::should_refresh_with_counts(
+            old_t,
+            new_t,
+            fresh,
+            now,
+            6 * 3600,
+            Some(4),
+            8
+        ));
+        assert!(!super::should_refresh_with_counts(
+            old_t,
+            new_t,
+            fresh,
+            now,
+            6 * 3600,
+            Some(4),
+            7
+        ));
         // ABSENT old count leaves the cooldown in charge. Absence is not growth.
         assert!(
             !super::should_refresh_with_counts(old_t, new_t, fresh, now, 6 * 3600, None, 9_999),
@@ -9253,8 +11052,11 @@ mod tests {
     fn carded_count_reads_the_evidence_line_or_says_it_cannot() {
         let desc = "verdict: whatever\ncount: 4\ndistinct_clients: 1 (ip:100.108.219.90)\n";
         assert_eq!(super::carded_count(desc), Some(4));
-        assert_eq!(super::carded_count("no count here\n"), None,
-            "absent must be None, never 0 — 0 would read as a real measurement");
+        assert_eq!(
+            super::carded_count("no count here\n"),
+            None,
+            "absent must be None, never 0 — 0 would read as a real measurement"
+        );
         assert_eq!(super::carded_count("count: not-a-number\n"), None);
     }
 
@@ -9329,6 +11131,8 @@ mod tests {
                     "gmail": {"status": "ok", "http": 200},
                     "calendar": {"status": "api_error", "http": 403, "detail": "insufficientPermissions"},
                     "drive": {"status": "not_granted"},
+                    // AF-1085: a provider's own failure is not token rot.
+                    "sheets": {"status": "api_error", "http": 503, "detail": "Backend Error"},
                     "slack": {"status": "unreachable", "detail": "dns"},
                 }},
             ],
@@ -9742,7 +11546,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
-             archived INTEGER DEFAULT 0, deleted TEXT);",
+             archived INTEGER DEFAULT 0, deleted TEXT, updated INTEGER);",
         )
         .unwrap();
         let sig = "latency|outlier|GET|/api/sessions|1788121035";
@@ -9764,7 +11568,7 @@ mod tests {
 
         // An ARCHIVED card is the specimen: still `review`, hidden by an operator.
         add("AMUX-3864", "review", 1);
-        let (id, disp) = released_predecessor(&conn, sig).expect("the archived card must be found");
+        let (id, disp, _) = released_predecessor(&conn, sig).expect("the archived card must be found");
         assert_eq!(
             (id.as_str(), disp.as_str()),
             ("AMUX-3864", "archived"),
@@ -9779,7 +11583,7 @@ mod tests {
         conn2
             .execute_batch(
                 "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
-                 archived INTEGER DEFAULT 0, deleted TEXT);",
+                 archived INTEGER DEFAULT 0, deleted TEXT, updated INTEGER);",
             )
             .unwrap();
         conn2
@@ -9804,7 +11608,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
-             archived INTEGER DEFAULT 0, deleted TEXT);",
+             archived INTEGER DEFAULT 0, deleted TEXT, updated INTEGER);",
         )
         .unwrap();
         let add = |id: &str, sref: &str, status: &str| {
@@ -9906,6 +11710,20 @@ mod tests {
             "a rollup and a single-endpoint outlier are different faults"
         );
 
+        // AF-992: so does the system-job rollup. Real signatures from
+        // 2026-10-29's server-rs.log, two of the 88 open cards it filed.
+        let j1 = "silent|system-job|ROLLUP|autofix,board-drive,invariants-monitor,orchestrator-runtime,status-history,telegram-relay";
+        let j2 = "silent|system-job|ROLLUP|autofix,board-drive,invariants-monitor,message-capture,needs-input-auto,\
+                  orchestrator-runtime,status-history,steer-deliver,token-ledger,worker-resources";
+        assert_eq!(fault_identity(j1), Some("silent|system-job|ROLLUP"));
+        assert_eq!(fault_identity(j1), fault_identity(j2), "one stalled runtime, not a card per job set");
+        add("AMUX-6590", &format!("autofix:{j1}"), "todo");
+        assert_eq!(
+            open_card_for_fault(&conn, j2).as_deref(),
+            Some("AMUX-6590"),
+            "an open system-job rollup suppresses a rollup over a different job set"
+        );
+
         // AMUX-4648: the p95 rollup gets the same treatment. These are the real
         // signatures of AMUX-4640 and AMUX-4646, filed 33 minutes apart during
         // one loaded stretch, differing only in which families were over.
@@ -10005,6 +11823,71 @@ mod tests {
             card_of("hooks.shared_guard", ""),
             "AMUX-1",
             "must not be overwritten"
+        );
+    }
+
+    /// AMUX-4920. A ROLLUP card could never link, so it could never be told.
+    ///
+    /// `detect_invariants` mints the rollup signature as
+    /// `invariant|{id}|ROLLUP|...`, and no incident row is ever keyed to
+    /// "ROLLUP" — it names a grouping. The exact-match UPDATE therefore hit
+    /// zero rows and left `board_issue` empty, which is the same class of miss
+    /// AMUX-3664 recorded for "fleet" one bug earlier: a display token leaking
+    /// into a storage key.
+    ///
+    /// Measured 2026-09-22: `session.registered_lane_is_running` carried 100
+    /// incident rows with 88 unlinked, while its rollup card sat open over a
+    /// fault that had already cleared.
+    ///
+    /// The CONTROL is the half that makes the fallback safe: a row that already
+    /// belongs to an entity-specific card must keep it. A blanket UPDATE would
+    /// smear the rollup across rows a narrower card owns.
+    #[test]
+    fn a_rollup_card_claims_unlinked_rows_and_leaves_an_entity_card_its_own() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _amux_invariant_incident (invariant_id TEXT, entity_key TEXT, \
+             board_issue TEXT);
+             INSERT INTO _amux_invariant_incident VALUES ('session.lane_running','lane-a','');
+             INSERT INTO _amux_invariant_incident VALUES ('session.lane_running','lane-b','');
+             INSERT INTO _amux_invariant_incident VALUES ('session.lane_running','lane-c','');
+             INSERT INTO _amux_invariant_incident VALUES ('other.check','lane-a','');",
+        )
+        .unwrap();
+        let link = |c: &str, i: &str, e: &str| link_incident_to_card(&conn, c, i, e).unwrap();
+        let card_of = |i: &str, e: &str| -> String {
+            conn.query_row(
+                "SELECT COALESCE(board_issue,'') FROM _amux_invariant_incident \
+                 WHERE invariant_id=?1 AND entity_key=?2",
+                rusqlite::params![i, e],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // An entity-specific card claims its own row FIRST.
+        assert_eq!(link("AMUX-ENT", "session.lane_running", "lane-b"), 1);
+
+        // TREATMENT: the rollup claims what is left. Zero before the fix.
+        assert_eq!(
+            link("AMUX-ROLL", "session.lane_running", ROLLUP_ENTITY),
+            2,
+            "a rollup card must claim the rows that have no card of their own"
+        );
+        assert_eq!(card_of("session.lane_running", "lane-a"), "AMUX-ROLL");
+        assert_eq!(card_of("session.lane_running", "lane-c"), "AMUX-ROLL");
+
+        // CONTROL 1: the entity card keeps its exact match.
+        assert_eq!(
+            card_of("session.lane_running", "lane-b"),
+            "AMUX-ENT",
+            "the rollup must not steal a row a narrower card already owns"
+        );
+        // CONTROL 2: a different invariant is untouched.
+        assert_eq!(
+            card_of("other.check", "lane-a"),
+            "",
+            "the fallback is scoped to its own invariant"
         );
     }
 
@@ -11287,7 +13170,7 @@ mod tests {
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
                 auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
             dir,
         )
@@ -11477,6 +13360,69 @@ mod tests {
     /// that files per-row would put 14 cards on the board for one bug, which
     /// is how a board stops being read (ethos rule 5 — at 100x volume, does
     /// this stay coherent?).
+    /// AMUX-4851. A crash loop and one sick handler produce the SAME
+    /// per-endpoint group, because this detector has no process dimension and
+    /// every boot re-files the same endpoint. The restart count is the only
+    /// thing that separates them, so the card has to carry it.
+    ///
+    /// Inserts directly rather than through `log_row`, because `Row` has 73
+    /// literal constructions in this file and widening it to carry a boot_at
+    /// would touch every one of them for a field only this cell needs.
+    #[tokio::test]
+    async fn a_group_spanning_restarts_says_so_and_one_confined_to_a_process_says_that() {
+        for (boots, expect, forbid) in [
+            (
+                vec![111.0_f64, 222.0, 333.0],
+                "3",
+                "confined to a single server process",
+            ),
+            (
+                vec![111.0_f64, 111.0, 111.0],
+                "confined to a single server process",
+                "SERVER RESTARTS",
+            ),
+        ] {
+            let (st, _d) = state();
+            let now = unix_now();
+            for (i, boot) in boots.iter().enumerate() {
+                let (ts, b) = (now - 60.0 - i as f64, *boot);
+                st.store
+                    .write(move |conn| {
+                        conn.execute(
+                            "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                             latency_ms, client_ip, user_agent, amux_session, worker, \
+                             answered_by, error_body, boot_at) \
+                             VALUES (?1,'GET','/api/health','/api/health',500,7.0,\
+                             '127.0.0.1','curl/8','','lane','native','{\"message\":\"boom\"}',?2)",
+                            rusqlite::params![ts, b],
+                        )?;
+                        Ok(crate::db::WriteOutcome {
+                            applied: true,
+                            events: vec![],
+                        })
+                    })
+                    .unwrap();
+            }
+            let _ = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
+            let c = cards(&st);
+            assert_eq!(
+                c.len(),
+                1,
+                "three rows on one route are one card, got {c:#?}"
+            );
+            let body = format!("{:?}", c[0]);
+            assert!(
+                body.contains(expect),
+                "a group over boots {boots:?} must report {expect:?} in distinct_processes; \
+                 without it a crash loop is indistinguishable from a sick handler.\nbody: {body}"
+            );
+            assert!(
+                !body.contains(forbid),
+                "a group over boots {boots:?} must NOT claim {forbid:?}.\nbody: {body}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn n_identical_5xx_produce_one_card() {
         let (st, _d) = state();
@@ -11685,7 +13631,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test-after-restart".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let r = autofix_tick(&restarted, std::path::Path::new("/nonexistent")).await;
         assert_eq!(
@@ -11770,6 +13716,10 @@ mod tests {
     /// to reproduce the finding before reading a word of prose.
     #[tokio::test]
     async fn the_card_carries_the_evidence() {
+        // Without a temp home the owner check reads this machine's real
+        // amux.env, whose board is off, and reroutes the card (AF-1007).
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..6 {
@@ -12426,6 +14376,83 @@ mod tests {
     /// sentence deliberately does not spell the whole string: an earlier
     /// version of this doc did, which put a second copy in the file and made
     /// `mutate.sh` refuse its own instructions as an ambiguous revert.
+    /// AMUX-4918. THE ROLLUP'S EVIDENCE MUST SUPPORT ITS OWN GROUPING.
+    ///
+    /// The rollup groups N slow targets and says "one fault, not N tasks".
+    /// Its only evidence used to be client_split, whose published rule, applied
+    /// to the rollup's own numbers, threw out 5 of 6 endpoints. A reader who
+    /// trusted it reached the opposite conclusion from the card.
+    ///
+    /// The fixture is the shape that matters: three distinct paths going slow
+    /// WITHIN SECONDS of each other. Two clients' networks cannot do that on
+    /// different paths, so it is a server-side stall and the grouping is right.
+    #[tokio::test]
+    async fn the_rollup_shows_its_targets_went_slow_together() {
+        let (st, _d) = state();
+        let now = unix_now();
+        fn log_at(st: &AppState, ts: f64, path: &str, ms: f64) {
+            let pa = path.to_string();
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                         latency_ms, client_ip, user_agent, amux_session, worker, answered_by, \
+                         error_body) VALUES (?1,'POST',?2,?2,200,?3,'127.0.0.1','ua','','','native','')",
+                        rusqlite::params![ts, pa, ms],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        }
+        // Two bursts. Inside each, three DISTINCT paths stall within seconds.
+        for (base, k) in [(600.0_f64, 0), (300.0_f64, 1)] {
+            let _ = k;
+            for (off, path) in [(0.0, "/api/alpha"), (2.0, "/api/beta"), (4.0, "/api/gamma")] {
+                for rep in 0..6 {
+                    log_at(&st, now - base + off + rep as f64 * 0.1, path, 20_000.0);
+                }
+            }
+        }
+        let (found, _sup) = detect_latency_at(&st.store.read().unwrap(), now, None);
+        let rollup = found
+            .iter()
+            .find(|f| f.evidence.iter().any(|(k, _)| k == "co_occurrence"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no rollup carried co_occurrence evidence: {:?}",
+                    found
+                        .iter()
+                        .map(|f| f.signature.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+        let co = rollup
+            .evidence
+            .iter()
+            .find(|(k, _)| k == "co_occurrence")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert!(
+            co.contains("touched MORE THAN ONE distinct target"),
+            "co_occurrence must state the shared-burst count: {co}"
+        );
+        assert!(
+            !co.starts_with("0 of "),
+            "three paths stalling within seconds of each other must register as a SHARED burst, \
+             which is the evidence the grouping rests on: {co}"
+        );
+        // The corrected client_split must no longer tell the reader to discard
+        // targets by their off-box multiple, which is what contradicted the
+        // grouping this same card asserts.
+        if let Some((_, split)) = rollup.evidence.iter().find(|(k, _)| k == "client_split") {
+            assert!(
+                !split.contains("belongs to this fault"),
+                "client_split must not re-state a rule that throws out the rollup's own \
+                 targets: {split}"
+            );
+        }
+    }
+
     #[tokio::test]
     /// AMUX-4818: the outlier card must say whether the slowness is the
     /// SERVER's or the reporting CLIENT's. Those are different faults and the
@@ -12452,14 +14479,29 @@ mod tests {
                          error_body) VALUES (?1,'POST',?2,?2,200,?3,?4,'ua','','','native','')",
                         rusqlite::params![ts, pa, ms, ia],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         }
         // A REAL SERVER FAULT: every call is slow, from both populations.
         for k in 0..6 {
-            log_ip(&st, now - 100.0 - k as f64, "/api/serverfault", 20_000.0, "127.0.0.1");
-            log_ip(&st, now - 200.0 - k as f64, "/api/serverfault", 20_000.0, "10.0.0.5");
+            log_ip(
+                &st,
+                now - 100.0 - k as f64,
+                "/api/serverfault",
+                20_000.0,
+                "127.0.0.1",
+            );
+            log_ip(
+                &st,
+                now - 200.0 - k as f64,
+                "/api/serverfault",
+                20_000.0,
+                "10.0.0.5",
+            );
         }
         // A CLIENT ARTIFACT: the server answers on-box calls instantly and
         // almost never stalls locally; off-box calls stall every time.
@@ -12468,7 +14510,13 @@ mod tests {
         }
         log_ip(&st, now - 380.0, "/api/beacon", 20_000.0, "127.0.0.1");
         for k in 0..6 {
-            log_ip(&st, now - 400.0 - k as f64, "/api/beacon", 20_000.0, "10.0.0.5");
+            log_ip(
+                &st,
+                now - 400.0 - k as f64,
+                "/api/beacon",
+                20_000.0,
+                "10.0.0.5",
+            );
         }
 
         let (found, _sup) = detect_latency_at(&st.store.read().unwrap(), now, None);
@@ -12476,8 +14524,15 @@ mod tests {
             found
                 .iter()
                 .find(|f| f.signature.contains(needle))
-                .unwrap_or_else(|| panic!("no finding for {needle}: {:?}",
-                    found.iter().map(|f| f.signature.clone()).collect::<Vec<_>>()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no finding for {needle}: {:?}",
+                        found
+                            .iter()
+                            .map(|f| f.signature.clone())
+                            .collect::<Vec<_>>()
+                    )
+                })
                 .evidence
                 .iter()
                 .find(|(k, _)| k == "client_split")
@@ -12693,6 +14748,49 @@ mod tests {
     /// The fixture makes the cap bite with a baseline LARGER than the cap, so
     /// ascending order reaches zero window rows and the detector goes blind to
     /// the very period it reports on.
+    /// AF-1040: when the cap leaves a baseline shorter than the window, the
+    /// multiple compares the window with a sliver of itself, so it is
+    /// suppressed with its reason, never filed.
+    #[tokio::test]
+    async fn a_capped_scan_with_a_sliver_of_baseline_is_not_filed() {
+        let insert = |st: &AppState, ts: f64, ms: f64| {
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                         latency_ms, client_ip, user_agent, amux_session, worker, answered_by) \
+                         VALUES (?1,'GET','/api/sessions','/api/sessions',200,?2,\
+                         '127.0.0.1','curl/8','','','native')",
+                        rusqlite::params![ts, ms],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        let (st, _d) = state();
+        let now = unix_now();
+        let window_start = now - window_h() * 3600.0;
+        // 300 fast rows packed into the seconds just before the window, so a
+        // 200-row cap reaches only ~140 s of "baseline".
+        for i in 0..300 {
+            insert(&st, window_start - 1.0 - i as f64, 5.0);
+        }
+        for i in 0..60 {
+            insert(&st, now - 300.0 - i as f64, 900.0);
+        }
+        let conn = st.store.read().unwrap();
+        let (f, sup) = detect_latency_with_scan_cap(&conn, now, None, 200);
+        assert!(
+            !f.iter().any(|x| x.signature == "latency|p95|/api/sessions"),
+            "a 140 s baseline must not file a regression: {:?}",
+            f.iter().map(|x| &x.signature).collect::<Vec<_>>()
+        );
+        assert!(
+            format!("{sup:?}").contains("AF-1040"),
+            "the suppression names why it was not filed: {sup:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_scan_cap_truncates_the_baseline_never_the_window() {
         let insert = |st: &AppState, ts: f64, ms: f64| {
@@ -13079,7 +15177,10 @@ mod tests {
         );
 
         // NEWEST IS GREEN: not failing, nothing to explain.
-        let green = vec![mk("checks", 20, "success", 5.0), mk("checks", 21, "failure", 60.0)];
+        let green = vec![
+            mk("checks", 20, "success", 5.0),
+            mk("checks", 21, "failure", 60.0),
+        ];
         assert!(
             workflows_needing_backfill(&green).is_empty(),
             "a workflow that is currently passing must not be backfilled"
@@ -13126,6 +15227,103 @@ mod tests {
     /// honest: a rollup that swallowed every regression would pass a
     /// one-directional test and would have deleted the per-family card that is
     /// correct when a single endpoint really does regress.
+    /// AMUX-4930. A MULTIPLE NEEDS A DENOMINATOR THAT MEANS SOMETHING.
+    ///
+    /// The rollup title was built from max(window / baseline) across hits, so a
+    /// family whose trailing p95 is 1ms turned a 1217ms window into
+    /// "worst 938.0x" — a real regression wearing a catastrophic headline.
+    /// Measured on the specimen: that family averages 180ms across 10,086
+    /// requests over 7 days, so 1ms was never its normal.
+    ///
+    /// AMUX-3471's floor is on the WINDOW p95 and correctly allows this, since
+    /// 1217ms IS worth filing. It does not bound the denominator, which is the
+    /// half the title was built from.
+    ///
+    /// The fixture puts a near-zero baseline BESIDE two ratable ones, because
+    /// the bug is not "no ratio" but "the wrong family supplying it": the tiny
+    /// baseline wins a max() against honest competitors.
+    #[tokio::test]
+    async fn a_near_zero_baseline_does_not_supply_the_rollup_headline() {
+        let seed =
+            |st: &crate::api::AppState, now: f64, fam: &'static str, base_ms: f64, win_ms: f64| {
+                for i in 0..60 {
+                    log_row(
+                        st,
+                        Row {
+                            ts: now - 200_000.0 - i as f64,
+                            method: "GET",
+                            path: fam,
+                            family: fam,
+                            status: 200,
+                            body: "",
+                            worker: "",
+                            ua: "curl/8",
+                            ms: base_ms,
+                        },
+                    );
+                }
+                for i in 0..60 {
+                    log_row(
+                        st,
+                        Row {
+                            ts: now - 100.0 - i as f64,
+                            method: "GET",
+                            path: fam,
+                            family: fam,
+                            status: 200,
+                            body: "",
+                            worker: "",
+                            ua: "curl/8",
+                            ms: win_ms,
+                        },
+                    );
+                }
+            };
+        let (st, _d) = state();
+        let now = unix_now();
+        // Two honest regressions: baselines well above the ratable floor.
+        seed(&st, now, "/api/rate-a", 200.0, 1000.0); //  5x
+        seed(&st, now, "/api/rate-b", 400.0, 1600.0); //  4x
+                                                      // The specimen: a 1ms baseline that would otherwise headline at 1200x.
+        seed(&st, now, "/api/tiny-base", 1.0, 1200.0);
+
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let rollup = f
+            .iter()
+            .find(|x| x.signature.contains("p95|ROLLUP"))
+            .expect("three simultaneous regressions must roll up");
+
+        assert!(
+            !rollup.title.contains("1200.0x"),
+            "a 1ms baseline must not supply the headline multiple: {}",
+            rollup.title
+        );
+        assert!(
+            rollup.title.contains("5.0x"),
+            "the headline multiple must come from the worst RATABLE baseline: {}",
+            rollup.title
+        );
+        assert!(
+            rollup.title.contains("1600ms"),
+            "the headline must name the worst ABSOLUTE p95, which needs no denominator: {}",
+            rollup.title
+        );
+        let families = rollup
+            .evidence
+            .iter()
+            .find(|(k, _)| k == "families")
+            .map(|(_, v)| v.clone())
+            .expect("the rollup names its families");
+        assert!(
+            families.contains("too small to rate"),
+            "the unratable family's line must say so instead of printing a multiple: {families}"
+        );
+        assert!(
+            families.contains("5.0x") && families.contains("4.0x"),
+            "ratable families keep their multiples: {families}"
+        );
+    }
+
     #[tokio::test]
     async fn simultaneous_p95_regressions_collapse_to_one_card_but_two_do_not() {
         let fast_then_slow = |st: &crate::api::AppState, now: f64, fam: &'static str| {
@@ -13273,6 +15471,81 @@ mod tests {
     /// files, because that means the endpoint's own timeout failed to bound
     /// the call, which is the one latency story there that IS wrong.
     #[tokio::test]
+    /// AMUX-5024. The steer route's ordinary tail must stop filing, and a
+    /// request past its own bound must still file.
+    ///
+    /// Measured over the whole retained request log, n=226: p50 114 ms,
+    /// p90 7006, p95 11091, p99 14480, max 17094, with 15 requests (6.64%)
+    /// already over the 10s floor. The card that prompted this was 10,104 ms,
+    /// BELOW this route's own p95.
+    ///
+    /// The budget is added up from the route's own timeouts: `verify_submitted`
+    /// polls the pane twice at 5 x 300 ms (3,000 ms) and the auto-captured
+    /// ledger card calls `board_intake::plan`, whose classifier deadline is
+    /// `intake_model_timeout_ms()`, default 20,000 ms.
+    async fn the_steer_routes_ordinary_tail_is_budgeted_not_filed() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // Four rows over the 10s floor and inside the 23s budget — the shape
+        // the live distribution actually has.
+        for (i, ms) in [10_104.0, 11_500.0, 14_480.0, 17_094.0].iter().enumerate() {
+            log_row(
+                &st,
+                Row {
+                    ts: now - 500.0 + i as f64,
+                    method: "POST",
+                    path: "/api/sessions/amux/steer",
+                    family: "/api/sessions",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: *ms,
+                },
+            );
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/sessions/{name}/steer")),
+            "an ordinary tail inside the 23s budget must not file: {:?}",
+            f.iter().map(|x| x.signature.clone()).collect::<Vec<_>>()
+        );
+
+        // Past the budget the classifier's own 20s deadline has failed to bound
+        // the call, which is the one latency story on this route that IS wrong.
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "POST",
+                path: "/api/sessions/amux/steer",
+                family: "/api/sessions",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 31_000.0,
+            },
+        );
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now);
+        let card = f2
+            .iter()
+            .find(|x| x.signature.contains("/api/sessions/{name}/steer"))
+            .expect("a request past the 23s budget must still file");
+        let ev: BTreeMap<_, _> = card.evidence.iter().cloned().collect();
+        assert_eq!(ev["threshold_ms"], "23000", "the decision must use the budget");
+        assert!(
+            ev["verdict"].starts_with("1 request(s)"),
+            "the count must be over the BUDGET, not the floor: {}",
+            ev["verdict"]
+        );
+        assert_eq!(
+            ev["n_over_floor"], "5",
+            "the floor count stays available, just not as THE count"
+        );
+    }
+
+    #[tokio::test]
     async fn a_budgeted_route_counts_breaches_against_its_own_bound() {
         let (st, _d) = state();
         let now = unix_now();
@@ -13282,17 +15555,35 @@ mod tests {
         // breaches the budget. The live shape this reproduces: 52 of 99
         // requests over 48h passed 10s, exactly 1 passed 30s.
         for (i, ms) in [12_000.0, 14_000.0, 18_000.0, 22_000.0].iter().enumerate() {
-            log_row(&st, Row {
-                ts: now - 500.0 + i as f64,
-                method: "GET", path: "/api/email/inbox", family: "/api/email",
-                status: 200, body: "", worker: "", ua: "curl/8", ms: *ms,
-            });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 500.0 + i as f64,
+                    method: "GET",
+                    path: "/api/email/inbox",
+                    family: "/api/email",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: *ms,
+                },
+            );
         }
-        log_row(&st, Row {
-            ts: now - 100.0,
-            method: "GET", path: "/api/email/inbox", family: "/api/email",
-            status: 200, body: "", worker: "", ua: "curl/8", ms: 59_621.0,
-        });
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "GET",
+                path: "/api/email/inbox",
+                family: "/api/email",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 59_621.0,
+            },
+        );
 
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         let card = f
@@ -13315,7 +15606,10 @@ mod tests {
             card.title
         );
         assert_eq!(ev["threshold_ms"], "30000", "threshold must be the budget");
-        assert_eq!(ev["n_over_floor"], "5", "the floor count stays available, just not as THE count");
+        assert_eq!(
+            ev["n_over_floor"], "5",
+            "the floor count stays available, just not as THE count"
+        );
         assert_eq!(ev["design_budget_ms"], "30000");
         assert!(
             ev["verdict"].contains("do NOT size the incident from that number"),
@@ -13337,11 +15631,20 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for (i, ms) in [11_000.0, 12_000.0].iter().enumerate() {
-            log_row(&st, Row {
-                ts: now - 300.0 + i as f64,
-                method: "GET", path: "/api/no-such-budget", family: "/api/no-such-budget",
-                status: 200, body: "", worker: "", ua: "curl/8", ms: *ms,
-            });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 300.0 + i as f64,
+                    method: "GET",
+                    path: "/api/no-such-budget",
+                    family: "/api/no-such-budget",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: *ms,
+                },
+            );
         }
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         let card = f
@@ -13349,8 +15652,15 @@ mod tests {
             .find(|x| x.signature.contains("/api/no-such-budget"))
             .expect("an unbudgeted route over the floor must file");
         let ev: BTreeMap<_, _> = card.evidence.iter().cloned().collect();
-        assert!(ev["verdict"].starts_with("2 request(s)"), "{}", ev["verdict"]);
-        assert_eq!(ev["threshold_ms"], "10000", "no budget means the floor IS the bound");
+        assert!(
+            ev["verdict"].starts_with("2 request(s)"),
+            "{}",
+            ev["verdict"]
+        );
+        assert_eq!(
+            ev["threshold_ms"], "10000",
+            "no budget means the floor IS the bound"
+        );
         assert!(
             ev["verdict"].contains("the fix is a LONG_BY_DESIGN entry"),
             "an unbudgeted route must still get the original advice: {}",
@@ -13748,8 +16058,7 @@ mod tests {
         );
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            !f.iter()
-                .any(|x| x.signature.contains("/api/browser/start")),
+            !f.iter().any(|x| x.signature.contains("/api/browser/start")),
             "a launch inside its own 30s CDP-wait bound is designed behaviour: {f:?}"
         );
 
@@ -13910,7 +16219,8 @@ mod tests {
         );
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            !f.iter().any(|x| x.signature.contains("/api/gmail/accounts")),
+            !f.iter()
+                .any(|x| x.signature.contains("/api/gmail/accounts")),
             "inside its 30s design budget, a health-probe rollup must not file: {f:?}"
         );
 
@@ -14126,6 +16436,145 @@ mod tests {
         assert!(
             excluded.contains("0 dropped as failed"),
             "same for the failed-request filter: {excluded}"
+        );
+    }
+
+    /// AMUX-4859. The per-target counts and the window-wide counts are
+    /// different populations, and the card must say which is which.
+    ///
+    /// Specimen: AMUX-4852 published "11 row(s) matched ... 0 dropped ... 0
+    /// dropped" directly beside `n_over_floor: 1`, on a card whose title names
+    /// ONE route. All four numbers were correct. 8 of the 11 belonged to
+    /// /api/email/inbox, which carries its own 30s budget and could never have
+    /// filed. A reader subtracting the published numbers finds 10 rows removed
+    /// by a filter that does not exist, which is the opposite of the
+    /// mis-sizing AMUX-3907 added this field to prevent.
+    ///
+    /// The fixture reproduces that shape on purpose: the filing route
+    /// contributes ONE row, and a BUDGETED route contributes three more that
+    /// count toward the window while never filing. The two figures are 1 and 4
+    /// here, so a regression that fed either number into the other's slot
+    /// cannot keep both assertions green.
+    #[tokio::test]
+    async fn outliers_excluded_separates_this_target_from_the_whole_window() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // The route under test: one slow row, no budget, so it files.
+        log_row(
+            &st,
+            Row {
+                ts: now - 50.0,
+                method: "GET",
+                path: "/api/board",
+                family: "/api/board",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 21_000.0,
+            },
+        );
+        // A DIFFERENT route, over the 10s floor but under its OWN 30s
+        // LONG_BY_DESIGN budget, so these three count toward the window and
+        // never produce a card. This is the /api/email/inbox role in the
+        // specimen.
+        for i in 0..3 {
+            log_row(
+                &st,
+                Row {
+                    ts: now - 40.0 + i as f64,
+                    method: "GET",
+                    path: "/api/sessions",
+                    family: "/api/sessions",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 12_000.0,
+                },
+            );
+        }
+        // TWO ROWS THIS TARGET'S OWN `failed` FILTER DROPS. Without these the
+        // per-target failed counter is never exercised: a mutation deleting it
+        // stayed green, which is how this half got here (the tally counters
+        // were added with a fixture that had nothing for them to count).
+        for i in 0..2 {
+            log_row(
+                &st,
+                Row {
+                    ts: now - 30.0 + i as f64,
+                    method: "GET",
+                    path: "/api/board",
+                    family: "/api/board",
+                    status: 502,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 15_000.0,
+                },
+            );
+        }
+        // AND ONE THE restart-spanning FILTER DROPS. `spans_own_restart` takes
+        // `Some(boot) => ts < boot`, so a row stamped with a boot_at LATER than
+        // itself is one the process cannot have served end to end. log_row
+        // leaves boot_at NULL, so this goes in directly.
+        let spanned_ts = now - 20.0;
+        st.store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_request_log (ts, method, path, family, status, latency_ms, \
+                     client_ip, user_agent, amux_session, worker, answered_by, boot_at) \
+                     VALUES (?1,'GET','/api/board','/api/board',200,18000.0, \
+                     '127.0.0.1','curl/8','','','native',?2)",
+                    rusqlite::params![spanned_ts, spanned_ts + 1.0],
+                )?;
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let hit = f
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|GET"))
+            .expect("the unbudgeted 21s row files on its own");
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        let excluded = ev
+            .get("outliers_excluded")
+            .expect("the card must say what its filters removed");
+
+        // THIS TARGET'S OWN FIGURES, the ones that reconcile with `n`:
+        // 4 matched here (1 survivor + 1 restart-spanning + 2 failed).
+        assert!(
+            excluded.contains("ON THIS TARGET (GET /api/board): 4 row(s) matched"),
+            "the per-target count must be this route's own, not the window's: {excluded}"
+        );
+        assert!(
+            excluded.contains("1 dropped as spanning a server restart"),
+            "the per-target restart-spanning count must be this route's own: {excluded}"
+        );
+        assert!(
+            excluded.contains("2 dropped as failed requests"),
+            "the per-target failed count must be this route's own: {excluded}"
+        );
+        // THE WINDOW'S FIGURE, kept and LABELLED as a different population:
+        // 7 = this target's 4 plus the budgeted route's 3.
+        assert!(
+            excluded.contains("ACROSS ALL TARGETS in the same window: 7 matched"),
+            "the window-wide count must be published and named as such: {excluded}"
+        );
+        // AND THE CARD SHOWS ITS OWN ARITHMETIC, so a reader can see the
+        // per-target numbers reconcile instead of taking it on faith.
+        assert!(
+            excluded.contains("4 - 1 - 2 = 1"),
+            "the per-target figures must visibly reconcile with n: {excluded}"
+        );
+        assert_eq!(
+            ev.get("n_over_floor").map(String::as_str),
+            Some("1"),
+            "and n itself is this target's survivor count"
         );
     }
 
@@ -14436,8 +16885,7 @@ mod tests {
         // environment import, a 3000ms poll after `unset ANTHROPIC_API_KEY`, a
         // 150ms settle before Enter, and the 20-iteration launch watch loop at
         // 500ms per turn.
-        let derived_ms =
-            2.0 * 100.0 + 2.0 * 3_000.0 + 3_000.0 + 3_000.0 + 150.0 + 20.0 * 500.0;
+        let derived_ms = 2.0 * 100.0 + 2.0 * 3_000.0 + 3_000.0 + 3_000.0 + 150.0 + 20.0 * 500.0;
         assert_eq!(
             b, derived_ms,
             "budget {b} must BE the wake path's own ladder ({derived_ms}ms), not a number chosen to cover a sample"
@@ -14569,7 +17017,12 @@ mod tests {
         // `tmux_capture` pinned at its own 10s timeout puts the request past the
         // ladder, and that is the one latency story this route can still tell.
         let (st2, _d2) = state();
-        insert(&st2, now - 300.0, 22_350.0 + 10_000.0, "/api/workers/gtm-engine/resume");
+        insert(
+            &st2,
+            now - 300.0,
+            22_350.0 + 10_000.0,
+            "/api/workers/gtm-engine/resume",
+        );
         let conn2 = st2.store.read().unwrap();
         let (f2, _s2) = detect_latency_at(&conn2, now, None);
         assert!(
@@ -14586,6 +17039,20 @@ mod tests {
     /// value is that the route keeps ONE latency story it can still tell —
     /// "this hung", as against "this was big". A budget set to infinity, or a
     /// blanket exemption, silences both.
+    /// AF-1167: a real peek path reaches the budget through the same
+    /// normalizer the detector uses, the 13.1s full peeks measured on
+    /// 2026-11-02 sit under it, and a peek that outlives the dashboard's 15s
+    /// abort still files. A fast sibling verb (report) does not inherit it.
+    #[test]
+    fn a_full_peek_inside_the_dashboards_deadline_is_not_an_outlier() {
+        let target = rl::normalize_target_verb("/api/sessions/mixpeek-meta-worker/peek");
+        let budget = design_budget_ms(&target);
+        assert!(13_110.0 < budget, "{target}: {budget}");
+        assert!(budget <= 15_000.0, "past the dashboard's abort nobody receives it: {budget}");
+        let report = rl::normalize_target_verb("/api/sessions/mixpeek-meta-worker/report");
+        assert_eq!(design_budget_ms(&report), 0.0, "{report}");
+    }
+
     #[test]
     fn a_long_by_design_route_keeps_the_one_latency_story_that_is_still_wrong() {
         // The measurement that set the number: three consecutive calls at
@@ -15052,7 +17519,33 @@ mod tests {
             created_at: unix_now() - mins_ago * 60.0,
             url: format!("https://github.com/mixpeek/amux/actions/runs/{id}"),
             failing_step: None,
+            failing_tests: Vec::new(),
+            test_owners: Vec::new(),
+            head_sha: String::new(),
+            head_lane: None,
+            head_lane_isolated: false,
         }
+    }
+
+    #[test]
+    fn the_card_names_the_first_red_commit_and_whether_its_lane_can_be_told() {
+        let mut runs = vec![ci_run("checks", 1, "success", 300.0)];
+        for i in 0..3 {
+            runs.push(ci_run("checks", 10 + i, "failure", 200.0 - i as f64 * 50.0));
+        }
+        runs[1].head_sha = "2fd93f843deadbeef".into();
+        runs[1].head_lane = Some("amux-helper".into());
+        runs[1].head_lane_isolated = true;
+        runs[3].head_sha = "f3d3c6989cafe".into();
+        let (f, _) = ci_findings(&runs, unix_now());
+        let line = f[0].evidence.iter().find(|(k, _)| k == "first_red_commit").map(|(_, v)| v.clone());
+        assert_eq!(line.as_deref(), Some("2fd93f843 by amux-helper, which is ISOLATED: `amux send` cannot reach it, so fix it here or ask the owner"));
+        runs[1].head_lane_isolated = false;
+        let (g, _) = ci_findings(&runs, unix_now());
+        assert!(g[0].evidence.iter().any(|(k, v)| k == "first_red_commit" && v == "2fd93f843 by amux-helper"));
+        runs[1].head_lane = None;
+        let (h, _) = ci_findings(&runs, unix_now());
+        assert!(h[0].evidence.iter().any(|(k, v)| k == "first_red_commit" && v.starts_with("2fd93f843 (no Amux-Session")));
     }
 
     fn card_row(st: &AppState, id: &str) -> (String, String, String) {
@@ -15070,6 +17563,76 @@ mod tests {
     /// If the detector is removed, misfiltered, or its threshold is set above
     /// the streak, this fails — which is the property "nobody saw 29 failures"
     /// needed and did not have.
+    /// Lines copied from rust runs 39721002526 and 39748901102 (2026-10-22).
+    /// The un-numbered `[desktop] › board-…` lines are Playwright's flaky and
+    /// skipped list, present on every run; reading them as failures would
+    /// route every card to whoever wrote the board specs.
+    #[test]
+    fn failing_test_paths_come_from_failure_headers_and_panics_only() {
+        let log = "e2e-shards (14)\tGolden\t2026-10-22T04:20:00Z   1) [desktop] › e2e/map-manage.spec.ts:121:5 › categories: any group within a category\n\
+            e2e-shards (14)\tGolden\t2026-10-22T04:20:00Z     [desktop] › e2e/map-manage.spec.ts:121:5 › categories: any group within a category\n\
+            e2e-shards (14)\tGolden\t2026-10-22T04:20:01Z   [desktop] › board-activity-scrolls.spec.ts:16:5 › the worker activity banner scrolls away\n\
+            e2e-shards (2)\tGolden\t2026-10-22T08:42:00Z   2) [ios-safari] › e2e/worker-configurations.spec.ts:10:5 › worker Configurations edits\n\
+            test-shards (1)\tnextest\t2026-10-20T21:59:46Z     thread 'bilateral_peers' (6422) panicked at crates/amux-server/tests/bilateral_peers.rs:102:5:\n\
+            spa-gates\tunit\t2026-10-21T11:36:04Z not ok 90 - full history cannot block streaming\n\
+            shard (17)\tChecks\t2026-11-10T03:24:10Z test at tests/site-header.test.mjs:13:1\n\
+            shard (17)\tChecks\t2026-11-10T03:24:10Z       at TestContext.<anonymous> (file:///home/runner/work/amux/amux/tests/site-header.test.mjs:17:10)\n";
+        assert_eq!(
+            ci_failing_test_paths(log),
+            vec![
+                "e2e/map-manage.spec.ts".to_string(),
+                "e2e/worker-configurations.spec.ts".to_string(),
+                "crates/amux-server/tests/bilateral_peers.rs".to_string(),
+                "tests/site-header.test.mjs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_owners_rank_by_commits_and_skip_hand_commits() {
+        let trailers = "amux-cloud\n\namux,amux-app\namux\n(human)\namux-cloud\namux\n";
+        assert_eq!(
+            ci_rank_owners(trailers),
+            vec!["amux".to_string(), "amux-cloud".into(), "amux-app".into()]
+        );
+        assert!(ci_rank_owners("").is_empty());
+    }
+
+    /// The finding routes to the failing test's author and names the test; with
+    /// no author known it stays unowned, which `file` routes to
+    /// AMUX_AUTOFIX_SESSION exactly as before.
+    #[test]
+    fn a_red_run_routes_to_the_failing_tests_author() {
+        let mut runs = vec![ci_run("rust", 1, "success", 300.0)];
+        for i in 0..3 {
+            runs.push(ci_run("rust", 10 + i, "failure", 200.0 - i as f64 * 50.0));
+        }
+        let (f, _) = ci_findings(&runs, unix_now());
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].owner, None, "no test named: unowned, as before");
+        assert!(!f[0].title.contains('('), "{}", f[0].title);
+        let newest = runs.last_mut().unwrap();
+        newest.failing_tests = vec!["e2e/map-manage.spec.ts".into()];
+        newest.test_owners = vec!["amux-cloud".into(), "amux".into()];
+        let (g, _) = ci_findings(&runs, unix_now());
+        assert_eq!(g[0].owner.as_deref(), Some("amux-cloud"));
+        assert!(
+            g[0].title.ends_with("(e2e/map-manage.spec.ts)"),
+            "{}",
+            g[0].title
+        );
+        assert_eq!(
+            g[0].signature, f[0].signature,
+            "naming the test must not refile"
+        );
+        let ev: BTreeMap<&str, &str> = g[0]
+            .evidence
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(ev["test_owners"], "amux-cloud, amux");
+    }
+
     #[tokio::test]
     async fn a_failing_workflow_produces_a_card_with_its_streak() {
         let (st, _d) = state();
@@ -15191,7 +17754,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "after-restart".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         assert!(
             file_finding(&restarted, &f2[0]).await.unwrap().is_none(),
@@ -15227,7 +17790,7 @@ mod tests {
             "a second outage must not be deduped against the first"
         );
         assert!(
-            sig_new.ends_with("|200"),
+            sig_new.contains("|200|"),
             "the anchor is the streak's OLDEST failure: {sig_new}"
         );
     }
@@ -15310,7 +17873,7 @@ mod tests {
             "a cancelled run must not mask the outage behind it"
         );
         assert!(
-            f[0].signature.ends_with("|2"),
+            f[0].signature.contains("|2|"),
             "cancel must not move the anchor: {}",
             f[0].signature
         );
@@ -15707,21 +18270,148 @@ mod tests {
             // worse of the two failures.
             // `episode` likewise mirrors migration 0081 (AMUX-4798), with the
             // same DEFAULT 1, so a fixture row that does not name one behaves
-            // like every incident that predates the column.
+            // like every incident that predates the column. `episode_occurrences`
+            // mirrors 0147 (AF-1126); 0 makes the filer read `occurrences`.
             "CREATE TABLE _amux_invariant_incident (invariant_id TEXT, entity_key TEXT, \
              status TEXT, first_seen REAL, last_seen REAL, occurrences INTEGER, \
              resolved_at REAL, expected TEXT, observed TEXT, evidence TEXT, \
-             episode INTEGER NOT NULL DEFAULT 1);",
+             episode INTEGER NOT NULL DEFAULT 1, episode_occurrences INTEGER NOT NULL DEFAULT 0);",
         )
         .unwrap();
         for r in rows {
             conn.execute(
-                "INSERT INTO _amux_invariant_incident VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10)",
+                "INSERT INTO _amux_invariant_incident VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10,0)",
                 rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9],
             )
             .unwrap();
         }
         detect_invariants(&conn, 9999.0).0
+    }
+
+    /// `invariant_findings` with the two tables the regrowth rule reads: the
+    /// filed signatures (`session_events.idem`) and the cards they became
+    /// (`issues.source_ref`). `filed` is (signature, card id, status).
+    fn invariant_findings_after(rows: &[InvRow], filed: &[(&str, &str, &str)]) -> Vec<Finding> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _amux_invariant_incident (invariant_id TEXT, entity_key TEXT, \
+             status TEXT, first_seen REAL, last_seen REAL, occurrences INTEGER, \
+             resolved_at REAL, expected TEXT, observed TEXT, evidence TEXT, \
+             episode INTEGER NOT NULL DEFAULT 1, episode_occurrences INTEGER NOT NULL DEFAULT 0); \
+             CREATE TABLE session_events (idem TEXT); \
+             CREATE UNIQUE INDEX idx_sev_idem ON session_events(idem) WHERE idem IS NOT NULL; \
+             CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
+             archived INTEGER DEFAULT 0, updated INTEGER);",
+        )
+        .unwrap();
+        for r in rows {
+            conn.execute(
+                "INSERT INTO _amux_invariant_incident VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9,?10,0)",
+                rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8, r.9],
+            )
+            .unwrap();
+        }
+        for (sig, card, status) in filed {
+            conn.execute("INSERT INTO session_events(idem) VALUES (?1)", [idem_of(sig)]).unwrap();
+            conn.execute(
+                "INSERT INTO issues(id, status, updated, source_ref) VALUES (?1, ?2, 1, ?3)",
+                rusqlite::params![card, status, idem_of(sig)],
+            )
+            .unwrap();
+        }
+        detect_invariants(&conn, 9999.0).0
+    }
+
+    fn sized_row(id: &str, episode: i64, magnitude: i64) -> InvRow {
+        let mut r = inv_row_in_episode(id, "", 61, episode);
+        r.8 = json!({"stranded": magnitude, "magnitude": magnitude}).to_string();
+        r
+    }
+
+    fn ev<'f>(f: &'f Finding, key: &str) -> Option<&'f str> {
+        f.evidence.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// AF-1045, the live case: board.todo_is_reachable_by_dispatch, episode 4,
+    /// its only card discarded when 1 card was stranded, now 49. It files ONE
+    /// new card naming the old card and both sizes.
+    #[test]
+    fn a_grown_invariant_files_again_past_the_card_that_judged_it_smaller() {
+        let id = "board.todo_is_reachable_by_dispatch";
+        let legacy = "invariant|board.todo_is_reachable_by_dispatch|fleet|1000|e4";
+        let f = invariant_findings_after(&[sized_row(id, 4, 49)], &[(legacy, "AMUX-4968", "discarded")]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].signature, format!("{legacy}|m49"), "a new signature, so already_filed lets it through");
+        let line = ev(&f[0], "regrown").expect("the card says why it filed again");
+        assert!(line.contains("AMUX-4968 (discarded)"), "names the old card: {line}");
+        assert!(line.contains("not recorded (counted as 1)") && line.contains("now 49"), "both sizes: {line}");
+        assert_eq!(ev(&f[0], "magnitude"), Some("49"));
+        assert_eq!(
+            fault_identity(&f[0].signature),
+            Some("invariant|board.todo_is_reachable_by_dispatch"),
+            "same fault identity, so an OPEN card still suppresses the regrowth"
+        );
+    }
+
+    /// The other direction, or the rule is a card per tick: once a card is
+    /// filed at a size, the same size, modest growth and any shrink all keep
+    /// THAT signature, which `already_filed` holds. Doubling files again.
+    #[test]
+    fn an_invariant_that_has_not_doubled_stays_already_filed() {
+        let id = "board.todo_is_reachable_by_dispatch";
+        let sized = "invariant|board.todo_is_reachable_by_dispatch|fleet|1000|e4|m49";
+        let sig_at = |m: i64| {
+            let f = invariant_findings_after(&[sized_row(id, 4, m)], &[(sized, "AF-9001", "discarded")]);
+            assert_eq!(f.len(), 1, "{f:?}");
+            (f[0].signature.clone(), ev(&f[0], "regrown").map(str::to_string))
+        };
+        for m in [49, 60, 97, 10, 1] {
+            assert_eq!(sig_at(m), (sized.to_string(), None), "magnitude {m} is not 2x 49: stays judged");
+        }
+        let (sig, line) = sig_at(98);
+        assert_eq!(sig, format!("{}|m98", sized.trim_end_matches("|m49")));
+        let line = line.expect("a doubling refile names its predecessor");
+        assert!(line.contains("AF-9001 (discarded)") && line.contains("magnitude 49") && line.contains("now 98"), "{line}");
+    }
+
+    /// A check that declares no magnitude keeps the exact signature it had,
+    /// so no card already on the board is re-filed by this change.
+    #[test]
+    fn an_invariant_without_a_magnitude_keeps_its_signature() {
+        let f = invariant_findings_after(&[inv_row_in_episode("hooks.x", "", 61, 3)], &[]);
+        assert_eq!(f[0].signature, "invariant|hooks.x|fleet|1000|e3");
+        assert!(ev(&f[0], "regrown").is_none() && ev(&f[0], "magnitude").is_none());
+        let first = invariant_findings_after(&[sized_row("hooks.x", 3, 5)], &[]);
+        assert_eq!(first[0].signature, "invariant|hooks.x|fleet|1000|e3|m5", "a first card records its size");
+        assert!(ev(&first[0], "regrown").is_none(), "nothing judged it yet, so it is not a regrowth");
+    }
+
+    /// AMUX-4798 added `|e<N>` after the epoch and AF-1045 adds `|m<N>`. Only
+    /// the epoch was stripped, so every episode-2+ card failed to link to its
+    /// incident ("could not link it to any incident row", entity=fleet|…|e10).
+    #[test]
+    fn the_episode_and_magnitude_tags_are_stripped_before_the_epoch() {
+        for sig in [
+            "invariant|board.todo_is_reachable_by_dispatch|fleet|1793300324|e10",
+            "invariant|board.todo_is_reachable_by_dispatch|fleet|1793300324|e4|m49",
+            "invariant|board.todo_is_reachable_by_dispatch|fleet|1793300324",
+        ] {
+            assert_eq!(
+                invariant_signature_parts(sig),
+                Some(("board.todo_is_reachable_by_dispatch".into(), "fleet".into())),
+                "{sig}"
+            );
+        }
+        assert_eq!(
+            invariant_signature_parts("invariant|route.callers_have_routes|GET /api/x|y|1787569200|e2"),
+            Some(("route.callers_have_routes".into(), "GET /api/x|y".into())),
+            "a piped entity survives both tags"
+        );
+        // CONTROL: an entity segment that merely starts with the letter is kept.
+        assert_eq!(
+            invariant_signature_parts("invariant|session.x|mixpeek-studio|1787569200"),
+            Some(("session.x".into(), "mixpeek-studio".into()))
+        );
     }
 
     /// AMUX-4798: a RECURRENCE earns a new card; a continuing failure does not.
@@ -15732,6 +18422,31 @@ mod tests {
     /// shipped — 77 incidents frozen, still failing up to 25 days after their
     /// card was minted, including the one that pinned three lanes for four
     /// hours on 2026-09-18.
+    /// AMUX-5371. A streak that never ends kept one signature for good, so a
+    /// judged card silenced the workflow forever. The bucket moves the
+    /// signature on; the identity stays put so an open card still suppresses.
+    #[test]
+    fn a_still_red_workflow_refiles_after_its_card_is_judged() {
+        let runs = vec![
+            ci_run("rust", 901, "failure", 400.0),
+            ci_run("rust", 902, "failure", 300.0),
+        ];
+        let bucket_s = ci_refile_h() * 3600.0;
+        let t0 = 1_790_000_000.0_f64;
+        let now = (t0 / bucket_s).floor() * bucket_s + 10.0;
+        let a = ci_findings(&runs, now).0[0].signature.clone();
+        let same_bucket = ci_findings(&runs, now + 60.0).0[0].signature.clone();
+        let next_bucket = ci_findings(&runs, now + bucket_s).0[0].signature.clone();
+        assert_eq!(a, same_bucket, "one card per bucket, not per tick");
+        assert_ne!(a, next_bucket, "a judged card must not latch the workflow forever");
+        assert_eq!(
+            fault_identity(&a),
+            fault_identity(&next_bucket),
+            "an OPEN card for the streak suppresses every later bucket"
+        );
+        assert!(fault_identity(&a).is_some_and(|id| id.starts_with("ci|") && !id.ends_with('|')));
+    }
+
     #[test]
     fn a_reopened_incident_earns_a_new_card_and_a_continuing_one_does_not() {
         let id = "hooks.report_hook_matches_committed";
@@ -15758,7 +18473,11 @@ mod tests {
         // A REOPEN earns a new one. This is the case that was impossible
         // before: the incident row is reused and `first_seen` never moves, so
         // without the episode component these two are byte-identical.
-        assert_ne!(sig(1), sig(2), "a recurrence must not dedupe against the old card");
+        assert_ne!(
+            sig(1),
+            sig(2),
+            "a recurrence must not dedupe against the old card"
+        );
         assert_ne!(sig(2), sig(3), "and each later episode is distinct again");
         assert!(
             sig(2).starts_with(&sig(1)),
@@ -16003,12 +18722,18 @@ mod tests {
                          VALUES (?1,'GET',?2,?2,200,?3,'127.0.0.1','curl/8','','','native')",
                         rusqlite::params![ts, path, ms],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         };
-        let file_rollup = |st: &AppState, id: &'static str, status: &'static str,
-                           targets: String, created: i64| {
+        let file_rollup = |st: &AppState,
+                           id: &'static str,
+                           status: &'static str,
+                           targets: String,
+                           created: i64| {
             st.store
                 .write(move |conn| {
                     conn.execute(
@@ -16022,7 +18747,10 @@ mod tests {
                             format!("autofix:latency|outlier|ROLLUP|{targets}")
                         ],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         };
@@ -16044,8 +18772,9 @@ mod tests {
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         let per_endpoint = |f: &[Finding]| -> Vec<String> {
             f.iter()
-                .filter(|x| x.signature.starts_with("latency|outlier|")
-                    && !x.signature.contains("|ROLLUP|"))
+                .filter(|x| {
+                    x.signature.starts_with("latency|outlier|") && !x.signature.contains("|ROLLUP|")
+                })
                 .map(|x| x.signature.clone())
                 .collect()
         };
@@ -16057,7 +18786,13 @@ mod tests {
         );
 
         // Now the rollup that already reported both, filed AFTER them.
-        file_rollup(&st, "AMUX-T4701", "todo", format!("{A},{B}"), (now - 600.0) as i64);
+        file_rollup(
+            &st,
+            "AMUX-T4701",
+            "todo",
+            format!("{A},{B}"),
+            (now - 600.0) as i64,
+        );
         let (f2, s2) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
             per_endpoint(&f2).is_empty(),
@@ -16094,7 +18829,10 @@ mod tests {
         st.store
             .write(|conn| {
                 conn.execute("UPDATE issues SET status='done' WHERE id='AMUX-T4701'", [])?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         let (f3, _) = detect_latency(&st.store.read().unwrap(), now);
@@ -16122,7 +18860,9 @@ mod tests {
         //    card stays open.
         let rollup_at = now - 3600.0;
         let cov = vec![(
-            [A.to_string()].into_iter().collect::<std::collections::BTreeSet<_>>(),
+            [A.to_string()]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
             rollup_at,
         )];
         assert!(
@@ -16206,7 +18946,11 @@ mod window_scan_tests {
         );
         assert!(scan.covered, "the fixture spans the window");
         assert_eq!(scan.hits.len(), 1, "got {:?}", scan.hits);
-        assert!(scan.hits[0].contains("gmail batch transport error"), "{:?}", scan.hits);
+        assert!(
+            scan.hits[0].contains("gmail batch transport error"),
+            "{:?}",
+            scan.hits
+        );
         assert!(
             !scan.hits.iter().any(|h| h.contains("connector_auth")),
             "warns outside the window must not be reported: {:?}",
@@ -16235,12 +18979,12 @@ mod window_scan_tests {
     #[test]
     fn a_log_that_starts_after_the_window_is_not_covered() {
         let late: Vec<Vec<u8>> = breach_log().into_iter().skip(2).collect();
-        let scan = scan_lines_for_window(
-            late,
-            at("2026-09-18T04:37:33Z"),
-            at("2026-09-18T04:38:33Z"),
+        let scan =
+            scan_lines_for_window(late, at("2026-09-18T04:37:33Z"), at("2026-09-18T04:38:33Z"));
+        assert!(
+            !scan.covered,
+            "nothing at or before the window start was seen"
         );
-        assert!(!scan.covered, "nothing at or before the window start was seen");
     }
 
     /// Covered with no hits is a REAL answer and must read differently from
@@ -16249,13 +18993,28 @@ mod window_scan_tests {
     fn covered_and_empty_reads_differently_from_uncovered() {
         let start = at("2026-09-18T04:37:33Z");
         let end = at("2026-09-18T04:38:33Z");
-        let quiet = WindowScan { hits: vec![], covered: true, dropped: 0 };
-        let blind = WindowScan { hits: vec![], covered: false, dropped: 0 };
+        let quiet = WindowScan {
+            hits: vec![],
+            covered: true,
+            dropped: 0,
+            base_counts: Default::default(),
+            span: None,
+        };
+        let blind = WindowScan {
+            hits: vec![],
+            covered: false,
+            dropped: 0,
+            base_counts: Default::default(),
+            span: None,
+        };
         let quiet_s = logged_during_worst_request(&quiet, start, end);
         let blind_s = logged_during_worst_request(&blind, start, end);
         assert!(quiet_s.starts_with("none."), "{quiet_s}");
         assert!(blind_s.starts_with("NOT MEASURED"), "{blind_s}");
-        assert_ne!(quiet_s, blind_s, "an absence of warnings is not an absence of coverage");
+        assert_ne!(
+            quiet_s, blind_s,
+            "an absence of warnings is not an absence of coverage"
+        );
         assert!(
             blind_s.contains("not an absence of warnings"),
             "the uncovered branch must say what it could not do: {blind_s}"
@@ -16322,27 +19081,117 @@ mod window_scan_tests {
         );
     }
 
+    /// AMUX-4857. A line at its background rate and a line far above it must
+    /// NOT read the same. On AMUX-4852 eight identical warns inside a 14.4s
+    /// window looked like eight findings; the background rate predicted 9.3,
+    /// so the window was QUIETER than usual and the lines said nothing.
+    ///
+    /// Both arms in one cell on purpose. A test that only checks a rate is
+    /// PRINTED is exactly as green when the rate is computed over the wrong
+    /// window, which is the failure the card names.
+    #[test]
+    fn a_warn_above_its_background_reads_differently_from_one_at_it() {
+        // One hour of log. "chatty" fires every minute (60 total), "rare"
+        // fires 3 times in the hour. The window is the last 60s and holds
+        // one of each — so chatty is AT background and rare is ~20x above it.
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        for m in 0..60 {
+            lines.push(
+                format!("2026-09-18T04:{m:02}:05.000000Z  WARN noisy: chatty thing happened")
+                    .into_bytes(),
+            );
+        }
+        for m in [7u32, 23, 59] {
+            lines.push(
+                format!("2026-09-18T04:{m:02}:30.000000Z  WARN rareish: rare thing happened")
+                    .into_bytes(),
+            );
+        }
+        let start = at("2026-09-18T04:59:00Z");
+        let end = at("2026-09-18T05:00:00Z");
+        lines.push(
+            "2026-09-18T04:00:00.000000Z  INFO gen start"
+                .as_bytes()
+                .to_vec(),
+        );
+        lines.push(
+            "2026-09-18T05:00:30.000000Z  INFO gen end"
+                .as_bytes()
+                .to_vec(),
+        );
+
+        let scan = scan_lines_for_window(lines, start, end);
+        let out = logged_during_worst_request(&scan, start, end);
+
+        assert!(
+            out.contains("rare thing happened"),
+            "the rare line must appear at all: {out}"
+        );
+        // The discrimination itself.
+        let rare_line = out
+            .lines()
+            .skip_while(|l| !l.contains("rare thing happened"))
+            .nth(1)
+            .unwrap_or("");
+        let chatty_line = out
+            .lines()
+            .skip_while(|l| !l.contains("chatty thing happened"))
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            rare_line.contains("ABOVE background"),
+            "a warn ~20x its base rate must be called out as the lead, got {rare_line:?}\n{out}"
+        );
+        assert!(
+            chatty_line.contains("at or below background"),
+            "a warn AT its base rate must be named as noise, or it reads as a finding \
+             exactly like the AMUX-4852 case, got {chatty_line:?}\n{out}"
+        );
+        assert_ne!(
+            rare_line, chatty_line,
+            "the two must not print identically; that identity IS the defect"
+        );
+        // The denominator travels with the number (the card's second rule).
+        assert!(
+            out.contains("of log"),
+            "the period the rate is OVER must be stated: {out}"
+        );
+        // And the corpus caveat, so a quiet verdict is not read as silence.
+        assert!(
+            out.contains("WARN/ERROR ONLY"),
+            "the payload must say what corpus it scanned: {out}"
+        );
+    }
+
     /// The cap bounds what reaches the board, and `dropped` carries the rest
     /// rather than silently truncating.
     #[test]
     fn the_cap_reports_what_it_dropped() {
         let many: Vec<Vec<u8>> = (0..20)
-            .map(|i| format!("2026-09-18T04:38:{:02}.000000Z  WARN x: line {i}", i % 60).into_bytes())
+            .map(|i| {
+                format!("2026-09-18T04:38:{:02}.000000Z  WARN x: line {i}", i % 60).into_bytes()
+            })
             .chain(std::iter::once(
-                "2026-09-18T04:37:33.000000Z  INFO start".as_bytes().to_vec(),
+                "2026-09-18T04:37:33.000000Z  INFO start"
+                    .as_bytes()
+                    .to_vec(),
             ))
             .chain(std::iter::once(
                 "2026-09-18T04:38:33.000000Z  INFO end".as_bytes().to_vec(),
             ))
             .collect();
-        let scan = scan_lines_for_window(
-            many,
+        let scan =
+            scan_lines_for_window(many, at("2026-09-18T04:37:33Z"), at("2026-09-18T04:38:33Z"));
+        assert_eq!(scan.hits.len(), WINDOW_SCAN_CAP);
+        assert!(
+            scan.dropped > 0,
+            "the overflow must be counted, not dropped silently"
+        );
+        let s = logged_during_worst_request(
+            &scan,
             at("2026-09-18T04:37:33Z"),
             at("2026-09-18T04:38:33Z"),
         );
-        assert_eq!(scan.hits.len(), WINDOW_SCAN_CAP);
-        assert!(scan.dropped > 0, "the overflow must be counted, not dropped silently");
-        let s = logged_during_worst_request(&scan, at("2026-09-18T04:37:33Z"), at("2026-09-18T04:38:33Z"));
         assert!(s.contains("more, capped"), "{s}");
     }
 }

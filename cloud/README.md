@@ -17,7 +17,7 @@ deliberately does **not** recreate running workspaces. See
 
 | Path | What it is |
 |---|---|
-| `main.tf`, `variables.tf`, `outputs.tf`, `setup.sh`, `deploy.sh` | GCP single-VM box (`amux-dev`). **NOT migrated** — see below. |
+| `deploy-gateway.sh` | Manual gateway deploy over ssh to `$AMUX_CLOUD_HOST`, for when CI cannot be used. |
 | `setup-cloud.sh` | Bootstrap for the multi-tenant host: docker, nginx, certbot, the gateway systemd unit, `/etc/amux/gateway.env`. |
 | `gateway/gateway.py` | The auth + orchestration gateway. Host process, stays python. |
 | `gateway/nginx.conf` | TLS termination for `cloud.amux.io` → `127.0.0.1:8080` (the gateway). |
@@ -204,6 +204,23 @@ Required repo secrets: `CLOUD_SSH_KEY`, `STRIPE_SECRET_KEY`, `ANTHROPIC_API_KEY`
 `STRIPE_PLATFORM_FEE_PRICE_ID`, `STRIPE_PLATFORM_PRICE_ID`. `GITHUB_TOKEN` is
 automatic and is what pushes to ghcr.io.
 
+## Opening an instance's workers from a terminal
+
+A dedicated instance's dashboard sits behind its sign-in door, so `amux-remote`'s
+API token cannot reach it. An operator who can SSH in uses `amux-cloud`
+(installed by `make install-cli`), which runs everything over SSH as the box's
+`amux` user against its loopback API:
+
+```bash
+amux-cloud connect sandbox --key ~/.ssh/<your key>   # sandbox -> root@sandbox.amux.io, proves amux answers, saves it
+amux-cloud attach <worker>                           # the worker's terminal here (iTerm2 native tabs with -CC)
+amux-cloud ls | peek <worker> | send <worker> <text>
+amux-cloud -r <instance> <command>                   # another saved instance
+```
+
+Saved instances live in `~/.amux/remotes/<name>.env` (mode 600; `amux-remote
+remotes` lists them). Test: `scripts/test-amux-cloud.sh`.
+
 ## The python that is still here, and why
 
 None of these ever imported the python server; all are stdlib HTTP clients.
@@ -250,13 +267,12 @@ and every endpoint they call is routed on the rust server (checked against
 `gateway.py` stays python for the same reason: it is a host process that never
 runs customer code, and rewriting it was not part of the server cutover.
 
-## Not migrated: the single-VM GCP box
+## Removed: the GCP box
 
-`main.tf` + `setup.sh` + `deploy.sh` provision `amux-dev`, a one-machine
-Tailscale-only box whose systemd unit ran `python3 /opt/amux/amux-server.py`.
-That is a different topology from cloud.amux.io and it has **not** been ported.
-`deploy.sh` now refuses at its prerequisite check with the real reason rather
-than provisioning a VM whose service can never start; `--destroy` still works.
-
-Porting it is small: ship `target/release/amux-server` instead of the `.py` and
-change one `ExecStart`. Nobody has needed the box, so it has not been done.
+amux cloud runs on Hetzner. The GCP VM `amux-dev` (project
+`mixpeek-inference-463103`) is deleted for good, and the Terraform and scripts
+that created it (`main.tf`, `variables.tf`, `outputs.tf`, `setup.sh`,
+`deploy.sh`) were removed on 2026-10-12. A new host is bootstrapped with
+`setup-cloud.sh` (multi-tenant) or `desktop/bootstrap.sh` (one customer per
+box). `tests/no_gcp_cloud_provisioning.rs` fails the build if a path that
+creates a GCP instance comes back.

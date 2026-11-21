@@ -1,29 +1,28 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
   <title>amux vs Zed — AI Agent Orchestration vs Collaborative Code Editor (2026)</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="amux vs Zed: Zed is a fast, collaborative code editor with built-in AI. amux is an open-source control plane for running dozens of background AI coding agents simultaneously. They serve different needs — many engineers use both.">
+  <meta name="description" content="amux vs Zed: Zed is a fast, collaborative code editor with built-in AI. amux is a self-hosted control plane for running dozens of background AI coding agents simultaneously. They serve different needs — many engineers use both.">
   <meta name="keywords" content="amux vs zed, zed ai agent orchestration, zed vs claude code manager, zed alternative for ai agents, zed ai assistant vs agent orchestrator, background coding agents zed, zed editor multi-agent">
   <link rel="canonical" href="https://amux.io/compare/amux-vs-zed/">
   <meta property="og:title" content="amux vs Zed — AI Agent Orchestration vs Collaborative Code Editor (2026)">
-  <meta property="og:description" content="Zed is a fast, AI-assisted code editor. amux is an open-source fleet manager for dozens of parallel background agents. Here is when to use each — and why many engineers use both.">
+  <meta property="og:description" content="Zed is a fast, AI-assisted code editor. amux is a self-hosted fleet manager for dozens of parallel background agents. Here is when to use each — and why many engineers use both.">
   <meta property="og:url" content="https://amux.io/compare/amux-vs-zed/">
   <meta property="og:image" content="https://amux.io/og-image.png">
   <meta property="og:type" content="article">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="amux vs Zed — AI Agent Orchestration vs Collaborative Code Editor (2026)">
-  <meta name="twitter:description" content="Zed is a fast, AI-assisted code editor. amux is an open-source fleet manager for dozens of parallel background agents. Here is when to use each — and why many engineers use both.">
+  <meta name="twitter:description" content="Zed is a fast, AI-assisted code editor. amux is a self-hosted fleet manager for dozens of parallel background agents. Here is when to use each — and why many engineers use both.">
   <meta name="twitter:image" content="https://amux.io/og-image.png">
   <link rel="alternate" type="application/rss+xml" title="amux Blog" href="https://amux.io/blog/rss.xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
 
   <script type="application/ld+json">
   {
@@ -42,7 +41,7 @@
     "@context": "https://schema.org",
     "@type": "Article",
     "headline": "amux vs Zed — AI Agent Orchestration vs Collaborative Code Editor",
-    "description": "Zed is a fast, collaborative code editor with built-in AI assistance. amux is an open-source control plane for running a fleet of background AI coding agents simultaneously. They serve different needs — here is how they compare.",
+    "description": "Zed is a fast, collaborative code editor with built-in AI assistance. amux is a self-hosted control plane for running a fleet of background AI coding agents simultaneously. They serve different needs — here is how they compare.",
     "url": "https://amux.io/compare/amux-vs-zed/",
     "datePublished": "2026-07-09",
     "dateModified": "2026-08-29",
@@ -70,7 +69,7 @@
         "name": "Can Zed run background AI coding agents?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "No. Zed's AI assistant is a foreground tool — it works when you are actively in the editor, helping you write, explain, or refactor code interactively. It does not run headless background agents, does not self-heal crashed sessions, does not manage a task queue across multiple agents, and does not provide phone monitoring or iOS app visibility. For background agent orchestration — running 10-50 coding agents overnight while you sleep — you need a tool like amux."
+          "text": "No. Zed's AI assistant is a foreground tool — it works when you are actively in the editor, helping you write, explain, or refactor code interactively. It does not run headless background agents, does not manage a task queue across multiple agents, and does not provide phone monitoring or iOS app visibility. For background agent orchestration — running 10-50 coding agents overnight while you sleep — you need a tool like amux."
         }
       },
       {
@@ -86,7 +85,7 @@
         "name": "Does Zed support running multiple AI agents in parallel?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Zed does not support parallel background agent orchestration. Its AI assistant handles one conversation at a time within the editor session you are actively using. amux is designed specifically for running 10-50 agents simultaneously, with a shared kanban board, atomic task claiming so agents never duplicate work, and a self-healing watchdog that restarts crashed sessions automatically."
+          "text": "Zed does not support parallel background agent orchestration. Its AI assistant handles one conversation at a time within the editor session you are actively using. amux is designed specifically for running 10-50 agents simultaneously, with a shared kanban board, atomic task claiming so agents never duplicate work, and automatic resume after usage limits, with stall alerts when an agent stops."
         }
       },
       {
@@ -94,7 +93,7 @@
         "name": "What does amux offer that Zed does not?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "amux provides multi-session orchestration (10-50 parallel agents), headless background execution, a self-healing watchdog, built-in kanban board, phone/PWA monitoring, iOS app, multi-runtime support (Claude Code + Codex + Gemini CLI), built-in CRM and email, browser automation, and a scheduler. Zed provides a beautiful fast editor, real-time collaborative coding, and interactive AI assistance — none of which amux offers. They address entirely different parts of the developer workflow."
+          "text": "amux provides multi-session orchestration (10-50 parallel agents), headless background execution, usage-limit resume, built-in kanban board, phone/PWA monitoring, iOS app, multi-runtime support (Claude Code + Codex + Gemini CLI), built-in CRM and email, browser automation, and a scheduler. Zed provides a beautiful fast editor, real-time collaborative coding, and interactive AI assistance — none of which amux offers. They address entirely different parts of the developer workflow."
         }
       },
       {
@@ -116,43 +115,52 @@
     ]
   }
   </script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/compare/">Compare</a> <span class="sep">›</span> <span>amux vs Zed</span></div>
 
     <h1>amux vs Zed</h1>
-    <p class="subtitle">Zed is a beautiful, fast code editor with real-time collaborative AI — the tool you interact with while you write. amux is an open-source control plane for running dozens of background AI agents in parallel — the tool that works while you sleep. They are not competitors. Many engineers use both. <em>Updated August 2026.</em></p>
+    <p class="subtitle">Zed is a beautiful, fast code editor with real-time collaborative AI — the tool you interact with while you write. amux is a self-hosted control plane for running dozens of background AI agents in parallel — the tool that works while you sleep. They are not competitors. Many engineers use both. <em>Updated August 2026.</em></p>
 
     <!-- EXP-068: zed compare top-of-page green CTA -->
-    <div style="background:linear-gradient(135deg,#064e3b,#065f46);border:1px solid #059669;border-radius:10px;padding:1.25rem 1.5rem;margin:1.5rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem"
-         data-exp="EXP-068">
-      <div>
-        <div style="font-weight:600;color:#d1fae5;font-size:1rem;margin-bottom:0.25rem">Run your entire AI engineering team overnight — while Zed handles your active coding</div>
-        <div style="color:#a7f3d0;font-size:0.875rem">amux orchestrates dozens of Claude Code, Codex &amp; Gemini CLI agents in parallel — session cloning, phone monitoring, self-healing — open source, MIT licensed, 374+ stars.</div>
-      </div>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener"
-         onclick="if(window.posthog) posthog.capture('exp068_zed_compare_topofpage_cta_click', {page: window.location.pathname})"
-         style="display:inline-flex;align-items:center;gap:0.5rem;background:#059669;color:#fff;text-decoration:none;padding:0.625rem 1.25rem;border-radius:8px;font-size:0.9rem;font-weight:600;white-space:nowrap;flex-shrink:0">
-        View amux on GitHub ★
-      </a>
-    </div>
 
     <p><strong>Zed</strong> (zed.dev) is a high-performance, open-source code editor written in Rust. It is designed for speed and collaboration: instant startup, GPU-accelerated rendering, and a built-in AI "Assistant" panel that connects to Claude, GPT-4, and other models. Zed also supports real-time pair programming — multiple engineers can share a live editing session, with each person's cursor visible to the others. Zed is an editor you open, interact with, and actively use to write code.</p>
 
-    <p><strong>amux</strong> is an open-source control plane for running an AI engineering team from a single dashboard or your phone. It launches, monitors, and self-heals dozens of Claude Code, Codex, or Gemini CLI sessions simultaneously — all running headlessly in the background. Built-in kanban board with atomic task claiming, notes, CRM, Gmail API, browser automation, and Google Calendar sync. Single Rust binary, MIT licensed, zero external dependencies. amux is not an editor — it is the orchestration layer that lets you run background agents at scale while you do other things.</p>
+    <p><strong>amux</strong> is a self-hosted control plane for running an AI engineering team from a single dashboard or your phone. It launches and monitors dozens of Claude Code, Codex, or Gemini CLI sessions simultaneously — all running headlessly in the background. Built-in kanban board with atomic task claiming, notes, CRM, Gmail API, browser automation, and Google Calendar sync. Single Rust binary, MIT + Commons Clause, zero external dependencies. amux is not an editor — it is the orchestration layer that lets you run background agents at scale while you do other things.</p>
 
     <h2>At a Glance</h2>
     <div style="overflow-x:auto;margin:1.5rem 0;">
@@ -186,8 +194,8 @@
             <td style="padding:10px 16px;text-align:center;">No</td>
           </tr>
           <tr style="border-bottom:1px solid var(--border);">
-            <td style="padding:10px 16px;">Self-healing watchdog</td>
-            <td style="padding:10px 16px;text-align:center;">Yes (auto-restart, /compact)</td>
+            <td style="padding:10px 16px;">Recovery</td>
+            <td style="padding:10px 16px;text-align:center;">Resumes after usage limits; workers return after a macOS reboot; stall alerts</td>
             <td style="padding:10px 16px;text-align:center;">No</td>
           </tr>
           <tr style="border-bottom:1px solid var(--border);">
@@ -260,7 +268,7 @@
     <p>What Zed does not do: run code autonomously, execute tasks in the background, manage a queue of work across multiple agents, or continue working when you are not actively in the editor. Zed's AI is an interactive assistant, not an autonomous agent.</p>
 
     <h2>How amux Works</h2>
-    <p>amux runs on your machine or a cloud VM and manages a fleet of AI coding agents — Claude Code, Codex CLI, or Gemini CLI — all executing in the background inside tmux sessions. You define tasks on the shared kanban board, and agents pull tasks with atomic claiming so no two agents work on the same thing. A background watchdog monitors every session: it auto-compacts context overflow, auto-approves tool prompts (YOLO mode), restarts crashed sessions, and detects idle hangs.</p>
+    <p>amux runs on your machine or a cloud VM and manages a fleet of AI coding agents — Claude Code, Codex CLI, or Gemini CLI — all executing in the background inside tmux sessions. You define tasks on the shared kanban board, and agents pull tasks with atomic claiming so no two agents work on the same thing. amux monitors every session: it resumes agents after usage limits, auto-approves tool prompts (YOLO mode), lets you set Claude Code's compaction threshold, and flags stalled work.</p>
     <p>You monitor everything from a web dashboard at <code>https://localhost:8824</code>, from the iOS app, or from your phone via the PWA. Agents work while you sleep, commute, or focus on other things. amux is not an editor and does not change how you write code — it only manages the background work agents do on your behalf.</p>
 
     <h2>Which Should You Use?</h2>
@@ -310,7 +318,7 @@
 
     <details style="border:1px solid var(--border);border-radius:6px;padding:1rem;margin:0.8rem 0;">
       <summary style="cursor:pointer;font-weight:600;">Can Zed run background AI coding agents?</summary>
-      <p style="margin:0.8rem 0 0;">No. Zed's AI assistant is a foreground, interactive tool — it works when you are actively in the editor. It does not run headless background agents, does not self-heal crashed sessions, and does not manage a task queue across multiple agents. For background agent orchestration — running 10-50 coding agents overnight — you need a tool like amux.</p>
+      <p style="margin:0.8rem 0 0;">No. Zed's AI assistant is a foreground, interactive tool — it works when you are actively in the editor. It does not run headless background agents, and does not manage a task queue across multiple agents. For background agent orchestration — running 10-50 coding agents overnight — you need a tool like amux.</p>
     </details>
 
     <details style="border:1px solid var(--border);border-radius:6px;padding:1rem;margin:0.8rem 0;">
@@ -340,7 +348,7 @@
 
     <div class="cta-box">
       <h3>Run your AI engineering team from one dashboard</h3>
-      <p>amux is the open-source control plane for running a fleet of AI coding agents — Claude Code, Codex, Gemini CLI — simultaneously, with self-healing, kanban, Google Calendar sync, and iOS app monitoring. Single Rust binary, zero dependencies, MIT licensed.</p>
+      <p>amux is the self-hosted control plane for running a fleet of AI coding agents — Claude Code, Codex, Gemini CLI — simultaneously, with usage-limit resume, kanban, Google Calendar sync, and iOS app monitoring. Single Rust binary, zero dependencies, MIT + Commons Clause.</p>
       <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
@@ -358,51 +366,24 @@ amux serve  # → https://localhost:8824</code></pre>
       <a href="/compare/">All comparisons →</a>
     </p>
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-jules/">vs Jules</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-            <li><a href="/concierge/">Concierge</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>
 </html>

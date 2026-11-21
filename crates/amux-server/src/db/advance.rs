@@ -51,11 +51,26 @@ pub struct AdvanceOpts {
 pub enum AdvanceRefusal {
     NotFound,
     NoOp,
-    Stale { actual: String, expected: String },
-    GateBlocked { criteria: Vec<String>, source: String },
-    ContinuationMissing { verdict: bs::ContinuationVerdict },
-    WipLimitReached { limit: i64, current: i64 },
-    InvalidTransition { from: String, to: String, reason: String },
+    Stale {
+        actual: String,
+        expected: String,
+    },
+    GateBlocked {
+        criteria: Vec<String>,
+        source: String,
+    },
+    ContinuationMissing {
+        verdict: bs::ContinuationVerdict,
+    },
+    WipLimitReached {
+        limit: i64,
+        current: i64,
+    },
+    InvalidTransition {
+        from: String,
+        to: String,
+        reason: String,
+    },
     ArchivedImmutable,
 }
 
@@ -95,6 +110,37 @@ pub fn advance(
         return Ok(Err(AdvanceRefusal::ArchivedImmutable));
     }
 
+    // Terminal is terminal (amux_core::board::TaskStatus::is_terminal):
+    // verified, discarded and quarantined are left only by an attributed
+    // force, as core's `apply_transition` already requires. Before this the
+    // engine had no from-to check at all, so any caller could reopen a
+    // verified card (implicit state machines inventory 2026-10-31, #6).
+    if !opts.force {
+        if let Some(from) = bs::parse_status(&row.status).filter(|s| s.is_terminal()) {
+            if bs::parse_status(destination) != Some(from) {
+                tracing::warn!(card = %row.id, from = %row.status, to = %destination, actor = %actor,
+                    measured = true, n_considered = 1, verdict = "advance_terminal_exit_refused",
+                    "a terminal card is left only by a forced, attributed transition");
+                return Ok(Err(AdvanceRefusal::InvalidTransition {
+                    from: row.status.clone(),
+                    to: destination.to_string(),
+                    reason: "the card is terminal; leaving it needs force".into(),
+                }));
+            }
+        }
+    }
+
+    // Orchestration contract (AH-374): the one transition engine holds rule 2
+    // and 3 for every caller, not only the PATCH route. Before this, bulk
+    // moves, /api/verify, the orchestrator runtime and capture reconcile could
+    // move a contract lane's code card to done or verified with no server check.
+    if let Some(reason) = crate::api::contract::advance_gate(conn, &row, destination, actor, opts.force) {
+        return Ok(Err(AdvanceRefusal::InvalidTransition {
+            from: row.status.clone(),
+            to: destination.to_string(),
+            reason,
+        }));
+    }
     let from_raw = row.status.clone();
     let prev_holder = row.lease_owner.clone();
     let workflow = workflow_store::load_workflow(conn);
@@ -141,6 +187,46 @@ pub fn advance(
     }))
 }
 
+/// The harness closes a card it filed (or a stale one it owns the cleanup of).
+/// Goes through [`advance`] with force, so the lease is released, the attempt
+/// is recorded and the status-change event is emitted, which the raw
+/// `UPDATE issues SET status=...` these sites used did not do. `desc_note` is
+/// appended to the description after the move. A refusal (already terminal,
+/// archived, gone) is logged as `harness_close_refused` and returns None.
+pub fn harness_close(
+    conn: &Connection,
+    card: &str,
+    destination: &str,
+    actor: &str,
+    desc_note: Option<&str>,
+    log_line: &str,
+) -> Result<Option<AdvanceOutcome>, rusqlite::Error> {
+    let opts = AdvanceOpts {
+        force: true,
+        skip_continuation: true,
+        reason: Some(log_line.to_string()),
+        log_line: Some(log_line.to_string()),
+        ..Default::default()
+    };
+    match advance(conn, card, destination, actor, &opts)? {
+        Ok(out) => {
+            if let Some(note) = desc_note.filter(|n| !n.is_empty()) {
+                conn.execute(
+                    "UPDATE issues SET \"desc\" = COALESCE(\"desc\",'') || ?1 WHERE id = ?2",
+                    rusqlite::params![note, card],
+                )?;
+            }
+            Ok(Some(out))
+        }
+        Err(refusal) => {
+            tracing::warn!(card = %card, to = %destination, actor = %actor, refusal = ?refusal,
+                measured = true, n_considered = 1, verdict = "harness_close_refused",
+                "the harness could not close a card it owns");
+            Ok(None)
+        }
+    }
+}
+
 fn advance_typed(
     conn: &Connection,
     row: &mut IssueRow,
@@ -150,9 +236,21 @@ fn advance_typed(
     opts: &AdvanceOpts,
     workflow: &Option<BoardWorkflow>,
 ) -> Result<Result<(), AdvanceRefusal>, rusqlite::Error> {
-    if target == TaskStatus::NeedsYou && !bs::approval_type_allowed(row.session.as_deref(),row.ask_type.as_deref().unwrap_or("")) {
+    if target == TaskStatus::NeedsYou
+        && !bs::approval_type_allowed(
+            row.session.as_deref(),
+            row.ask_type.as_deref().unwrap_or(""),
+        )
+    {
         tracing::warn!(card=%row.id,verdict="approval_category_refused","transition refused by standing approval policy");
-        return Ok(Err(AdvanceRefusal::InvalidTransition{from:row.status.clone(),to:"needsyou".into(),reason:format!("approval category outside policy; allowed: {}",bs::approval_types(row.session.as_deref()).join(","))}));
+        return Ok(Err(AdvanceRefusal::InvalidTransition {
+            from: row.status.clone(),
+            to: "needsyou".into(),
+            reason: format!(
+                "approval category outside policy; allowed: {}",
+                bs::approval_types(row.session.as_deref()).join(",")
+            ),
+        }));
     }
     // Gate check: workflow gates are the authority when present, otherwise
     // the five-tier precedence trail.
@@ -204,7 +302,13 @@ fn advance_typed(
         }));
     }
 
-    apply_common(conn, row, &bs::status_to_db(target, &row.status), actor, opts)?;
+    apply_common(
+        conn,
+        row,
+        &bs::status_to_db(target, &row.status),
+        actor,
+        opts,
+    )?;
 
     // Gap 4: populate waiting_on when entering NeedsYou.
     if target == TaskStatus::NeedsYou && row.waiting_on.is_none() {
@@ -476,9 +580,7 @@ pub fn apply_status_side_effects(row: &mut IssueRow, destination: &str) {
         row.waiting_on = Some(waiting.to_string());
     }
     // Clear waiting_on when leaving NeedsYou.
-    if from_parsed == Some(TaskStatus::NeedsYou)
-        && target_typed != Some(TaskStatus::NeedsYou)
-    {
+    if from_parsed == Some(TaskStatus::NeedsYou) && target_typed != Some(TaskStatus::NeedsYou) {
         row.waiting_on = None;
     }
 }

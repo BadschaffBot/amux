@@ -13,13 +13,9 @@
 //! `info.total_token_usage` (cumulative). This reads the DELTA, keyed by the
 //! event's own `ordinal`, so a re-read cannot double-bill.
 //!
-//! Attribution is by working directory and only when it is unambiguous. Codex
-//! records `cwd` in its `session_meta`; a lane records the same path. When two
-//! lanes share one directory the row is left unattributed (`session = ''`),
-//! which the ledger already means as "counts toward fleet totals, owned by
-//! nobody". Charging a guess to a named lane is worse than charging nobody:
-//! the ledger is what the cost view bills, and AMUX-2612 already records what
-//! a wrong owner costs to unpick.
+//! Attribution prefers a validated native CLI session ID plus its recorded cwd.
+//! Directory-only fallback is allowed only when one worker owns the directory.
+//! Project workers share a checkout, so its path alone cannot identify a turn.
 use crate::db::SharedStore;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -49,7 +45,9 @@ fn rollout_files(root: &Path) -> Vec<PathBuf> {
         if depth > 3 {
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -75,23 +73,26 @@ fn rollout_files(root: &Path) -> Vec<PathBuf> {
 /// unprefixed collision would let one provider's cursor skip the other's file.
 /// It also makes a codex row identifiable in the ledger without a join.
 pub(crate) fn conversation_key(path: &Path) -> String {
-    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     // rollout-2026-09-09T14-12-21-<uuid>
-    let id = stem.rsplit_once("-").map(|(_, tail)| tail.to_string()).unwrap_or_default();
+    let id = stem
+        .rsplit_once("-")
+        .map(|(_, tail)| tail.to_string())
+        .unwrap_or_default();
     let id = if id.len() >= 12 { id } else { stem.clone() };
     format!("codex:{id}")
 }
 
 /// The `cwd` a rollout file was opened in, from its `session_meta` first line.
-pub(crate) fn rollout_cwd(path: &Path) -> Option<String> {
+fn rollout_identity(path: &Path) -> Option<serde_json::Value> {
     let f = std::fs::File::open(path).ok()?;
     let mut first = String::new();
     BufReader::new(f).read_line(&mut first).ok()?;
     let v: serde_json::Value = serde_json::from_str(&first).ok()?;
-    v.pointer("/payload/cwd")
-        .and_then(serde_json::Value::as_str)
-        .map(|s| s.trim_end_matches('/').to_string())
-        .filter(|s| !s.is_empty())
+    v.get("payload").cloned()
 }
 
 /// Parse `token_count` deltas after `offset`.
@@ -119,7 +120,9 @@ pub(crate) fn parse_codex_from(path: &Path, offset: u64) -> (u64, Vec<CodexTurn>
         if bytes.last() == Some(&b'\r') {
             bytes.pop();
         }
-        let Ok(e) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+        let Ok(e) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
         // The model is named by turn context events, not by `session_meta`.
         // Remember the most recent one: it is what the turns below were spent on.
         for key in ["/payload/model", "/model", "/payload/turn_context/model"] {
@@ -129,10 +132,15 @@ pub(crate) fn parse_codex_from(path: &Path, offset: u64) -> (u64, Vec<CodexTurn>
                 }
             }
         }
-        if e.pointer("/payload/type").and_then(serde_json::Value::as_str) != Some("token_count") {
+        if e.pointer("/payload/type")
+            .and_then(serde_json::Value::as_str)
+            != Some("token_count")
+        {
             continue;
         }
-        let Some(last) = e.pointer("/payload/info/last_token_usage") else { continue };
+        let Some(last) = e.pointer("/payload/info/last_token_usage") else {
+            continue;
+        };
         let n = |k: &str| last.get(k).and_then(serde_json::Value::as_i64).unwrap_or(0);
         // `input_tokens` INCLUDES the cached part (measured on a live rollout:
         // 58880 input of which 57344 cached), and `total_tokens` is input +
@@ -140,7 +148,12 @@ pub(crate) fn parse_codex_from(path: &Path, offset: u64) -> (u64, Vec<CodexTurn>
         // and must not be added again.
         let cache_read = n("cached_input_tokens");
         let fresh_input = (n("input_tokens") - cache_read).max(0);
-        let tokens = [fresh_input, cache_read, n("cache_write_input_tokens"), n("output_tokens")];
+        let tokens = [
+            fresh_input,
+            cache_read,
+            n("cache_write_input_tokens"),
+            n("output_tokens"),
+        ];
         if tokens.iter().all(|t| *t == 0) {
             continue;
         }
@@ -152,8 +165,16 @@ pub(crate) fn parse_codex_from(path: &Path, offset: u64) -> (u64, Vec<CodexTurn>
         else {
             continue;
         };
-        let ordinal = e.get("ordinal").and_then(serde_json::Value::as_i64).unwrap_or(-1);
-        out.push(CodexTurn { ts, ordinal, model: model.clone(), tokens });
+        let ordinal = e
+            .get("ordinal")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1);
+        out.push(CodexTurn {
+            ts,
+            ordinal,
+            model: model.clone(),
+            tokens,
+        });
     }
     (new_off, out)
 }
@@ -176,9 +197,174 @@ pub(crate) fn unambiguous_owners(workdirs: &BTreeMap<String, String>) -> HashMap
         .collect()
 }
 
+/// Prefer durable validated workspace identity over the configured parent clone.
+/// Retirement keeps both the workspace record and .env.reaped as provenance.
+pub(crate) fn workspace_workdirs(
+    home: &Path,
+    mut dirs: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if let Ok(entries) = std::fs::read_dir(home.join("workspaces")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !crate::api::session_verbs::valid_session_name(name) {
+                continue;
+            }
+            let Some(w) = crate::fanout_workspace::load(home, name) else {
+                continue;
+            };
+            let env = home.join("sessions").join(format!("{name}.env"));
+            let env = if env.exists() {
+                env
+            } else {
+                env.with_extension("env.reaped")
+            };
+            let settings = crate::config::parse_env_file(&env);
+            let worker_owned = w.path
+                == crate::fanout_workspace::expected_path(&w.repo, name).to_string_lossy()
+                && w.branch == format!("amux/fanout/{name}");
+            if !worker_owned
+                || !Path::new(&w.repo).is_absolute()
+                || w.base.len() != 40
+                || !w.base.bytes().all(|b| b.is_ascii_hexdigit())
+                || !settings.get("CC_DIR").is_some_and(|repo| {
+                    crate::fanout_workspace::same_repository(repo, &w.repo)
+                })
+            {
+                continue;
+            }
+            dirs.insert(name.into(), w.path);
+        }
+    }
+    dirs
+}
+
+/// Native events have already passed launch nonce, provider and sequence checks.
+/// Keep contradictory claims as None so a cwd fallback cannot override them.
+///
+/// Incremental (Mac hog RCA 20261014-112244, AMUX-5999): the full scan ran
+/// json_extract over every native_status row (384k on the live DB, over 200s)
+/// on each ledger pass. Pairs already seen are cached per database with the
+/// highest id read, and each pass reads only newer rows.
+type OwnerPairs = (i64, std::collections::BTreeSet<(String, String)>);
+static NATIVE_OWNER_CACHE: std::sync::Mutex<Option<(String, OwnerPairs)>> = std::sync::Mutex::new(None);
+
+fn native_owners(c: &rusqlite::Connection) -> rusqlite::Result<HashMap<String, Option<String>>> {
+    let db = c.path().unwrap_or("").to_string();
+    let max_id: i64 = c.query_row("SELECT coalesce(max(id),0) FROM session_events", [], |r| r.get(0))?;
+    let (mut since, mut pairs) = {
+        let g = NATIVE_OWNER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref() {
+            Some((path, (seen, p))) if !db.is_empty() && *path == db && *seen <= max_id => (*seen, p.clone()),
+            _ => (0, Default::default()),
+        }
+    };
+    let started = std::time::Instant::now();
+    let mut q = c.prepare("SELECT DISTINCT session,json_extract(data,'$.session_id') FROM session_events WHERE id > ?1 AND id <= ?2 AND type='session.native_status' AND json_valid(data) AND json_extract(data,'$.provider')='codex' AND json_extract(data,'$.event')='SessionStart' AND json_extract(data,'$.session_id')<>''")?;
+    let rows = q.query_map([since, max_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        pairs.insert(row?);
+    }
+    let ms = started.elapsed().as_millis() as u64;
+    if ms > 2000 {
+        tracing::warn!(target: "codex_ledger", verdict = "native_owners_slow", elapsed_ms = ms, rows_from = since,
+            measured = true, n_considered = pairs.len(), "native owner scan was slow");
+    }
+    since = max_id;
+    *NATIVE_OWNER_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((db, (since, pairs.clone())));
+    let mut owners = HashMap::<String, Option<String>>::new();
+    for (worker, id) in pairs {
+        owners
+            .entry(id)
+            .and_modify(|prior| {
+                if prior.as_deref() != Some(&worker) {
+                    *prior = None;
+                }
+            })
+            .or_insert(Some(worker));
+    }
+    Ok(owners)
+}
+
+fn rollout_owner(
+    path: &Path,
+    native: &HashMap<String, Option<String>>,
+    workdirs: &BTreeMap<String, String>,
+    directories: &HashMap<String, String>,
+) -> String {
+    let Some(meta) = rollout_identity(path) else {
+        return String::new();
+    };
+    let cwd = meta["cwd"].as_str().unwrap_or("").trim_end_matches('/');
+    let id = meta["id"]
+        .as_str()
+        .or_else(|| meta["session_id"].as_str())
+        .unwrap_or("");
+    if let Some(owner) = native.get(id) {
+        return owner
+            .as_ref()
+            .filter(|worker| {
+                workdirs
+                    .get(*worker)
+                    .is_some_and(|dir| dir.trim_end_matches('/') == cwd)
+            })
+            .cloned()
+            .unwrap_or_default();
+    }
+    directories.get(cwd).cloned().unwrap_or_default()
+}
+
+/// Read through the existing session index once; write only bounded exact row IDs.
+fn ownership_repairs(
+    c: &rusqlite::Connection,
+    owners: &[(String, String)],
+) -> rusqlite::Result<Vec<(i64, String)>> {
+    if owners.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut unique = HashMap::<String, Option<String>>::new();
+    for (conversation, owner) in owners {
+        unique
+            .entry(conversation.clone())
+            .and_modify(|prior| {
+                if prior.as_deref() != Some(owner.as_str()) {
+                    *prior = None;
+                }
+            })
+            .or_insert_with(|| Some(owner.clone()));
+    }
+    let owners: HashMap<_, _> = unique
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|v| (key, v)))
+        .collect();
+    if owners.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let conversations = serde_json::to_string(&owners.keys().collect::<Vec<_>>()).unwrap();
+    let mut q=c.prepare("SELECT id,conversation FROM token_ledger INDEXED BY idx_ledger_session WHERE session='' AND task='' AND conversation IN (SELECT value FROM json_each(?1)) ORDER BY id LIMIT 1000")?;
+    let rows = q.query_map([conversations], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    rows.map(|r| r.map(|(id, conversation)| (id, owners[&conversation].clone())))
+        .collect()
+}
+
 /// One pass over the codex rollouts. Returns how many ledger rows were written.
 pub async fn index_once(store: &SharedStore, home: &Path) -> anyhow::Result<usize> {
-    index_once_at(store, home, &codex_sessions_dir(), &crate::api::session_verbs::all_session_workdirs()).await
+    let workdirs = {
+        let home = home.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            workspace_workdirs(&home, crate::api::session_verbs::all_session_workdirs())
+        })
+        .await?
+    };
+    index_once_at(store, home, &codex_sessions_dir(), &workdirs).await
 }
 
 /// The pass with its roots injected, so a test drives a temp tree and a fixed
@@ -189,27 +375,101 @@ pub async fn index_once_at(
     sessions: &Path,
     workdirs: &BTreeMap<String, String>,
 ) -> anyhow::Result<usize> {
-    use super::token_ledger::{self, LedgerFileBatch, LedgerRow};
+    use super::token_ledger;
     if !sessions.is_dir() {
         return Ok(0);
     }
+    // On a blocking thread for the reason token_ledger::index_once_at gives.
+    let (table, batches, repairs) = {
+        let store = store.clone();
+        let home = home.to_path_buf();
+        let sessions = sessions.to_path_buf();
+        let workdirs = workdirs.clone();
+        tokio::task::spawn_blocking(move || scan_rollouts(&store, &home, &sessions, &workdirs))
+            .await??
+    };
+
+    token_ledger::warn_unpriced("codex", &table, &batches);
+    let inserted = token_ledger::commit_ledger_batch(store, batches).await?;
+    let repairs = store
+        .read_async(move |c| Ok(ownership_repairs(c, &repairs)?))
+        .await?;
+    let repaired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = repaired.clone();
+    if !repairs.is_empty() {
+        store
+            .write_async(move |c| {
+                let mut n = 0;
+                for (id, lane) in repairs {
+                    n += c.execute(
+                        "UPDATE token_ledger SET session=?2 WHERE id=?1 AND session='' AND task=''",
+                        rusqlite::params![id, lane],
+                    )?;
+                }
+                count.store(n, std::sync::atomic::Ordering::Relaxed);
+                if n > 0 {
+                    tracing::info!(
+                        measured = true,
+                        n_considered = n,
+                        verdict = "codex_workspace_usage_recovered",
+                        "unowned exact-match rollout rows assigned from durable workspace identity"
+                    );
+                }
+                Ok(crate::db::WriteOutcome {
+                    applied: n > 0,
+                    events: vec![],
+                })
+            })
+            .await?;
+    }
+    let recovered = repaired.load(std::sync::atomic::Ordering::Relaxed);
+    if recovered > 0 {
+        tracing::info!(verdict="codex_usage_owner_recovered", rows=recovered,
+            "bound previously unowned usage to validated CLI sessions");
+    }
+    if inserted > 0 || recovered > 0 {
+        token_ledger::attribute_tasks(store).await?;
+    }
+    Ok(inserted)
+}
+
+type RolloutScan = (
+    Vec<(String, [f64; 4])>,
+    Vec<super::token_ledger::LedgerFileBatch>,
+    Vec<(String, String)>,
+);
+
+/// The cursors, the walk and the parse: blocking by nature.
+fn scan_rollouts(
+    store: &SharedStore,
+    home: &Path,
+    sessions: &Path,
+    workdirs: &BTreeMap<String, String>,
+) -> anyhow::Result<RolloutScan> {
+    use super::token_ledger::{self, LedgerFileBatch, LedgerRow};
     let table = token_ledger::prices(home);
     let owners = unambiguous_owners(workdirs);
+    let native = {
+        let conn = store.read()?;
+        native_owners(&conn)?
+    };
     let cursors = token_ledger::read_cursors(store)?;
 
     let mut batches: Vec<LedgerFileBatch> = Vec::new();
+    let mut repairs = Vec::new();
     for path in rollout_files(sessions) {
         let conversation = conversation_key(&path);
         let Ok(meta) = path.metadata() else { continue };
         let size = meta.len();
         let offset = cursors.get(&conversation).copied().unwrap_or(0);
-        if offset >= size {
+        let lane = rollout_owner(&path, &native, workdirs, &owners);
+        if !lane.is_empty() {
+            repairs.push((conversation.clone(), lane.clone()));
+        }
+        if offset == size {
             continue;
         }
         let offset = if offset > size { 0 } else { offset };
-        let lane = rollout_cwd(&path)
-            .and_then(|cwd| owners.get(&cwd).cloned())
-            .unwrap_or_default();
         let mtime = meta
             .modified()
             .ok()
@@ -235,15 +495,15 @@ pub async fn index_once_at(
                 }
             })
             .collect();
-        batches.push(LedgerFileBatch { conversation, offset: new_off, mtime, rows });
+        batches.push(LedgerFileBatch {
+            conversation,
+            offset: new_off,
+            mtime,
+            rows,
+        });
     }
 
-    token_ledger::warn_unpriced("codex", &table, &batches);
-    let inserted = token_ledger::commit_ledger_batch(store, batches).await?;
-    if inserted > 0 {
-        token_ledger::attribute_tasks(store).await?;
-    }
-    Ok(inserted)
+    Ok((table, batches, repairs))
 }
 
 #[cfg(test)]
@@ -253,13 +513,20 @@ mod tests {
     fn store() -> SharedStore {
         let dir = tempfile::tempdir().unwrap();
         let st = crate::db::Store::open(&dir.path().join("codex-ledger-test.db")).unwrap();
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         std::sync::Arc::new(st)
     }
 
     /// One `token_count` event in the shape codex actually writes (copied from a
     /// live rollout on this box, trimmed).
-    fn token_count(ordinal: i64, ts: &str, input: i64, cached: i64, cache_write: i64, output: i64) -> String {
+    fn token_count(
+        ordinal: i64,
+        ts: &str,
+        input: i64,
+        cached: i64,
+        cache_write: i64,
+        output: i64,
+    ) -> String {
         format!(
             r#"{{"timestamp":"{ts}","ordinal":{ordinal},"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":999999,"cached_input_tokens":0,"output_tokens":999}},"last_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"cache_write_input_tokens":{cache_write},"output_tokens":{output},"reasoning_output_tokens":{reasoning},"total_tokens":{total}}},"model_context_window":258400}}}}}}"#,
             reasoning = output / 3,
@@ -296,14 +563,25 @@ mod tests {
         let p = rollout(dir.path(), "/Users/ethan/Dev/amux", &body);
 
         let (off, turns) = parse_codex_from(&p, 0);
-        assert_eq!(turns.len(), 1, "the zero-token event is not a ledger row: {turns:?}");
+        assert_eq!(
+            turns.len(),
+            1,
+            "the zero-token event is not a ledger row: {turns:?}"
+        );
         let t = &turns[0];
         assert_eq!(t.tokens, [1536, 57344, 0, 390],
             "fresh input is input_tokens minus the cached part, and output is not summed with reasoning");
-        assert_eq!(t.model, "gpt-5-codex", "the model comes from the turn context, not session_meta");
+        assert_eq!(
+            t.model, "gpt-5-codex",
+            "the model comes from the turn context, not session_meta"
+        );
         assert_eq!(t.ordinal, 2);
         assert_eq!(t.ts, 1789466402);
-        assert_eq!(off, std::fs::metadata(&p).unwrap().len(), "the cursor lands on the end of the file");
+        assert_eq!(
+            off,
+            std::fs::metadata(&p).unwrap().len(),
+            "the cursor lands on the end of the file"
+        );
 
         // Resuming from that cursor finds nothing: the same turn cannot be
         // billed twice by a second pass.
@@ -322,8 +600,14 @@ mod tests {
         dirs.insert("solo".to_string(), "/Users/ethan/Dev/solo".to_string());
         dirs.insert("nowhere".to_string(), String::new());
         let owners = unambiguous_owners(&dirs);
-        assert_eq!(owners.get("/Users/ethan/Dev/solo"), Some(&"solo".to_string()));
-        assert!(!owners.contains_key("/Users/ethan/Dev/amux"), "two lanes, no owner: {owners:?}");
+        assert_eq!(
+            owners.get("/Users/ethan/Dev/solo"),
+            Some(&"solo".to_string())
+        );
+        assert!(
+            !owners.contains_key("/Users/ethan/Dev/amux"),
+            "two lanes, no owner: {owners:?}"
+        );
         assert!(!owners.contains_key(""), "an empty workdir owns nothing");
     }
 
@@ -341,24 +625,48 @@ mod tests {
         );
         rollout(sessions.path(), "/Users/ethan/Dev/amux", &body);
         let mut workdirs = BTreeMap::new();
-        workdirs.insert("amux-research".to_string(), "/Users/ethan/Dev/amux".to_string());
+        workdirs.insert(
+            "amux-research".to_string(),
+            "/Users/ethan/Dev/amux".to_string(),
+        );
 
         let st = store();
-        let n = index_once_at(&st, home.path(), sessions.path(), &workdirs).await.unwrap();
+        let n = index_once_at(&st, home.path(), sessions.path(), &workdirs)
+            .await
+            .unwrap();
         assert_eq!(n, 2);
         {
             let conn = st.read().unwrap();
             let rows: Vec<(String, String, String, i64, i64, i64, String)> = conn
-                .prepare("SELECT session, conversation, model, input, cache_read, output, message_id \
-                          FROM token_ledger ORDER BY ts")
+                .prepare(
+                    "SELECT session, conversation, model, input, cache_read, output, message_id \
+                          FROM token_ledger ORDER BY ts",
+                )
                 .unwrap()
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                })
                 .unwrap()
                 .flatten()
                 .collect();
             assert_eq!(rows.len(), 2, "{rows:?}");
-            assert_eq!(rows[0].0, "amux-research", "charged to the lane working in that cwd");
-            assert!(rows[0].1.starts_with("codex:"), "the conversation says which provider it came from: {}", rows[0].1);
+            assert_eq!(
+                rows[0].0, "amux-research",
+                "charged to the lane working in that cwd"
+            );
+            assert!(
+                rows[0].1.starts_with("codex:"),
+                "the conversation says which provider it came from: {}",
+                rows[0].1
+            );
             assert_eq!(rows[0].2, "gpt-5-codex");
             assert_eq!((rows[0].3, rows[0].4, rows[0].5), (600, 400, 50));
             assert_eq!(rows[0].6, "ord:2");
@@ -366,11 +674,15 @@ mod tests {
         }
 
         // Idempotent: the cursor holds, and re-running bills nothing again.
-        let again = index_once_at(&st, home.path(), sessions.path(), &workdirs).await.unwrap();
+        let again = index_once_at(&st, home.path(), sessions.path(), &workdirs)
+            .await
+            .unwrap();
         assert_eq!(again, 0, "a second pass must not re-bill the same turns");
         let conn = st.read().unwrap();
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r.get::<_, i64>(0)).unwrap(),
+            conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
             2
         );
     }
@@ -381,16 +693,219 @@ mod tests {
     async fn an_unknown_working_directory_still_reaches_the_ledger_unowned() {
         let home = tempfile::tempdir().unwrap();
         let sessions = tempfile::tempdir().unwrap();
-        rollout(sessions.path(), "/somewhere/nobody/owns",
-            &format!("{}\n", token_count(2, "2026-09-15T10:00:02.000Z", 500, 0, 0, 10)));
+        rollout(
+            sessions.path(),
+            "/somewhere/nobody/owns",
+            &format!(
+                "{}\n",
+                token_count(2, "2026-09-15T10:00:02.000Z", 500, 0, 0, 10)
+            ),
+        );
         let st = store();
-        let n = index_once_at(&st, home.path(), sessions.path(), &BTreeMap::new()).await.unwrap();
+        let n = index_once_at(&st, home.path(), sessions.path(), &BTreeMap::new())
+            .await
+            .unwrap();
         assert_eq!(n, 1);
         let conn = st.read().unwrap();
         let (session, input): (String, i64) = conn
-            .query_row("SELECT session, input FROM token_ledger", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row("SELECT session, input FROM token_ledger", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(session, "", "unowned, not dropped and not guessed");
         assert_eq!(input, 500);
+    }
+    #[test]
+    fn native_owners_reads_only_new_rows_and_keeps_earlier_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = rusqlite::Connection::open(dir.path().join("o.db")).unwrap();
+        c.execute_batch("CREATE TABLE session_events(id INTEGER PRIMARY KEY, ts REAL, session TEXT, type TEXT, data TEXT, source TEXT);").unwrap();
+        let add = |w: &str, sid: &str| {
+            c.execute("INSERT INTO session_events(ts,session,type,data) VALUES(1,?1,'session.native_status',?2)",
+                rusqlite::params![w, serde_json::json!({"provider":"codex","event":"SessionStart","session_id":sid}).to_string()]).unwrap();
+        };
+        add("a", "s1");
+        assert_eq!(native_owners(&c).unwrap().get("s1"), Some(&Some("a".to_string())));
+        add("b", "s2");
+        let o = native_owners(&c).unwrap();
+        assert_eq!(o.get("s1"), Some(&Some("a".to_string())), "earlier claim survives the incremental pass");
+        assert_eq!(o.get("s2"), Some(&Some("b".to_string())), "new claim is read");
+        add("c", "s1");
+        assert_eq!(native_owners(&c).unwrap().get("s1"), Some(&None), "a contradiction still reads as unowned");
+    }
+    #[tokio::test]
+    async fn shared_checkout_usage_uses_native_identity_and_recovers_unowned_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let st = store();
+        let dirs = BTreeMap::from([
+            ("first".into(), "/project/checkout".into()),
+            ("second".into(), "/project/checkout".into()),
+        ]);
+        let p = rollout(
+            sessions.path(),
+            "/project/checkout",
+            &format!(
+                "{}\n",
+                token_count(2, "2026-09-15T10:00:02.000Z", 500, 0, 0, 10)
+            ),
+        );
+        index_once_at(&st, home.path(), sessions.path(), &dirs)
+            .await
+            .unwrap();
+        st.write(|c| {
+            c.execute("INSERT INTO session_events(ts,session,type,data,source) VALUES(1,'first','session.native_status',?1,'native-hook')",
+                [serde_json::json!({"provider":"codex","event":"SessionStart","session_id":"019a4580-abd6-7153-993c-217e6941ea1d"}).to_string()])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        index_once_at(&st, home.path(), sessions.path(), &dirs)
+            .await
+            .unwrap();
+        let c = st.read().unwrap();
+        let (owner, count, tokens): (String, i64, i64) = c
+            .query_row(
+                "SELECT session,count(*),sum(input+output) FROM token_ledger",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((owner, count, tokens), ("first".into(), 1, 510));
+        let mut native = native_owners(&c).unwrap();
+        let directories = unambiguous_owners(&dirs);
+        assert_eq!(rollout_owner(&p, &native, &dirs, &directories), "first");
+        let wrong_dirs = BTreeMap::from([("first".into(), "/foreign".into())]);
+        assert_eq!(rollout_owner(&p, &native, &wrong_dirs, &directories), "");
+        native.insert("019a4580-abd6-7153-993c-217e6941ea1d".into(), None);
+        assert_eq!(rollout_owner(&p, &native, &dirs, &directories), "");
+    }
+
+    #[tokio::test]
+    async fn workspace_owners_survive_retirement_and_recover_exact_unowned_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let mut parent_dirs = BTreeMap::new();
+        for (name, suffix) in [("active", "env"), ("retired", "env.reaped")] {
+            let w = crate::fanout_workspace::Workspace {
+                repo: "/parent/clone".into(),
+                path: crate::fanout_workspace::expected_path("/parent/clone", name)
+                    .to_string_lossy()
+                    .into(),
+                branch: format!("amux/fanout/{name}"),
+                base: "a".repeat(40),
+            };
+            crate::fanout_workspace::save(home.path(), name, &w).unwrap();
+            std::fs::write(
+                home.path()
+                    .join("sessions")
+                    .join(format!("{name}.{suffix}")),
+                "CC_DIR=/parent/clone\n",
+            )
+            .unwrap();
+            parent_dirs.insert(name.into(), w.repo);
+        }
+        let dirs = workspace_workdirs(home.path(), parent_dirs);
+        assert_eq!(dirs.len(), 2);
+        assert_ne!(dirs["active"], dirs["retired"]);
+        assert!(!unambiguous_owners(&dirs).contains_key("/parent/clone"));
+        let st = store();
+        rollout(
+            sessions.path(),
+            &dirs["retired"],
+            &format!(
+                "{}\n",
+                token_count(2, "2026-09-15T10:00:02.000Z", 500, 0, 0, 10)
+            ),
+        );
+        assert_eq!(
+            index_once_at(&st, home.path(), sessions.path(), &BTreeMap::new())
+                .await
+                .unwrap(),
+            1
+        );
+        let mut ambiguous = dirs.clone();
+        ambiguous.insert("other".into(), dirs["retired"].clone());
+        index_once_at(&st, home.path(), sessions.path(), &ambiguous)
+            .await
+            .unwrap();
+        assert_eq!(
+            st.read()
+                .unwrap()
+                .query_row("SELECT session FROM token_ledger", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            ""
+        );
+        index_once_at(&st, home.path(), sessions.path(), &dirs)
+            .await
+            .unwrap();
+        index_once_at(&st, home.path(), sessions.path(), &dirs)
+            .await
+            .unwrap();
+        let c = st.read().unwrap();
+        let row: (String, String, i64) = c
+            .query_row("SELECT session,task,count(*) FROM token_ledger", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            row,
+            ("retired".into(), "".into(), 1),
+            "ownership repair neither double bills nor invents a claim window"
+        );
+        std::fs::write(home.path().join("sessions/active.env"), "CC_DIR=/foreign\n").unwrap();
+        assert!(!workspace_workdirs(home.path(), BTreeMap::new()).contains_key("active"));
+    }
+
+    #[tokio::test]
+    async fn codex_ownership_repair_skips_unchanged_rows_and_admits_new_owners() {
+        let st = store();
+        st.write(|c| {
+            for (conversation, session) in [("one", ""), ("two", ""), ("foreign", "fixed")] {
+                c.execute(
+                    "INSERT INTO token_ledger(ts,session,conversation,input) VALUES(1,?1,?2,10)",
+                    rusqlite::params![session, conversation],
+                )?;
+            }
+            let first = vec![
+                ("one".into(), "owner".into()),
+                ("foreign".into(), "wrong".into()),
+            ];
+            let rows = ownership_repairs(c, &first)?;
+            assert_eq!(rows.len(), 1);
+            for (id, owner) in rows {
+                c.execute(
+                    "UPDATE token_ledger SET session=?2 WHERE id=?1",
+                    rusqlite::params![id, owner],
+                )?;
+            }
+            assert!(
+                ownership_repairs(c, &first)?.is_empty(),
+                "unchanged pass does not enter writer"
+            );
+            let later = vec![
+                ("one".into(), "owner".into()),
+                ("two".into(), "retired-owner".into()),
+            ];
+            let rows = ownership_repairs(c, &later)?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].1, "retired-owner");
+            assert!(
+                ownership_repairs(
+                    c,
+                    &[
+                        ("two".into(), "first".into()),
+                        ("two".into(), "second".into())
+                    ]
+                )?
+                .is_empty(),
+                "ambiguous conversation ownership refused"
+            );
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
+        })
+        .unwrap();
     }
 }

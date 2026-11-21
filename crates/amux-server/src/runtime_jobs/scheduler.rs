@@ -21,15 +21,12 @@
 //!
 //! # Dual-scheduler safety (see runtime_jobs/mod.rs for the full statement)
 //!
-//! ONLY the Python server fires schedules until `AMUX_RS_SCHEDULER=1` is
-//! set. With firing disabled, [`run_scheduler`] runs in SHADOW MODE: it
-//! computes due schedules and journals `Other("schedule_shadow")` events
-//! into `_amux_state_events` — never touching `schedules`/`schedule_runs` —
-//! so Phase 11 can diff shadow events against Python's actual fires. Even
-//! with firing enabled, each fire re-checks the row inside the write
-//! transaction, so an occurrence Python already advanced is not re-fired.
-//! NOTE: enabling `AMUX_RS_SCHEDULER=1` while the Python scheduler is also
-//! running is the double-fire configuration; don't.
+//! Firing is ON by default. `AMUX_RS_SCHEDULER=0` selects SHADOW MODE, a
+//! leftover of the Python cutover: [`run_scheduler`] computes due schedules
+//! and journals `Other("schedule_shadow")` events into `_amux_state_events`,
+//! never touching `schedules`/`schedule_runs`. Each real fire re-checks the
+//! row inside the write transaction, so an occurrence already advanced by
+//! another writer is not re-fired.
 //!
 //! # Timezone semantics
 //!
@@ -66,12 +63,28 @@ pub const CATCH_UP_CAP: usize = 10;
 /// exact count — an announced omission, not a silent one.
 pub const SCAN_LIMIT: usize = 1000;
 
-/// Is real firing enabled? Anything but the literal `1` is shadow mode.
+/// Is real firing enabled? ON unless `AMUX_RS_SCHEDULER` says off.
 /// Read per-call (not cached) so a test or operator change is honored
 /// without a restart; [`run_scheduler`] still takes `enabled` explicitly so
 /// the loop's mode is decided once, visibly, by its caller.
+///
+/// The default was OFF while the Python server owned firing, to avoid a
+/// double fire. Python was deleted at 792ce1f and the default stayed, so
+/// every install that had not copied `AMUX_RS_SCHEDULER=1` into its env,
+/// every amux Cloud server included, accepted schedules and never ran one
+/// (amux-cloud e2e, 2026-10-18: `every 1m`, run_count 0 after four minutes).
 pub fn firing_enabled() -> bool {
-    std::env::var("AMUX_RS_SCHEDULER").map(|v| v == "1").unwrap_or(false)
+    firing_from(std::env::var("AMUX_RS_SCHEDULER").ok().as_deref())
+}
+
+/// The parse behind [`firing_enabled`], separate so tests need no env var.
+/// `0`, `false`, `off` and `no` (any case) select shadow mode; anything
+/// else, unset included, fires for real.
+pub fn firing_from(v: Option<&str>) -> bool {
+    !matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -108,9 +121,25 @@ pub enum RunOutcome {
     /// Delivery was attempted and failed.
     Failed { reason: String },
     /// A `kind=shell` command ran to completion.
-    ShellOk { note: Option<String> },
+    ShellOk {
+        note: Option<String>,
+        output: Option<ShellOutput>,
+    },
     /// A `kind=shell` command failed (non-zero exit, or an exit_actions alert).
-    ShellError { note: String },
+    ShellError {
+        note: String,
+        output: Option<ShellOutput>,
+    },
+}
+
+/// What a finished shell run leaves on its run row (AMUX-5241): the exit code
+/// and the tail of stdout+stderr in arrival order, shell-startup noise removed.
+/// `None` on the outcome means the process never produced one (spawn failure,
+/// or an outcome built by a caller that has no subprocess).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOutput {
+    pub exit_code: i32,
+    pub tail: String,
 }
 
 impl RunOutcome {
@@ -139,6 +168,15 @@ impl RunOutcome {
         }
     }
 
+    /// The steering queue row a `Queued` run waits in. Stored on the run so
+    /// the delivery can mark the run delivered (0102).
+    pub fn queue_id(&self) -> Option<&str> {
+        match self {
+            RunOutcome::Queued { queue_id, .. } if !queue_id.is_empty() => Some(queue_id),
+            _ => None,
+        }
+    }
+
     /// `verify_submitted`'s verdict, for the paths that have one. `None` is a
     /// real answer (shell runs never submit anything to a session) and must not
     /// be rendered as a confident value.
@@ -161,8 +199,8 @@ impl RunOutcome {
             }
             RunOutcome::Refused { reason } => Some(format!("refused: {reason}")),
             RunOutcome::Failed { reason } => Some(format!("delivery failed: {reason}")),
-            RunOutcome::ShellOk { note } => note.clone(),
-            RunOutcome::ShellError { note } => Some(note.clone()),
+            RunOutcome::ShellOk { note, .. } => note.clone(),
+            RunOutcome::ShellError { note, .. } => Some(note.clone()),
         }
     }
 
@@ -170,7 +208,10 @@ impl RunOutcome {
     /// FALSE here — it is pending, and a caller that treats pending as done is
     /// the bug this type exists to prevent.
     pub fn landed(&self) -> bool {
-        matches!(self, RunOutcome::Delivered { .. } | RunOutcome::ShellOk { .. })
+        matches!(
+            self,
+            RunOutcome::Delivered { .. } | RunOutcome::ShellOk { .. }
+        )
     }
 
     /// The reason a run did not land, for surfacing beside `last_delivery` on
@@ -180,13 +221,21 @@ impl RunOutcome {
     /// the field name itself carries that context there.
     pub fn refusal_reason(&self) -> Option<String> {
         match self {
-            RunOutcome::Refused { reason } | RunOutcome::Failed { reason } => {
-                Some(reason.clone())
+            RunOutcome::Refused { reason } | RunOutcome::Failed { reason } => Some(reason.clone()),
+            RunOutcome::ShellError { note, .. } => Some(note.clone()),
+            RunOutcome::Delivered { .. }
+            | RunOutcome::Queued { .. }
+            | RunOutcome::ShellOk { .. } => None,
+        }
+    }
+
+    /// The shell run's exit code and output tail, for the run row.
+    pub fn shell_output(&self) -> Option<&ShellOutput> {
+        match self {
+            RunOutcome::ShellOk { output, .. } | RunOutcome::ShellError { output, .. } => {
+                output.as_ref()
             }
-            RunOutcome::ShellError { note } => Some(note.clone()),
-            RunOutcome::Delivered { .. } | RunOutcome::Queued { .. } | RunOutcome::ShellOk { .. } => {
-                None
-            }
+            _ => None,
         }
     }
 
@@ -245,6 +294,64 @@ pub trait Deliverer: Send + Sync {
     /// session can tell a run-now from the 9am fire in its own terminal rather
     /// than by polling an endpoint (AMUX-1998).
     async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome;
+
+    /// Finish a shell run a previous server process started (see
+    /// [`reconcile_shell_runs_at_startup`]). `None`: this deliverer cannot
+    /// adopt runs, and the row is recorded as lost.
+    async fn adopt_shell(
+        &self,
+        _sched: &DurableSchedule,
+        _files: super::shell_detached::RunFiles,
+        _meta: super::shell_detached::RunMeta,
+    ) -> Option<RunOutcome> {
+        None
+    }
+
+    /// When the plan window the background reserve gates on will reset, if
+    /// amux has seen it. A reserve refusal aims its retry here. Overridable so
+    /// tests inject a reset instead of reading the process-wide reading.
+    fn window_reset(&self) -> Option<DateTime<chrono::Utc>> {
+        crate::api::usage::window_reset_known()
+    }
+}
+
+/// The fallback retry step for a reserve-refused one-off when no future
+/// window reset is known.
+pub const RESERVE_RETRY_FALLBACK_MINUTES: i64 = 15;
+
+/// Where a reserve-refused fire should retry, and which basis chose it.
+///
+/// A known reset still in the future wins: nothing can lift the reserve before
+/// the window resets, so polling every 15 minutes only spends refusals. The
+/// target is the reset plus 30 to 90 seconds of jitter (spread per schedule so
+/// a fleet of refused rows does not land on the new window in one tick),
+/// rounded UP to the minute because `next_run` has minute resolution and a
+/// rounded-down minute could fire before the reset. An unknown or already
+/// passed reset keeps the 15-minute fallback.
+pub fn reserve_retry_target(
+    sid: &str,
+    now: DateTime<Local>,
+    reset: Option<DateTime<chrono::Utc>>,
+) -> (DateTime<Local>, &'static str) {
+    match reset.filter(|r| *r > now.with_timezone(&chrono::Utc)) {
+        Some(r) => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (sid, r.timestamp()).hash(&mut h);
+            let jitter = 30 + (h.finish() % 61) as i64;
+            let t = (r + ChronoDuration::seconds(jitter)).with_timezone(&Local);
+            let floor = t
+                .with_second(0)
+                .and_then(|x| x.with_nanosecond(0))
+                .unwrap_or(t);
+            let ceil = if floor < t { floor + ChronoDuration::minutes(1) } else { floor };
+            (ceil, "reserve_retry_at_reset")
+        }
+        None => (
+            now + ChronoDuration::minutes(RESERVE_RETRY_FALLBACK_MINUTES),
+            "reserve_retry_fallback_15m",
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,22 +378,92 @@ pub struct ExprParseError(pub String);
 /// - `monthly on N at HH:MM` (N in 1..=28, like Python — day 29-31 is
 ///   rejected rather than silently drifting on short months)
 /// - 5-field cron `MIN HOUR DOM MON DOW` (standard DOW: 0 or 7 = Sunday)
+/// - `daily at sunset`, `every saturday at sunset+50m`, `weekly on friday at
+///   sunset-18m`, `every day at sunrise`, and `after shabbos` (Saturday,
+///   sunset + AMUX_SHABBAT_END_MIN, 50 by default), at AMUX_LATITUDE /
+///   AMUX_LONGITUDE -> [`ScheduleExpr::Sun`]
 ///
 /// `Cron` boxes the crate schedule: it is ~250 bytes against everyone
 /// else's 16, and this enum is cloned into write closures.
 #[derive(Debug, Clone)]
 pub enum ScheduleExpr {
     /// Fixed interval from the last fire (not wall-clock aligned).
-    Interval { every: ChronoDuration },
-    Daily { hour: u32, minute: u32 },
+    Interval {
+        every: ChronoDuration,
+    },
+    Daily {
+        hour: u32,
+        minute: u32,
+    },
     /// Mon-Fri at a time.
-    Weekday { hour: u32, minute: u32 },
-    Weekly { weekday: Weekday, hour: u32, minute: u32 },
+    Weekday {
+        hour: u32,
+        minute: u32,
+    },
+    Weekly {
+        weekday: Weekday,
+        hour: u32,
+        minute: u32,
+    },
     /// Day-of-month 1..=28 at a time.
-    Monthly { day: u32, hour: u32, minute: u32 },
+    Monthly {
+        day: u32,
+        hour: u32,
+        minute: u32,
+    },
     /// 5-field cron, held as the `cron` crate's schedule (seconds pinned to
     /// 0, DOW translated — see [`translate_dow`]).
     Cron(Box<cron::Schedule>),
+    /// At sunset or sunrise, plus an offset, every day or on one weekday
+    /// (`daily at sunset`, `every saturday at sunset+50m`, `after shabbos`).
+    /// Where: AMUX_LATITUDE / AMUX_LONGITUDE, captured when parsed.
+    Sun {
+        weekday: Option<Weekday>,
+        sunset: bool,
+        offset_min: i64,
+        lat: f64,
+        lon: f64,
+    },
+}
+
+/// The server's place on Earth, for sun-based schedules.
+pub fn sun_location() -> Option<(f64, f64)> {
+    let get = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<f64>().ok());
+    match (get("AMUX_LATITUDE"), get("AMUX_LONGITUDE")) {
+        (Some(la), Some(lo)) if (-90.0..=90.0).contains(&la) && (-180.0..=180.0).contains(&lo) => Some((la, lo)),
+        _ => None,
+    }
+}
+
+/// Minutes after sunset that "after Shabbos" means (nightfall). 50 by
+/// default; communities use 42 to 72, so AMUX_SHABBAT_END_MIN sets it.
+pub fn shabbat_end_offset_min() -> i64 {
+    std::env::var("AMUX_SHABBAT_END_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(50)
+}
+
+/// Sunset (or sunrise) on `date` at `lat`, `lon` (east positive), in UTC, by
+/// the sunrise equation (accurate to a minute or two away from the poles).
+/// None when the sun does not set or rise that day.
+pub fn sun_event_utc(date: NaiveDate, lat: f64, lon: f64, sunset: bool) -> Option<DateTime<chrono::Utc>> {
+    let rad = std::f64::consts::PI / 180.0;
+    let noon = date.and_hms_opt(12, 0, 0)?.and_utc().timestamp() as f64;
+    let jdate = noon / 86400.0 + 2440587.5;
+    // jdate is already at noon, so the day number rounds (ceil gives tomorrow).
+    let n = (jdate - 2451545.0 + 0.0008).round();
+    let jstar = n - lon / 360.0;
+    let m = (357.5291 + 0.98560028 * jstar).rem_euclid(360.0);
+    let c = 1.9148 * (m * rad).sin() + 0.02 * (2.0 * m * rad).sin() + 0.0003 * (3.0 * m * rad).sin();
+    let l = (m + c + 180.0 + 102.9372).rem_euclid(360.0);
+    let jtransit = 2451545.0 + jstar + 0.0053 * (m * rad).sin() - 0.0069 * (2.0 * l * rad).sin();
+    let decl = ((l * rad).sin() * (23.4397 * rad).sin()).asin();
+    let cos_w = ((-0.833 * rad).sin() - (lat * rad).sin() * decl.sin()) / ((lat * rad).cos() * decl.cos());
+    if !(-1.0..=1.0).contains(&cos_w) {
+        return None;
+    }
+    let w = cos_w.acos() / rad;
+    let j = if sunset { jtransit + w / 360.0 } else { jtransit - w / 360.0 };
+    let unix = (j - 2440587.5) * 86400.0;
+    DateTime::from_timestamp(unix.round() as i64, 0)
 }
 
 /// How many times a day this expression fires (AMUX-3546).
@@ -320,15 +497,24 @@ pub fn fires_per_day(expr: &ScheduleExpr) -> Option<f64> {
         // monthly schedule as firing 1.4% more often than it does, which is
         // invisible and wrong rather than approximate and honest.
         ScheduleExpr::Monthly { .. } => Some(12.0 / 365.2425),
+        ScheduleExpr::Sun { weekday, .. } => Some(if weekday.is_some() { 1.0 / 7.0 } else { 1.0 }),
         // COUNTED, not derived from the field pattern. A cron expression's
         // firing rate is not readable from its shape without reimplementing
         // cron, and the `cron` crate already owns that: walk the next 24 hours
         // and count. Bounded, because `* * * * *` yields 1440 and a malformed
         // schedule could in principle yield more.
+        // Counted in UTC: a rate does not change with daylight saving, and a
+        // local walk across the fall-back night counted 87 fires for
+        // `*/15 * * * *` instead of 96 (2026-10-31 evening, the eve of the
+        // Nov 1 change).
         ScheduleExpr::Cron(sched) => {
-            let now = chrono::Local::now();
+            let now = chrono::Utc::now();
             let until = now + ChronoDuration::days(1);
-            let n = sched.after(&now).take(MAX_CRON_FIRES).take_while(|t| *t < until).count();
+            let n = sched
+                .after(&now)
+                .take(MAX_CRON_FIRES)
+                .take_while(|t| *t < until)
+                .count();
             (n < MAX_CRON_FIRES).then_some(n as f64)
         }
     }
@@ -341,14 +527,20 @@ const MAX_CRON_FIRES: usize = 2000;
 
 static RE_IN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^in\s+(\d+)\s*(m|min|minutes?|h|hr|hours?)$").unwrap());
-static RE_EVERY_N: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^every\s+(\d+)\s*(m|min|minutes?|h|hr|hours?|d|days?)$").unwrap());
+static RE_EVERY_N: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^every\s+(\d+)\s*(m|min|minutes?|h|hr|hours?|d|days?)$").unwrap()
+});
 static RE_EVERY_WORD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^every\s+(morning|evening|night)$").unwrap());
 static RE_WEEKDAY_AT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^every\s+weekday\s+at\s+(.+)$").unwrap());
 static RE_EVERY_DAY_AT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^every\s+(\w+)\s+at\s+(.+)$").unwrap());
+static RE_SUN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:(?:daily|every\s+day)|(?:every|weekly\s+on)\s+(\w+))\s+at\s+(sunset|sundown|sunrise)\s*(?:([+-])\s*(\d+)\s*(m|min|mins|minutes?|h|hrs?|hours?)?)?$").unwrap()
+});
+static RE_SHABBOS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:(?:every\s+week|weekly)\s+)?after\s+(?:shabbos|shabbat|shabbes|sabbath|havdalah)$").unwrap());
 static RE_DAILY_AT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^daily\s+at\s+(.+)$").unwrap());
 static RE_WEEKLY_ON: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^weekly\s+on\s+(\w+)\s+at\s+(.+)$").unwrap());
@@ -490,6 +682,38 @@ impl ScheduleExpr {
             return Ok(ScheduleExpr::Interval { every });
         }
 
+        // Sun-based: "after shabbos", "daily at sunset", "every saturday at
+        // sunset+50m" (NetSuite worker, 2026-10-26: the scheduler could not say
+        // "after Shabbos", which moves with the season). Needs a location.
+        let shabbos = RE_SHABBOS.is_match(&s);
+        if shabbos || RE_SUN.is_match(&s) {
+            let Some((lat, lon)) = sun_location() else {
+                return Err(ExprParseError(format!(
+                    "{orig} (sunset depends on where you are: set AMUX_LATITUDE and AMUX_LONGITUDE in ~/.amux/server.env)"
+                )));
+            };
+            if shabbos {
+                return Ok(ScheduleExpr::Sun { weekday: Some(Weekday::Sat), sunset: true, offset_min: shabbat_end_offset_min(), lat, lon });
+            }
+            let c = RE_SUN.captures(&s).ok_or_else(fail)?;
+            let weekday = match c.get(1) {
+                Some(d) => Some(day_from_name(d.as_str()).ok_or_else(fail)?),
+                None => None,
+            };
+            let sunset = &c[2] != "sunrise";
+            let mut offset_min: i64 = c.get(4).map(|n| n.as_str().parse().unwrap_or(0)).unwrap_or(0);
+            if c.get(5).is_some_and(|u| u.as_str().starts_with('h')) {
+                offset_min *= 60;
+            }
+            if c.get(3).is_some_and(|sign| sign.as_str() == "-") {
+                offset_min = -offset_min;
+            }
+            if offset_min.abs() > 12 * 60 {
+                return Err(fail());
+            }
+            return Ok(ScheduleExpr::Sun { weekday, sunset, offset_min, lat, lon });
+        }
+
         // every morning / evening / night (Python aliases: 9am / 18:00)
         if let Some(c) = RE_EVERY_WORD.captures(&s) {
             let hour = if &c[1] == "morning" { 9 } else { 18 };
@@ -507,7 +731,11 @@ impl ScheduleExpr {
         if let Some(c) = RE_EVERY_DAY_AT.captures(&s) {
             if let Some(weekday) = day_from_name(&c[1]) {
                 let (hour, minute) = parse_time(&c[2]).ok_or_else(fail)?;
-                return Ok(ScheduleExpr::Weekly { weekday, hour, minute });
+                return Ok(ScheduleExpr::Weekly {
+                    weekday,
+                    hour,
+                    minute,
+                });
             }
             // fall through: "every foo at 5" might still be garbage-or-cron
         }
@@ -522,7 +750,11 @@ impl ScheduleExpr {
         if let Some(c) = RE_WEEKLY_ON.captures(&s) {
             let weekday = day_from_name(&c[1]).ok_or_else(fail)?;
             let (hour, minute) = parse_time(&c[2]).ok_or_else(fail)?;
-            return Ok(ScheduleExpr::Weekly { weekday, hour, minute });
+            return Ok(ScheduleExpr::Weekly {
+                weekday,
+                hour,
+                minute,
+            });
         }
 
         // monthly on N at TIME (1..=28, Python's bound: day 29-31 would
@@ -540,7 +772,10 @@ impl ScheduleExpr {
         let parts: Vec<&str> = orig.split_whitespace().collect();
         if parts.len() == 5 && parts.iter().all(|p| RE_CRON_FIELD.is_match(p)) {
             let dow = translate_dow(parts[4]).ok_or_else(fail)?;
-            let six = format!("0 {} {} {} {} {}", parts[0], parts[1], parts[2], parts[3], dow);
+            let six = format!(
+                "0 {} {} {} {} {}",
+                parts[0], parts[1], parts[2], parts[3], dow
+            );
             return cron::Schedule::from_str(&six)
                 .map(|s| ScheduleExpr::Cron(Box::new(s)))
                 .map_err(|_| fail());
@@ -562,7 +797,11 @@ impl ScheduleExpr {
                     !matches!(d.weekday(), Weekday::Sat | Weekday::Sun)
                 })
             }
-            ScheduleExpr::Weekly { weekday, hour, minute } => {
+            ScheduleExpr::Weekly {
+                weekday,
+                hour,
+                minute,
+            } => {
                 let wd = *weekday;
                 next_date_matching(after, *hour, *minute, move |d| d.weekday() == wd)
             }
@@ -587,6 +826,24 @@ impl ScheduleExpr {
                 None
             }
             ScheduleExpr::Cron(sched) => sched.after(&after).next(),
+            ScheduleExpr::Sun { weekday, sunset, offset_min, lat, lon } => {
+                // From the day before: a negative offset can put a fire on
+                // the previous evening's wall-clock date.
+                let mut d = after.date_naive().pred_opt()?;
+                for _ in 0..=372 {
+                    if weekday.is_none_or(|w| d.weekday() == w) {
+                        if let Some(t) = sun_event_utc(d, *lat, *lon, *sunset) {
+                            let t = t.with_timezone(&Local) + ChronoDuration::minutes(*offset_min);
+                            let t = t.with_second(0).unwrap_or(t);
+                            if t > after {
+                                return Some(t);
+                            }
+                        }
+                    }
+                    d = d.succ_opt()?;
+                }
+                None
+            }
         }
     }
 }
@@ -621,21 +878,43 @@ fn at_local_time(date: NaiveDate, hour: u32, minute: u32) -> Option<DateTime<Loc
     resolve_local(date.and_hms_opt(hour, minute, 0)?)
 }
 
-fn resolve_local(n: NaiveDateTime) -> Option<DateTime<Local>> {
+pub(crate) fn resolve_local(n: NaiveDateTime) -> Option<DateTime<Local>> {
     match Local.from_local_datetime(&n) {
         LocalResult::Single(t) => Some(t),
-        LocalResult::Ambiguous(earliest, _) => Some(earliest),
+        // The order of the two is chrono's, and on macOS the later one comes
+        // first: a `daily at 1am` that fired at the first 1:00 was handed the
+        // second 1:00, whose text is the same, and re-fired every tick
+        // (2026-11-01, SCHED-124).
+        LocalResult::Ambiguous(a, b) => Some(a.min(b)),
         LocalResult::None => {
             for h in 1..=3 {
                 match Local.from_local_datetime(&(n + ChronoDuration::hours(h))) {
                     LocalResult::Single(t) => return Some(t),
-                    LocalResult::Ambiguous(earliest, _) => return Some(earliest),
+                    LocalResult::Ambiguous(a, b) => return Some(a.min(b)),
                     LocalResult::None => continue,
                 }
             }
             None
         }
     }
+}
+
+/// True while a `next_run` in the repeated hour of a DST fall-back names its
+/// second occurrence. The stored text has no zone, so `every 1h` set at the
+/// first 1:42 stores "01:42", which already compares as due. A row that ran
+/// at or after the first occurrence is waiting for the second.
+fn fall_back_held(next_run: &str, last_run: i64, now: DateTime<Local>) -> bool {
+    let Ok(n) = NaiveDateTime::parse_from_str(next_run, "%Y-%m-%dT%H:%M") else { return false };
+    match Local.from_local_datetime(&n) {
+        LocalResult::Ambiguous(a, b) => {
+            held_for_second_occurrence(a.min(b).timestamp(), a.max(b).timestamp(), last_run, now.timestamp())
+        }
+        _ => false,
+    }
+}
+
+fn held_for_second_occurrence(first: i64, second: i64, last_run: i64, now: i64) -> bool {
+    last_run >= first && now < second
 }
 
 /// Format an instant the way Python stores `next_run`/`run_at`: local
@@ -725,7 +1004,11 @@ pub fn runs_due(
         MissedRunPolicy::CatchUp => {
             let overflow = total.saturating_sub(CATCH_UP_CAP);
             all.truncate(CATCH_UP_CAP);
-            DueRuns { runs: all, overflow, truncated_scan }
+            DueRuns {
+                runs: all,
+                overflow,
+                truncated_scan,
+            }
         }
     }
 }
@@ -743,7 +1026,11 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        RetryPolicy { max_attempts: 3, base_delay_ms: 2_000, max_delay_ms: 30_000 }
+        RetryPolicy {
+            max_attempts: 3,
+            base_delay_ms: 2_000,
+            max_delay_ms: 30_000,
+        }
     }
 }
 
@@ -752,7 +1039,10 @@ impl RetryPolicy {
     /// capped.
     pub fn delay(&self, attempt: u32) -> std::time::Duration {
         let exp = attempt.saturating_sub(1).min(16);
-        let ms = self.base_delay_ms.saturating_mul(1u64 << exp).min(self.max_delay_ms);
+        let ms = self
+            .base_delay_ms
+            .saturating_mul(1u64 << exp)
+            .min(self.max_delay_ms);
         std::time::Duration::from_millis(ms)
     }
 }
@@ -764,8 +1054,17 @@ impl RetryPolicy {
 /// The seven fields whose changes are audited into `schedule_audit`
 /// (mirrors Python's `_AUDIT_FIELDS` exactly, so both servers' trails agree
 /// on what counts as an auditable mutation).
-pub const AUDIT_FIELDS: [&str; 7] =
-    ["enabled", "session", "command", "schedule_expr", "done_action", "trigger_on", "kind"];
+pub const AUDIT_FIELDS: [&str; 9] = [
+    "enabled",
+    "pass_check",
+    "when_check",
+    "session",
+    "command",
+    "schedule_expr",
+    "done_action",
+    "trigger_on",
+    "kind",
+];
 
 /// A row of the live `schedules` table. DB-backed with history and audit —
 /// the durable half of the DurableSchedule/PeriodicTask split (see
@@ -790,9 +1089,9 @@ impl DurableSchedule {
             let v = match row.get_ref(i)? {
                 rusqlite::types::ValueRef::Null => Value::Null,
                 rusqlite::types::ValueRef::Integer(n) => Value::from(n),
-                rusqlite::types::ValueRef::Real(f) => {
-                    serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
-                }
+                rusqlite::types::ValueRef::Real(f) => serde_json::Number::from_f64(f)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null),
                 rusqlite::types::ValueRef::Text(t) => {
                     Value::String(String::from_utf8_lossy(t).into_owned())
                 }
@@ -875,7 +1174,7 @@ fn select_schedules(
     params: &[&dyn rusqlite::ToSql],
 ) -> rusqlite::Result<Vec<DurableSchedule>> {
     let mut stmt = conn.prepare(sql)?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let cols: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let rows = stmt.query_map(params, |r| DurableSchedule::from_row(r, &cols))?;
     rows.collect()
 }
@@ -884,7 +1183,10 @@ fn select_schedules(
 /// SAME counter Python's `_next_issue_id` uses, so ids never collide across
 /// the two servers.
 pub fn mint_schedule_id(conn: &Connection) -> rusqlite::Result<String> {
-    conn.execute("INSERT OR IGNORE INTO issue_counters (prefix, next_n) VALUES ('SCHED', 1)", [])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO issue_counters (prefix, next_n) VALUES ('SCHED', 1)",
+        [],
+    )?;
     let n: i64 = conn.query_row(
         "UPDATE issue_counters SET next_n = next_n + 1 WHERE prefix = 'SCHED' RETURNING next_n - 1",
         [],
@@ -926,7 +1228,8 @@ fn due_schedules(conn: &Connection, now_str: &str) -> rusqlite::Result<Vec<Durab
     select_schedules(
         conn,
         "SELECT * FROM schedules WHERE deleted IS NULL AND enabled = 1
-         AND next_run IS NOT NULL AND next_run != '' AND next_run <= ?1",
+         AND next_run IS NOT NULL AND next_run != '' AND next_run <= ?1
+         ORDER BY next_run ASC, created ASC, id ASC",
         &[&now_str],
     )
 }
@@ -961,11 +1264,52 @@ fn due_schedules(conn: &Connection, now_str: &str) -> rusqlite::Result<Vec<Durab
 /// is still written, and the only behavioural difference is that an unset
 /// defaulted column now gets its default instead of failing the insert.
 pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<()> {
-    const COLS: [&str; 27] = [
-        "id", "title", "session", "command", "kind", "sched_type", "recurrence", "run_at",
-        "next_run", "last_run", "enabled", "run_count", "schedule_expr", "watch", "watch_timeout",
-        "done_pattern", "done_action", "trigger_on", "trigger_cooldown", "trigger_sessions",
-        "exit_actions", "created", "updated", "deleted", "worktree", "fan_out", "fan_out_model",
+    const COLS: [&str; 41] = [
+        "id",
+        "title",
+        "session",
+        "command",
+        "kind",
+        "sched_type",
+        "recurrence",
+        "run_at",
+        "next_run",
+        "last_run",
+        "enabled",
+        "run_count",
+        "schedule_expr",
+        "watch",
+        "watch_timeout",
+        "done_pattern",
+        "done_action",
+        "trigger_on",
+        "trigger_cooldown",
+        "trigger_sessions",
+        "exit_actions",
+        "created",
+        "updated",
+        "deleted",
+        "worktree",
+        "fan_out",
+        "fan_out_model",
+        // 0125 lifecycle columns. cron_runs is written only by the fire path.
+        "not_before",
+        "until",
+        "max_runs",
+        "locked_by",
+        "lock_reason",
+        "locked_at",
+        "disabled_reason",
+        // 0135 pass/fail (schedule_check.rs).
+        "pass_check",
+        "pass_state",
+        "pass_next_at",
+        // 0141 wake condition (schedule_wake.rs).
+        "when_check",
+        "when_once",
+        // 0160 proven creator (schedule_authority.rs).
+        "created_by",
+        "created_by_verified",
     ];
     let present: Vec<&str> = COLS
         .iter()
@@ -978,22 +1322,62 @@ pub fn insert_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Resu
         present.join(","),
         placeholders.join(",")
     );
-    let vals: Vec<rusqlite::types::Value> =
-        present.iter().map(|c| to_sql(s.raw.get(*c))).collect();
+    let vals: Vec<rusqlite::types::Value> = present.iter().map(|c| to_sql(s.raw.get(*c))).collect();
     conn.execute(&sql, rusqlite::params_from_iter(vals))?;
     Ok(())
 }
 
 /// Full-row UPDATE with Python's PATCH column list.
 pub fn update_schedule(conn: &Connection, s: &DurableSchedule) -> rusqlite::Result<usize> {
-    const COLS: [&str; 22] = [
-        "title", "session", "command", "kind", "sched_type", "recurrence", "run_at", "next_run",
-        "enabled", "schedule_expr", "watch", "watch_timeout", "done_pattern", "done_action",
-        "trigger_on", "trigger_cooldown", "trigger_sessions", "exit_actions", "updated",
-        "worktree", "fan_out", "fan_out_model",
+    const COLS: [&str; 32] = [
+        "title",
+        "session",
+        "command",
+        "kind",
+        "sched_type",
+        "recurrence",
+        "run_at",
+        "next_run",
+        "enabled",
+        "schedule_expr",
+        "watch",
+        "watch_timeout",
+        "done_pattern",
+        "done_action",
+        "trigger_on",
+        "trigger_cooldown",
+        "trigger_sessions",
+        "exit_actions",
+        "updated",
+        "worktree",
+        "fan_out",
+        "fan_out_model",
+        // 0125 lifecycle columns. cron_runs is written only by the fire path
+        // and by an explicit reset, never by a full-row write.
+        "not_before",
+        "until",
+        "max_runs",
+        "locked_by",
+        "lock_reason",
+        "locked_at",
+        "disabled_reason",
+        // 0135. The sweep's state columns are written by schedule_check.rs.
+        "pass_check",
+        // 0141 wake condition. `when_once` is NOT NULL: a row built without
+        // it keeps its stored value (COALESCE below).
+        "when_check",
+        "when_once",
     ];
-    let sets: Vec<String> = COLS.iter().enumerate().map(|(i, c)| format!("{c}=?{}", i + 1)).collect();
-    let sql = format!("UPDATE schedules SET {} WHERE id=?{}", sets.join(","), COLS.len() + 1);
+    let sets: Vec<String> = COLS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| if *c == "when_once" { format!("{c}=COALESCE(?{}, {c})", i + 1) } else { format!("{c}=?{}", i + 1) })
+        .collect();
+    let sql = format!(
+        "UPDATE schedules SET {} WHERE id=?{}",
+        sets.join(","),
+        COLS.len() + 1
+    );
     let mut vals: Vec<rusqlite::types::Value> =
         COLS.iter().map(|c| to_sql(s.raw.get(*c))).collect();
     vals.push(rusqlite::types::Value::Text(s.id().to_string()));
@@ -1080,8 +1464,9 @@ pub fn insert_run(
     }
     .map(|s| s.chars().take(500).collect());
     conn.execute(
-        "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source, delivery, submission)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source, delivery, submission,
+                                    exit_code, output_tail, queue_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             schedule_id,
             ran_at,
@@ -1089,7 +1474,10 @@ pub fn insert_run(
             note,
             source,
             outcome.delivery(),
-            outcome.submission()
+            outcome.submission(),
+            outcome.shell_output().map(|o| o.exit_code),
+            outcome.shell_output().map(|o| o.tail.as_str()),
+            outcome.queue_id(),
         ],
     )?;
     Ok(())
@@ -1119,7 +1507,12 @@ pub fn record_run(
         "UPDATE schedules SET run_count = COALESCE(run_count,0) + 1, last_run=?1, updated=?1,
          last_delivery=?2, last_refusal_reason=?3
          WHERE id=?4",
-        rusqlite::params![now_ts, outcome.status(), outcome.refusal_reason(), schedule_id],
+        rusqlite::params![
+            now_ts,
+            outcome.status(),
+            outcome.refusal_reason(),
+            schedule_id
+        ],
     )?;
     Ok(())
 }
@@ -1160,12 +1553,17 @@ pub fn legacy_next_run(
                 .next()
                 .and_then(|p| p.parse::<u32>().ok())
                 .and_then(weekday_from_mon0);
-            let time = run_at.split_once(':').map(|(_, rest)| tail_time(rest)).unwrap_or((h, m));
+            let time = run_at
+                .split_once(':')
+                .map(|(_, rest)| tail_time(rest))
+                .unwrap_or((h, m));
             match wd {
-                Some(wd) => {
-                    ScheduleExpr::Weekly { weekday: wd, hour: time.0, minute: time.1 }
-                        .next_run_after(now)?
+                Some(wd) => ScheduleExpr::Weekly {
+                    weekday: wd,
+                    hour: time.0,
+                    minute: time.1,
                 }
+                .next_run_after(now)?,
                 None => ScheduleExpr::Daily { hour: h, minute: m }.next_run_after(now)?,
             }
         }
@@ -1175,12 +1573,17 @@ pub fn legacy_next_run(
                 .next()
                 .and_then(|p| p.parse::<u32>().ok())
                 .filter(|d| (1..=28).contains(d));
-            let time = run_at.split_once(':').map(|(_, rest)| tail_time(rest)).unwrap_or((h, m));
+            let time = run_at
+                .split_once(':')
+                .map(|(_, rest)| tail_time(rest))
+                .unwrap_or((h, m));
             match day {
-                Some(day) => {
-                    ScheduleExpr::Monthly { day, hour: time.0, minute: time.1 }
-                        .next_run_after(now)?
+                Some(day) => ScheduleExpr::Monthly {
+                    day,
+                    hour: time.0,
+                    minute: time.1,
                 }
+                .next_run_after(now)?,
                 None => ScheduleExpr::Daily { hour: h, minute: m }.next_run_after(now)?,
             }
         }
@@ -1268,7 +1671,11 @@ pub fn skip_next_run(s: &DurableSchedule) -> Option<String> {
 /// `min(base.day, calendar.monthrange(...)[1])`) so Jan 31 -> Feb 28/29 rather
 /// than failing or overflowing into March.
 fn add_one_month(base: DateTime<Local>) -> Option<DateTime<Local>> {
-    let (y, mo) = if base.month() == 12 { (base.year() + 1, 1) } else { (base.year(), base.month() + 1) };
+    let (y, mo) = if base.month() == 12 {
+        (base.year() + 1, 1)
+    } else {
+        (base.year(), base.month() + 1)
+    };
     let last = days_in_month(y, mo)?;
     let date = NaiveDate::from_ymd_opt(y, mo, base.day().min(last))?;
     at_local_time(date, base.hour(), base.minute())
@@ -1286,6 +1693,145 @@ fn days_in_month(y: i32, mo: u32) -> Option<u32> {
 /// How long a `kind=shell` command may run before it is killed. Python's
 /// `subprocess.run(..., timeout=600)`.
 pub const SHELL_TIMEOUT_S: u64 = 600;
+
+/// `/bin/bash -o pipefail -c <cmd>` in a process group of its own, so a run
+/// that times out can be stopped whole. `kill_on_drop` alone kills only this
+/// bash: SCHED-783's `bash "$R" | tail -60` kept running after its 600s
+/// timeout (2026-10-22 04:00), finished at 04:15 and quarantined a file under
+/// a run already reported failed.
+pub(crate) fn shell_schedule_command(cmd: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("/bin/bash");
+    // A check piped into tail must report the check's failure.
+    command.args(["-o", "pipefail", "-c"]).arg(cmd).env_remove("TMUX").env_remove("TMUX_PANE");
+    command.process_group(0);
+    command
+}
+
+
+/// How much of a shell run's output the run ROW keeps (AMUX-5241). The full
+/// stream is in `~/.amux/shell-runs/<schedule>/`; the row keeps enough to read a
+/// failure from `/api/schedules/runs` without opening a file.
+pub const SHELL_OUTPUT_TAIL_BYTES: usize = 4096;
+/// How much combined output is held in memory while the run is live, so the
+/// tail survives noise filtering. Older bytes are counted, not kept.
+const SHELL_COMBINED_KEEP: usize = 64 * 1024;
+
+/// The rc files a login or interactive shell sources before the command runs.
+const SHELL_STARTUP_FILES: &[&str] = &[
+    ".bash_profile",
+    ".bashrc",
+    ".bash_login",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+];
+
+/// Is this line a shell-startup complaint rather than the command's output?
+///
+/// SCHED-494's command is `bash -lc "..."`, so a login shell sources
+/// ~/.bash_profile first and prints "/Users/ethan/.bash_profile: line 32:
+/// /Users/ethan/google-cloud-sdk/path.bash.inc: No such file or directory" to
+/// stderr on EVERY run. The note kept stderr's head, so three hours of preflight
+/// failures all read as that one line (AMUX-5241). The command owns `-l`, so
+/// the spawn cannot drop it; the fix is to recognise the noise.
+///
+/// Narrow on purpose: the line must START with a path ending in a known rc
+/// file, followed by bash's `: line N:` or zsh's `:N:`. A command that prints
+/// the word ".bashrc" in its own output is not matched.
+pub fn is_shell_startup_noise(line: &str) -> bool {
+    let line = line.trim_start_matches(['-']).trim_start();
+    let line = line
+        .strip_prefix("bash: ")
+        .or_else(|| line.strip_prefix("zsh: "))
+        .unwrap_or(line);
+    if !(line.starts_with('/') || line.starts_with('~')) {
+        return false;
+    }
+    let Some(colon) = line.find(':') else {
+        return false;
+    };
+    let (path, rest) = (&line[..colon], &line[colon + 1..]);
+    if !SHELL_STARTUP_FILES
+        .iter()
+        .any(|f| path.ends_with(&format!("/{f}")))
+    {
+        return false;
+    }
+    let rest = rest.strip_prefix(" line ").unwrap_or(rest);
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest[digits..].starts_with(':')
+}
+
+/// The run row's `output_tail`: the last `max` bytes of combined output with
+/// startup noise removed. Every cut is SAID in the text (no silent caps): the
+/// number of noise lines dropped and whether earlier output was truncated.
+pub fn shell_output_tail(raw: &[u8], dropped_front: usize, max: usize) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let mut noise = 0usize;
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            let n = is_shell_startup_noise(l);
+            noise += n as usize;
+            !n
+        })
+        .collect();
+    let body = kept.join("\n");
+    let body = body.trim_end();
+    let mut truncated = dropped_front > 0;
+    let body = if body.len() > max {
+        truncated = true;
+        let mut start = body.len() - max;
+        while !body.is_char_boundary(start) {
+            start += 1;
+        }
+        // Start on a line boundary when one is near, so the first line is whole.
+        match body[start..].find('\n') {
+            Some(nl) if nl < 200 => &body[start + nl + 1..],
+            _ => &body[start..],
+        }
+    } else {
+        body
+    };
+    let mut out = String::new();
+    if truncated {
+        out.push_str("[earlier output not kept here; full log under ~/.amux/shell-runs/]\n");
+    }
+    if noise > 0 {
+        out.push_str(&format!("[{noise} shell-startup noise line(s) removed]\n"));
+    }
+    out.push_str(body);
+    out
+}
+
+/// The note's failure excerpt: the END of the filtered output, because that is
+/// where a failing command says why. The old code kept stderr's HEAD, which for
+/// a `bash -lc` command is the login noise.
+fn failure_excerpt(stdout: &str, stderr: &str, code: i32, chars: usize) -> String {
+    let clean = |t: &str| -> String {
+        t.lines()
+            .filter(|l| !is_shell_startup_noise(l))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    };
+    let (e, o) = (clean(stderr), clean(stdout));
+    let raw = if !e.is_empty() { e } else { o };
+    let n = raw.chars().count();
+    let raw: String = if n <= chars {
+        raw
+    } else {
+        raw.chars().skip(n - chars).collect()
+    };
+    if raw.is_empty() {
+        format!("exit {code}")
+    } else {
+        format!("exit {code}: {raw}")
+    }
+}
 
 /// Result of atomically claiming a manual shell run. A second tap while the
 /// first process is alive returns the existing row instead of launching the
@@ -1311,6 +1857,40 @@ impl ShellRunClaim {
 
     pub fn started(self) -> bool {
         matches!(self, Self::Started { .. })
+    }
+}
+
+/// Where a shell run's output goes: `~/.amux/shell-runs/<schedule>/<start_ms>.log`.
+/// Keeps the newest `SHELL_RUN_LOGS_KEPT` per schedule. `None` if the dir
+/// cannot be made (the run still happens; only the live view is lost).
+pub const SHELL_RUN_LOGS_KEPT: usize = 30;
+pub const SHELL_RUN_LOG_CAP: u64 = 2 * 1024 * 1024;
+pub fn shell_runs_dir(schedule_id: &str) -> std::path::PathBuf {
+    let safe: String = schedule_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    crate::config::amux_home().join("shell-runs").join(safe)
+}
+/// Append-only, size-capped writer; silently inert when there is no file.
+pub(crate) struct ShellRunLog { f: Option<std::fs::File>, written: u64, capped: bool }
+impl ShellRunLog {
+    /// Start the log empty (a fresh run, or an adopted one rebuilt from its raw output).
+    pub(crate) fn create(p: Option<&std::path::Path>) -> Self {
+        if let Some(p) = p { let _ = std::fs::write(p, b""); }
+        Self::open(p)
+    }
+    pub(crate) fn open(p: Option<&std::path::Path>) -> Self {
+        let f = p.and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok());
+        let written = f.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+        Self { f, written, capped: false }
+    }
+    pub(crate) fn write(&mut self, b: &[u8]) {
+        use std::io::Write;
+        let Some(f) = self.f.as_mut() else { return };
+        if self.written >= SHELL_RUN_LOG_CAP {
+            if !self.capped { let _ = f.write_all(b"\n[output past 2 MB not kept]\n"); self.capped = true; }
+            return;
+        }
+        let _ = f.write_all(b);
+        self.written += b.len() as u64;
     }
 }
 
@@ -1362,7 +1942,10 @@ pub fn claim_manual_shell_run(
          WHERE id=?2",
         rusqlite::params![now, schedule_id],
     )?;
-    Ok(ShellRunClaim::Started { run_id, ran_at: now })
+    Ok(ShellRunClaim::Started {
+        run_id,
+        ran_at: now,
+    })
 }
 
 /// Replace a manual shell run's provisional row with its actual exit verdict.
@@ -1371,9 +1954,12 @@ pub fn finish_manual_shell_run(
     run_id: i64,
     outcome: &RunOutcome,
 ) -> rusqlite::Result<usize> {
-    let note = outcome.note().map(|s| s.chars().take(500).collect::<String>());
-    conn.execute(
-        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4
+    let note = outcome
+        .note()
+        .map(|s| s.chars().take(500).collect::<String>());
+    let n = conn.execute(
+        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4,
+                exit_code=?6, output_tail=?7
          WHERE id=?5 AND status='running'",
         rusqlite::params![
             outcome.status(),
@@ -1381,16 +1967,33 @@ pub fn finish_manual_shell_run(
             outcome.delivery(),
             outcome.submission(),
             run_id,
+            outcome.shell_output().map(|o| o.exit_code),
+            outcome.shell_output().map(|o| o.tail.as_str()),
         ],
-    )
+    )?;
+    // AF-648 parity: cron fires and record_run stamp the schedule row with the
+    // latest outcome; a manual Run did not, so a passing rerun of SCHED-646
+    // (2026-10-18) left the schedule reading last_delivery=error beside a
+    // green run row and failure_streak 0.
+    if n > 0 {
+        conn.execute(
+            "UPDATE schedules SET last_delivery=?1, last_refusal_reason=?2
+             WHERE id=(SELECT schedule_id FROM schedule_runs WHERE id=?3)",
+            rusqlite::params![outcome.status(), outcome.refusal_reason(), run_id],
+        )?;
+        tracing::info!(run_id, status = outcome.status(), measured = true, n_considered = 1,
+            verdict = "manual_shell_run_outcome_stamped",
+            "manual shell run finished; its outcome is stamped on the schedule row");
+    }
+    Ok(n)
 }
 
 /// Replace a cron fire's provisional row with what delivery actually did (AF-515).
 ///
 /// Guarded on `status='running'` so it cannot overwrite a row a reconciler has
 /// already failed, and cannot resurrect one another path finished. Returns the
-/// rows updated: 0 means the provisional row is gone and the caller must insert,
-/// rather than drop the outcome.
+/// rows updated: 0 means the row disappeared OR was already finalized. The
+/// caller inserts only when it disappeared; reconciliation is never duplicated.
 pub fn finish_cron_run(
     conn: &Connection,
     run_id: i64,
@@ -1404,7 +2007,8 @@ pub fn finish_cron_run(
     }
     .map(|s| s.chars().take(500).collect());
     conn.execute(
-        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4 \
+        "UPDATE schedule_runs SET status=?1, note=?2, delivery=?3, submission=?4, \
+                exit_code=?6, output_tail=?7, queue_id=?8 \
          WHERE id=?5 AND status='running'",
         rusqlite::params![
             outcome.status(),
@@ -1412,6 +2016,12 @@ pub fn finish_cron_run(
             outcome.delivery(),
             outcome.submission(),
             run_id,
+            outcome.shell_output().map(|o| o.exit_code),
+            outcome.shell_output().map(|o| o.tail.as_str()),
+            // The cron path finishes its provisional row here, not through
+            // insert_run, so the queue id has to be written here too (0102;
+            // SCHED-544's 05:02Z fire stayed `queued` without it).
+            outcome.queue_id(),
         ],
     )
 }
@@ -1427,8 +2037,8 @@ pub fn finish_cron_run(
 pub fn fail_orphaned_cron_runs(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE schedule_runs \
-         SET status='error', \
-             note='server restarted before this fire recorded a delivery outcome', \
+         SET status='interrupted', \
+             note='interrupted: server restarted before this fire recorded a delivery outcome', \
              delivery='unknown', submission=NULL \
          WHERE status='running' AND delivery IS NULL",
         [],
@@ -1441,11 +2051,173 @@ pub fn fail_orphaned_cron_runs(conn: &Connection) -> rusqlite::Result<usize> {
 pub fn fail_orphaned_manual_shell_runs(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE schedule_runs
-         SET status='error', note='server restarted before the shell result was recorded',
+         SET status='interrupted', note='interrupted: server restarted before the shell result was recorded',
              delivery='shell', submission=NULL
          WHERE status='running' AND delivery='shell'",
         [],
     )
+}
+
+/// A running shell row a starting server takes over instead of failing.
+#[derive(Debug)]
+pub struct ShellAdoption {
+    pub run_id: i64,
+    pub schedule_id: String,
+    /// A cron fire's row (finished by `finish_cron_run`), not a Run-now row.
+    pub cron: bool,
+    /// The provisional row's note, kept beside the outcome for a cron row.
+    pub note: Option<String>,
+    pub files: super::shell_detached::RunFiles,
+    pub meta: super::shell_detached::RunMeta,
+    /// The exit code was already on disk: it ended while no server watched.
+    pub finished_while_down: bool,
+}
+
+/// What [`reconcile_shell_runs_at_startup`] decided.
+#[derive(Debug, Default)]
+pub struct ShellReconcile {
+    pub adopted: Vec<ShellAdoption>,
+    /// Rows marked interrupted: no files, or a dead process with no exit code.
+    pub lost: Vec<(i64, String)>,
+    /// Rows this same process is still watching (the loop restarted in-process).
+    pub watched: Vec<(i64, String)>,
+}
+
+/// THE STARTUP SWEEP FOR SHELL RUNS (cicd-two-minutes item 1). A shell run is
+/// a detached process with its result in files (shell_detached.rs), so a
+/// `running` shell row at startup is usually NOT lost: if its process is alive
+/// or its exit code is on disk, adopt it and record the real result. Only a
+/// row whose process is gone with no exit code, or that has no run files at
+/// all, is marked `interrupted`. Covers Run-now rows (`delivery='shell'`) and
+/// cron fires of shell schedules (`delivery IS NULL`, schedule `kind='shell'`);
+/// cron rows of tmux schedules stay with [`fail_orphaned_cron_runs`].
+///
+/// An adopted cron row is stamped `delivery='shell'` so the cron reconciler,
+/// which runs after this, leaves it alone.
+pub fn reconcile_shell_runs_at_startup(conn: &Connection) -> rusqlite::Result<ShellReconcile> {
+    let rows: Vec<(i64, String, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.schedule_id, r.delivery, r.note FROM schedule_runs r
+             LEFT JOIN schedules s ON s.id = r.schedule_id
+             WHERE r.status='running'
+               AND (r.delivery='shell' OR (r.delivery IS NULL AND s.kind='shell'))
+             ORDER BY r.id",
+        )?;
+        let it = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        it.collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = ShellReconcile::default();
+    for (run_id, schedule_id, delivery, note) in rows {
+        let cron = delivery.is_none();
+        if super::shell_detached::is_watched(run_id) {
+            if cron {
+                conn.execute("UPDATE schedule_runs SET delivery='shell' WHERE id=?1 AND status='running'", [run_id])?;
+            }
+            out.watched.push((run_id, schedule_id));
+            continue;
+        }
+        match super::shell_detached::inspect(&shell_runs_dir(&schedule_id), run_id) {
+            Some(found) => {
+                if cron {
+                    conn.execute("UPDATE schedule_runs SET delivery='shell' WHERE id=?1 AND status='running'", [run_id])?;
+                }
+                tracing::info!(run_id, schedule = %schedule_id, pid = ?found.pid, exit_code = ?found.rc,
+                    attempt = found.meta.attempt, measured = true, n_considered = 1, verdict = "shell_run_adopted",
+                    "startup: a shell run survived the restart; this server records its result");
+                out.adopted.push(ShellAdoption {
+                    run_id,
+                    schedule_id,
+                    cron,
+                    note: note.filter(|n| cron && n != "fired; delivery pending"),
+                    finished_while_down: found.rc.is_some(),
+                    files: found.files,
+                    meta: found.meta,
+                });
+            }
+            None => {
+                conn.execute(
+                    "UPDATE schedule_runs
+                     SET status='interrupted', note='interrupted: the shell run''s process ended during a server restart without recording an exit code',
+                         delivery='shell', submission=NULL
+                     WHERE id=?1 AND status='running'",
+                    [run_id],
+                )?;
+                tracing::warn!(run_id, schedule = %schedule_id, measured = true, n_considered = 1, verdict = "shell_run_lost",
+                    "startup: a shell run's process is gone with no exit code (or it left no run files); recorded interrupted");
+                out.lost.push((run_id, schedule_id));
+            }
+        }
+    }
+    let keep: Vec<i64> = out.adopted.iter().map(|a| a.run_id).collect();
+    let swept = super::shell_detached::sweep_leftovers(&crate::config::amux_home().join("shell-runs"), &keep);
+    tracing::info!(adopted = out.adopted.len(), lost = out.lost.len(), watched = out.watched.len(), swept,
+        measured = true, n_considered = out.adopted.len() + out.lost.len() + out.watched.len(),
+        verdict = "shell_runs_reconciled_at_startup",
+        "startup: shell runs in flight at the restart were adopted, or recorded lost when their process was gone");
+    Ok(out)
+}
+
+/// Record an adopted shell run's real result on its row, once. Guarded on
+/// `status='running'` by both finish functions, so a row another path already
+/// finished is never overwritten. Returns the rows updated.
+pub fn finish_adopted_shell_run(conn: &Connection, a: &ShellAdoption, outcome: &RunOutcome) -> rusqlite::Result<usize> {
+    if !a.cron {
+        return finish_manual_shell_run(conn, a.run_id, outcome);
+    }
+    let n = finish_cron_run(conn, a.run_id, outcome, a.note.as_deref())?;
+    if n > 0 {
+        conn.execute(
+            "UPDATE schedules SET last_delivery=?1, last_refusal_reason=?2 WHERE id=?3",
+            rusqlite::params![outcome.status(), outcome.refusal_reason(), a.schedule_id],
+        )?;
+    }
+    Ok(n)
+}
+
+/// Watch an adopted run to its end and record it. A deliverer that cannot
+/// adopt (a test stub) records the row lost rather than leaving it running.
+pub async fn complete_adopted_shell_run(store: SharedStore, deliverer: std::sync::Arc<dyn Deliverer>, a: ShellAdoption) {
+    let sched = store.read().ok().and_then(|c| get_schedule(&c, &a.schedule_id).ok().flatten());
+    let outcome = match &sched {
+        Some(s) => deliverer.adopt_shell(s, a.files.clone(), a.meta.clone()).await,
+        None => None,
+    }
+    .unwrap_or_else(|| RunOutcome::Failed {
+        reason: "interrupted: the server restarted and this run could not be adopted".into(),
+    });
+    let status = outcome.status();
+    let for_notice = outcome.clone();
+    let (run_id, sid, finished_while_down) = (a.run_id, a.schedule_id.clone(), a.finished_while_down);
+    let files = a.files.clone();
+    let res = store
+        .write_async(move |conn| {
+            let n = finish_adopted_shell_run(conn, &a, &outcome)?;
+            Ok(WriteOutcome {
+                applied: n > 0,
+                events: vec![PendingEvent {
+                    entity_type: EntityType::Schedule,
+                    entity_id: a.schedule_id.clone(),
+                    mutation: MutationKind::Updated,
+                    payload: None,
+                }],
+            })
+        })
+        .await;
+    match res {
+        Ok(r) => {
+            files.remove_all_but_log();
+            tracing::info!(run_id, schedule = %sid, status, recorded = r.applied, finished_while_down,
+                measured = true, n_considered = 1, verdict = "shell_run_adopted_recorded",
+                "an adopted shell run's real result is on its row");
+            if r.applied {
+                if let Some(s) = &sched {
+                    super::schedule_failure::on_run_outcome(&store, s, &for_notice, "cron-rs").await;
+                }
+            }
+        }
+        Err(e) => tracing::error!(run_id, schedule = %sid, error = %e, verdict = "shell_run_adopted_unrecorded",
+            measured = true, n_considered = 1, "could not record an adopted shell run's result"),
+    }
 }
 
 /// Delivers through the REAL send path.
@@ -1471,203 +2243,392 @@ impl LiveDeliverer {
     /// alert-dispatched run that reads identically to a generic failure is why
     /// mvs-infra concluded dispatch was bypassed when it had run (rule 4).
     async fn run_shell(&self, sched: &DurableSchedule) -> RunOutcome {
-        let command = sched.str_field("command").to_string();
-        if command.trim().is_empty() {
-            return RunOutcome::Refused { reason: "shell schedule has no command".into() };
-        }
-        let actions: Map<String, Value> = serde_json::from_str::<Value>(sched.str_field("exit_actions"))
-            .ok()
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
+        self.run_shell_from(sched, None).await
+    }
 
-        let run_once = |cmd: String| async move {
-            // kill_on_drop: SHELL_TIMEOUT_S firing drops this future, and a
-            // scheduled shell command is precisely the kind that hangs. Without
-            // it the bash child is left unreaped (DESKT-30).
-            let fut = tokio::process::Command::new("/bin/bash")
-                .arg("-c")
-                .arg(cmd)
-                .kill_on_drop(true)
-                .output();
-            match tokio::time::timeout(std::time::Duration::from_secs(SHELL_TIMEOUT_S), fut).await {
-                Ok(Ok(o)) => Ok((
-                    o.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&o.stdout).into_owned(),
-                    String::from_utf8_lossy(&o.stderr).into_owned(),
-                )),
-                Ok(Err(e)) => Err(format!("could not spawn /bin/bash: {e}")),
-                Err(_) => Err(format!("timed out after {SHELL_TIMEOUT_S}s")),
+    /// Finish a shell run a previous server process started: watch it to its
+    /// end (or read the exit code it already wrote), then map it through the
+    /// schedule's `exit_actions` exactly as a run this process started is.
+    pub async fn adopt_shell_run(&self, sched: &DurableSchedule, files: super::shell_detached::RunFiles, meta: super::shell_detached::RunMeta) -> RunOutcome {
+        self.run_shell_from(sched, Some((files, meta))).await
+    }
+
+    async fn run_shell_from(
+        &self,
+        sched: &DurableSchedule,
+        adopted: Option<(super::shell_detached::RunFiles, super::shell_detached::RunMeta)>,
+    ) -> RunOutcome {
+        use super::shell_detached as det;
+        let command = sched.str_field("command").to_string();
+        if adopted.is_none() && command.trim().is_empty() {
+            return RunOutcome::Refused {
+                reason: "shell schedule has no command".into(),
+            };
+        }
+        let actions: Map<String, Value> =
+            serde_json::from_str::<Value>(sched.str_field("exit_actions"))
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+
+        // OUTPUT IS STREAMED TO A FILE AS IT IS PRODUCED (Ethan 2026-09-25:
+        // "i need to be able to see it ... maybe there should be a shell tab
+        // assigned to each worker"). Each run's stdout and stderr are copied,
+        // redacted, to ~/.amux/shell-runs/<schedule>/<start_ms>.log, which the
+        // worker's Shell tab tails.
+        //
+        // THE RUN OUTLIVES THIS PROCESS (cicd-two-minutes item 1). The child is
+        // detached (its own session, output in files, exit code in a file), so
+        // a deploy that restarts the server no longer kills it and no longer
+        // has to wait for it: the next server adopts it (shell_detached.rs).
+        let sched_id = sched.id().to_string();
+        // The run speaks AS the schedule's owner. Without this a shell run had
+        // no AMUX_SESSION, and the CLI's tmux fallback named whichever session
+        // was most recently active: SCHED-550 (amux-helper's) sent 55 messages
+        // stamped amux, canvas-app-use-cases, amux-app and gainz (2026-10-04).
+        let owner = sched.str_field("session").trim().to_string();
+        // The owner's vault secrets (AMUX-5375), resolved at every run so a
+        // rotation applies to the next fire. They go into the child's
+        // environment, never argv, and are masked out of every byte of output
+        // amux stores, so a command that echoes one does not write it into
+        // the run log or the run row. An unowned schedule gets none: it is no
+        // worker's, so no worker's grant covers it.
+        let vault_vals: std::sync::Arc<Vec<(String, String)>> = std::sync::Arc::new(if owner.is_empty() {
+            Vec::new()
+        } else {
+            match crate::api::vault_secrets::deliver(
+                &crate::config::amux_home(),
+                &owner,
+                crate::api::vault_secrets::DeliveryPath::ShellSchedule,
+            ) {
+                Ok(d) => d.values,
+                Err(error) => {
+                    tracing::warn!(schedule = %sched_id, session = %owner, %error, measured = false, n_considered = 0,
+                        verdict = "vault_delivery_failed",
+                        "vault: a shell schedule runs without its owner's secrets (AMUX-5375)");
+                    Vec::new()
+                }
+            }
+        });
+        let run_id = adopted.as_ref().and_then(|(_, m)| m.run_id).or_else(det::current_run_id);
+        // One attempt: spawn it (or take over the adopted one) and watch it.
+        let run_once = |cmd: String, attempt: u32, adopt: Option<(det::RunFiles, det::RunMeta)>| {
+            let sid = sched_id.clone();
+            let owner = owner.clone();
+            let vault_vals = vault_vals.clone();
+            async move {
+                let _in_flight = ShellRunInFlight::enter(&sid);
+                let _watched = det::Watched::enter(run_id);
+                let (files, meta, proc, mut log) = match adopt {
+                    Some((files, meta)) => {
+                        // Rebuild the log from the raw files when they are
+                        // still there; otherwise keep what the old process wrote.
+                        let raw_kept = files.stdout().exists() || files.stderr().exists();
+                        let log = if raw_kept { ShellRunLog::create(Some(&files.log())) } else { ShellRunLog::open(Some(&files.log())) };
+                        let pid = files.read_pid().unwrap_or(0);
+                        (files, meta, det::Proc::Pid(pid), log)
+                    }
+                    None => {
+                        let files = det::new_run_files(&shell_runs_dir(&sid), SHELL_RUN_LOGS_KEPT)
+                            .ok_or_else(|| format!("could not create {}", shell_runs_dir(&sid).display()))?;
+                        let mut command = det::detached_command(&cmd, &files)
+                            .map_err(|e| format!("could not prepare the run's output files: {e}"))?;
+                        for (k, v) in vault_vals.iter() {
+                            command.env(k, v);
+                        }
+                        if owner.is_empty() {
+                            command.env_remove("AMUX_SESSION");
+                        } else {
+                            command.env("AMUX_SESSION", &owner);
+                        }
+                        // Its own worker token for the life of the run (rule
+                        // 10). Kept on disk past this process, so an adopted
+                        // run keeps its identity; removed when it is recorded.
+                        let token = (!owner.is_empty())
+                            .then(|| crate::api::worker_identity::mint_run(&crate::config::amux_home(), &owner))
+                            .flatten();
+                        match &token {
+                            Some(t) => { command.env(crate::api::worker_identity::TOKEN_ENV, &t.value); }
+                            None => { command.env_remove(crate::api::worker_identity::TOKEN_ENV); }
+                        }
+                        let meta = det::RunMeta {
+                            run_id,
+                            schedule_id: sid.clone(),
+                            started_ms: chrono::Utc::now().timestamp_millis(),
+                            attempt,
+                            token_path: token.map(|t| t.keep()),
+                        };
+                        if let Err(e) = files.write_meta(&meta) {
+                            // Unadoptable but still runnable: say so, and run.
+                            tracing::warn!(schedule = %sid, error = %e, verdict = "shell_run_meta_unwritten", measured = true, n_considered = 1,
+                                "shell run starts without its meta file; a restart during it will record it lost");
+                        }
+                        let log = ShellRunLog::create(Some(&files.log()));
+                        let child = match command.spawn() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                if let Some(t) = &meta.token_path { let _ = std::fs::remove_file(t); }
+                                files.remove_all_but_log();
+                                return Err(format!("could not spawn /bin/bash: {e}"));
+                            }
+                        };
+                        (files, meta, det::Proc::Child(child), log)
+                    }
+                };
+                let end = det::watch(&files, meta.started_ms, proc, vault_vals.clone(), &mut log, SHELL_TIMEOUT_S,
+                    SHELL_COMBINED_KEEP, SHELL_OUTPUT_TAIL_BYTES).await;
+                if let Some(t) = &meta.token_path {
+                    let _ = std::fs::remove_file(t);
+                }
+                // Raw output may hold a vault value; the redacted log stays.
+                files.remove_raw();
+                if run_id.is_none() {
+                    files.remove_all_but_log();
+                }
+                if !vault_vals.is_empty() {
+                    // A value split across two reads escaped the per-chunk
+                    // mask; one pass over the whole file catches it.
+                    if let Ok(bytes) = std::fs::read(files.log()) {
+                        let clean = crate::api::vault_secrets::redact_bytes(&bytes, &vault_vals);
+                        if clean != bytes {
+                            let _ = std::fs::write(files.log(), clean);
+                        }
+                    }
+                }
+                match end {
+                    det::WatchEnd::Exited(code, o, e, tail) => Ok::<_, String>((code, o, e, tail)),
+                    det::WatchEnd::TimedOut => {
+                        tracing::warn!(schedule = %sid, verdict = "shell_schedule_timed_out_group_killed", measured = true, n_considered = 1,
+                            "shell schedule timed out after {SHELL_TIMEOUT_S}s; killed its whole process group, so nothing it started keeps running");
+                        Err(format!("timed out after {SHELL_TIMEOUT_S}s"))
+                    }
+                    det::WatchEnd::Vanished => {
+                        tracing::warn!(schedule = %sid, verdict = "shell_run_lost", measured = true, n_considered = 1,
+                            "shell run's process ended without writing an exit code");
+                        Err("the run's process ended without recording an exit code".into())
+                    }
+                }
             }
         };
 
-        let (mut code, mut stdout, mut stderr) = match run_once(command.clone()).await {
+        let first_attempt = adopted.as_ref().map(|(_, m)| m.attempt).unwrap_or(1);
+        let (mut code, mut stdout, mut stderr, mut tail) = match run_once(command.clone(), first_attempt, adopted).await {
             Ok(t) => t,
             Err(e) => return RunOutcome::Failed { reason: e },
         };
-        let mut act = actions.get(&code.to_string()).and_then(Value::as_str).unwrap_or("").to_string();
-        if act == "retry_once_then_alert" && code != 0 {
-            match run_once(command).await {
+        let mut act = actions
+            .get(&code.to_string())
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if first_attempt >= 2 {
+            // Adopted the retry of `retry_once_then_alert`: the first attempt
+            // already failed, so this one decides alert or noop.
+            act = if code != 0 { "alert".into() } else { "noop".into() };
+        } else if act == "retry_once_then_alert" && code != 0 {
+            match run_once(command, 2, None).await {
                 Ok(t) => {
-                    (code, stdout, stderr) = t;
-                    act = if code != 0 { "alert".into() } else { "noop".into() };
+                    (code, stdout, stderr, tail) = t;
+                    act = if code != 0 {
+                        "alert".into()
+                    } else {
+                        "noop".into()
+                    };
                 }
                 Err(e) => return RunOutcome::Failed { reason: e },
             }
         }
-        let reason = |s: usize| -> String {
-            let raw = if !stderr.trim().is_empty() { &stderr } else { &stdout };
-            let raw = if raw.trim().is_empty() { format!("exit {code}") } else { raw.clone() };
-            raw.chars().take(s).collect()
-        };
+        let reason = |s: usize| -> String { failure_excerpt(&stdout, &stderr, code, s) };
+        let output = Some(ShellOutput {
+            exit_code: code,
+            tail: tail.clone(),
+        });
+        tracing::info!(
+            schedule = %sched.id(),
+            exit_code = code,
+            tail_bytes = tail.len(),
+            verdict = if code == 0 { "shell_run_output_recorded" } else { "shell_run_failed_output_recorded" },
+            "shell schedule finished; exit code and filtered output tail stored on the run row (AMUX-5241)"
+        );
+        // `wake`: the run's stdout is a message for the schedule's own lane
+        // (scripts/wake-watch.py prints one and exits 10 when a watched file or
+        // CI run fires). Delivered like a tmux schedule's command, so it reaches
+        // an isolated lane as that lane's own schedule and is refused for a
+        // paused, archived or unregistered one.
+        if act == "wake" {
+            return self.shell_wake(sched, code, &stdout, &vault_vals, output).await;
+        }
         if act == "alert" || (act.is_empty() && code != 0 && !actions.is_empty()) {
             let why = reason(400);
-            self.wake_owner(sched, code, &why).await;
+            // `why` already leads with "exit N"; keep the action tag beside it.
+            let detail = why
+                .strip_prefix(&format!("exit {code}"))
+                .unwrap_or(&why)
+                .trim_start_matches(':')
+                .trim_start()
+                .to_string();
+            // The owning worker is told by `schedule_failure::on_run_outcome`
+            // once the run is recorded, for this and every other failure.
             return RunOutcome::ShellError {
-                note: format!("exit {code} [{}] {why}", if act.is_empty() { "alert-default" } else { &act }),
+                note: format!(
+                    "exit {code} [{}] {detail}",
+                    if act.is_empty() {
+                        "alert-default"
+                    } else {
+                        &act
+                    }
+                ),
+                output,
             };
         }
         if act == "noop" || act == "log" || (!actions.is_empty() && code == 0) {
             let body: String = stdout.chars().take(400).collect();
             return RunOutcome::ShellOk {
-                note: Some(format!("exit {code} [{}] {body}", if act.is_empty() { "ok" } else { &act })),
+                note: Some(format!(
+                    "exit {code} [{}] {body}",
+                    if act.is_empty() { "ok" } else { &act }
+                )),
+                output,
             };
         }
         if code != 0 {
-            return RunOutcome::ShellError { note: reason(480) };
+            return RunOutcome::ShellError {
+                note: reason(480),
+                output,
+            };
         }
         RunOutcome::ShellOk {
-            note: Some(stdout.chars().take(480).collect::<String>()).filter(|s| !s.trim().is_empty()),
+            note: Some(stdout.chars().take(480).collect::<String>())
+                .filter(|s| !s.trim().is_empty()),
+            output,
         }
     }
+}
 
-    /// Tell the owning lane its schedule failed, through the steering queue.
-    ///
-    /// Python called `_push_alert` here, which writes an SSE blip and a Web Push
-    /// broadcast — and `push_subscriptions` is empty on this deployment, so the
-    /// action named "alert" alerted nobody: mvs-infra logged five exit-1 runs
-    /// and zero wakes. The steering queue is the one channel that provably
-    /// reaches a session, and it lands at a turn boundary.
-    async fn wake_owner(&self, sched: &DurableSchedule, code: i32, why: &str) {
-        let owner = sched.str_field("session").trim().to_string();
-        if owner.is_empty() || !crate::api::session_verbs::is_running(&owner).await {
-            tracing::warn!(
-                schedule = %sched.id(), code,
-                "schedule alert has no reachable owning lane — nobody was told"
-            );
-            return;
-        }
-        let text = format!(
-            "[amux] SCHEDULE FAILED — '{}' ({}) exited {code}.\n\n{why}\n\nThis is the `alert` exit \
-             action on your schedule. Investigate, fix, or change the schedule's exit_actions if a \
-             non-zero exit is expected here. If this is noise, say so on a card rather than \
-             silencing it quietly — a schedule that alerts on a normal exit trains you to ignore \
-             the channel.",
-            sched.str_field("title"),
-            sched.id()
-        );
-        let _ = crate::api::session_verbs::steer_enqueue(
-            &self.state,
-            &owner,
-            &text,
-            &format!("sched:{}", sched.id()),
-            "",
-        )
-        .await;
-    }
-
-    async fn deliver_fan_out(&self, sched: &DurableSchedule, command: &str) -> RunOutcome {
-        use crate::api::session_verbs::env_path;
-
-        let session = sched.str_field("session").to_string();
-        let model = {
-            let m = sched.str_field("fan_out_model");
-            if m.is_empty() { "haiku" } else { m }
+impl LiveDeliverer {
+    /// Deliver a `wake` run's stdout to the schedule's own lane, retrying a
+    /// failed (not refused) delivery up to [`shell_wake_attempts`] times. This
+    /// is the only retry layer on the path: the script that printed the text
+    /// has already closed the watch, so it never re-sends.
+    async fn shell_wake(&self, sched: &DurableSchedule, code: i32, stdout: &str, vault: &[(String, String)], output: Option<ShellOutput>) -> RunOutcome {
+        let session = sched.str_field("session").trim().to_string();
+        let text = match shell_wake_text(&session, stdout, vault) {
+            Ok(t) => t,
+            Err(why) => {
+                tracing::warn!(schedule = %sched.id(), session = %session, exit_code = code, measured = true, n_considered = 1,
+                    verdict = "shell_wake_unsendable", why = %why, "wake exit action had nothing it could deliver");
+                return RunOutcome::ShellError { note: format!("exit {code} [wake] {why}"), output };
+            }
         };
-
-        let priorities: Vec<String> = command
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        if priorities.is_empty() {
-            return RunOutcome::Refused {
-                reason: "fan-out schedule has no parseable priorities in command".into(),
-            };
+        // `:wake`: each wake is a distinct message, never folded into the last (AF-1047).
+        let guard = format!("sched:{}{}", sched.id(), crate::api::session_verbs::WAKE_GUARD_SUFFIX);
+        let started = std::time::Instant::now();
+        let (d, attempts) = shell_wake_with_retry(shell_wake_attempts(), std::time::Duration::from_secs(shell_wake_backoff_s()), || {
+            crate::api::session_verbs::deliver_automated(&self.state, &session, &text, &guard)
+        })
+        .await;
+        let outcome = shell_wake_outcome(d);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let verdict = match &outcome {
+            RunOutcome::Delivered { .. } => "shell_wake_delivered",
+            RunOutcome::Queued { .. } => "shell_wake_queued",
+            RunOutcome::Refused { .. } => "shell_wake_refused",
+            _ => "shell_wake_failed",
+        };
+        if matches!(outcome, RunOutcome::Delivered { .. } | RunOutcome::Queued { .. }) {
+            tracing::info!(schedule = %sched.id(), session = %session, exit_code = code, attempts, elapsed_ms, chars = text.chars().count(),
+                status = outcome.status(), measured = true, n_considered = 1, verdict, "wake exit action delivered the run's output to its lane");
+        } else {
+            tracing::warn!(schedule = %sched.id(), session = %session, exit_code = code, attempts, elapsed_ms, status = outcome.status(),
+                measured = true, n_considered = 1, verdict, outcome = ?outcome, "wake exit action could not deliver the run's output to its lane");
         }
-
-        let ep = env_path(&session);
-        if !ep.exists() {
-            return RunOutcome::Failed {
-                reason: format!("fan-out parent session {session} has no env file"),
-            };
+        if let RunOutcome::Delivered { .. } = &outcome {
+            let origin = schedule_message_origin(sched.str_field("title"), sched.id(), "wake");
+            crate::api::session_verbs::cmd_hist_record_schedule(&self.state, &session, &text, &origin).await;
         }
+        outcome
+    }
+}
 
-        let launch_body = serde_json::json!({
-            "title": sched.str_field("title"),
-            "priorities": priorities,
-            "parent_session": session,
-            "model": model,
-            "provider": "claude",
-        });
+/// Characters of a wake run's stdout delivered; the rest is cut with a marker.
+pub const SHELL_WAKE_MAX_CHARS: usize = 4000;
 
-        let port = crate::config::canonical_port();
-        let base = format!("https://127.0.0.1:{port}");
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap_or_default();
-        let r = client
-            .post(format!("{base}/api/board/launch"))
-            .header("Content-Type", "application/json")
-            .header("X-Amux-Session", format!("sched:{}", sched.id()))
-            .json(&launch_body)
-            .send()
-            .await;
+/// Delivery attempts for one wake run (`AMUX_SHELL_WAKE_ATTEMPTS`, 1..=5, default 3).
+pub fn shell_wake_attempts() -> u32 {
+    std::env::var("AMUX_SHELL_WAKE_ATTEMPTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3u32).clamp(1, 5)
+}
 
-        match r {
-            Ok(resp) if resp.status().is_success() => {
-                let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                let started = body.get("workers_started").and_then(|v| v.as_u64()).unwrap_or(0);
-                let epic_id = body.get("epic").and_then(|v| v.as_str()).unwrap_or("?");
-                let detail = format!("fan-out: epic {epic_id}, {started} workers ({model})");
-                tracing::info!(
-                    target: "amux::scheduler",
-                    schedule = %sched.id(),
-                    epic = %epic_id,
-                    workers = started,
-                    model = %model,
-                    verdict = "fan_out_delivered",
-                    measured = true,
-                    "scheduler fan-out delivered"
-                );
-                let origin = schedule_message_origin(
-                    sched.str_field("title"),
-                    sched.id(),
-                    "cron-rs",
-                );
-                crate::api::session_verbs::cmd_hist_record_schedule(
-                    &self.state,
-                    &session,
-                    &format!("[fan-out] {detail}\n\n{command}"),
-                    &origin,
-                )
-                .await;
-                RunOutcome::Delivered {
-                    submission: "confirmed".into(),
-                    detail,
-                }
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                RunOutcome::Failed {
-                    reason: format!("fan-out launch returned {status}: {text}"),
-                }
-            }
-            Err(e) => RunOutcome::Failed {
-                reason: format!("fan-out launch request failed: {e}"),
-            },
+/// Seconds between wake delivery attempts (`AMUX_SHELL_WAKE_BACKOFF_S`, 0..=30, default 5).
+pub fn shell_wake_backoff_s() -> u64 {
+    std::env::var("AMUX_SHELL_WAKE_BACKOFF_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5u64).min(30)
+}
+
+/// The message a wake run delivers, or why there is none.
+///
+/// The text goes into a lane's prompt, so it is masked with the run's vault
+/// values (`[vault:KEY]`) HERE, at the delivery boundary, with the redactor the
+/// run log uses. `run_shell` already masks the stdout it returns; this does not
+/// rely on that, so a later change to how stdout is captured cannot put a vault
+/// value into a prompt.
+pub fn shell_wake_text(session: &str, stdout: &str, vault: &[(String, String)]) -> Result<String, String> {
+    if session.trim().is_empty() {
+        return Err("the schedule has no session to wake".into());
+    }
+    let masked = crate::api::vault_secrets::redact(stdout, vault);
+    let t = masked.trim();
+    if t.is_empty() {
+        return Err("the run printed nothing to deliver".into());
+    }
+    if t.chars().count() <= SHELL_WAKE_MAX_CHARS {
+        return Ok(t.to_string());
+    }
+    let cut: String = t.chars().take(SHELL_WAKE_MAX_CHARS).collect();
+    Ok(format!("{cut}\n[cut at {SHELL_WAKE_MAX_CHARS} chars; the full output is in this schedule's Shell tab]"))
+}
+
+/// Is this delivery a failure worth another attempt? A refusal is a policy
+/// answer (paused, archived, unregistered) and a queued one is pending, so
+/// neither is retried.
+pub(crate) fn shell_wake_retryable(d: &crate::api::session_verbs::AutoDelivery) -> bool {
+    !d.refused && d.queue_id.is_none() && d.submitted == Some(false)
+}
+
+/// Run `attempt` until it is not retryable or `max` attempts are spent.
+/// Returns the last delivery and how many attempts were made.
+pub(crate) async fn shell_wake_with_retry<F, Fut>(
+    max: u32,
+    backoff: std::time::Duration,
+    mut attempt: F,
+) -> (crate::api::session_verbs::AutoDelivery, u32)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::api::session_verbs::AutoDelivery>,
+{
+    let max = max.max(1);
+    let mut n = 0;
+    loop {
+        n += 1;
+        let d = attempt().await;
+        if !shell_wake_retryable(&d) || n >= max {
+            return (d, n);
         }
+        tracing::warn!(attempt = n, max, measured = true, n_considered = 1, verdict = "shell_wake_retry",
+            message = %d.message, "wake delivery failed; retrying");
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// The run outcome for a wake delivery, mapped exactly as a tmux fire maps it.
+pub(crate) fn shell_wake_outcome(d: crate::api::session_verbs::AutoDelivery) -> RunOutcome {
+    if d.refused {
+        return RunOutcome::Refused { reason: format!("[wake] {}", d.message) };
+    }
+    if let Some(queue_id) = d.queue_id {
+        return RunOutcome::Queued { queue_id, detail: format!("[wake] {}", d.message) };
+    }
+    match d.submitted {
+        Some(false) => RunOutcome::Failed { reason: format!("[wake] {}", d.message) },
+        _ => RunOutcome::Delivered { submission: d.submission.to_string(), detail: format!("[wake] {}", d.message) },
     }
 }
 
@@ -1725,6 +2686,15 @@ pub fn reserve_applies_to(source: &str) -> bool {
 
 #[async_trait::async_trait]
 impl Deliverer for LiveDeliverer {
+    async fn adopt_shell(
+        &self,
+        sched: &DurableSchedule,
+        files: super::shell_detached::RunFiles,
+        meta: super::shell_detached::RunMeta,
+    ) -> Option<RunOutcome> {
+        Some(self.adopt_shell_run(sched, files, meta).await)
+    }
+
     async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome {
         if sched.str_field("kind") == "shell" {
             // NOT GATED BY THE RESERVE, and the exemption is the point: a shell
@@ -1777,16 +2747,38 @@ impl Deliverer for LiveDeliverer {
         }
         let command = sched.str_field("command").trim().to_string();
         if command.is_empty() {
-            return RunOutcome::Refused { reason: "schedule has no command to deliver".into() };
+            return RunOutcome::Refused {
+                reason: "schedule has no command to deliver".into(),
+            };
         }
 
         // Fan-out path: treat the command as priorities and call the launch endpoint
         if sched.i64_field("fan_out", 0) != 0 {
-            return self.deliver_fan_out(sched, &command).await;
+            tracing::warn!(schedule=%sched.id(), measured=true, n_considered=1,
+                verdict="retired_fan_out_refused", "use Projects for decomposed work");
+            return RunOutcome::Refused {
+                reason: "Fan-out schedules are retired; use Projects".into(),
+            };
         }
 
+        // Wake economics (schedule_wake.rs): a goal-continuation fire obeys the
+        // goal keeper's rules, a long brief becomes a pointer while unchanged,
+        // and held receipts ride along instead of waking the worker themselves.
+        if let Some(reason) = super::schedule_wake::goal_gate(&self.state, sched, source).await {
+            return RunOutcome::Refused { reason };
+        }
         let session = sched.str_field("session").to_string();
-        let text = delivered_text(&command, source);
+        let brief = super::schedule_wake::brief(
+            &super::schedule_wake::briefs_dir(),
+            sched.id(),
+            &session,
+            &command,
+            source,
+            super::schedule_wake::brief_min_chars(),
+        );
+        let home = crate::api::session_verbs::home();
+        let (text, carried) =
+            super::receipts::attach(&home, &session, &delivered_text(&brief.text, source));
         let d = crate::api::session_verbs::deliver_automated(
             &self.state,
             &session,
@@ -1797,8 +2789,22 @@ impl Deliverer for LiveDeliverer {
         if d.refused {
             return RunOutcome::Refused { reason: d.message };
         }
+        if d.submitted != Some(false) {
+            super::schedule_wake::brief_delivered(&brief);
+            super::receipts::consume(&home, &session, carried);
+            if super::schedule_wake::is_goal_continuation(sched.str_field("title"), &command) {
+                super::goal_keeper::note_wake(
+                    &session,
+                    crate::config::now_f64(),
+                    &format!("sched:{}", sched.id()),
+                );
+            }
+        }
         if let Some(queue_id) = d.queue_id {
-            return RunOutcome::Queued { queue_id, detail: d.message };
+            return RunOutcome::Queued {
+                queue_id,
+                detail: d.message,
+            };
         }
         // `ok` is not "delivered" — read the SUBMISSION verdict. `Some(false)`
         // is the AMUX-2629 specimen: the keys landed and Claude Code never took
@@ -1811,11 +2817,7 @@ impl Deliverer for LiveDeliverer {
                 // origin so the row is clickable and the health audit can
                 // prove this specific delivered run produced a message rather
                 // than guessing from a possibly-duplicated title.
-                let origin = schedule_message_origin(
-                    sched.str_field("title"),
-                    sched.id(),
-                    source,
-                );
+                let origin = schedule_message_origin(sched.str_field("title"), sched.id(), source);
                 crate::api::session_verbs::cmd_hist_record_schedule(
                     &self.state,
                     &session,
@@ -1842,11 +2844,16 @@ impl Deliverer for LiveDeliverer {
 pub struct TickReport {
     pub due: usize,
     pub fired: usize,
+    /// Started asynchronously; completion is reported by its durable run row.
+    pub dispatched: usize,
     pub shadowed: usize,
     /// Due schedules whose shadow event was already journaled for this
     /// occurrence (in-memory dedupe hit).
     pub deduped: usize,
     pub errors: usize,
+    /// Due fires held back because the host was critical. They stay due
+    /// (`next_run` untouched) and fire on a later tick.
+    pub deferred: usize,
 }
 
 /// One scheduler pass. `firing=false` is SHADOW MODE (see module docs):
@@ -1861,6 +2868,49 @@ pub async fn scheduler_tick(
     shadow_seen: &mut HashMap<String, String>,
     deliverer: &dyn Deliverer,
 ) -> anyhow::Result<TickReport> {
+    scheduler_tick_inner(store, firing, policy, shadow_seen, deliverer, None).await
+}
+
+/// Production dispatch is bounded independently for shell and provider jobs.
+/// One slow shell must not consume the provider slots or stop future ticks.
+#[derive(Default)]
+struct FireDispatch {
+    tasks: tokio::task::JoinSet<anyhow::Result<bool>>,
+    active: HashMap<tokio::task::Id, (String, bool)>,
+}
+
+impl FireDispatch {
+    fn reap(&mut self) {
+        while let Some(result) = self.tasks.try_join_next_with_id() {
+            let (id, verdict) = match result {
+                Ok((id, result)) => (id, result.map(|fired| if fired { "finished" } else { "raced" })),
+                Err(e) => (e.id(), Err(anyhow::anyhow!(e))),
+            };
+            let schedule = self.active.remove(&id).map(|(id, _)| id).unwrap_or_default();
+            match verdict {
+                Ok(verdict) => tracing::info!(schedule, verdict, measured = true, n_considered = 1,
+                    "scheduler dispatch completed; durable result recorded"),
+                Err(e) => tracing::warn!(schedule, error = %e, verdict = "schedule_dispatch_failed",
+                    "scheduler dispatch failed; provisional receipt remains authoritative"),
+            }
+        }
+    }
+
+    fn admit(&self, id: &str, shell: bool) -> bool {
+        !self.active.values().any(|(active, _)| active == id)
+            && self.active.values().filter(|(_, kind)| *kind == shell).count() < 4
+    }
+}
+
+async fn scheduler_tick_inner(
+    store: &SharedStore,
+    firing: bool,
+    policy: MissedRunPolicy,
+    shadow_seen: &mut HashMap<String, String>,
+    deliverer: &dyn Deliverer,
+    mut dispatch: Option<(&mut FireDispatch, std::sync::Arc<dyn Deliverer>)>,
+) -> anyhow::Result<TickReport> {
+    if let Some((queue, _)) = dispatch.as_mut() { queue.reap(); }
     let now = Local::now();
     let now_str = fmt_minute(now);
     let store_read = store.clone();
@@ -1870,8 +2920,21 @@ pub async fn scheduler_tick(
         Ok(due_schedules(&conn, &ns)?)
     })
     .await??;
+    let due: Vec<DurableSchedule> = due
+        .into_iter()
+        .filter(|s| {
+            let held = fall_back_held(s.str_field("next_run"), s.i64_field("last_run", 0), now);
+            if held {
+                tracing::info!(id = s.id(), next_run = s.str_field("next_run"), verdict = "schedule_fall_back_held", "schedule waits for the second occurrence of a repeated hour");
+            }
+            !held
+        })
+        .collect();
 
-    let mut report = TickReport { due: due.len(), ..Default::default() };
+    let mut report = TickReport {
+        due: due.len(),
+        ..Default::default()
+    };
 
     for sched in due {
         let id = sched.id().to_string();
@@ -1917,41 +2980,116 @@ pub async fn scheduler_tick(
             continue;
         }
 
-        // FIRING mode: one write transaction PER schedule (the Python loop's
-        // MO-3058 lesson: a shared batch turns one poison entry into missed
-        // and double fires for everyone else).
-        match fire_one(store, deliverer, &id, now, policy).await {
-            Ok(true) => report.fired += 1,
-            Ok(false) => {} // raced: no longer due inside the txn
-            Err(e) => {
-                report.errors += 1;
-                tracing::warn!(schedule = %id, error = %e, "fire failed");
-                // Poison-entry guard (Python parity): record the error run
-                // and push next_run out so the row cannot wedge every tick.
-                let eid = id.clone();
-                let bump = fmt_minute(now + ChronoDuration::minutes(15));
-                let emsg: String = format!("fire aborted: {e}").chars().take(500).collect();
-                let _ = store
-                    .write_async(move |conn| {
-                        insert_run(
-                            conn,
-                            &eid,
-                            chrono::Utc::now().timestamp(),
-                            &RunOutcome::Failed { reason: emsg.clone() },
-                            "cron-rs",
-                            None,
-                        )?;
-                        conn.execute(
-                            "UPDATE schedules SET next_run=?1, updated=?2 WHERE id=?3",
-                            rusqlite::params![bump, chrono::Utc::now().timestamp(), eid],
-                        )?;
-                        Ok(WriteOutcome { applied: true, events: vec![] })
-                    })
-                    .await;
+        // HOST GUARD, BEFORE fire_one. fire_one advances next_run and records a
+        // run inside its claim transaction before delivering, so a gate any
+        // later would record a refused run instead of deferring one. Here the
+        // row simply stays due. A deferral long enough to cross another
+        // occurrence is reported by the existing missed-run note, honestly.
+        if !crate::runtime_jobs::host_guard::admit_automation("schedules") {
+            report.deferred += 1;
+            continue;
+        }
+
+        if let Some((queue, live)) = dispatch.as_mut() {
+            let shell = sched.str_field("kind") == "shell";
+            if !queue.admit(&id, shell) {
+                report.deferred += 1;
+                continue;
             }
+            let owned_store = store.clone();
+            let owned_deliverer = live.clone();
+            let owned_id = id.clone();
+            let task = queue.tasks.spawn(async move {
+                fire_recorded(&owned_store, owned_deliverer.as_ref(), &owned_id, now, policy).await
+            });
+            queue.active.insert(task.id(), (id.clone(), shell));
+            report.dispatched += 1;
+            tracing::info!(schedule = %id, shell, verdict = "schedule_dispatched",
+                measured = true, n_considered = 1, "due schedule dispatched without blocking the next tick");
+            continue;
+        }
+        match fire_recorded(store, deliverer, &id, now, policy).await {
+            Ok(true) => report.fired += 1,
+            Ok(false) => {},
+            Err(_) => report.errors += 1,
         }
     }
     Ok(report)
+}
+
+/// Preserve the same poison-entry receipt in synchronous and dispatched paths.
+async fn fire_recorded(
+    store: &SharedStore,
+    deliverer: &dyn Deliverer,
+    id: &str,
+    now: DateTime<Local>,
+    policy: MissedRunPolicy,
+) -> anyhow::Result<bool> {
+    use futures::FutureExt;
+    // Governance PR 13: the creator must still have authority over the worker
+    // this fires as. `report` fires and counts; `enforce` pauses and asks.
+    if crate::api::schedule_authority::gate(store, id).await == crate::api::schedule_authority::Gate::Paused {
+        return Ok(false);
+    }
+    // A firing is an origin: it starts its own trace, and everything the
+    // delivery records (the message row, the worker's trace file) descends
+    // from it (api/trace.rs).
+    let trace = crate::api::trace::TraceCtx::mint(format!("schedule:{id}"));
+    let fire = crate::api::trace::CURRENT.scope(trace.clone(), fire_one(store, deliverer, id, now, policy));
+    let result = std::panic::AssertUnwindSafe(fire)
+        .catch_unwind().await.unwrap_or_else(|_| {
+            tracing::warn!(schedule = id, verdict = "schedule_consumer_panicked",
+                measured = true, n_considered = 1, "schedule consumer panicked; outcome remains unknown");
+            Err(anyhow::anyhow!("schedule consumer panicked; delivery outcome unknown"))
+        });
+    // The firing is the root of its trace: record it, so the delivery that
+    // descends from it has a parent in the ledger rather than an orphan span.
+    if !matches!(result, Ok(false)) && crate::api::trace::enabled() {
+        let ev = crate::api::ledger::Event {
+            event_id: format!("sched:{id}:{}", trace.span_id),
+            ts_ms: chrono::Utc::now().timestamp_millis(),
+            kind: "schedule".into(),
+            actor: "policy:scheduler".into(),
+            authority: Some("schedule".into()),
+            action: Some("fire".into()),
+            resource: Some(format!("schedule:{id}")),
+            decision: Some(if result.is_ok() { "allowed" } else { "failed" }.into()),
+            outcome: Some(if result.is_ok() { "fired" } else { "failed" }.into()),
+            trace_id: Some(trace.trace_id.clone()),
+            span_id: Some(trace.span_id.clone()),
+            trace_source: Some(crate::api::trace::MINTED.into()),
+            ..Default::default()
+        };
+        if let Err(e) = store.write_async(move |conn| {
+            crate::api::ledger::append(conn, &ev);
+            Ok(WriteOutcome { applied: false, events: vec![] })
+        }).await {
+            tracing::warn!(error = %e, verdict = "ledger_append_failed", "the schedule fire was not recorded in the ledger");
+        }
+    }
+    if let Err(e) = &result {
+        tracing::warn!(schedule = id, error = %e, "fire failed");
+        let eid = id.to_owned();
+        let bump = fmt_minute(now + ChronoDuration::minutes(15));
+        let emsg: String = format!("fire aborted: {e}").chars().take(500).collect();
+        store.write_async(move |conn| {
+            let finalized = conn.execute(
+                "UPDATE schedule_runs SET status='error', note=?1, delivery='unknown', submission=NULL                  WHERE schedule_id=?2 AND source='cron-rs' AND status='running'",
+                rusqlite::params![emsg, eid])?;
+            if finalized == 0 {
+                insert_run(conn, &eid, chrono::Utc::now().timestamp(),
+                    &RunOutcome::Failed { reason: emsg }, "cron-rs", None)?;
+            }
+            conn.execute("UPDATE schedules SET next_run=?1, updated=?2 WHERE id=?3",
+                rusqlite::params![bump, chrono::Utc::now().timestamp(), eid])?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).await?;
+        let (rid, reason) = (id.to_string(), format!("fire aborted: {e}"));
+        if let Ok(Some(sched)) = store.read_async(move |c| Ok(get_schedule(c, &rid)?)).await {
+            super::schedule_failure::on_run_outcome(store, &sched, &RunOutcome::Failed { reason }, "cron-rs").await;
+        }
+    }
+    result
 }
 
 /// What the claim transaction handed back: the row we won, and one note per
@@ -1963,6 +3101,14 @@ struct Claim {
     /// claim transaction, so the fire is on record before delivery is
     /// attempted. RECORD updates these by id instead of inserting.
     run_ids: Vec<i64>,
+    /// The claim disabled the row because this was its last fire (a one-shot,
+    /// or a bound reached). A reserve refusal re-arms exactly these.
+    ended_by_claim: bool,
+    /// The `disabled_reason` that claim wrote. A re-arm re-enables only a row
+    /// still disabled for this reason and not locked by the owner: a row
+    /// something else disabled in between (the owner, a failure streak, a
+    /// retired worker) stays off (implicit state machines inventory #13).
+    claim_reason: String,
 }
 
 /// Fire one due schedule: CLAIM the occurrence, DELIVER outside the write
@@ -1993,22 +3139,69 @@ async fn fire_one(
     let slot: std::sync::Arc<std::sync::Mutex<Option<Claim>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot_w = slot.clone();
+    // A claim that only applied a lifecycle bound (ended the row, or moved its
+    // first fire to `not_before`) commits without firing.
+    let bound_only = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bound_only_w = bound_only.clone();
     let reply = store
         .write_async(move |conn| {
             let Some(sched) = get_schedule(conn, &id)? else {
-                return Ok(WriteOutcome { applied: false, events: vec![] });
+                return Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                });
             };
             let stored_next = sched.str_field("next_run").to_string();
             if sched.is_deleted()
                 || !sched.enabled()
                 || stored_next.is_empty()
                 || stored_next.as_str() > now_str.as_str()
+                || fall_back_held(&stored_next, sched.i64_field("last_run", 0), now)
             {
-                return Ok(WriteOutcome { applied: false, events: vec![] });
+                return Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                });
             }
 
             let now_ts = chrono::Utc::now().timestamp();
-            let expr = sched.schedule_expr().and_then(|e| ScheduleExpr::parse(e).ok());
+            let expr = sched
+                .schedule_expr()
+                .and_then(|e| ScheduleExpr::parse(e).ok());
+
+            // LIFECYCLE BOUNDS (GS-12 finding 5), before anything fires. A
+            // bound reached while the row sat due ends it here; a first fire
+            // earlier than `not_before` moves to the first one at or after it.
+            let bounds = super::schedule_lifecycle::Bounds::of(&sched);
+            let bound_event = || PendingEvent {
+                entity_type: EntityType::Schedule,
+                entity_id: sched.id().to_string(),
+                mutation: MutationKind::Updated,
+                payload: None,
+            };
+            if let Some(reason) = bounds.end_reason(Some(&stored_next)) {
+                super::schedule_lifecycle::end_schedule(conn, sched.id(), &reason)?;
+                bound_only_w.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(WriteOutcome { applied: true, events: vec![bound_event()] });
+            }
+            if bounds.too_early(&stored_next) {
+                let next = expr
+                    .as_ref()
+                    .and_then(|e| bounds.first_after(e, now))
+                    .map(fmt_minute)
+                    .or_else(|| bounds.not_before.clone())
+                    .unwrap_or_else(|| stored_next.clone());
+                conn.execute(
+                    "UPDATE schedules SET next_run=?1, updated=?2 WHERE id=?3",
+                    rusqlite::params![next, now_ts, sched.id()],
+                )?;
+                tracing::info!(schedule = %sched.id(), next_run = %next,
+                    not_before = ?bounds.not_before, verdict = "schedule_bound_deferred_start",
+                    measured = true, n_considered = 1,
+                    "schedule was due before its not_before; moved to the first fire after it");
+                bound_only_w.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Ok(WriteOutcome { applied: true, events: vec![bound_event()] });
+            }
             let prev = parse_minute(&stored_next).unwrap_or(now);
 
             // Occurrences due in (anchor, now]. The anchor sits one step
@@ -2021,20 +3214,34 @@ async fn fire_one(
                         ScheduleExpr::Interval { every } => prev - *every,
                         _ => prev - ChronoDuration::minutes(1),
                     };
-                    runs_due(e, anchor, now, policy)
+                    // Replaying an identical model prompt ten times buys ten
+                    // context reads, not ten different occurrences. Shell
+                    // backfills retain the explicitly selected catch-up policy.
+                    let effective = if sched.str_field("kind") == "shell" { policy } else { MissedRunPolicy::Skip };
+                    runs_due(e, anchor, now, effective)
                 }
-                None => DueRuns { runs: vec![now], overflow: 0, truncated_scan: false },
+                None => DueRuns {
+                    runs: vec![now],
+                    overflow: 0,
+                    truncated_scan: false,
+                },
             };
             let fallback = [now];
-            let occurrences: &[DateTime<Local>] =
-                if due.runs.is_empty() { &fallback } else { &due.runs };
+            let occurrences: &[DateTime<Local>] = if due.runs.is_empty() {
+                &fallback
+            } else {
+                &due.runs
+            };
 
             let mut events = Vec::new();
             let mut notes = Vec::with_capacity(occurrences.len());
             for (i, occ) in occurrences.iter().enumerate() {
                 let is_catch_up = occurrences.len() > 1 && i + 1 < occurrences.len();
                 notes.push(if is_catch_up {
-                    Some(format!("catch-up for missed occurrence {}", fmt_minute(*occ)))
+                    Some(format!(
+                        "catch-up for missed occurrence {}",
+                        fmt_minute(*occ)
+                    ))
                 } else if due.overflow > 0 {
                     Some(format!(
                         "{}{} missed occurrence(s) not replayed (policy={:?})",
@@ -2046,19 +3253,26 @@ async fn fire_one(
                     None
                 });
             }
+            // `cron_runs` counts scheduled fires against `max_runs` (0125); a
+            // reserve refusal gives its count back in RECORD below.
             conn.execute(
-                "UPDATE schedules SET run_count = COALESCE(run_count,0) + ?1 WHERE id=?2",
+                "UPDATE schedules SET run_count = COALESCE(run_count,0) + ?1, \
+                 cron_runs = COALESCE(cron_runs,0) + ?1 WHERE id=?2",
                 rusqlite::params![occurrences.len() as i64, sched.id()],
             )?;
+            let mut ended_by_claim = false;
+            let mut claim_reason = String::new();
 
             if sched.str_field("sched_type") == "once" {
+                claim_reason = format!("one-shot: fired at {now_str}");
                 conn.execute(
-                    "UPDATE schedules SET enabled=0, last_run=?1, updated=?1 WHERE id=?2",
-                    rusqlite::params![now_ts, sched.id()],
+                    "UPDATE schedules SET enabled=0, last_run=?1, updated=?1, disabled_reason=?3 WHERE id=?2",
+                    rusqlite::params![now_ts, sched.id(), claim_reason],
                 )?;
                 // run-once disable is audited exactly like Python's
                 // ("run-once" source; ours is suffixed for the dual period).
                 insert_audit(conn, sched.id(), "enabled", "1", "0", "run-once-rs", "")?;
+                ended_by_claim = true;
             } else {
                 let next = expr
                     .as_ref()
@@ -2079,6 +3293,18 @@ async fn fire_one(
                     "UPDATE schedules SET last_run=?1, next_run=?2, updated=?1 WHERE id=?3",
                     rusqlite::params![now_ts, next, sched.id()],
                 )?;
+                // This fire may be the last one its bounds allow: end it now so
+                // the row reads disabled, with the reason, from this moment on.
+                let after = super::schedule_lifecycle::Bounds {
+                    cron_runs: bounds.cron_runs + occurrences.len() as i64,
+                    ..bounds.clone()
+                };
+                if let Some(reason) = after.end_reason(Some(&next)) {
+                    ended_by_claim = super::schedule_lifecycle::end_schedule(conn, sched.id(), &reason)?;
+                    if ended_by_claim {
+                        claim_reason = reason;
+                    }
+                }
             }
 
             events.push(PendingEvent {
@@ -2090,7 +3316,10 @@ async fn fire_one(
             events.push(PendingEvent {
                 entity_type: EntityType::Other("schedule_fire".into()),
                 entity_id: sched.id().to_string(),
-                mutation: MutationKind::StatusChanged { from: stored_next, to: "fired".into() },
+                mutation: MutationKind::StatusChanged {
+                    from: stored_next,
+                    to: "fired".into(),
+                },
                 payload: None,
             });
             if due.overflow > 0 {
@@ -2135,16 +3364,26 @@ async fn fire_one(
                     rusqlite::params![
                         sched.id(),
                         now_ts,
-                        note.clone().unwrap_or_else(|| "fired; delivery pending".into()),
+                        note.clone()
+                            .unwrap_or_else(|| "fired; delivery pending".into()),
                     ],
                 )?;
                 run_ids.push(conn.last_insert_rowid());
             }
-            *slot_w.lock().expect("claim slot poisoned") = Some(Claim { sched, notes, run_ids });
-            Ok(WriteOutcome { applied: true, events })
+            *slot_w.lock().expect("claim slot poisoned") = Some(Claim {
+                sched,
+                notes,
+                run_ids,
+                ended_by_claim,
+                claim_reason,
+            });
+            Ok(WriteOutcome {
+                applied: true,
+                events,
+            })
         })
         .await?;
-    if !reply.applied {
+    if !reply.applied || bound_only.load(std::sync::atomic::Ordering::SeqCst) {
         return Ok(false);
     }
     let Some(claim) = slot.lock().expect("claim slot poisoned").take() else {
@@ -2154,17 +3393,78 @@ async fn fire_one(
     };
 
     // ---- DELIVER (outside the write lock) ----
+    // WAKE CONDITION (`when`, schedule_wake.rs): a tmux schedule's shell check
+    // runs once per scheduled fire, before any delivery or gate. A failing
+    // check skips the fire; it is not a delivery attempt, so it spends no
+    // max_runs and wakes nobody. Run now never reaches here, so it skips it.
+    let when_check = super::schedule_wake::when_check_of(&claim.sched);
+    let when_skip: Option<String> = match &when_check {
+        Some(c) => super::schedule_wake::when_gate(&claim.sched, c).await.err(),
+        None => None,
+    };
     let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(claim.notes.len());
-    for _ in 0..claim.notes.len() {
-        outcomes.push(deliverer.deliver(&claim.sched, "cron-rs").await);
+    for i in 0..claim.notes.len() {
+        outcomes.push(match (&when_skip, claim.run_ids.get(i)) {
+            (Some(reason), _) => RunOutcome::Refused { reason: reason.clone() },
+            // The row id travels with the delivery, so a shell run's files
+            // name the row a restarted server finishes (shell_detached.rs).
+            (None, Some(id)) => {
+                super::shell_detached::SHELL_RUN_ID
+                    .scope(*id, deliverer.deliver(&claim.sched, "cron-rs"))
+                    .await
+            }
+            (None, None) => deliverer.deliver(&claim.sched, "cron-rs").await,
+        });
     }
+    let when_skipped_all = when_skip.is_some();
+    // The check passed and the prompt is delivered or pending: a `when_once`
+    // schedule has done its job.
+    let when_met_once = when_check.is_some()
+        && !when_skipped_all
+        && claim.sched.i64_field("when_once", 1) != 0
+        && outcomes.iter().any(|o| matches!(o, RunOutcome::Delivered { .. } | RunOutcome::Queued { .. }));
+    let bounds_before = super::schedule_lifecycle::Bounds::of(&claim.sched);
+    let is_once_row = claim.sched.str_field("sched_type") == "once";
 
     // ---- RECORD what actually happened ----
     let sid = claim.sched.id().to_string();
+    // A fire the background reserve refused consumed no input. It gives its
+    // `cron_runs` back, and a ONE-SHOT is deferred rather than lost: a
+    // `once` row, a row this fire ended by a bound, or a fixed-date cron whose
+    // next fire is a year away. Seven GS-12 one-offs were fixed-date crons and
+    // lost their only fire this way because only `sched_type=once` retried.
+    let reserve_refused_all = !outcomes.is_empty()
+        && outcomes.iter().all(|o| matches!(o, RunOutcome::Refused { reason } if reason.starts_with("schedule PAUSED: the plan window")));
+    let ended_by_claim = claim.ended_by_claim;
+    let claim_reason = claim.claim_reason.clone();
+    let fixed_date = claim
+        .sched
+        .schedule_expr()
+        .is_some_and(super::schedule_lifecycle::is_fixed_date_cron);
+    let retry_once = reserve_refused_all && (ended_by_claim || fixed_date);
+    // Read the reset once, after delivery: the refusal itself may have just
+    // probed the window and recorded a fresh one.
+    let (retry_target, retry_verdict) = reserve_retry_target(
+        claim.sched.id(),
+        now,
+        if reserve_refused_all { deliverer.window_reset() } else { None },
+    );
+    // A RECURRING refusal keeps its natural next fire unless the window resets
+    // sooner; then it is pulled forward to the reset (never delayed, and never
+    // on the 15-minute fallback, which would turn a cron into a poll). The
+    // target always lies past the reset, so the retry lands in the NEXT window
+    // and a refused recurring fire retries at most once per window.
+    let pull_forward = reserve_refused_all && !retry_once && retry_verdict == "reserve_retry_at_reset";
+    let last_run_id = claim.run_ids.last().copied();
+    let occurrences_n = outcomes.len() as i64;
+    let expected_version = claim.sched.i64_field("version", 0);
+    let expected_command = claim.sched.str_field("command").to_string();
+    let expected_session = claim.sched.str_field("session").to_string();
     let notes = claim.notes;
     let run_ids = claim.run_ids;
     let all_lost = should_warn_undelivered(&outcomes);
     let statuses: Vec<&'static str> = outcomes.iter().map(|o| o.status()).collect();
+    let for_notice = outcomes.clone();
     store
         .write_async(move |conn| {
             let now_ts = chrono::Utc::now().timestamp();
@@ -2181,8 +3481,103 @@ async fn fire_one(
                 // never silently drop the outcome. Without this a reconciled row
                 // would leave the real verdict unrecorded, which is the same
                 // silence one layer along.
-                if updated == 0 {
+                let receipt_exists = match run_ids.get(i) {
+                    Some(id) => conn.query_row("SELECT EXISTS(SELECT 1 FROM schedule_runs WHERE id=?1)", [id], |r| r.get::<_, bool>(0))?,
+                    None => false,
+                };
+                if updated == 0 && !receipt_exists {
                     insert_run(conn, &sid, now_ts, outcome, "cron-rs", note.as_deref())?;
+                }
+            }
+            // Definite reserve refusal consumed no input. Preserve a one-off
+            // until capacity returns; never replay queued/unknown delivery or
+            // resurrect a schedule its owner changed while delivery was running.
+            if reserve_refused_all {
+                conn.execute(
+                    "UPDATE schedules SET cron_runs = MAX(0, COALESCE(cron_runs,0) - ?1) WHERE id=?2",
+                    rusqlite::params![occurrences_n, sid],
+                )?;
+            }
+            // A fire skipped by its wake condition is not a fire: its run rows
+            // read `skipped` (not counted as failures), it gives its max_runs
+            // count back, and a recurring row the claim ended only because
+            // that count reached max_runs is re-armed. Only cron_runs and the
+            // bound end are touched: the reserve retry logic does not apply.
+            if when_skipped_all {
+                for id in &run_ids {
+                    conn.execute(
+                        "UPDATE schedule_runs SET status='skipped', delivery='skipped' WHERE id=?1",
+                        [id],
+                    )?;
+                }
+                conn.execute(
+                    "UPDATE schedules SET cron_runs = MAX(0, COALESCE(cron_runs,0) - ?1) WHERE id=?2",
+                    rusqlite::params![occurrences_n, sid],
+                )?;
+                if ended_by_claim && !is_once_row {
+                    let next: String = conn
+                        .query_row("SELECT COALESCE(next_run,'') FROM schedules WHERE id=?1", [&sid], |r| r.get(0))
+                        .unwrap_or_default();
+                    if bounds_before.end_reason(Some(&next)).is_none() {
+                        let changed = conn.execute(
+                            "UPDATE schedules SET enabled=1, disabled_reason=NULL WHERE id=?1 AND enabled=0 AND deleted IS NULL AND version=?2 AND command=?3 AND session=?4 \
+                             AND COALESCE(disabled_reason,'') = ?5 AND COALESCE(locked_by,'') = ''",
+                            rusqlite::params![sid, expected_version, expected_command, expected_session, claim_reason])?;
+                        if changed > 0 {
+                            insert_audit(conn, &sid, "enabled", "0", "1", "wake-condition-rs", "")?;
+                        }
+                    }
+                }
+            }
+            if when_met_once {
+                let changed = conn.execute(
+                    "UPDATE schedules SET enabled=0, updated=?1, disabled_reason=?2 WHERE id=?3 AND enabled=1",
+                    rusqlite::params![now_ts, format!("wake condition met: delivered at {}", fmt_minute(Local::now())), sid],
+                )?;
+                if changed > 0 {
+                    insert_audit(conn, &sid, "enabled", "1", "0", "wake-condition-rs", "")?;
+                }
+                tracing::info!(schedule = %sid, verdict = "schedule_when_disabled", measured = true, n_considered = 1,
+                    "wake condition met and the prompt delivered; when_once schedule disabled");
+            }
+            let retry_at = fmt_minute(retry_target);
+            let mut retried = false;
+            if retry_once {
+                let changed = if ended_by_claim {
+                    conn.execute(
+                        "UPDATE schedules SET enabled=1, next_run=?1, disabled_reason=NULL WHERE id=?2 AND enabled=0 AND deleted IS NULL AND version=?3 AND command=?4 AND session=?5 \
+                         AND COALESCE(disabled_reason,'') = ?6 AND COALESCE(locked_by,'') = ''",
+                        rusqlite::params![retry_at, sid, expected_version, expected_command, expected_session, claim_reason])?
+                } else {
+                    // A fixed-date cron is still enabled; only its next fire moves.
+                    conn.execute(
+                        "UPDATE schedules SET next_run=?1 WHERE id=?2 AND enabled=1 AND deleted IS NULL AND version=?3 AND command=?4 AND session=?5",
+                        rusqlite::params![retry_at, sid, expected_version, expected_command, expected_session])?
+                };
+                if changed > 0 {
+                    if ended_by_claim {
+                        insert_audit(conn, &sid, "enabled", "0", "1", "capacity-retry-rs", "")?;
+                    }
+                    tracing::info!(schedule = %sid, retry_at, fixed_date, measured = true, n_considered = 1,
+                        verdict = "schedule_capacity_deferred", "undelivered one-off retained for capacity recovery");
+                    retried = true;
+                }
+            } else if pull_forward {
+                // `next_run > ?1`: only ever SOONER than the natural next fire
+                // the claim already wrote (minute strings sort as times).
+                let changed = conn.execute(
+                    "UPDATE schedules SET next_run=?1 WHERE id=?2 AND enabled=1 AND deleted IS NULL AND next_run > ?1 AND version=?3 AND command=?4 AND session=?5",
+                    rusqlite::params![retry_at, sid, expected_version, expected_command, expected_session])?;
+                retried = changed > 0;
+            }
+            if retried {
+                tracing::info!(schedule = %sid, retry_at, verdict = retry_verdict, recurring = pull_forward,
+                    measured = true, n_considered = 1, "reserve-refused fire rescheduled");
+                if let Some(id) = last_run_id {
+                    let basis = if retry_verdict == "reserve_retry_at_reset" { "at window reset" } else { "fallback 15m" };
+                    conn.execute(
+                        "UPDATE schedule_runs SET note = substr(COALESCE(note || ' · ', '') || ?1, 1, 500) WHERE id=?2",
+                        rusqlite::params![format!("retry at {retry_at} ({basis}; {retry_verdict})"), id])?;
                 }
             }
             // AF-648: last_run/run_count already advanced in the CLAIM phase
@@ -2191,20 +3586,26 @@ async fn fire_one(
             // schedule object itself — not the run history — can see a
             // refusal/failure without last_run masquerading as health.
             if let Some(last_outcome) = outcomes.last() {
+                let status = if when_skipped_all { "skipped" } else { last_outcome.status() };
                 conn.execute(
                     "UPDATE schedules SET last_delivery=?1, last_refusal_reason=?2 WHERE id=?3",
-                    rusqlite::params![
-                        last_outcome.status(),
-                        last_outcome.refusal_reason(),
-                        sid
-                    ],
+                    rusqlite::params![status, last_outcome.refusal_reason(), sid],
                 )?;
             }
-            Ok(WriteOutcome { applied: true, events: vec![] })
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await?;
     // An empty outcome set still warns — nothing was delivered because nothing
     // was attempted, which is the same silence from a reader's side.
+    // A wake-condition skip is a deliberate no-op: no "nothing was delivered"
+    // warning (it would fire every check interval), no failure notice and no
+    // pass-check scheduling. `schedule_when_skipped` already logged it.
+    if when_skipped_all {
+        return Ok(true);
+    }
     if all_lost {
         // Loud, because it is the AMUX-2647 shape: the schedule fired and the
         // command did not reach anyone. It is on the run row too, but a fleet
@@ -2214,6 +3615,10 @@ async fn fire_one(
             session = %claim.sched.str_field("session"), outcomes = ?statuses,
             "schedule fired but nothing was delivered"
         );
+    }
+    // Tell the owning worker (or the owner) when a run failed, once per streak.
+    for outcome in &for_notice {
+        super::schedule_failure::on_run_outcome(store, &claim.sched, outcome, "cron-rs").await;
     }
     Ok(true)
 }
@@ -2226,15 +3631,35 @@ pub async fn run_scheduler(
     enabled: bool,
     deliverer: std::sync::Arc<dyn Deliverer>,
 ) {
+    let adoptions: std::sync::Arc<std::sync::Mutex<Vec<ShellAdoption>>> = Default::default();
+    let adoptions_w = adoptions.clone();
     let reconciled = store
-        .write_async(|conn| {
-            let n = fail_orphaned_manual_shell_runs(conn)?;
+        .write_async(move |conn| {
+            // GS-12 finding 5: 276 runs in flight at a restart read as `error`,
+            // the word a real failure uses. They are `interrupted` now, and each
+            // schedule gets its own WARN line and a stamp on its row.
+            let mut affected = super::schedule_lifecycle::running_rows_by_schedule(conn)?;
+            // A shell run survives a restart (shell_detached.rs): adopt the
+            // ones whose process lives on or whose exit code is on disk, and
+            // fail only the ones that are really gone. Adopted and still
+            // watched rows are not interrupted, so their schedules are not
+            // stamped as if they were.
+            let shell = reconcile_shell_runs_at_startup(conn)?;
+            for (sid, _) in shell.adopted.iter().map(|a| (&a.schedule_id, a.run_id)).chain(shell.watched.iter().map(|(id, s)| (s, *id))) {
+                if let Some(row) = affected.iter_mut().find(|r| &r.0 == sid) {
+                    row.1 -= 1;
+                }
+            }
+            affected.retain(|(_, n)| *n > 0);
+            let n = shell.lost.len();
+            *adoptions_w.lock().unwrap_or_else(|e| e.into_inner()) = shell.adopted;
             // AF-515: cron fires now write a provisional row too, so a restart
             // mid-delivery can orphan one of those as well. Counted separately
             // because the two mean different things: a shell orphan lost a child
             // process, a cron orphan lost a DELIVERY, and only the second says a
             // lane may not have received its turn.
             let c = fail_orphaned_cron_runs(conn)?;
+            super::schedule_lifecycle::stamp_interrupted(conn, &affected)?;
             if c > 0 {
                 tracing::warn!(
                     orphaned_cron_runs = c,
@@ -2255,19 +3680,27 @@ pub async fn run_scheduler(
                      moved to steering_history as interrupted rather than retried (AF-678)"
                 );
             }
-            Ok(WriteOutcome { applied: n > 0 || c > 0 || s > 0, events: vec![] })
+            Ok(WriteOutcome {
+                applied: n > 0 || c > 0 || s > 0,
+                events: vec![],
+            })
         })
         .await;
     match reconciled {
         Ok(r) if r.applied => {
-            tracing::warn!("scheduler startup marked orphaned provisional runs as failed")
+            tracing::warn!("scheduler startup marked orphaned provisional runs as interrupted")
         }
         Err(e) => tracing::error!(error = %e, "scheduler could not reconcile orphaned runs"),
         _ => {}
     }
+    for a in std::mem::take(&mut *adoptions.lock().unwrap_or_else(|e| e.into_inner())) {
+        tokio::spawn(complete_adopted_shell_run(store.clone(), deliverer.clone(), a));
+    }
     let policy = missed_policy_from_env();
     let retry = RetryPolicy::default();
     let mut shadow_seen: HashMap<String, String> = HashMap::new();
+    let mut dispatch = FireDispatch::default();
+    let mut moot_ticks: u64 = 0;
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(SCHEDULER_TICK_SECS));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(
@@ -2284,12 +3717,27 @@ pub async fn run_scheduler(
         super::registry::tick(super::registry::ids::SCHEDULER);
         let mut attempt = 0u32;
         loop {
-            match scheduler_tick(&store, enabled, policy, &mut shadow_seen, deliverer.as_ref()).await {
+            match scheduler_tick_inner(
+                &store,
+                enabled,
+                policy,
+                &mut shadow_seen,
+                deliverer.as_ref(),
+                Some((&mut dispatch, deliverer.clone())),
+            )
+            .await
+            {
                 Ok(r) => {
                     if r.due > 0 {
                         tracing::info!(
-                            due = r.due, fired = r.fired, shadowed = r.shadowed,
-                            deduped = r.deduped, errors = r.errors, "scheduler tick"
+                            due = r.due,
+                            fired = r.fired,
+                            dispatched = r.dispatched,
+                            deferred = r.deferred,
+                            shadowed = r.shadowed,
+                            deduped = r.deduped,
+                            errors = r.errors,
+                            "scheduler tick"
                         );
                     }
                     break;
@@ -2305,6 +3753,16 @@ pub async fn run_scheduler(
                 }
             }
         }
+        // Pass/fail schedules: check the due ones, re-fire the failing ones
+        // (schedule_check.rs). Firing mode only: a re-fire is a fire.
+        if enabled {
+            super::schedule_check::spawn_sweep(store.clone(), deliverer.clone());
+            // Failure cards a delete or disable already answered, every ~10 min.
+            moot_ticks += 1;
+            if moot_ticks % super::schedule_failure::MOOT_SWEEP_TICKS == 1 {
+                super::schedule_failure::spawn_moot_sweep(store.clone());
+            }
+        }
     }
 }
 
@@ -2313,7 +3771,697 @@ pub async fn run_scheduler(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod shell_output_tests {
+    use super::*;
+
+    /// The exact stderr SCHED-494 stored as its whole run record on 2026-09-26.
+    const BASH_PROFILE_NOISE: &str = "/Users/ethan/.bash_profile: line 32: /Users/ethan/google-cloud-sdk/path.bash.inc: No such file or directory\n/Users/ethan/.bash_profile: line 33: /Users/ethan/google-cloud-sdk/completion.bash.inc: No such file or directory\n";
+
+    #[test]
+    fn startup_noise_is_recognised_narrowly() {
+        for l in BASH_PROFILE_NOISE.lines() {
+            assert!(is_shell_startup_noise(l), "{l}");
+        }
+        assert!(is_shell_startup_noise("/Users/x/.zshrc:12: command not found: nvm"));
+        assert!(is_shell_startup_noise("bash: /Users/x/.bashrc: line 4: foo: command not found"));
+        // A command's own output that merely mentions an rc file is kept.
+        for keep in [
+            "sourcing ~/.bashrc failed earlier",
+            "FAIL: gate 7 (shard metrics)",
+            "/Users/x/project/.bashrc.example: line 3: not an rc file",
+            "/Users/x/.bash_profile has been updated",
+        ] {
+            assert!(!is_shell_startup_noise(keep), "{keep}");
+        }
+    }
+
+    /// The pre-fix shape: stderr is ONLY the noise, the real failure is on
+    /// stdout. The old note kept stderr's head and showed only the noise.
+    #[test]
+    fn the_sched_494_shape_yields_the_real_failure() {
+        let stdout = "== preflight (seed 1)\n== FAIL: 14 of 15 gates passed; gate 7 timed out\n";
+        let note = failure_excerpt(stdout, BASH_PROFILE_NOISE, 1, 480);
+        assert!(note.starts_with("exit 1: "), "{note}");
+        assert!(note.contains("gate 7 timed out"), "{note}");
+        assert!(!note.contains(".bash_profile"), "{note}");
+
+        let combined = format!("{BASH_PROFILE_NOISE}{stdout}");
+        let tail = shell_output_tail(combined.as_bytes(), 0, SHELL_OUTPUT_TAIL_BYTES);
+        assert!(tail.contains("[2 shell-startup noise line(s) removed]"), "{tail}");
+        assert!(tail.ends_with("gate 7 timed out"), "{tail}");
+        assert!(!tail.contains("google-cloud-sdk"), "{tail}");
+        // Nothing at all: the exit code alone, never an empty note.
+        assert_eq!(failure_excerpt("", BASH_PROFILE_NOISE, 2, 480), "exit 2");
+    }
+
+    /// Bounded, and the cut is SAID rather than silent.
+    #[test]
+    fn the_tail_is_bounded_and_says_when_it_cut() {
+        let big: String = (0..2000).map(|i| format!("line {i}\n")).collect();
+        let tail = shell_output_tail(big.as_bytes(), 0, 4096);
+        assert!(tail.len() <= 4096 + 100, "{}", tail.len());
+        assert!(tail.starts_with("[earlier output not kept here"), "{}", &tail[..80]);
+        assert!(tail.ends_with("line 1999"));
+        // Bytes dropped while the run was live are also announced.
+        let small = shell_output_tail(b"ok\n", 10, 4096);
+        assert!(small.starts_with("[earlier output not kept here"));
+        // A short clean run is stored verbatim.
+        assert_eq!(shell_output_tail(b"all good\n", 0, 4096), "all good");
+        // A multi-byte boundary cannot panic.
+        let wide = "\u{00e9}".repeat(5000);
+        let _ = shell_output_tail(wide.as_bytes(), 0, 4097);
+    }
+
+    /// Exit code and tail land in the row, through the real insert.
+    #[test]
+    fn insert_run_stores_exit_code_and_tail() {
+        let d = tempfile::tempdir().unwrap();
+        // Store::open runs the real migrations (0088 included); then write
+        // through a plain connection, the way the API test does.
+        let _store = crate::db::Store::open(&d.path().join("t.db")).unwrap();
+        let conn = rusqlite::Connection::open(d.path().join("t.db")).unwrap();
+        let out = RunOutcome::ShellError {
+            note: "exit 1: boom".into(),
+            output: Some(ShellOutput {
+                exit_code: 1,
+                tail: "boom".into(),
+            }),
+        };
+        insert_run(&conn, "SCHED-1", 1, &out, "cron-rs", None).unwrap();
+        let (code, tail): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT exit_code, output_tail FROM schedule_runs WHERE schedule_id='SCHED-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(code, Some(1));
+        assert_eq!(tail.as_deref(), Some("boom"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    /// AF-1082: the startup reconcile's three status='running' statements run
+    /// inside the single writer; on the migrated schema they use the partial
+    /// index instead of scanning every run (149,741 rows, held up to 42 s).
+    #[test]
+    fn the_startup_reconcile_reads_running_runs_through_their_index() {
+        let conn = crate::db::migrate::test_memdb();
+        for sql in [
+            "SELECT schedule_id, COUNT(*) FROM schedule_runs WHERE status='running' GROUP BY schedule_id ORDER BY schedule_id",
+            "UPDATE schedule_runs SET status='interrupted' WHERE status='running' AND delivery IS NULL",
+            "UPDATE schedule_runs SET status='interrupted' WHERE status='running' AND delivery='shell'",
+        ] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(plan.iter().any(|p| p.contains("idx_schedule_runs_running")), "{sql}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn firing_defaults_on_and_only_explicit_off_words_disable_it() {
+        use super::firing_from;
+        assert!(firing_from(None), "unset must fire: the cloud servers never set it");
+        for on in ["1", "true", "yes", "", "on"] {
+            assert!(firing_from(Some(on)), "{on:?} fires");
+        }
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!firing_from(Some(off)), "{off:?} is shadow mode");
+        }
+    }
+
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Spawns a schedule shell that backgrounds a sleeper and waits on it, as
+    /// `bash "$R" | tail -60` leaves the script under the top bash. Returns
+    /// the child and the sleeper's pid.
+    async fn shell_with_grandchild() -> (tokio::process::Child, i32) {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = shell_schedule_command("sleep 60 & echo $!; wait")
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).await.unwrap();
+        (child, line.trim().parse().unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_schedule_shell_leads_its_own_process_group() {
+        let (child, _sleeper) = shell_with_grandchild().await;
+        let pid = child.id().unwrap() as i32;
+        // SAFETY: getpgid reads the group of a live child.
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid, "the run's bash must lead a new group, or a timeout cannot stop what it started");
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_run_kills_what_its_shell_started_and_a_finished_one_does_not() {
+        // Timed out: the watcher kills the run's whole group.
+        let (child, sleeper) = shell_with_grandchild().await;
+        super::super::shell_detached::kill_group(child.id().unwrap() as i32);
+        drop(child);
+        let mut gone = false;
+        for _ in 0..50 {
+            if !alive(sleeper) { gone = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(gone, "pid {sleeper}, started by a timed-out run, is still running");
+
+        // Finished: nothing kills the group, so a daemon it started outlives it.
+        let (child, sleeper) = shell_with_grandchild().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(alive(sleeper), "a finished run must not kill a daemon it started");
+        // SAFETY: the sleeper is this test's own grandchild.
+        unsafe { libc::kill(sleeper, libc::SIGKILL); }
+        drop(child);
+    }
+
+    #[tokio::test]
+    async fn reserve_refusal_preserves_a_one_off_but_never_replays_uncertain_delivery() {
+        for outcome in [RunOutcome::Refused { reason: "schedule PAUSED: the plan window is 99% used".into() },
+            RunOutcome::Queued { queue_id: "q".into(), detail: "queued".into() },
+            RunOutcome::Failed { reason: "delivery unknown".into() },
+            RunOutcome::Refused { reason: "target archived".into() }] {
+            let (store, _dir) = store();
+            store.write(|conn| { insert_schedule(conn, &make_row("ONCE", "lane", None, "2020-01-01T00:00"))?; Ok(WriteOutcome { applied: true, events: vec![] }) }).unwrap();
+            let now = Local::now();
+            let reserve = matches!(&outcome, RunOutcome::Refused {reason} if reason.starts_with("schedule PAUSED"));
+            let stub = StubDeliverer::new(outcome);
+            fire_one(&store, &stub, "ONCE", now, MissedRunPolicy::Skip).await.unwrap();
+            assert_eq!(stub.calls(), 1);
+            let sched = get_schedule(&store.read().unwrap(), "ONCE").unwrap().unwrap();
+            assert_eq!(sched.enabled(), reserve);
+            if reserve {
+                assert_eq!(sched.str_field("next_run"), fmt_minute(now + ChronoDuration::minutes(15)));
+                drop(store);
+                let reopened = std::sync::Arc::new(crate::db::Store::open(&_dir.path().join("sched-test.db")).unwrap());
+                let confirmed = StubDeliverer::confirmed();
+                fire_one(&reopened, &confirmed, "ONCE", now + ChronoDuration::minutes(16), MissedRunPolicy::Skip).await.unwrap();
+                assert_eq!(confirmed.calls(), 1);
+                assert!(!get_schedule(&reopened.read().unwrap(), "ONCE").unwrap().unwrap().enabled());
+            }
+        }
+    }
+
+    // ---- GS-12 finding 5: lifecycle bounds on the fire path ----------------
+
+    fn put_row(store: &SharedStore, row: DurableSchedule) {
+        store.write(move |conn| { insert_schedule(conn, &row)?; Ok(WriteOutcome { applied: true, events: vec![] }) }).unwrap();
+    }
+
+    fn exec(store: &SharedStore, sql: String) {
+        store.write(move |conn| { conn.execute(&sql, [])?; Ok(WriteOutcome { applied: true, events: vec![] }) }).unwrap();
+    }
+
+    fn reserve_refusal() -> RunOutcome {
+        RunOutcome::Refused { reason: "schedule PAUSED: the plan window is 99% used".into() }
+    }
+
+    fn lifecycle_cols(store: &SharedStore, id: &str) -> (bool, i64, String, String) {
+        let s = get_schedule(&store.read().unwrap(), id).unwrap().unwrap();
+        (s.enabled(), s.i64_field("cron_runs", -1), s.str_field("disabled_reason").to_string(), s.str_field("next_run").to_string())
+    }
+
+    #[tokio::test]
+    async fn max_runs_ends_a_recurring_schedule_and_a_reserve_refusal_does_not_spend_it() {
+        let (store, _dir) = store();
+        let now = Local::now();
+        let due = fmt_minute(now - ChronoDuration::minutes(1));
+        let mut row = make_row("MAX", "lane", Some("every 10m"), &due);
+        row.set("max_runs", Value::from(2));
+        put_row(&store, row);
+
+        let refused = StubDeliverer::new(reserve_refusal());
+        fire_one(&store, &refused, "MAX", now, MissedRunPolicy::Skip).await.unwrap();
+        let (en, runs, _, _) = lifecycle_cols(&store, "MAX");
+        assert!(en && runs == 0, "a reserve refusal consumed no input, so it spends no run: enabled={en} cron_runs={runs}");
+
+        let ok = StubDeliverer::confirmed();
+        for n in 1..=2 {
+            exec(&store, format!("UPDATE schedules SET next_run='{due}' WHERE id='MAX'"));
+            fire_one(&store, &ok, "MAX", now, MissedRunPolicy::Skip).await.unwrap();
+            let (en, runs, why, _) = lifecycle_cols(&store, "MAX");
+            assert_eq!(runs, n);
+            assert_eq!(en, n < 2, "fire {n} of max_runs 2");
+            if n == 2 {
+                assert!(why.contains("max_runs 2 reached"), "the row says why it ended: {why}");
+            }
+        }
+        assert_eq!(ok.calls(), 2);
+        let audit: i64 = store.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM schedule_audit WHERE schedule_id='MAX' AND source='schedule-bound-rs' AND field='enabled'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(audit, 1, "the harness's own disable is in the audit trail");
+        // Even if something re-arms next_run, a spent budget does not fire.
+        exec(&store, format!("UPDATE schedules SET next_run='{due}', enabled=1 WHERE id='MAX'"));
+        assert!(!fire_one(&store, &ok, "MAX", now, MissedRunPolicy::Skip).await.unwrap());
+        assert_eq!(ok.calls(), 2, "a spent max_runs ends the row at claim instead of firing");
+    }
+
+    fn run_statuses(store: &SharedStore, id: &str) -> Vec<String> {
+        let conn = store.read().unwrap();
+        let mut st = conn.prepare("SELECT status FROM schedule_runs WHERE schedule_id=?1 ORDER BY id").unwrap();
+        st.query_map([id], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    /// `when` (0141): a failing wake condition skips the fire. Nothing is
+    /// delivered, the run reads `skipped` (not a failure), and the fire gives
+    /// its max_runs count back, so a max_runs 1 row the claim ended is re-armed.
+    #[tokio::test]
+    async fn a_failing_wake_condition_skips_the_fire_and_spends_no_run() {
+        let (store, _dir) = store();
+        let now = Local::now();
+        let due = fmt_minute(now - ChronoDuration::minutes(1));
+        let mut row = make_row("WHEN", "lane", Some("every 2m"), &due);
+        row.set("max_runs", Value::from(1));
+        row.set("when_check", Value::from("echo not yet; exit 3"));
+        put_row(&store, row);
+        let ok = StubDeliverer::confirmed();
+        for _ in 0..2 {
+            exec(&store, format!("UPDATE schedules SET next_run='{due}' WHERE id='WHEN'"));
+            assert!(fire_one(&store, &ok, "WHEN", now, MissedRunPolicy::Skip).await.unwrap());
+        }
+        assert_eq!(ok.calls(), 0, "a failing check delivers nothing");
+        let (en, runs, why, _) = lifecycle_cols(&store, "WHEN");
+        assert!(en, "max_runs 1 is not spent by a skipped fire: {why}");
+        assert_eq!(runs, 0);
+        assert_eq!(run_statuses(&store, "WHEN"), vec!["skipped", "skipped"]);
+        let s = get_schedule(&store.read().unwrap(), "WHEN").unwrap().unwrap();
+        assert_eq!(s.str_field("last_delivery"), "skipped");
+        let reason = s.str_field("last_refusal_reason").to_string();
+        assert!(reason.starts_with(super::super::schedule_wake::WHEN_PREFIX) && reason.contains("exited 3"), "{reason}");
+        let streak = s.i64_field("failure_streak", 0);
+        assert_eq!(streak, 0, "a skip is not a failure");
+
+        // The condition comes true: one delivery, then the row ends.
+        exec(&store, format!("UPDATE schedules SET next_run='{due}', when_check='true' WHERE id='WHEN'"));
+        assert!(fire_one(&store, &ok, "WHEN", now, MissedRunPolicy::Skip).await.unwrap());
+        assert_eq!(ok.calls(), 1);
+        let (en, runs, why, _) = lifecycle_cols(&store, "WHEN");
+        assert!(!en && runs == 1, "delivered once: enabled={en} cron_runs={runs}");
+        assert!(why.starts_with("wake condition met: delivered at") || why.contains("max_runs"), "{why}");
+        assert_eq!(run_statuses(&store, "WHEN").last().map(String::as_str), Some("delivered"));
+    }
+
+    #[tokio::test]
+    async fn a_passing_wake_condition_delivers_once_and_disables_the_row() {
+        let (store, _dir) = store();
+        let now = Local::now();
+        let due = fmt_minute(now - ChronoDuration::minutes(1));
+        let mut row = make_row("MET", "lane", Some("every 2m"), &due);
+        row.set("when_check", Value::from("test \"$AMUX_SESSION\" = lane"));
+        put_row(&store, row);
+        let ok = StubDeliverer::confirmed();
+        assert!(fire_one(&store, &ok, "MET", now, MissedRunPolicy::Skip).await.unwrap());
+        assert_eq!(ok.calls(), 1, "the check ran as the owner and passed");
+        let (en, _, why, _) = lifecycle_cols(&store, "MET");
+        assert!(!en, "when_once (the default) disables after the delivery");
+        assert!(why.starts_with("wake condition met: delivered at"), "{why}");
+        let audit: i64 = store.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM schedule_audit WHERE schedule_id='MET' AND source='wake-condition-rs' AND field='enabled'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(audit, 1);
+        // Re-armed by hand, it does not fire again: it is disabled.
+        assert!(!fire_one(&store, &ok, "MET", now, MissedRunPolicy::Skip).await.unwrap());
+
+        // when_once off: it keeps firing while the check passes.
+        let mut keep = make_row("KEEP", "lane", Some("every 2m"), &due);
+        keep.set("when_check", Value::from("true"));
+        keep.set("when_once", Value::from(0));
+        put_row(&store, keep);
+        assert!(fire_one(&store, &ok, "KEEP", now, MissedRunPolicy::Skip).await.unwrap());
+        assert!(lifecycle_cols(&store, "KEEP").0, "when_once=0 stays enabled");
+
+        // A check that passes but whose delivery is refused does not end it.
+        let mut held = make_row("HELD", "lane", Some("every 2m"), &due);
+        held.set("when_check", Value::from("true"));
+        put_row(&store, held);
+        let refused = StubDeliverer::new(reserve_refusal());
+        fire_one(&store, &refused, "HELD", now, MissedRunPolicy::Skip).await.unwrap();
+        assert_eq!(refused.calls(), 1);
+        assert!(lifecycle_cols(&store, "HELD").0, "nothing was delivered, so the wake is still pending");
+    }
+
+    #[test]
+    fn a_shell_schedule_has_no_wake_condition() {
+        let mut row = make_row("SH", "lane", Some("every 2m"), "2026-01-01T00:00");
+        row.set("when_check", Value::from("true"));
+        assert_eq!(super::super::schedule_wake::when_check_of(&row).as_deref(), Some("true"));
+        row.set("kind", Value::from("shell"));
+        assert_eq!(super::super::schedule_wake::when_check_of(&row), None);
+        row.set("kind", Value::from("tmux"));
+        row.set("when_check", Value::from("  "));
+        assert_eq!(super::super::schedule_wake::when_check_of(&row), None);
+    }
+
+    #[tokio::test]
+    async fn until_ends_the_schedule_after_its_last_allowed_fire() {
+        let (store, _dir) = store();
+        let now = Local::now();
+        let mut row = make_row("UNTIL", "lane", Some("every 10m"), &fmt_minute(now - ChronoDuration::minutes(1)));
+        row.set("until", Value::from(fmt_minute(now + ChronoDuration::minutes(5))));
+        put_row(&store, row);
+        let ok = StubDeliverer::confirmed();
+        assert!(fire_one(&store, &ok, "UNTIL", now, MissedRunPolicy::Skip).await.unwrap());
+        assert_eq!(ok.calls(), 1, "the fire inside the window happens");
+        let (en, _, why, _) = lifecycle_cols(&store, "UNTIL");
+        assert!(!en, "the next fire would be past until, so the row ends now");
+        assert!(why.contains("until"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn not_before_holds_the_first_fire_until_its_start() {
+        let (store, _dir) = store();
+        let now = Local::now();
+        let start = fmt_minute(now + ChronoDuration::days(2));
+        let mut row = make_row("AFTER", "lane", Some("daily at 09:00"), &fmt_minute(now - ChronoDuration::minutes(1)));
+        row.set("not_before", Value::from(start.clone()));
+        put_row(&store, row);
+        let ok = StubDeliverer::confirmed();
+        assert!(!fire_one(&store, &ok, "AFTER", now, MissedRunPolicy::Skip).await.unwrap());
+        assert_eq!(ok.calls(), 0, "nothing fires before not_before");
+        let (en, _, _, next) = lifecycle_cols(&store, "AFTER");
+        assert!(en);
+        assert!(next >= start && next.ends_with("09:00"), "first fire moved to the first 09:00 at or after {start}: {next}");
+    }
+
+    #[tokio::test]
+    async fn a_fixed_date_cron_refused_by_the_reserve_is_deferred_rather_than_a_year_late() {
+        let (store, _dir) = store();
+        let now = Local::now();
+        let mut row = make_row("FIXED", "lane", Some("5 0 3 10 *"), &fmt_minute(now - ChronoDuration::minutes(1)));
+        row.set("sched_type", Value::from("recurring"));
+        put_row(&store, row);
+        let refused = StubDeliverer::new(reserve_refusal());
+        fire_one(&store, &refused, "FIXED", now, MissedRunPolicy::Skip).await.unwrap();
+        let (en, _, _, next) = lifecycle_cols(&store, "FIXED");
+        assert!(en);
+        assert_eq!(next, fmt_minute(now + ChronoDuration::minutes(15)), "deferred 15 minutes, not to next year");
+        let ok = StubDeliverer::confirmed();
+        fire_one(&store, &ok, "FIXED", now + ChronoDuration::minutes(16), MissedRunPolicy::Skip).await.unwrap();
+        assert_eq!(ok.calls(), 1, "the deferred one-off fires once capacity returns");
+        let (_, _, _, next) = lifecycle_cols(&store, "FIXED");
+        assert!(next > fmt_minute(now + ChronoDuration::days(1)), "after it lands, the cron's own next date applies: {next}");
+    }
+
+
+    // ---- reserve retry aimed at the window reset --------------------------
+
+    fn last_run_note(store: &SharedStore, id: &str) -> String {
+        store.read().unwrap().query_row(
+            "SELECT COALESCE(note,'') FROM schedule_runs WHERE schedule_id=?1 ORDER BY id DESC LIMIT 1",
+            [id], |r| r.get(0)).unwrap()
+    }
+
+    fn fixed_now() -> DateTime<Local> {
+        Local.with_ymd_and_hms(2030, 6, 1, 12, 0, 20).single().unwrap()
+    }
+
+    #[test]
+    fn reserve_retry_target_aims_at_reset_plus_jitter_and_falls_back_otherwise() {
+        let now = fixed_now();
+        let reset = (now + ChronoDuration::minutes(97)).with_timezone(&chrono::Utc);
+        for sid in ["A", "B", "SCHED-1", "SCHED-999"] {
+            let (t, v) = reserve_retry_target(sid, now, Some(reset));
+            assert_eq!(v, "reserve_retry_at_reset");
+            let lead = (t.with_timezone(&chrono::Utc) - reset).num_seconds();
+            assert!((30..=150).contains(&lead), "{sid}: at least 30s of jitter, rounded up to a minute: {lead}s");
+            assert_eq!(t.second(), 0, "minute resolution");
+        }
+        let (t, v) = reserve_retry_target("A", now, None);
+        assert_eq!((t, v), (now + ChronoDuration::minutes(15), "reserve_retry_fallback_15m"));
+        let passed = (now - ChronoDuration::minutes(1)).with_timezone(&chrono::Utc);
+        let (t, v) = reserve_retry_target("A", now, Some(passed));
+        assert_eq!((t, v), (now + ChronoDuration::minutes(15), "reserve_retry_fallback_15m"), "a reset already passed is no target");
+    }
+
+    #[tokio::test]
+    async fn a_refused_one_off_retries_at_the_known_reset_not_every_15_minutes() {
+        let (store, _dir) = store();
+        let now = fixed_now();
+        put_row(&store, make_row("ONE", "lane", None, &fmt_minute(now - ChronoDuration::minutes(1))));
+        let reset = (now + ChronoDuration::minutes(140)).with_timezone(&chrono::Utc);
+        let refused = StubDeliverer::new(reserve_refusal()).with_reset(reset);
+        fire_one(&store, &refused, "ONE", now, MissedRunPolicy::Skip).await.unwrap();
+        let (en, _, _, next) = lifecycle_cols(&store, "ONE");
+        let (want, _) = reserve_retry_target("ONE", now, Some(reset));
+        assert!(en, "the one-off is kept");
+        assert_eq!(next, fmt_minute(want), "aimed at the reset");
+        assert_ne!(next, fmt_minute(now + ChronoDuration::minutes(15)));
+        let note = last_run_note(&store, "ONE");
+        assert!(note.contains("reserve_retry_at_reset") && note.contains(&next), "the run row says why: {note}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_one_off_with_no_or_a_passed_reset_keeps_the_15_minute_fallback() {
+        let now = fixed_now();
+        for reset in [None, Some((now - ChronoDuration::minutes(3)).with_timezone(&chrono::Utc))] {
+            let (store, _dir) = store();
+            put_row(&store, make_row("ONE", "lane", None, &fmt_minute(now - ChronoDuration::minutes(1))));
+            let mut refused = StubDeliverer::new(reserve_refusal());
+            refused.reset = reset;
+            fire_one(&store, &refused, "ONE", now, MissedRunPolicy::Skip).await.unwrap();
+            let (en, _, _, next) = lifecycle_cols(&store, "ONE");
+            assert!(en);
+            assert_eq!(next, fmt_minute(now + ChronoDuration::minutes(15)), "reset {reset:?}");
+            assert!(last_run_note(&store, "ONE").contains("reserve_retry_fallback_15m"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_recurring_fire_is_pulled_to_a_sooner_reset_once_and_never_delayed() {
+        let now = fixed_now();
+        let due = fmt_minute(now - ChronoDuration::minutes(1));
+        // Daily at 09:00: the natural next fire is tomorrow, the reset is in 2h.
+        let (s1, _d1) = store();
+        put_row(&s1, make_row("DAILY", "lane", Some("daily at 09:00"), &due));
+        let reset = (now + ChronoDuration::minutes(120)).with_timezone(&chrono::Utc);
+        let refused = StubDeliverer::new(reserve_refusal()).with_reset(reset);
+        fire_one(&s1, &refused, "DAILY", now, MissedRunPolicy::Skip).await.unwrap();
+        let (en, _, _, next) = lifecycle_cols(&s1, "DAILY");
+        let (want, _) = reserve_retry_target("DAILY", now, Some(reset));
+        assert!(en);
+        assert_eq!(next, fmt_minute(want), "pulled forward to the reset");
+        assert!(last_run_note(&s1, "DAILY").contains("reserve_retry_at_reset"));
+        // The retry fires in the new window and is refused again on a reading
+        // that still names the reset just passed: no second retry this window,
+        // the cron's own next date applies.
+        let at = want + ChronoDuration::seconds(10);
+        fire_one(&s1, &refused, "DAILY", at, MissedRunPolicy::Skip).await.unwrap();
+        assert_eq!(refused.calls(), 2);
+        let (_, _, _, next) = lifecycle_cols(&s1, "DAILY");
+        assert!(next.ends_with("09:00") && next > fmt_minute(at), "back on its natural cadence: {next}");
+
+        // Every 10m: the natural next fire is sooner than the reset, so it stays.
+        let (st2, _d2) = store();
+        put_row(&st2, make_row("TEN", "lane", Some("every 10m"), &due));
+        let refused = StubDeliverer::new(reserve_refusal()).with_reset(reset);
+        fire_one(&st2, &refused, "TEN", now, MissedRunPolicy::Skip).await.unwrap();
+        let (_, _, _, next) = lifecycle_cols(&st2, "TEN");
+        assert!(next <= fmt_minute(now + ChronoDuration::minutes(10)), "never delayed to the reset: {next}");
+
+        // No known reset: a recurring refusal does not start a 15-minute poll.
+        let (st3, _d3) = store();
+        put_row(&st3, make_row("NORESET", "lane", Some("daily at 09:00"), &due));
+        fire_one(&st3, &StubDeliverer::new(reserve_refusal()), "NORESET", now, MissedRunPolicy::Skip).await.unwrap();
+        let (_, _, _, next) = lifecycle_cols(&st3, "NORESET");
+        assert!(next.ends_with("09:00"), "{next}");
+    }
+
+    #[tokio::test]
+    async fn a_run_in_flight_at_restart_is_recorded_interrupted_and_stamped_on_its_schedule() {
+        let (store, _dir) = store();
+        put_row(&store, make_row("INFLIGHT", "lane", Some("every 10m"), "2020-01-01T00:00"));
+        exec(&store, "INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source, delivery) VALUES ('INFLIGHT', 1, 'running', 'fired', 'cron-rs', NULL)".into());
+        store.write(|conn| {
+            let affected = super::super::schedule_lifecycle::running_rows_by_schedule(conn)?;
+            assert_eq!(affected, vec![("INFLIGHT".to_string(), 1)]);
+            assert_eq!(fail_orphaned_cron_runs(conn)?, 1);
+            super::super::schedule_lifecycle::stamp_interrupted(conn, &affected)?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let conn = store.read().unwrap();
+        let st: String = conn.query_row("SELECT status FROM schedule_runs WHERE schedule_id='INFLIGHT'", [], |r| r.get(0)).unwrap();
+        assert_eq!(st, "interrupted");
+        let s = get_schedule(&conn, "INFLIGHT").unwrap().unwrap();
+        assert_eq!(s.str_field("last_delivery"), "interrupted", "the schedule row says its last run was interrupted");
+    }
+
+    #[tokio::test]
+    async fn a_late_delivery_cannot_duplicate_reconciled_receipts_or_resurrect_owner_edits() {
+        struct Racing { store: SharedStore, mode: &'static str }
+        #[async_trait::async_trait]
+        impl Deliverer for Racing {
+            async fn deliver(&self, _sched: &DurableSchedule, _source: &str) -> RunOutcome {
+                let mode = self.mode;
+                self.store.write_async(move |conn| {
+                    match mode {
+                        "reconciled" => { fail_orphaned_cron_runs(conn)?; },
+                        "missing" => { conn.execute("DELETE FROM schedule_runs", [])?; },
+                        "owner-edit" => { conn.execute("UPDATE schedules SET version=COALESCE(version,0)+1,command='owner replacement' WHERE id='RACE'", [])?; },
+                        _ => unreachable!(),
+                    }
+                    Ok(WriteOutcome { applied:true, events:vec![] })
+                }).await.unwrap();
+                if mode == "owner-edit" { RunOutcome::Refused { reason:"schedule PAUSED: the plan window is 99% used".into() } }
+                else { RunOutcome::Delivered { submission:"confirmed".into(), detail:"late confirmed delivery".into() } }
+            }
+        }
+        for mode in ["reconciled", "missing", "owner-edit"] {
+            let (store, _dir) = store();
+            store.write(|conn| { insert_schedule(conn, &make_row("RACE", "lane", None, "2020-01-01T00:00"))?; Ok(WriteOutcome { applied:true, events:vec![] }) }).unwrap();
+            fire_one(&store, &Racing { store:store.clone(), mode }, "RACE", Local::now(), MissedRunPolicy::Skip).await.unwrap();
+            let conn = store.read().unwrap();
+            let (count, status): (i64, String) = conn.query_row("SELECT COUNT(*),status FROM schedule_runs WHERE schedule_id='RACE'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(count, 1, "{mode}: one attempt cannot produce two receipts");
+            assert_eq!(status, match mode { "reconciled"=>"interrupted", "missing"=>"delivered", _=>"refused" });
+            assert!(!get_schedule(&conn, "RACE").unwrap().unwrap().enabled(), "owner changes must fence the capacity retry");
+        }
+    }
+
+    #[tokio::test]
+    async fn missed_model_prompts_coalesce_while_shell_backfills_keep_their_policy() {
+        for kind in ["tmux", "shell"] {
+            let (store, _dir) = store();
+            let now = Local::now();
+            let due = fmt_minute(now - ChronoDuration::minutes(60));
+            let mut row = make_row("CATCHUP", "lane", Some("every 10m"), &due);
+            row.raw.insert("kind".into(), Value::from(kind));
+            store.write(move |conn| { insert_schedule(conn, &row)?; Ok(WriteOutcome { applied: true, events: vec![] }) }).unwrap();
+            let stub = StubDeliverer::confirmed();
+            fire_one(&store, &stub, "CATCHUP", now, MissedRunPolicy::CatchUp).await.unwrap();
+            assert_eq!(stub.calls(), if kind == "shell" { 7 } else { 1 });
+            let conn = store.read().unwrap();
+            let note: String = conn.query_row("SELECT note FROM schedule_runs WHERE schedule_id='CATCHUP' AND note LIKE '%missed occurrence%' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+            assert!(note.contains("missed occurrence"), "{note}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_pipeline_failure_is_not_hidden_by_a_successful_tail() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let (store, _dir) = store();
+        let state = crate::api::AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let live = LiveDeliverer::new(state);
+        for (command, success) in [("(echo failure; exit 37) | tail -1", false), ("echo measured | tail -1", true), ("(exit 37) | tail -1 || echo explicitly-handled", true)] {
+            let mut row = make_row("PIPE", "", None, "2020-01-01T00:00");
+            row.raw.insert("kind".into(), Value::from("shell"));
+            row.raw.insert("command".into(), Value::from(command));
+            let out = live.run_shell(&row).await;
+            assert_eq!(matches!(out, RunOutcome::ShellOk { .. }), success, "{out:?}");
+            if !success { assert!(matches!(out, RunOutcome::ShellError { .. }), "{out:?}"); }
+        }
+    }
+    fn wake_delivery(refused: bool, submitted: Option<bool>, queue_id: Option<&str>) -> crate::api::session_verbs::AutoDelivery {
+        crate::api::session_verbs::AutoDelivery {
+            message: format!("refused={refused} submitted={submitted:?}"),
+            submitted,
+            submission: "test",
+            queue_id: queue_id.map(String::from),
+            refused,
+        }
+    }
+
+    /// wake-watch: a failed delivery is retried, a success stops the loop, and
+    /// the attempts are bounded. A refusal is final on the first attempt.
+    #[tokio::test]
+    async fn shell_wake_retries_a_failed_delivery_and_stops_at_the_bound() {
+        let zero = std::time::Duration::ZERO;
+        // Fails twice, then lands: three attempts, delivered.
+        let mut calls = 0;
+        let (d, n) = shell_wake_with_retry(3, zero, || {
+            calls += 1;
+            let ok = calls >= 3;
+            async move { wake_delivery(false, Some(ok), None) }
+        })
+        .await;
+        assert_eq!((n, calls), (3, 3));
+        assert!(matches!(shell_wake_outcome(d), RunOutcome::Delivered { .. }));
+        // Never lands: stops at the bound and is recorded as a failure.
+        let mut calls = 0;
+        let (d, n) = shell_wake_with_retry(3, zero, || {
+            calls += 1;
+            async { wake_delivery(false, Some(false), None) }
+        })
+        .await;
+        assert_eq!((n, calls), (3, 3), "bounded at max attempts");
+        assert_eq!(shell_wake_outcome(d).status(), "error");
+        // A refusal is a policy answer: one attempt, recorded refused.
+        let mut calls = 0;
+        let (d, n) = shell_wake_with_retry(3, zero, || {
+            calls += 1;
+            async { wake_delivery(true, Some(false), None) }
+        })
+        .await;
+        assert_eq!((n, calls), (1, 1));
+        assert_eq!(shell_wake_outcome(d).status(), "refused");
+        // Queued is pending, not failed: no retry.
+        let (d, n) = shell_wake_with_retry(3, zero, || async { wake_delivery(false, None, Some("Q-1")) }).await;
+        assert_eq!(n, 1);
+        assert_eq!(shell_wake_outcome(d).queue_id(), Some("Q-1"));
+    }
+
+    #[test]
+    fn shell_wake_text_refuses_empty_output_and_caps_long_output() {
+        assert!(shell_wake_text("", "hello", &[]).is_err());
+        assert!(shell_wake_text("lane", "  \n ", &[]).is_err());
+        assert_eq!(shell_wake_text("lane", " hi\n", &[]).unwrap(), "hi");
+        let long = "x".repeat(SHELL_WAKE_MAX_CHARS + 10);
+        let t = shell_wake_text("lane", &long, &[]).unwrap();
+        assert!(t.starts_with(&"x".repeat(SHELL_WAKE_MAX_CHARS)) && t.contains("[cut at"), "{t}");
+    }
+
+    /// A wake delivers into a lane's prompt, so a vault value the run printed
+    /// arrives masked as `[vault:KEY]`, never as the value.
+    #[test]
+    fn shell_wake_text_masks_vault_values_before_delivery() {
+        let vault = vec![("GH_PAT".to_string(), "ghp_s3cretVALUE123".to_string())];
+        let t = shell_wake_text("lane", "wake-watch: fired, token=ghp_s3cretVALUE123 done\n", &vault).unwrap();
+        assert!(!t.contains("ghp_s3cretVALUE123"), "vault value reached the delivered text: {t}");
+        assert_eq!(t, "wake-watch: fired, token=[vault:GH_PAT] done");
+    }
+
+    /// The exit action is honoured on the shipped path: exit 10 mapped to
+    /// `wake` goes to delivery (refused here: the lane is not registered, and
+    /// a paused lane is refused too), never to a plain shell ok/error.
+    #[tokio::test]
+    async fn a_wake_exit_action_delivers_instead_of_recording_shell_output() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let (store, _dir) = store();
+        let state = crate::api::AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let live = LiveDeliverer::new(state);
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/paused-lane.env"), "CC_PAUSED=1\n").unwrap();
+        for lane in ["ghost-lane", "paused-lane"] {
+            let mut row = make_row("WAKE", lane, None, "2020-01-01T00:00");
+            row.raw.insert("kind".into(), Value::from("shell"));
+            row.raw.insert("command".into(), Value::from("echo 'wake-watch: W-1 fired'; exit 10"));
+            row.raw.insert("exit_actions".into(), Value::from(r#"{"10":"wake"}"#));
+            let out = live.run_shell(&row).await;
+            assert!(matches!(out, RunOutcome::Refused { .. }), "{lane}: {out:?}");
+        }
+        // Empty output has nothing to deliver: an error, not a silent ok.
+        let mut row = make_row("WAKE", "ghost-lane", None, "2020-01-01T00:00");
+        row.raw.insert("kind".into(), Value::from("shell"));
+        row.raw.insert("command".into(), Value::from("exit 10"));
+        row.raw.insert("exit_actions".into(), Value::from(r#"{"10":"wake"}"#));
+        assert!(matches!(live.run_shell(&row).await, RunOutcome::ShellError { .. }));
+    }
     /// AMUX-3546: a cadence has a number, and it is the number nobody saw.
     ///
     /// From the live board when the card was filed: 165 schedules enabled, ~1,650
@@ -2350,11 +4498,14 @@ mod tests {
 
     #[test]
     fn fires_per_day_counts_every_expression_shape() {
-        let f = |e: &str| {
-            super::fires_per_day(&ScheduleExpr::parse(e).expect(e)).expect("countable")
-        };
+        let f =
+            |e: &str| super::fires_per_day(&ScheduleExpr::parse(e).expect(e)).expect("countable");
         // The card's own census, expression by expression.
-        assert_eq!(f("every 15m"), 96.0, "the eleven characters that motivated this card");
+        assert_eq!(
+            f("every 15m"),
+            96.0,
+            "the eleven characters that motivated this card"
+        );
         assert_eq!(f("every 10m"), 144.0);
         assert_eq!(f("every 30m"), 48.0);
         assert_eq!(f("every 1h"), 24.0);
@@ -2363,7 +4514,10 @@ mod tests {
 
         // Sub-daily shapes are per-DAY too, so every arm shares one unit and a
         // caller never has to ask which it got.
-        assert!((f("every weekday at 9am") - 5.0 / 7.0).abs() < 1e-9, "Mon-Fri is 5/7 per day");
+        assert!(
+            (f("every weekday at 9am") - 5.0 / 7.0).abs() < 1e-9,
+            "Mon-Fri is 5/7 per day"
+        );
         assert!((f("weekly on Monday at 9am") - 1.0 / 7.0).abs() < 1e-9);
         // Mean Gregorian month, not a flat 30: that would over-report a monthly
         // schedule by 1.4%, which is invisible and wrong rather than approximate
@@ -2373,7 +4527,11 @@ mod tests {
         // CRON IS COUNTED, not pattern-matched. Reimplementing cron to read a
         // rate off the field shapes is how the count and the firing disagree.
         assert_eq!(f("0 9 * * *"), 1.0, "daily cron");
-        assert_eq!(f("*/15 * * * *"), 96.0, "quarter-hourly cron matches `every 15m`");
+        assert_eq!(
+            f("*/15 * * * *"),
+            96.0,
+            "quarter-hourly cron matches `every 15m`"
+        );
         assert_eq!(f("0 * * * *"), 24.0, "hourly cron");
 
         // THE CONTROL, and it is the one that matters: this must not return a
@@ -2400,6 +4558,100 @@ mod tests {
         (Arc::new(s), dir)
     }
 
+    #[tokio::test]
+    async fn dispatched_consumer_panic_finishes_its_durable_claim_and_releases_capacity() {
+        struct Panics;
+        #[async_trait::async_trait]
+        impl Deliverer for Panics {
+            async fn deliver(&self, _: &DurableSchedule, _: &str) -> RunOutcome { panic!("injected consumer panic"); }
+        }
+        let (store, _dir) = store();
+        let at = fmt_minute(Local::now() - ChronoDuration::minutes(1));
+        store.write(move |conn| {
+            let mut row = make_row("PANIC-CLAIM", "lane", None, &at);
+            row.raw.insert("kind".into(), Value::from("shell"));
+            insert_schedule(conn, &row)?;
+            Ok(WriteOutcome { applied:true, events:vec![] })
+        }).unwrap();
+        let mut queue = FireDispatch::default();
+        let mut seen = HashMap::new();
+        let deliverer = Arc::new(Panics);
+        let tick = scheduler_tick_inner(&store, true, MissedRunPolicy::Skip, &mut seen,
+            deliverer.as_ref(), Some((&mut queue, deliverer.clone()))).await.unwrap();
+        assert_eq!(tick.dispatched, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !queue.tasks.is_empty() { queue.reap(); tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert!(queue.admit("PANIC-CLAIM", true), "panicked consumer cannot retain a dispatch slot");
+        let conn = store.read().unwrap();
+        let runs: Vec<(String, String, String)> = conn.prepare("SELECT status,note,delivery FROM schedule_runs WHERE schedule_id='PANIC-CLAIM'").unwrap()
+            .query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(runs.len(),1,"finalize the original claim instead of duplicating it");
+        assert_eq!(runs[0].0,"error");
+        assert!(runs[0].1.contains("delivery outcome unknown"));
+        assert_eq!(runs[0].2,"unknown");
+        assert!(!get_schedule(&conn,"PANIC-CLAIM").unwrap().unwrap().enabled(), "uncertain one-off work is not replayed");
+    }
+
+    #[tokio::test]
+    async fn dispatched_shell_capacity_does_not_consume_provider_slots_or_duplicate_claims() {
+        struct Held {
+            calls: std::sync::atomic::AtomicUsize,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait::async_trait]
+        impl Deliverer for Held {
+            async fn deliver(&self, _: &DurableSchedule, _: &str) -> RunOutcome {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.release.notified().await;
+                RunOutcome::Delivered { submission: "confirmed".into(), detail: "actual held consumer released".into() }
+            }
+        }
+        let (store, _dir) = store();
+        store.write(|conn| {
+            for n in 0..6 {
+                let mut row = make_row(&format!("DISPATCH-{n}"), "alpha", None, "2020-01-01T00:00");
+                row.raw.insert("kind".into(), Value::from(if n < 5 { "shell" } else { "tmux" }));
+                insert_schedule(conn, &row)?;
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let held = Arc::new(Held { calls: std::sync::atomic::AtomicUsize::new(0), release: tokio::sync::Notify::new() });
+        let mut queue = FireDispatch::default();
+        let mut seen = HashMap::new();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1),
+            scheduler_tick_inner(&store, true, MissedRunPolicy::Skip, &mut seen, held.as_ref(), Some((&mut queue, held.clone())))).await.unwrap().unwrap();
+        assert_eq!(first.dispatched, 5, "four held shells and an independent provider slot");
+        assert_eq!(first.deferred, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while held.calls.load(std::sync::atomic::Ordering::SeqCst) < 5 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let second = scheduler_tick_inner(&store, true, MissedRunPolicy::Skip, &mut seen, held.as_ref(), Some((&mut queue, held.clone()))).await.unwrap();
+        assert_eq!(second.dispatched, 0, "a full shell pool leaves the fifth occurrence due");
+        let conn = store.read().unwrap();
+        let running: i64 = conn.query_row("SELECT count(*) FROM schedule_runs WHERE status='running'", [], |r| r.get(0)).unwrap();
+        assert_eq!(running, 5, "repeated discovery cannot duplicate the active claims");
+        let provider: i64 = conn.query_row("SELECT count(*) FROM schedule_runs WHERE schedule_id='DISPATCH-5'", [], |r| r.get(0)).unwrap();
+        assert_eq!(provider, 1, "provider made progress while all shell slots were occupied");
+        drop(conn);
+        held.release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !queue.tasks.is_empty() { queue.reap(); tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let third = scheduler_tick_inner(&store, true, MissedRunPolicy::Skip, &mut seen, held.as_ref(), Some((&mut queue, held.clone()))).await.unwrap();
+        assert_eq!(third.dispatched, 1, "the deferred shell recovers when capacity returns");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while held.calls.load(std::sync::atomic::Ordering::SeqCst) < 6 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        held.release.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !queue.tasks.is_empty() { queue.reap(); tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let conn = store.read().unwrap();
+        let completed: i64 = conn.query_row("SELECT count(*) FROM schedule_runs WHERE status='delivered'", [], |r| r.get(0)).unwrap();
+        assert_eq!(completed, 6);
+    }
+
     /// A deliverer that returns whatever verdict a test needs, and COUNTS its
     /// calls — so "the loop fired" and "the command was delivered" are separate
     /// assertions. Conflating those two is the bug (AMUX-2647): the old firing
@@ -2408,11 +4660,20 @@ mod tests {
     struct StubDeliverer {
         outcome: RunOutcome,
         calls: std::sync::atomic::AtomicUsize,
+        reset: Option<DateTime<chrono::Utc>>,
     }
 
     impl StubDeliverer {
         fn new(outcome: RunOutcome) -> Self {
-            StubDeliverer { outcome, calls: std::sync::atomic::AtomicUsize::new(0) }
+            StubDeliverer {
+                outcome,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                reset: None,
+            }
+        }
+        fn with_reset(mut self, reset: DateTime<chrono::Utc>) -> Self {
+            self.reset = Some(reset);
+            self
         }
         fn confirmed() -> Self {
             StubDeliverer::new(RunOutcome::Delivered {
@@ -2431,37 +4692,60 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.outcome.clone()
         }
+        fn window_reset(&self) -> Option<DateTime<chrono::Utc>> {
+            self.reset
+        }
     }
 
     #[test]
     fn refusal_reason_is_none_for_landed_or_pending_outcomes_only() {
         assert_eq!(
-            RunOutcome::Refused { reason: "target archived".into() }.refusal_reason(),
+            RunOutcome::Refused {
+                reason: "target archived".into()
+            }
+            .refusal_reason(),
             Some("target archived".to_string())
         );
         assert_eq!(
-            RunOutcome::Failed { reason: "tmux send failed".into() }.refusal_reason(),
+            RunOutcome::Failed {
+                reason: "tmux send failed".into()
+            }
+            .refusal_reason(),
             Some("tmux send failed".to_string())
         );
         assert_eq!(
-            RunOutcome::ShellError { note: "exit 1".into() }.refusal_reason(),
+            RunOutcome::ShellError {
+                note: "exit 1".into(),
+                output: None,
+            }
+            .refusal_reason(),
             Some("exit 1".to_string())
         );
         assert_eq!(
-            RunOutcome::Delivered { submission: "confirmed".into(), detail: "sent".into() }
-                .refusal_reason(),
+            RunOutcome::Delivered {
+                submission: "confirmed".into(),
+                detail: "sent".into()
+            }
+            .refusal_reason(),
             None
         );
         assert_eq!(
-            RunOutcome::Queued { queue_id: "q1".into(), detail: "queued".into() }.refusal_reason(),
+            RunOutcome::Queued {
+                queue_id: "q1".into(),
+                detail: "queued".into()
+            }
+            .refusal_reason(),
             None
         );
-        assert_eq!(RunOutcome::ShellOk { note: None }.refusal_reason(), None);
+        assert_eq!(RunOutcome::ShellOk { note: None, output: None }.refusal_reason(), None);
     }
 
     fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
         resolve_local(
-            NaiveDate::from_ymd_opt(y, mo, d).unwrap().and_hms_opt(h, mi, 0).unwrap(),
+            NaiveDate::from_ymd_opt(y, mo, d)
+                .unwrap()
+                .and_hms_opt(h, mi, 0)
+                .unwrap(),
         )
         .unwrap()
     }
@@ -2474,31 +4758,179 @@ mod tests {
         // Python-compat extras existing live rows use.
         type Check = Box<dyn Fn(&ScheduleExpr) -> bool>;
         let ok: Vec<(&str, Check)> = vec![
-            ("every 15m", Box::new(|e| matches!(e, ScheduleExpr::Interval { every } if *every == ChronoDuration::minutes(15)))),
-            ("every 2h", Box::new(|e| matches!(e, ScheduleExpr::Interval { every } if *every == ChronoDuration::hours(2)))),
-            ("every 3d", Box::new(|e| matches!(e, ScheduleExpr::Interval { every } if *every == ChronoDuration::days(3)))),
-            ("in 30m", Box::new(|e| matches!(e, ScheduleExpr::Interval { every } if *every == ChronoDuration::minutes(30)))),
-            ("daily at 09:00", Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 9, minute: 0 }))),
-            ("daily at 6pm", Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 18, minute: 0 }))),
-            ("daily at 6:30pm", Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 18, minute: 30 }))),
-            ("daily at 12am", Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 0, minute: 0 }))),
-            ("every morning", Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 9, minute: 0 }))),
-            ("every evening", Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 18, minute: 0 }))),
-            ("every weekday at 09:30", Box::new(|e| matches!(e, ScheduleExpr::Weekday { hour: 9, minute: 30 }))),
-            ("weekly on Monday at 10:00", Box::new(|e| matches!(e, ScheduleExpr::Weekly { weekday: Weekday::Mon, hour: 10, minute: 0 }))),
-            ("weekly on fri at 5pm", Box::new(|e| matches!(e, ScheduleExpr::Weekly { weekday: Weekday::Fri, hour: 17, minute: 0 }))),
-            ("every sunday at 8am", Box::new(|e| matches!(e, ScheduleExpr::Weekly { weekday: Weekday::Sun, hour: 8, minute: 0 }))),
-            ("monthly on 1 at 9am", Box::new(|e| matches!(e, ScheduleExpr::Monthly { day: 1, hour: 9, minute: 0 }))),
-            ("monthly on 15 at 18:45", Box::new(|e| matches!(e, ScheduleExpr::Monthly { day: 15, hour: 18, minute: 45 }))),
-            ("*/5 * * * *", Box::new(|e| matches!(e, ScheduleExpr::Cron(_)))),
-            ("30 9 * * 1-5", Box::new(|e| matches!(e, ScheduleExpr::Cron(_)))),
-            ("0 0 1 1 *", Box::new(|e| matches!(e, ScheduleExpr::Cron(_)))),
-            ("0 12 * * 0,6", Box::new(|e| matches!(e, ScheduleExpr::Cron(_)))),
+            (
+                "every 15m",
+                Box::new(
+                    |e| matches!(e, ScheduleExpr::Interval { every } if *every == ChronoDuration::minutes(15)),
+                ),
+            ),
+            (
+                "every 2h",
+                Box::new(
+                    |e| matches!(e, ScheduleExpr::Interval { every } if *every == ChronoDuration::hours(2)),
+                ),
+            ),
+            (
+                "every 3d",
+                Box::new(
+                    |e| matches!(e, ScheduleExpr::Interval { every } if *every == ChronoDuration::days(3)),
+                ),
+            ),
+            (
+                "in 30m",
+                Box::new(
+                    |e| matches!(e, ScheduleExpr::Interval { every } if *every == ChronoDuration::minutes(30)),
+                ),
+            ),
+            (
+                "daily at 09:00",
+                Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 9, minute: 0 })),
+            ),
+            (
+                "daily at 6pm",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Daily {
+                            hour: 18,
+                            minute: 0
+                        }
+                    )
+                }),
+            ),
+            (
+                "daily at 6:30pm",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Daily {
+                            hour: 18,
+                            minute: 30
+                        }
+                    )
+                }),
+            ),
+            (
+                "daily at 12am",
+                Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 0, minute: 0 })),
+            ),
+            (
+                "every morning",
+                Box::new(|e| matches!(e, ScheduleExpr::Daily { hour: 9, minute: 0 })),
+            ),
+            (
+                "every evening",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Daily {
+                            hour: 18,
+                            minute: 0
+                        }
+                    )
+                }),
+            ),
+            (
+                "every weekday at 09:30",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Weekday {
+                            hour: 9,
+                            minute: 30
+                        }
+                    )
+                }),
+            ),
+            (
+                "weekly on Monday at 10:00",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Weekly {
+                            weekday: Weekday::Mon,
+                            hour: 10,
+                            minute: 0
+                        }
+                    )
+                }),
+            ),
+            (
+                "weekly on fri at 5pm",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Weekly {
+                            weekday: Weekday::Fri,
+                            hour: 17,
+                            minute: 0
+                        }
+                    )
+                }),
+            ),
+            (
+                "every sunday at 8am",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Weekly {
+                            weekday: Weekday::Sun,
+                            hour: 8,
+                            minute: 0
+                        }
+                    )
+                }),
+            ),
+            (
+                "monthly on 1 at 9am",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Monthly {
+                            day: 1,
+                            hour: 9,
+                            minute: 0
+                        }
+                    )
+                }),
+            ),
+            (
+                "monthly on 15 at 18:45",
+                Box::new(|e| {
+                    matches!(
+                        e,
+                        ScheduleExpr::Monthly {
+                            day: 15,
+                            hour: 18,
+                            minute: 45
+                        }
+                    )
+                }),
+            ),
+            (
+                "*/5 * * * *",
+                Box::new(|e| matches!(e, ScheduleExpr::Cron(_))),
+            ),
+            (
+                "30 9 * * 1-5",
+                Box::new(|e| matches!(e, ScheduleExpr::Cron(_))),
+            ),
+            (
+                "0 0 1 1 *",
+                Box::new(|e| matches!(e, ScheduleExpr::Cron(_))),
+            ),
+            (
+                "0 12 * * 0,6",
+                Box::new(|e| matches!(e, ScheduleExpr::Cron(_))),
+            ),
         ];
         for (expr, check) in ok {
-            let parsed = ScheduleExpr::parse(expr)
-                .unwrap_or_else(|e| panic!("'{expr}' should parse: {e}"));
-            assert!(check(&parsed), "'{expr}' parsed to the wrong variant: {parsed:?}");
+            let parsed =
+                ScheduleExpr::parse(expr).unwrap_or_else(|e| panic!("'{expr}' should parse: {e}"));
+            assert!(
+                check(&parsed),
+                "'{expr}' parsed to the wrong variant: {parsed:?}"
+            );
         }
 
         // Rejections — including the incident shapes: 5-word garbage that
@@ -2542,7 +4974,12 @@ mod tests {
         let next = e.next_run_after(local(2026, 8, 12, 12, 0)).unwrap();
         assert!(matches!(next.weekday(), Weekday::Sat | Weekday::Sun));
         let e = ScheduleExpr::parse("0 12 * * 7").unwrap();
-        assert_eq!(e.next_run_after(local(2026, 8, 12, 12, 0)).unwrap().weekday(), Weekday::Sun);
+        assert_eq!(
+            e.next_run_after(local(2026, 8, 12, 12, 0))
+                .unwrap()
+                .weekday(),
+            Weekday::Sun
+        );
         let e = ScheduleExpr::parse("0 12 * * 5-7").unwrap(); // Fri..Sun
         let next = e.next_run_after(local(2026, 8, 12, 12, 0)).unwrap(); // Wed
         assert_eq!(next.weekday(), Weekday::Fri);
@@ -2551,26 +4988,73 @@ mod tests {
     // ---- next-run correctness around boundaries --------------------------
 
     #[test]
+    fn a_fired_daily_is_not_handed_the_repeated_hour_again() {
+        // Runs where the zone has a fall-back (this Mac, and any TZ=America/*
+        // run); `measured` says so, since a UTC host has no repeated hour.
+        let n = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap().and_hms_opt(1, 0, 0).unwrap();
+        let LocalResult::Ambiguous(a, b) = Local.from_local_datetime(&n) else {
+            eprintln!("measured=false: no repeated hour in this zone");
+            return;
+        };
+        let (first, second) = (a.min(b), a.max(b));
+        assert_eq!(resolve_local(n), Some(first));
+        let expr = ScheduleExpr::parse("daily at 1am").unwrap();
+        let next = expr.next_run_after(first + ChronoDuration::seconds(6)).unwrap();
+        assert_eq!(next.date_naive(), NaiveDate::from_ymd_opt(2026, 11, 2).unwrap());
+        assert!(fall_back_held("2026-11-01T01:00", first.timestamp(), first + ChronoDuration::minutes(30)));
+        assert!(!fall_back_held("2026-11-01T01:00", first.timestamp(), second));
+    }
+
+    #[test]
+    fn an_interval_across_the_repeated_hour_waits_for_the_second_occurrence() {
+        let (first, second) = (1_000, 4_600);
+        assert!(held_for_second_occurrence(first, second, 1_300, 1_330), "ran after the first: wait");
+        assert!(!held_for_second_occurrence(first, second, 1_300, second), "the second has come");
+        assert!(!held_for_second_occurrence(first, second, 900, 1_000), "not run yet: the first is due");
+    }
+
+    #[test]
     fn next_run_month_and_week_boundaries() {
         // Monthly across a month boundary: Jan 31 -> Feb 1.
         let e = ScheduleExpr::parse("monthly on 1 at 9am").unwrap();
-        assert_eq!(fmt_minute(e.next_run_after(local(2026, 1, 31, 12, 0)).unwrap()), "2026-02-01T09:00");
+        assert_eq!(
+            fmt_minute(e.next_run_after(local(2026, 1, 31, 12, 0)).unwrap()),
+            "2026-02-01T09:00"
+        );
         // Same day before the time: today.
-        assert_eq!(fmt_minute(e.next_run_after(local(2026, 2, 1, 8, 0)).unwrap()), "2026-02-01T09:00");
+        assert_eq!(
+            fmt_minute(e.next_run_after(local(2026, 2, 1, 8, 0)).unwrap()),
+            "2026-02-01T09:00"
+        );
         // STRICTLY after: at the exact minute, next month.
-        assert_eq!(fmt_minute(e.next_run_after(local(2026, 2, 1, 9, 0)).unwrap()), "2026-03-01T09:00");
+        assert_eq!(
+            fmt_minute(e.next_run_after(local(2026, 2, 1, 9, 0)).unwrap()),
+            "2026-03-01T09:00"
+        );
         // December -> January (year boundary).
-        assert_eq!(fmt_minute(e.next_run_after(local(2026, 12, 15, 0, 0)).unwrap()), "2027-01-01T09:00");
+        assert_eq!(
+            fmt_minute(e.next_run_after(local(2026, 12, 15, 0, 0)).unwrap()),
+            "2027-01-01T09:00"
+        );
 
         // Daily across a month boundary.
         let e = ScheduleExpr::parse("daily at 09:00").unwrap();
-        assert_eq!(fmt_minute(e.next_run_after(local(2026, 1, 31, 10, 0)).unwrap()), "2026-02-01T09:00");
+        assert_eq!(
+            fmt_minute(e.next_run_after(local(2026, 1, 31, 10, 0)).unwrap()),
+            "2026-02-01T09:00"
+        );
 
         // Weekly wrap: 2026-08-10 is a Monday; after Monday 11:00, the next
         // Monday-10:00 is seven days out.
         let e = ScheduleExpr::parse("weekly on monday at 10:00").unwrap();
-        assert_eq!(fmt_minute(e.next_run_after(local(2026, 8, 10, 11, 0)).unwrap()), "2026-08-17T10:00");
-        assert_eq!(fmt_minute(e.next_run_after(local(2026, 8, 10, 9, 0)).unwrap()), "2026-08-10T10:00");
+        assert_eq!(
+            fmt_minute(e.next_run_after(local(2026, 8, 10, 11, 0)).unwrap()),
+            "2026-08-17T10:00"
+        );
+        assert_eq!(
+            fmt_minute(e.next_run_after(local(2026, 8, 10, 9, 0)).unwrap()),
+            "2026-08-10T10:00"
+        );
 
         // Weekday skips the weekend: Friday 18:00 -> Monday.
         let e = ScheduleExpr::parse("every weekday at 09:30").unwrap();
@@ -2580,7 +5064,10 @@ mod tests {
 
         // Interval: anchored on `after`, not wall-aligned.
         let e = ScheduleExpr::parse("every 90m").unwrap();
-        assert_eq!(fmt_minute(e.next_run_after(local(2026, 8, 10, 23, 0)).unwrap()), "2026-08-11T00:30");
+        assert_eq!(
+            fmt_minute(e.next_run_after(local(2026, 8, 10, 23, 0)).unwrap()),
+            "2026-08-11T00:30"
+        );
     }
 
     // ---- RR-0060: missed runs, skip vs catch-up, cap ---------------------
@@ -2603,13 +5090,23 @@ mod tests {
         assert_eq!(catch.overflow, 2); // 12 due - 10 kept, reported
 
         // Nothing due -> empty either way.
-        let none = runs_due(&e, t0, t0 + ChronoDuration::minutes(5), MissedRunPolicy::CatchUp);
+        let none = runs_due(
+            &e,
+            t0,
+            t0 + ChronoDuration::minutes(5),
+            MissedRunPolicy::CatchUp,
+        );
         assert!(none.runs.is_empty());
         assert_eq!(none.overflow, 0);
 
         // A year of every-1m: the scan bound announces itself.
         let e1 = ScheduleExpr::parse("every 1m").unwrap();
-        let huge = runs_due(&e1, t0, t0 + ChronoDuration::days(365), MissedRunPolicy::Skip);
+        let huge = runs_due(
+            &e1,
+            t0,
+            t0 + ChronoDuration::days(365),
+            MissedRunPolicy::Skip,
+        );
         assert!(huge.truncated_scan);
         assert_eq!(huge.runs.len(), 1);
         assert!(huge.overflow >= SCAN_LIMIT - 1);
@@ -2617,7 +5114,11 @@ mod tests {
 
     #[test]
     fn retry_policy_backoff_doubles_and_caps() {
-        let r = RetryPolicy { max_attempts: 5, base_delay_ms: 100, max_delay_ms: 500 };
+        let r = RetryPolicy {
+            max_attempts: 5,
+            base_delay_ms: 100,
+            max_delay_ms: 500,
+        };
         assert_eq!(r.delay(1).as_millis(), 100);
         assert_eq!(r.delay(2).as_millis(), 200);
         assert_eq!(r.delay(3).as_millis(), 400);
@@ -2645,7 +5146,10 @@ mod tests {
         m.insert("last_run".into(), Value::Null);
         m.insert("enabled".into(), Value::from(1));
         m.insert("run_count".into(), Value::from(0));
-        m.insert("schedule_expr".into(), expr.map(Value::from).unwrap_or(Value::Null));
+        m.insert(
+            "schedule_expr".into(),
+            expr.map(Value::from).unwrap_or(Value::Null),
+        );
         m.insert("watch".into(), Value::from(0));
         m.insert("watch_timeout".into(), Value::from(120));
         m.insert("done_pattern".into(), Value::Null);
@@ -2678,7 +5182,10 @@ mod tests {
                 // Built WITHOUT worktree/fan_out, like every fixture here and
                 // like any caller written before migration 0079.
                 let unset = make_row("SCHED-4769A", "amux", None, "2026-09-18T04:00");
-                assert!(unset.raw.get("worktree").is_none(), "fixture must not set it");
+                assert!(
+                    unset.raw.get("worktree").is_none(),
+                    "fixture must not set it"
+                );
                 insert_schedule(conn, &unset)?;
 
                 // Set explicitly, like the HTTP create path.
@@ -2699,22 +5206,270 @@ mod tests {
                         |r| r.get(0),
                     )
                 };
-                assert_eq!(read("SCHED-4769A", "worktree")?, 0, "unset must take the default");
+                assert_eq!(
+                    read("SCHED-4769A", "worktree")?,
+                    0,
+                    "unset must take the default"
+                );
                 assert_eq!(read("SCHED-4769A", "fan_out")?, 0);
                 // THE SILENT DIRECTION: a value the caller set must survive.
-                assert_eq!(read("SCHED-4769B", "worktree")?, 1, "a set value was dropped");
-                assert_eq!(read("SCHED-4769B", "fan_out")?, 1, "a set value was dropped");
-                assert_eq!(read("SCHED-4769C", "worktree")?, 0, "explicit null means the default");
+                assert_eq!(
+                    read("SCHED-4769B", "worktree")?,
+                    1,
+                    "a set value was dropped"
+                );
+                assert_eq!(
+                    read("SCHED-4769B", "fan_out")?,
+                    1,
+                    "a set value was dropped"
+                );
+                assert_eq!(
+                    read("SCHED-4769C", "worktree")?,
+                    0,
+                    "explicit null means the default"
+                );
 
                 // The same rule covers every other NOT NULL DEFAULT column on
                 // this table, which is why the fix is at the seam: these were
                 // one `ALTER TABLE` away from the identical failure.
                 assert_eq!(read("SCHED-4769A", "watch_timeout")?, 120);
                 assert_eq!(read("SCHED-4769A", "trigger_cooldown")?, 120);
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
+    }
+
+    /// gtm-engine, 2026-10-07 (SCHED-173): a rule-10 lane's shell schedule
+    /// runs with its own worker token, whose hash exists only while it runs.
+    #[tokio::test]
+    async fn a_shell_run_speaks_as_its_lane_with_its_own_worker_token() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/w.env"), "AMUX_CONTRACT_DONE=1\n").unwrap();
+        let _g = crate::api::settings::test_env::set_home(home.path());
+        let runs = home.path().join("worker-tokens/w.runs");
+        let (store, _dir) = store();
+        let state = crate::api::AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let mut sched = make_row("SCHED-T", "w", None, "");
+        sched.raw.insert("kind".into(), Value::from("shell"));
+        sched.raw.insert("command".into(), Value::from(format!(
+            "test -n \"$AMUX_WORKER_TOKEN\" && echo runs=$(ls '{}' | wc -l | tr -d ' ')", runs.display())));
+        let out = LiveDeliverer::new(state).deliver(&sched, "test").await;
+        let o = out.shell_output().expect("the shell run happened");
+        assert_eq!(o.exit_code, 0, "the run had a token: {}", o.tail);
+        assert!(o.tail.contains("runs=1"), "one run hash while it ran: {}", o.tail);
+        assert_eq!(std::fs::read_dir(&runs).map(|d| d.count()).unwrap_or(0), 0, "and none after");
+    }
+
+    // ---- cicd-two-minutes item 1: a shell run survives a server restart ----
+
+    fn shell_test_state(store: &SharedStore) -> crate::api::AppState {
+        crate::api::AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// A shell schedule whose command waits for `gate` to exist, so the test
+    /// decides when the run ends relative to the "restart".
+    fn gated_shell_row(id: &str, gate: &std::path::Path, tail: &str) -> DurableSchedule {
+        let mut row = make_row(id, "", None, "2020-01-01T00:00");
+        row.raw.insert("kind".into(), Value::from("shell"));
+        row.raw.insert("command".into(), Value::from(format!(
+            "echo before-restart; while [ ! -f '{}' ]; do sleep 0.05; done; {tail}", gate.display())));
+        row
+    }
+
+    async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Start the run as the server would, wait until its process is up and has
+    /// printed, then drop the watcher the way a dying server drops it.
+    async fn start_then_kill_the_server(store: &SharedStore, row: &DurableSchedule, run_id: i64) -> super::super::shell_detached::RunFiles {
+        let live = LiveDeliverer::new(shell_test_state(store));
+        let row_bg = row.clone();
+        let task = tokio::spawn(async move {
+            super::super::shell_detached::SHELL_RUN_ID.scope(run_id, async move { live.deliver(&row_bg, "cron-rs").await }).await
+        });
+        let dir = shell_runs_dir(row.id());
+        let mut found = None;
+        wait_for("the run's pid and first output", || {
+            found = super::super::shell_detached::find_run(&dir, run_id).map(|(f, _)| f);
+            found.as_ref().is_some_and(|f| f.read_pid().is_some()
+                && std::fs::read_to_string(f.stdout()).unwrap_or_default().contains("before-restart"))
+        })
+        .await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled(), "the old server's watcher is gone");
+        found.unwrap()
+    }
+
+    fn reconcile(store: &SharedStore) -> ShellReconcile {
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let w = slot.clone();
+        store.write(move |conn| {
+            *w.lock().unwrap() = Some(reconcile_shell_runs_at_startup(conn)?);
+            // The cron reconciler runs after it at startup and must not take an adopted row.
+            assert_eq!(fail_orphaned_cron_runs(conn)?, 0, "an adopted cron shell row is not an orphaned delivery");
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let r = slot.lock().unwrap().take().unwrap();
+        r
+    }
+
+    fn run_row(store: &SharedStore, sid: &str) -> (i64, String, Option<i64>, String, String) {
+        let conn = store.read().unwrap();
+        conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM schedule_runs WHERE schedule_id=?1), status, exit_code,
+                    COALESCE(output_tail,''), COALESCE(note,'') FROM schedule_runs WHERE schedule_id=?1 ORDER BY id DESC LIMIT 1",
+            [sid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap()
+    }
+
+    /// The server dies mid-run; the child keeps going; the next server adopts
+    /// it, and the run's REAL exit code and output land on its one row.
+    #[tokio::test]
+    async fn a_shell_run_still_running_at_a_restart_is_adopted_and_recorded_once() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let gate = home.path().join("go");
+        let (store, _dir) = store();
+        let row = gated_shell_row("SCHED-ADOPT", &gate, "echo after-restart; echo why >&2; exit 7");
+        let row_w = row.clone();
+        let slot = Arc::new(std::sync::Mutex::new(None));
+        let w = slot.clone();
+        store.write(move |conn| {
+            insert_schedule(conn, &row_w)?;
+            conn.execute("UPDATE schedules SET kind='shell' WHERE id='SCHED-ADOPT'", [])?;
+            *w.lock().unwrap() = Some(claim_manual_shell_run(conn, "SCHED-ADOPT", "manual:test")?);
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let run_id = slot.lock().unwrap().unwrap().run_id();
+
+        let files = start_then_kill_the_server(&store, &row, run_id).await;
+        let pid = files.read_pid().unwrap();
+        assert!(super::super::shell_detached::pid_alive(pid), "the child outlives the server that started it");
+        assert!(files.read_rc().is_none());
+
+        let r = reconcile(&store);
+        assert_eq!((r.adopted.len(), r.lost.len()), (1, 0), "{r:?}");
+        assert!(!r.adopted[0].finished_while_down);
+        assert_eq!(run_row(&store, "SCHED-ADOPT").1, "running", "an adopted run is not interrupted");
+
+        std::fs::write(&gate, b"").unwrap();
+        let a = r.adopted.into_iter().next().unwrap();
+        complete_adopted_shell_run(store.clone(), Arc::new(LiveDeliverer::new(shell_test_state(&store))), a).await;
+
+        let (count, status, code, tail, note) = run_row(&store, "SCHED-ADOPT");
+        assert_eq!(count, 1, "no duplicate row");
+        assert_eq!((status.as_str(), code), ("error", Some(7)), "the real exit code, not interrupted: {note}");
+        assert!(tail.contains("before-restart") && tail.contains("after-restart") && tail.contains("why"), "{tail}");
+        assert!(!note.contains("interrupted"), "{note}");
+        let log = std::fs::read_to_string(files.log()).unwrap();
+        assert!(log.contains("after-restart") && log.contains("[exit 7]"), "{log}");
+        assert!(!files.stdout().exists() && !files.meta().exists(), "run files are cleaned once recorded");
+
+        // A second startup finds nothing to adopt or lose: recorded once.
+        let again = reconcile(&store);
+        assert_eq!((again.adopted.len(), again.lost.len()), (0, 0));
+        assert_eq!(run_row(&store, "SCHED-ADOPT").0, 1);
+    }
+
+    /// The run ended while no server was up: its exit code is on disk and is
+    /// what gets recorded. A cron fire's row (delivery NULL) this time.
+    #[tokio::test]
+    async fn a_shell_run_that_finished_while_the_server_was_down_records_its_exit_code() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let gate = home.path().join("go");
+        let (store, _dir) = store();
+        let row = gated_shell_row("SCHED-DOWN", &gate, "echo finished-while-down; exit 3");
+        let row_w = row.clone();
+        let slot = Arc::new(std::sync::Mutex::new(0i64));
+        let w = slot.clone();
+        store.write(move |conn| {
+            insert_schedule(conn, &row_w)?;
+            conn.execute("UPDATE schedules SET kind='shell' WHERE id='SCHED-DOWN'", [])?;
+            conn.execute("INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source, delivery)
+                          VALUES ('SCHED-DOWN', 1, 'running', 'fired; delivery pending', 'cron-rs', NULL)", [])?;
+            *w.lock().unwrap() = conn.last_insert_rowid();
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let run_id = *slot.lock().unwrap();
+
+        let files = start_then_kill_the_server(&store, &row, run_id).await;
+        std::fs::write(&gate, b"").unwrap();
+        wait_for("the exit code on disk", || files.read_rc().is_some()).await;
+
+        let r = reconcile(&store);
+        assert_eq!((r.adopted.len(), r.lost.len()), (1, 0), "{r:?}");
+        assert!(r.adopted[0].finished_while_down && r.adopted[0].cron);
+        let a = r.adopted.into_iter().next().unwrap();
+        complete_adopted_shell_run(store.clone(), Arc::new(LiveDeliverer::new(shell_test_state(&store))), a).await;
+
+        let (count, status, code, tail, note) = run_row(&store, "SCHED-DOWN");
+        assert_eq!(count, 1);
+        assert_eq!((status.as_str(), code), ("error", Some(3)), "{note}");
+        assert!(tail.contains("finished-while-down"), "{tail}");
+        let last: String = store.read().unwrap()
+            .query_row("SELECT last_delivery FROM schedules WHERE id='SCHED-DOWN'", [], |r| r.get(0)).unwrap();
+        assert_eq!(last, "error", "the schedule row carries the adopted run's outcome");
+    }
+
+    /// Only a run whose process is gone with no exit code (or that left no
+    /// files) is lost, and it is recorded interrupted, not left running.
+    #[tokio::test]
+    async fn a_shell_run_whose_process_died_without_an_exit_code_is_lost() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        let (store, _dir) = store();
+        let ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let w = ids.clone();
+        store.write(move |conn| {
+            for sid in ["SCHED-DEAD", "SCHED-NOFILES"] {
+                conn.execute("INSERT INTO schedule_runs (schedule_id, ran_at, status, note, source, delivery)
+                              VALUES (?1, 1, 'running', 'started on host; result pending', 'manual:t', 'shell')", [sid])?;
+                w.lock().unwrap().push(conn.last_insert_rowid());
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        let dead_id = ids.lock().unwrap()[0];
+        // A process that has exited, as the dead run's pid.
+        let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let gone_pid = gone.id() as i32;
+        gone.wait().unwrap();
+        let files = super::super::shell_detached::new_run_files(&shell_runs_dir("SCHED-DEAD"), 30).unwrap();
+        files.write_meta(&super::super::shell_detached::RunMeta {
+            run_id: Some(dead_id), schedule_id: "SCHED-DEAD".into(), started_ms: 1, attempt: 1, token_path: None,
+        }).unwrap();
+        std::fs::write(files.pid(), gone_pid.to_string()).unwrap();
+
+        let r = reconcile(&store);
+        assert_eq!((r.adopted.len(), r.lost.len()), (0, 2), "{r:?}");
+        for sid in ["SCHED-DEAD", "SCHED-NOFILES"] {
+            let (_, status, _, _, note) = run_row(&store, sid);
+            assert_eq!(status, "interrupted", "{sid}: {note}");
+        }
+        assert!(!files.meta().exists(), "a lost run's leftovers are swept");
     }
 
     #[tokio::test]
@@ -2730,7 +5485,10 @@ mod tests {
                 );
                 row.raw.insert("kind".into(), Value::from("shell"));
                 insert_schedule(conn, &row)?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -2742,7 +5500,10 @@ mod tests {
                 .write_async(move |conn| {
                     let got = claim_manual_shell_run(conn, "SCHED-173", source)?;
                     *slot_w.lock().unwrap() = Some(got);
-                    Ok(WriteOutcome { applied: got.started(), events: vec![] })
+                    Ok(WriteOutcome {
+                        applied: got.started(),
+                        events: vec![],
+                    })
                 })
                 .await
                 .unwrap();
@@ -2777,26 +5538,53 @@ mod tests {
         let run_id = first.run_id();
         store
             .write_async(move |conn| {
+                conn.execute(
+                    "UPDATE schedules SET last_delivery='error', last_refusal_reason='an older failure' WHERE id='SCHED-173'",
+                    [],
+                )?;
                 finish_manual_shell_run(
                     conn,
                     run_id,
                     &RunOutcome::ShellOk {
                         note: Some("exit 0; anomaly relayed".into()),
+                        output: None,
                     },
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
+        {
+            let conn = store.read().unwrap();
+            let (d, r): (Option<String>, Option<String>) = conn
+                .query_row("SELECT last_delivery, last_refusal_reason FROM schedules WHERE id='SCHED-173'", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(
+                (d.as_deref(), r.as_deref()),
+                (Some(RunOutcome::ShellOk { note: None, output: None }.status()), None),
+                "a manual run's outcome replaces the schedule's stale failure"
+            );
+        }
         let third = claim(&store, "manual:browser-c").await;
-        assert!(third.started(), "a terminal prior run must not block a new run");
+        assert!(
+            third.started(),
+            "a terminal prior run must not block a new run"
+        );
         assert_ne!(third.run_id(), first.run_id());
 
         store
             .write_async(|conn| {
                 let n = fail_orphaned_manual_shell_runs(conn)?;
                 assert_eq!(n, 1, "only the still-running third attempt is orphaned");
-                Ok(WriteOutcome { applied: n > 0, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: n > 0,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -2808,7 +5596,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(orphan_status, "error");
+        assert_eq!(orphan_status, "interrupted", "a restart mid-run is not a failure of the command");
     }
 
     #[tokio::test]
@@ -2820,8 +5608,19 @@ mod tests {
                 let id = mint_schedule_id(conn)?;
                 let row = make_row(&id, "alpha", Some("daily at 09:00"), "2026-08-10T09:00");
                 insert_schedule(conn, &row)?;
-                insert_audit(conn, &id, "created", "", "{\"title\":\"t\"}", "api-create", "tester")?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                insert_audit(
+                    conn,
+                    &id,
+                    "created",
+                    "",
+                    "{\"title\":\"t\"}",
+                    "api-create",
+                    "tester",
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -2832,7 +5631,7 @@ mod tests {
         assert_eq!(all.len(), 1);
         let id = all[0].id().to_string();
         assert_eq!(id, "SCHED-1"); // Python's counter format, shared table
-        // Scope: bound to alpha, invisible to beta.
+                                   // Scope: bound to alpha, invisible to beta.
         assert_eq!(list_schedules(&conn, Some("alpha")).unwrap().len(), 1);
         assert_eq!(list_schedules(&conn, Some("beta")).unwrap().len(), 0);
         let (by, src): (String, String) = conn
@@ -2855,7 +5654,10 @@ mod tests {
                 s.set("updated", Value::from(chrono::Utc::now().timestamp()));
                 update_schedule(conn, &s)?;
                 insert_audit(conn, &uid, "enabled", "1", "0", "api-patch", "tester")?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -2869,7 +5671,10 @@ mod tests {
                 let again = soft_delete_schedule(conn, &did, chrono::Utc::now().timestamp())?;
                 assert_eq!(again, 0); // idempotent — no second audit row
                 insert_audit(conn, &did, "deleted", "{}", "now", "api-delete", "tester")?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -2878,7 +5683,11 @@ mod tests {
         assert_eq!(list_schedules(&conn, None).unwrap().len(), 0); // gone from list
         assert!(get_schedule(&conn, &id).unwrap().unwrap().is_deleted()); // row survives
         let audit_n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schedule_audit WHERE schedule_id=?1", [&id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM schedule_audit WHERE schedule_id=?1",
+                [&id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(audit_n, 3); // created + enabled + deleted
     }
@@ -2903,7 +5712,10 @@ mod tests {
                 .flatten()
                 .collect();
             *self.seen.lock().unwrap() = rows;
-            RunOutcome::Delivered { submission: "confirmed".into(), detail: "sent".into() }
+            RunOutcome::Delivered {
+                submission: "confirmed".into(),
+                detail: "sent".into(),
+            }
         }
     }
 
@@ -2919,13 +5731,21 @@ mod tests {
             .write_async(|conn| {
                 let row = make_row("SCHED-2", "alpha", Some("every 10m"), "2020-01-01T00:00");
                 insert_schedule(conn, &row)?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
-        let obs = ObservingDeliverer { store: store.clone(), seen: std::sync::Mutex::new(vec![]) };
+        let obs = ObservingDeliverer {
+            store: store.clone(),
+            seen: std::sync::Mutex::new(vec![]),
+        };
         let mut seen = HashMap::new();
-        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &obs).await.unwrap();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &obs)
+            .await
+            .unwrap();
 
         let during = obs.seen.lock().unwrap().clone();
         assert_eq!(
@@ -2935,7 +5755,10 @@ mod tests {
              last_run advanced and the ledger silent, which is AF-515 exactly",
             during.len()
         );
-        assert_eq!(during[0].1, "running", "the row must be provisional during delivery");
+        assert_eq!(
+            during[0].1, "running",
+            "the row must be provisional during delivery"
+        );
 
         // And afterwards it is the SAME row, updated — not a second one.
         let conn = store.read().unwrap();
@@ -2946,8 +5769,15 @@ mod tests {
             .unwrap()
             .flatten()
             .collect();
-        assert_eq!(after.len(), 1, "record inserted a second row instead of updating");
-        assert_eq!(after[0].0, during[0].0, "record wrote a DIFFERENT row than the claim");
+        assert_eq!(
+            after.len(),
+            1,
+            "record inserted a second row instead of updating"
+        );
+        assert_eq!(
+            after[0].0, during[0].0,
+            "record wrote a DIFFERENT row than the claim"
+        );
         assert_eq!(after[0].1, "delivered");
     }
 
@@ -2962,22 +5792,36 @@ mod tests {
             .write_async(|conn| {
                 let row = make_row("SCHED-1", "alpha", Some("every 10m"), "2020-01-01T00:00");
                 insert_schedule(conn, &row)?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
         let mut seen = HashMap::new();
-        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed())
-            .await
-            .unwrap();
+        scheduler_tick(
+            &store,
+            true,
+            MissedRunPolicy::Skip,
+            &mut seen,
+            &StubDeliverer::confirmed(),
+        )
+        .await
+        .unwrap();
 
         let conn = store.read().unwrap();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='SCHED-1'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='SCHED-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(n, 1, "the fire left {n} rows; claim-insert + record-insert double-writes");
+        assert_eq!(
+            n, 1,
+            "the fire left {n} rows; claim-insert + record-insert double-writes"
+        );
         let (status, delivery): (String, Option<String>) = conn
             .query_row(
                 "SELECT status, delivery FROM schedule_runs WHERE schedule_id='SCHED-1'",
@@ -3015,7 +5859,10 @@ mod tests {
                              'cron-rs', NULL, NULL)",
                     [],
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -3037,11 +5884,17 @@ mod tests {
         let fixed = store
             .write_async(|conn| {
                 let n = fail_orphaned_cron_runs(conn)?;
-                Ok(WriteOutcome { applied: n > 0, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: n > 0,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
-        assert!(fixed.applied, "the reconciler did not claim the orphaned cron row");
+        assert!(
+            fixed.applied,
+            "the reconciler did not claim the orphaned cron row"
+        );
 
         let conn = store.read().unwrap();
         let (status, note, delivery): (String, String, Option<String>) = conn
@@ -3051,10 +5904,20 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
-        assert_eq!(status, "error", "an unrecorded fire must not read as delivered");
+        assert_eq!(
+            status, "interrupted",
+            "an unrecorded fire must not read as delivered"
+        );
         assert_ne!(status, "running", "it must not sit provisional forever");
-        assert!(note.contains("restarted"), "the row does not say what happened: {note}");
-        assert_eq!(delivery.as_deref(), Some("unknown"), "delivery must not read as achieved");
+        assert!(
+            note.contains("restarted"),
+            "the row does not say what happened: {note}"
+        );
+        assert_eq!(
+            delivery.as_deref(),
+            Some("unknown"),
+            "delivery must not read as achieved"
+        );
     }
 
     /// The two reconcilers must not claim each other's rows. A shell run is
@@ -3075,25 +5938,36 @@ mod tests {
                              'shell', NULL)",
                     [],
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
         let n = store
             .write_async(|conn| {
                 let n = fail_orphaned_cron_runs(conn)?;
-                Ok(WriteOutcome { applied: n > 0, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: n > 0,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
         assert!(!n.applied, "the cron reconciler claimed a shell row");
         let conn = store.read().unwrap();
         let status: String = conn
-            .query_row("SELECT status FROM schedule_runs WHERE schedule_id='SCHED-5'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT status FROM schedule_runs WHERE schedule_id='SCHED-5'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(status, "running", "a live shell run was failed by the wrong reconciler");
+        assert_eq!(
+            status, "running",
+            "a live shell run was failed by the wrong reconciler"
+        );
     }
 
     #[tokio::test]
@@ -3112,17 +5986,28 @@ mod tests {
                     },
                     "manual:tester",
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
         let conn = store.read().unwrap();
         let src: String = conn
-            .query_row("SELECT source FROM schedule_runs WHERE schedule_id='SCHED-77'", [], |r| r.get(0))
+            .query_row(
+                "SELECT source FROM schedule_runs WHERE schedule_id='SCHED-77'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(src, "manual:tester"); // discriminable from 'cron'/'cron-rs'
         let rc: i64 = conn
-            .query_row("SELECT run_count FROM schedules WHERE id='SCHED-77'", [], |r| r.get(0))
+            .query_row(
+                "SELECT run_count FROM schedules WHERE id='SCHED-77'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(rc, 1);
     }
@@ -3140,10 +6025,15 @@ mod tests {
                 record_run(
                     conn,
                     "SCHED-78",
-                    &RunOutcome::Refused { reason: "target 'alpha' is archived".into() },
+                    &RunOutcome::Refused {
+                        reason: "target 'alpha' is archived".into(),
+                    },
                     "manual:tester",
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -3156,7 +6046,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last_delivery.as_deref(), Some("refused"));
-        assert_eq!(last_refusal_reason.as_deref(), Some("target 'alpha' is archived"));
+        assert_eq!(
+            last_refusal_reason.as_deref(),
+            Some("target 'alpha' is archived")
+        );
     }
 
     // ---- dual-scheduler: shadow mode fires NOTHING -----------------------
@@ -3168,17 +6061,43 @@ mod tests {
             .write_async(|conn| {
                 let row = make_row("SCHED-1", "alpha", Some("every 10m"), "2020-01-01T00:00");
                 insert_schedule(conn, &row)?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
 
         let mut seen = HashMap::new();
-        let r1 = scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
-        assert_eq!(r1, TickReport { due: 1, shadowed: 1, ..Default::default() });
+        let r1 = scheduler_tick(
+            &store,
+            false,
+            MissedRunPolicy::Skip,
+            &mut seen,
+            &StubDeliverer::confirmed(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r1,
+            TickReport {
+                due: 1,
+                shadowed: 1,
+                ..Default::default()
+            }
+        );
 
         // Second tick: same occurrence, deduped — one shadow event total.
-        let r2 = scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
+        let r2 = scheduler_tick(
+            &store,
+            false,
+            MissedRunPolicy::Skip,
+            &mut seen,
+            &StubDeliverer::confirmed(),
+        )
+        .await
+        .unwrap();
         assert_eq!(r2.deduped, 1);
         assert_eq!(r2.shadowed, 0);
 
@@ -3202,13 +6121,46 @@ mod tests {
             .unwrap();
         assert!(mutation.contains("2020-01-01T00:00"), "{mutation}");
         // NOTHING fired: no runs, next_run untouched (Python's to advance).
-        let runs: i64 =
-            conn.query_row("SELECT COUNT(*) FROM schedule_runs", [], |r| r.get(0)).unwrap();
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schedule_runs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(runs, 0);
         let next: String = conn
-            .query_row("SELECT next_run FROM schedules WHERE id='SCHED-1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT next_run FROM schedules WHERE id='SCHED-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(next, "2020-01-01T00:00");
+    }
+
+    #[tokio::test]
+    async fn a_critical_host_defers_a_fire_without_recording_or_advancing_it() {
+        let (store, _dir) = store();
+        store
+            .write_async(|conn| {
+                insert_schedule(conn, &make_row("SCHED-1", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        let mut seen = HashMap::new();
+        crate::runtime_jobs::host_guard::set_level_for_test(Some(crate::runtime_jobs::host_guard::Level::Critical));
+        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
+        assert_eq!((r.due, r.fired, r.deferred, r.errors), (1, 0, 1, 0));
+        {
+            let conn = store.read().unwrap();
+            let runs: i64 = conn.query_row("SELECT COUNT(*) FROM schedule_runs", [], |r| r.get(0)).unwrap();
+            let next: String = conn.query_row("SELECT next_run FROM schedules WHERE id='SCHED-1'", [], |r| r.get(0)).unwrap();
+            assert_eq!(runs, 0, "a deferral must not be recorded as a run");
+            assert_eq!(next, "2020-01-01T00:00", "a deferral must leave the schedule due");
+        }
+        // Strained is not critical: it fires.
+        crate::runtime_jobs::host_guard::set_level_for_test(Some(crate::runtime_jobs::host_guard::Level::Strained));
+        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
+        assert_eq!((r.fired, r.deferred), (1, 0));
+        crate::runtime_jobs::host_guard::set_level_for_test(None);
     }
 
     #[tokio::test]
@@ -3216,18 +6168,32 @@ mod tests {
         let (store, _dir) = store();
         store
             .write_async(|conn| {
-                insert_schedule(conn, &make_row("SCHED-1", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
+                insert_schedule(
+                    conn,
+                    &make_row("SCHED-1", "alpha", Some("every 10m"), "2020-01-01T00:00"),
+                )?;
                 // A once-type row, also due.
                 let mut once = make_row("SCHED-2", "beta", None, "2020-01-01T00:00");
                 once.set("sched_type", Value::from("once"));
                 insert_schedule(conn, &once)?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
 
         let mut seen = HashMap::new();
-        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
+        let r = scheduler_tick(
+            &store,
+            true,
+            MissedRunPolicy::Skip,
+            &mut seen,
+            &StubDeliverer::confirmed(),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.due, 2);
         assert_eq!(r.fired, 2);
         assert_eq!(r.errors, 0);
@@ -3243,19 +6209,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(src, "cron-rs");
-        assert!(note.unwrap().contains("missed occurrence"), "skip overflow must be reported");
+        assert!(
+            note.unwrap().contains("missed occurrence"),
+            "skip overflow must be reported"
+        );
         let next: String = conn
-            .query_row("SELECT next_run FROM schedules WHERE id='SCHED-1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT next_run FROM schedules WHERE id='SCHED-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(next.as_str() > "2026-01", "next_run should advance to the future: {next}");
+        assert!(
+            next.as_str() > "2026-01",
+            "next_run should advance to the future: {next}"
+        );
         let rc: i64 = conn
-            .query_row("SELECT run_count FROM schedules WHERE id='SCHED-1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT run_count FROM schedules WHERE id='SCHED-1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(rc, 1);
 
         // Once: fired then disabled, with the audited run-once flip.
         let enabled: i64 = conn
-            .query_row("SELECT enabled FROM schedules WHERE id='SCHED-2'", [], |r| r.get(0))
+            .query_row(
+                "SELECT enabled FROM schedules WHERE id='SCHED-2'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(enabled, 0);
         let audit_src: String = conn
@@ -3283,17 +6267,35 @@ mod tests {
         let prev = fmt_minute(Local::now() - ChronoDuration::minutes(45));
         store
             .write_async(move |conn| {
-                insert_schedule(conn, &make_row("SCHED-9", "alpha", Some("every 10m"), &prev))?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                insert_schedule(
+                    conn,
+                    &{ let mut row = make_row("SCHED-9", "alpha", Some("every 10m"), &prev); row.raw.insert("kind".into(), Value::from("shell")); row },
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
         let mut seen = HashMap::new();
-        let r = scheduler_tick(&store, true, MissedRunPolicy::CatchUp, &mut seen, &StubDeliverer::confirmed()).await.unwrap();
+        let r = scheduler_tick(
+            &store,
+            true,
+            MissedRunPolicy::CatchUp,
+            &mut seen,
+            &StubDeliverer::confirmed(),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.fired, 1);
         let conn = store.read().unwrap();
         let runs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='SCHED-9'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM schedule_runs WHERE schedule_id='SCHED-9'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         // 45 minutes of every-10m backlog: occurrences at +0,+10,+20,+30,+40.
         assert_eq!(runs, 5, "catch-up should replay each missed occurrence");
@@ -3321,25 +6323,53 @@ mod tests {
     #[test]
     fn no_undelivered_outcome_can_report_ok() {
         let undelivered = [
-            RunOutcome::Refused { reason: "target 'x' is archived".into() },
-            RunOutcome::Failed { reason: "not submitted — text is sitting in the input box".into() },
-            RunOutcome::Queued { queue_id: "steer-1".into(), detail: "queued (steering)".into() },
-            RunOutcome::ShellError { note: "exit 1".into() },
+            RunOutcome::Refused {
+                reason: "target 'x' is archived".into(),
+            },
+            RunOutcome::Failed {
+                reason: "not submitted — text is sitting in the input box".into(),
+            },
+            RunOutcome::Queued {
+                queue_id: "steer-1".into(),
+                detail: "queued (steering)".into(),
+            },
+            RunOutcome::ShellError {
+                note: "exit 1".into(),
+                output: None,
+            },
         ];
         for o in &undelivered {
             assert_ne!(o.status(), "ok", "{o:?} must not be recordable as ok");
             assert!(!o.landed(), "{o:?} did not land anywhere");
-            assert!(o.note().is_some(), "{o:?} must carry a reason — silence is what sent Ethan pressing again");
+            assert!(
+                o.note().is_some(),
+                "{o:?} must carry a reason — silence is what sent Ethan pressing again"
+            );
         }
         // Queued is PENDING, and the trap is that it feels like success.
-        assert_eq!(RunOutcome::Queued { queue_id: "q".into(), detail: String::new() }.status(), "queued");
-        // The only two that may claim to have landed.
-        assert!(RunOutcome::Delivered { submission: "confirmed".into(), detail: String::new() }.landed());
-        assert!(RunOutcome::ShellOk { note: None }.landed());
-        // ...and only ShellOk yields the word `ok`, from a finished subprocess.
-        assert_eq!(RunOutcome::ShellOk { note: None }.status(), "ok");
         assert_eq!(
-            RunOutcome::Delivered { submission: "confirmed".into(), detail: String::new() }.status(),
+            RunOutcome::Queued {
+                queue_id: "q".into(),
+                detail: String::new()
+            }
+            .status(),
+            "queued"
+        );
+        // The only two that may claim to have landed.
+        assert!(RunOutcome::Delivered {
+            submission: "confirmed".into(),
+            detail: String::new()
+        }
+        .landed());
+        assert!(RunOutcome::ShellOk { note: None, output: None }.landed());
+        // ...and only ShellOk yields the word `ok`, from a finished subprocess.
+        assert_eq!(RunOutcome::ShellOk { note: None, output: None }.status(), "ok");
+        assert_eq!(
+            RunOutcome::Delivered {
+                submission: "confirmed".into(),
+                detail: String::new()
+            }
+            .status(),
             "delivered"
         );
     }
@@ -3357,31 +6387,51 @@ mod tests {
     /// be. Both directions or neither.
     #[test]
     fn a_queued_steer_is_pending_not_undelivered() {
-        let queued =
-            || RunOutcome::Queued { queue_id: "steer-1786973425".into(), detail: "queued (steering)".into() };
+        let queued = || RunOutcome::Queued {
+            queue_id: "steer-1786973425".into(),
+            detail: "queued (steering)".into(),
+        };
 
         // The specimen: one Queued outcome, which is what both fires produced.
-        assert!(!should_warn_undelivered(&[queued()]), "a queued steer lands at the next turn boundary — not an outage");
+        assert!(
+            !should_warn_undelivered(&[queued()]),
+            "a queued steer lands at the next turn boundary — not an outage"
+        );
         // Still not `landed`: pending is not done, and the run row must keep
         // saying `queued`. Fixing the warning must not widen this.
-        assert!(!queued().landed(), "queued must stay pending at the type level");
+        assert!(
+            !queued().landed(),
+            "queued must stay pending at the type level"
+        );
         assert!(!queued().lost(), "queued is pending, not lost");
         assert_eq!(queued().status(), "queued");
 
         // CONTROL — the detector must still fire, or the fix deleted it.
         for o in [
-            RunOutcome::Refused { reason: "target 'x' is archived".into() },
-            RunOutcome::Failed { reason: "not submitted".into() },
-            RunOutcome::ShellError { note: "exit 1".into() },
+            RunOutcome::Refused {
+                reason: "target 'x' is archived".into(),
+            },
+            RunOutcome::Failed {
+                reason: "not submitted".into(),
+            },
+            RunOutcome::ShellError {
+                note: "exit 1".into(),
+                output: None,
+            },
         ] {
             assert!(o.lost(), "{o:?} reached nobody and is not pending");
-            assert!(should_warn_undelivered(std::slice::from_ref(&o)), "{o:?} must still warn");
+            assert!(
+                should_warn_undelivered(std::slice::from_ref(&o)),
+                "{o:?} must still warn"
+            );
         }
         // Nothing attempted still reads as silence — unchanged behaviour.
         assert!(should_warn_undelivered(&[]));
         // A mixed fire is not a fleet going quiet: one steer is still pending.
         assert!(!should_warn_undelivered(&[
-            RunOutcome::Refused { reason: "archived".into() },
+            RunOutcome::Refused {
+                reason: "archived".into()
+            },
             queued(),
         ]));
         // And a real delivery obviously does not warn.
@@ -3396,8 +6446,19 @@ mod tests {
         let (store, _dir) = store();
         store
             .write_async(|conn| {
-                insert_schedule(conn, &make_row("SCHED-5", "archived-lane", Some("every 10m"), "2020-01-01T00:00"))?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                insert_schedule(
+                    conn,
+                    &make_row(
+                        "SCHED-5",
+                        "archived-lane",
+                        Some("every 10m"),
+                        "2020-01-01T00:00",
+                    ),
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -3405,9 +6466,15 @@ mod tests {
             reason: "target 'archived-lane' is archived — not delivered, not woken".into(),
         });
         let mut seen = HashMap::new();
-        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        let r = scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub)
+            .await
+            .unwrap();
         assert_eq!(r.fired, 1, "the occurrence was consumed");
-        assert_eq!(stub.calls(), 1, "delivery must actually be ATTEMPTED, not assumed");
+        assert_eq!(
+            stub.calls(),
+            1,
+            "delivery must actually be ATTEMPTED, not assumed"
+        );
 
         let conn = store.read().unwrap();
         let (status, note, delivery, submission): (String, Option<String>, Option<String>, Option<String>) = conn
@@ -3417,16 +6484,26 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(status, "refused", "a refused delivery must never read as ok");
+        assert_eq!(
+            status, "refused",
+            "a refused delivery must never read as ok"
+        );
         assert_ne!(status, "ok");
         assert!(note.unwrap().contains("archived"), "the row must carry WHY");
         assert_eq!(delivery.as_deref(), Some("refused"));
         assert_eq!(submission.as_deref(), Some("not_submitted"));
         // The schedule still advanced — a refusal is not a wedge.
         let next: String = conn
-            .query_row("SELECT next_run FROM schedules WHERE id='SCHED-5'", [], |r| r.get(0))
+            .query_row(
+                "SELECT next_run FROM schedules WHERE id='SCHED-5'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert!(next.as_str() > "2026-01", "a refused fire must still advance: {next}");
+        assert!(
+            next.as_str() > "2026-01",
+            "a refused fire must still advance: {next}"
+        );
     }
 
     #[tokio::test]
@@ -3438,8 +6515,19 @@ mod tests {
         let (store, _dir) = store();
         store
             .write_async(|conn| {
-                insert_schedule(conn, &make_row("SCHED-419", "tubescience", Some("0 * * * *"), "2020-01-01T00:00"))?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                insert_schedule(
+                    conn,
+                    &make_row(
+                        "SCHED-419",
+                        "tubescience",
+                        Some("0 * * * *"),
+                        "2020-01-01T00:00",
+                    ),
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -3450,9 +6538,15 @@ mod tests {
         let before_count: i64 = store
             .read()
             .unwrap()
-            .query_row("SELECT run_count FROM schedules WHERE id='SCHED-419'", [], |r| r.get(0))
+            .query_row(
+                "SELECT run_count FROM schedules WHERE id='SCHED-419'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub)
+            .await
+            .unwrap();
 
         let conn = store.read().unwrap();
         let (last_run, run_count, last_delivery, last_refusal_reason): (
@@ -3470,12 +6564,21 @@ mod tests {
             .unwrap();
         // The CLAIM-phase clock still advances exactly as before (AF-515) —
         // this fix is additive, not a change to when last_run/run_count bump.
-        assert!(last_run.is_some(), "last_run must still advance on a refusal");
-        assert_eq!(run_count, before_count + 1, "run_count must still advance on a refusal");
+        assert!(
+            last_run.is_some(),
+            "last_run must still advance on a refusal"
+        );
+        assert_eq!(
+            run_count,
+            before_count + 1,
+            "run_count must still advance on a refusal"
+        );
         // The new fields are what makes the refusal visible on the object.
         assert_eq!(last_delivery.as_deref(), Some("refused"));
         assert!(
-            last_refusal_reason.unwrap().contains("plan window is 99% used"),
+            last_refusal_reason
+                .unwrap()
+                .contains("plan window is 99% used"),
             "the schedule object must carry WHY, not just THAT"
         );
     }
@@ -3485,8 +6588,19 @@ mod tests {
         let (store, _dir) = store();
         store
             .write_async(|conn| {
-                insert_schedule(conn, &make_row("SCHED-6", "busy-lane", Some("every 10m"), "2020-01-01T00:00"))?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                insert_schedule(
+                    conn,
+                    &make_row(
+                        "SCHED-6",
+                        "busy-lane",
+                        Some("every 10m"),
+                        "2020-01-01T00:00",
+                    ),
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -3495,7 +6609,9 @@ mod tests {
             detail: "queued (steering) — delivers to 'busy-lane' at its next turn boundary".into(),
         });
         let mut seen = HashMap::new();
-        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub)
+            .await
+            .unwrap();
 
         let conn = store.read().unwrap();
         let (status, note, delivery): (String, String, String) = conn
@@ -3518,14 +6634,22 @@ mod tests {
         let (store, _dir) = store();
         store
             .write_async(|conn| {
-                insert_schedule(conn, &make_row("SCHED-7", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                insert_schedule(
+                    conn,
+                    &make_row("SCHED-7", "alpha", Some("every 10m"), "2020-01-01T00:00"),
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
         let stub = StubDeliverer::confirmed();
         let mut seen = HashMap::new();
-        scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        scheduler_tick(&store, false, MissedRunPolicy::Skip, &mut seen, &stub)
+            .await
+            .unwrap();
         assert_eq!(stub.calls(), 0, "shadow mode must deliver NOTHING");
     }
 
@@ -3534,8 +6658,14 @@ mod tests {
         let (store, _dir) = store();
         store
             .write_async(|conn| {
-                insert_schedule(conn, &make_row("SCHED-8", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                insert_schedule(
+                    conn,
+                    &make_row("SCHED-8", "alpha", Some("every 10m"), "2020-01-01T00:00"),
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -3546,7 +6676,9 @@ mod tests {
             detail: "sent (keys delivered; submission could not be verified)".into(),
         });
         let mut seen = HashMap::new();
-        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub)
+            .await
+            .unwrap();
         let conn = store.read().unwrap();
         let (status, submission): (String, String) = conn
             .query_row(
@@ -3556,7 +6688,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "delivered");
-        assert_eq!(submission, "unverified", "a verdict of 'unverified' must survive to the row");
+        assert_eq!(
+            submission, "unverified",
+            "a verdict of 'unverified' must survive to the row"
+        );
     }
 
     #[tokio::test]
@@ -3567,14 +6702,22 @@ mod tests {
         let (store, _dir) = store();
         store
             .write_async(|conn| {
-                insert_schedule(conn, &make_row("SCHED-9", "alpha", Some("every 10m"), "2020-01-01T00:00"))?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                insert_schedule(
+                    conn,
+                    &make_row("SCHED-9", "alpha", Some("every 10m"), "2020-01-01T00:00"),
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
         let stub = StubDeliverer::confirmed();
         let mut seen = HashMap::new();
-        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub).await.unwrap();
+        scheduler_tick(&store, true, MissedRunPolicy::Skip, &mut seen, &stub)
+            .await
+            .unwrap();
         let conn = store.read().unwrap();
         let (last_delivery, last_refusal_reason): (Option<String>, Option<String>) = conn
             .query_row(
@@ -3584,7 +6727,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(last_delivery.as_deref(), Some("delivered"));
-        assert_eq!(last_refusal_reason, None, "a landed delivery has nothing to explain");
+        assert_eq!(
+            last_refusal_reason, None,
+            "a landed delivery has nothing to explain"
+        );
     }
 
     #[test]
@@ -3593,8 +6739,6 @@ mod tests {
         // byte-identical to the 9am cron fire.
         assert_eq!(delivered_text("do the thing", "cron-rs"), "do the thing");
         assert_eq!(delivered_text("do the thing", "cron"), "do the thing");
-
-
 
         let manual = delivered_text("do the thing", "manual:ethan");
         assert!(manual.contains("Run-now, triggered by ethan"), "{manual}");
@@ -3650,7 +6794,10 @@ mod tests {
             skip_of(Some("every 15m"), "2026-08-10T09:00").as_deref(),
             Some("2026-08-10T09:15")
         );
-        assert_eq!(skip_of(Some("every 2h"), "2026-08-10T09:00").as_deref(), Some("2026-08-10T11:00"));
+        assert_eq!(
+            skip_of(Some("every 2h"), "2026-08-10T09:00").as_deref(),
+            Some("2026-08-10T11:00")
+        );
         // weekday: Friday -> Monday, never Saturday
         assert_eq!(
             skip_of(Some("every weekday at 09:00"), "2026-08-14T09:00").as_deref(),
@@ -3681,7 +6828,13 @@ mod tests {
     /// deletes the second grammar, and this is the specimen that proves it.
     #[test]
     fn expressions_the_fire_loop_accepts_are_all_skippable() {
-        for expr in ["every morning", "every evening", "every night", "in 30m", "every 1d"] {
+        for expr in [
+            "every morning",
+            "every evening",
+            "every night",
+            "in 30m",
+            "every 1d",
+        ] {
             let armed = ScheduleExpr::parse(expr)
                 .unwrap_or_else(|e| panic!("{expr} must parse for firing: {e}"))
                 .next_run_after(Local::now())
@@ -3718,10 +6871,129 @@ mod tests {
         // No armed next_run at all.
         assert_eq!(skip_of(Some("daily at 09:00"), ""), None);
         // Garbage expr, no recurrence to fall back on.
-        assert_eq!(skip_of(Some("whenever i feel like it"), "2026-08-10T09:00"), None);
+        assert_eq!(
+            skip_of(Some("whenever i feel like it"), "2026-08-10T09:00"),
+            None
+        );
         // Legacy row with an unrecognised recurrence.
         let mut s = make_row("SCHED-3", "alpha", None, "2026-08-10T09:00");
         s.set("recurrence", Value::from("fortnightly"));
         assert_eq!(skip_next_run(&s), None);
+    }
+}
+
+/// Shell schedule runs executing in THIS process, so self-adoption can wait for
+/// them: an exec closes a run's output pipes and the run is recorded as "server
+/// restarted before this fire recorded a delivery outcome". The builder's own
+/// hold (rust-auto-build.sh SHELL-RUN DEFER) looks only before it builds, and
+/// SCHED-465 fired during the build at 17:18 and 18:18 on 2026-10-17, so both
+/// runs died at the adoption that followed.
+///
+/// Since shell runs are detached and adopted across a restart
+/// (shell_detached.rs), that hold defaults to 0; the registry stays for the
+/// `AMUX_ADOPT_SHELL_DEFER_MAX_S` override.
+static SHELL_RUNS_IN_FLIGHT: std::sync::Mutex<Vec<(u64, String, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+static SHELL_RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) struct ShellRunInFlight(u64);
+
+impl ShellRunInFlight {
+    pub(crate) fn enter(schedule: &str) -> Self {
+        let id = SHELL_RUN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut v) = SHELL_RUNS_IN_FLIGHT.lock() {
+            v.push((id, schedule.to_string(), std::time::Instant::now()));
+        }
+        Self(id)
+    }
+}
+
+impl Drop for ShellRunInFlight {
+    fn drop(&mut self) {
+        if let Ok(mut v) = SHELL_RUNS_IN_FLIGHT.lock() {
+            v.retain(|(id, _, _)| *id != self.0);
+        }
+    }
+}
+
+/// Schedule ids of shell runs in flight that started less than `max_age` ago.
+pub(crate) fn shell_runs_in_flight(max_age: std::time::Duration) -> Vec<String> {
+    let mut ids: Vec<String> = SHELL_RUNS_IN_FLIGHT.lock().map(|v| {
+        v.iter().filter(|(_, _, t)| t.elapsed() < max_age).map(|(_, s, _)| s.clone()).collect()
+    }).unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[cfg(test)]
+mod shell_in_flight_tests {
+    use super::*;
+
+    #[test]
+    fn a_shell_run_is_in_flight_until_its_guard_drops() {
+        let hour = std::time::Duration::from_secs(3600);
+        let g = ShellRunInFlight::enter("SCHED-test-inflight");
+        assert!(shell_runs_in_flight(hour).contains(&"SCHED-test-inflight".to_string()));
+        assert!(!shell_runs_in_flight(std::time::Duration::ZERO).contains(&"SCHED-test-inflight".to_string()),
+            "a run older than the cap no longer holds adoption");
+        drop(g);
+        assert!(!shell_runs_in_flight(hour).contains(&"SCHED-test-inflight".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod sun_schedule_tests {
+    use super::*;
+
+    fn near(t: DateTime<chrono::Utc>, want: &str, tol_min: i64) -> bool {
+        let w = DateTime::parse_from_rfc3339(want).unwrap().with_timezone(&chrono::Utc);
+        (t - w).num_minutes().abs() <= tol_min
+    }
+
+    /// New York's published sunsets: 20:31 EDT on the June solstice, 16:32
+    /// EST on the December one; sunrise 05:25 EDT in June.
+    #[test]
+    fn sunset_and_sunrise_match_published_times() {
+        let (lat, lon) = (40.7128, -74.0060);
+        let jun = NaiveDate::from_ymd_opt(2026, 6, 21).unwrap();
+        let dec = NaiveDate::from_ymd_opt(2026, 12, 21).unwrap();
+        assert!(near(sun_event_utc(jun, lat, lon, true).unwrap(), "2026-06-22T00:31:00Z", 3));
+        assert!(near(sun_event_utc(dec, lat, lon, true).unwrap(), "2026-12-21T21:32:00Z", 3));
+        assert!(near(sun_event_utc(jun, lat, lon, false).unwrap(), "2026-06-21T09:25:00Z", 3));
+        // No sunset at the pole in June.
+        assert!(sun_event_utc(jun, 89.0, 0.0, true).is_none());
+    }
+
+    #[test]
+    fn after_shabbos_is_saturday_night_and_the_forms_parse() {
+        // SAFETY: only this test reads these variables.
+        unsafe {
+            std::env::set_var("AMUX_LATITUDE", "40.7128");
+            std::env::set_var("AMUX_LONGITUDE", "-74.0060");
+        }
+        let e = ScheduleExpr::parse("after Shabbos").unwrap();
+        let ScheduleExpr::Sun { weekday, sunset, offset_min, .. } = e.clone() else { panic!("{e:?}") };
+        assert_eq!((weekday, sunset, offset_min), (Some(Weekday::Sat), true, shabbat_end_offset_min()));
+        let from = Local.from_local_datetime(&NaiveDate::from_ymd_opt(2026, 10, 26).unwrap().and_hms_opt(9, 0, 0).unwrap()).unwrap();
+        let next = e.next_run_after(from).unwrap();
+        assert_eq!(next.weekday(), Weekday::Sat);
+        assert!(next.with_timezone(&chrono_tz_ny()).hour() >= 18, "Saturday night: {next}");
+        for ok in ["daily at sunset", "every saturday at sunset+50m", "weekly on friday at sunset-18m", "every day at sunrise", "every sunday at sundown + 1h"] {
+            assert!(matches!(ScheduleExpr::parse(ok), Ok(ScheduleExpr::Sun { .. })), "{ok}");
+        }
+        let ScheduleExpr::Sun { offset_min, .. } = ScheduleExpr::parse("weekly on friday at sunset-18m").unwrap() else { unreachable!() };
+        assert_eq!(offset_min, -18);
+        assert!(ScheduleExpr::parse("daily at sunset+13h").is_err());
+        assert_eq!(fires_per_day(&ScheduleExpr::parse("after shabbat").unwrap()), Some(1.0 / 7.0));
+        unsafe {
+            std::env::remove_var("AMUX_LATITUDE");
+            std::env::remove_var("AMUX_LONGITUDE");
+        }
+        let e = ScheduleExpr::parse("after shabbos").unwrap_err();
+        assert!(e.0.contains("AMUX_LATITUDE"), "the refusal says what to set: {e}");
+    }
+
+    fn chrono_tz_ny() -> chrono::FixedOffset {
+        chrono::FixedOffset::west_opt(4 * 3600).unwrap()
     }
 }

@@ -25,9 +25,7 @@ fn default_max() -> usize {
 fn logs_dir() -> PathBuf {
     let home = std::env::var("AMUX_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-        });
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux"));
     home.join("logs")
 }
 
@@ -38,12 +36,44 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
     }
     let max_per = q.max.clamp(1, 500);
 
+    // The index first (`search_firehose`): every query word must appear in a
+    // chunk, in any order, and the lines carrying them come back. The bytes the
+    // ingest job has not reached are scanned directly, so the answer is never
+    // staler than the files. Only a query with no words (pure punctuation) or
+    // an index that cannot be opened falls through to the full grep below.
+    if let Some(match_expr) =
+        super::search::build_match(&query).filter(|_| query.chars().any(char::is_alphanumeric))
+    {
+        let started = std::time::Instant::now();
+        let home = crate::config::amux_home();
+        let q2 = query.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::search_firehose::log_search(&home, &match_expr, &q2, max_per)
+        })
+        .await
+        {
+            Ok(Ok((matches, tail_bytes))) => {
+                return Json(json!({
+                    "matches": matches,
+                    "q": query,
+                    "source": "index",
+                    "unindexed_bytes_scanned": tail_bytes,
+                    "took_ms": started.elapsed().as_millis() as u64,
+                }))
+                .into_response();
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(target: "amux::search", error = %e, "log index unavailable; grepping")
+            }
+            Err(e) => {
+                tracing::warn!(target: "amux::search", error = %e, "log index query panicked; grepping")
+            }
+        }
+    }
+
     let result = tokio::task::spawn_blocking(move || {
         let ql = query.to_lowercase();
-        let ansi_re = regex::Regex::new(
-            r"\x1b\[[0-9;?]*[a-zA-Z]",
-        )
-        .unwrap();
+        let ansi_re = regex::Regex::new(r"\x1b\[[0-9;?]*[a-zA-Z]").unwrap();
 
         let mut matches: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
         let dir = logs_dir();
@@ -103,14 +133,14 @@ pub async fn search(Query(q): Query<SearchQuery>) -> Response {
     .await;
 
     match result {
-        Ok((matches, query)) => Json(json!({"matches": matches, "q": query})).into_response(),
-        Err(e) => {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": e.to_string()}).to_string(),
-            )
-                .into_response()
+        Ok((matches, query)) => {
+            Json(json!({"matches": matches, "q": query, "source": "grep"})).into_response()
         }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": e.to_string()}).to_string(),
+        )
+            .into_response(),
     }
 }
 
@@ -124,10 +154,17 @@ mod tests {
     fn truncation_never_splits_a_multibyte_character() {
         let line = "─".repeat(400); // 3 bytes each: byte 500 lands mid-character
         let truncated: String = line.chars().take(500).collect();
-        assert_eq!(truncated.chars().count(), 400, "shorter than the cap: unchanged");
+        assert_eq!(
+            truncated.chars().count(),
+            400,
+            "shorter than the cap: unchanged"
+        );
         let long = "─".repeat(700);
         let t2: String = long.chars().take(500).collect();
         assert_eq!(t2.chars().count(), 500, "capped in CHARS, not bytes");
-        assert!(t2.len() > 500, "and the byte length exceeds the cap, which is why byte-slicing panicked");
+        assert!(
+            t2.len() > 500,
+            "and the byte length exceeds the cap, which is why byte-slicing panicked"
+        );
     }
 }

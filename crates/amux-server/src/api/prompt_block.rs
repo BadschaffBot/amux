@@ -1,0 +1,327 @@
+//! A lane blocked on a Claude Code permission prompt.
+//!
+//! gs12-mvs, 2026-10-07: a subagent's Bash call raised "This shell -c script
+//! runs rm and could not be checked / Do you want to proceed?" under bypass
+//! permissions. Claude Code fired no Notification or PermissionRequest hook
+//! for it, so the lane's last hook edge said `active` and outranked the pane.
+//! It read active for about an hour while three steering messages queued
+//! behind it, and the only log was "steering queue STALLED
+//! blocked_now=busy-past-deadline".
+//!
+//! amux answers ONE of these prompts, and only for a yolo lane: Claude Code's
+//! "runs rm and could not be checked" safety prompt (Ethan, AMUX-5850,
+//! 2026-10-11). A yolo lane already approved every command, and an unattended
+//! prompt auto-denies after two minutes, losing the work. See
+//! `yolo_auto_yes_command`. Every other permission prompt stays the human's
+//! (ethos D2). For those it makes the block visible: the lane
+//! reads `waiting` with `waiting_since`, the steering stall line names it, a
+//! WARN fires once per lane per 10 minutes, and after
+//! AMUX_PROMPT_BLOCK_ALERT_S (default 600) the lane's hub gets one message per
+//! prompt.
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// The prompt's own reason line (the line above "Do you want to proceed?"),
+/// when a Claude Code permission prompt is drawn at the bottom of the pane:
+/// the question, then its "❯ 1." option, and no status bar after it (the
+/// prompt replaces the bar, so a bar below means the question is scrollback).
+pub fn prompt_line(raw: &str) -> Option<String> {
+    let clean = crate::backend::adapter::strip_ansi(raw);
+    let lines: Vec<&str> = clean.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = &lines[lines.len().saturating_sub(14)..];
+    let i = tail.iter().rposition(|l| l.to_lowercase().starts_with("do you want to proceed"))?;
+    let after = &tail[i + 1..];
+    if !after.iter().any(|l| l.starts_with('\u{276f}') && l.contains("1.")) {
+        return None;
+    }
+    // THE PROMPT'S OWN FOOTER WITH ONLY CHROME BELOW IT IS A LIVE PROMPT
+    // (mixpeek-dev, 2026-11-01, Claude Code
+    // 2.1.316): with background agents running, the worker's name rule sits
+    // below "Esc to cancel". Requiring the footer to be the last line read a
+    // live prompt as gone for 24 minutes, and the yolo auto-yes never fired.
+    let footer = after.iter().rposition(|l| l.to_lowercase().contains("esc to cancel"));
+    let chrome = |l: &&str| l.starts_with('\u{2500}') || l.contains("\u{23f5}\u{23f5}") || l.to_lowercase().contains("bypass permissions on");
+    if footer.is_some_and(|f| after[f + 1..].iter().all(chrome)) {
+        return Some(reason_line(tail, i));
+    }
+    if after.iter().any(|l| l.contains("\u{23f5}\u{23f5}") || l.to_lowercase().contains("bypass permissions on")) {
+        return None;
+    }
+    // THE PROMPT MUST BE THE BOTTOM OF THE PANE (AMUX-5850 e2e, 2026-10-11).
+    // Output printed after an answered prompt leaves the question in the tail
+    // with no status bar below it; read as live, that lane was answered twice
+    // (a stray "1" into the composer) and kept a PERMISSION PROMPT badge. The
+    // last line of a drawn prompt is one of its options or its footer.
+    let last = after.last().map(|l| l.to_lowercase()).unwrap_or_default();
+    let is_option = |l: &str| {
+        let l = l.trim_start_matches('\u{276f}').trim_start();
+        l.split_once('.').is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    };
+    if !(last.contains("esc to cancel") || is_option(&last)) {
+        return None;
+    }
+    Some(reason_line(tail, i))
+}
+
+/// The reason line above the question at `tail[i]`.
+fn reason_line(tail: &[&str], i: usize) -> String {
+    // Claude Code may draw a countdown line above the question ("will
+    // automatically deny this request in 1:59 ..."); it changes every second,
+    // so it is never the reason line (gs12-extra-2, 2026-10-07: 50 warnings
+    // an hour, each one a "new" prompt at age 0).
+    let mut j = i;
+    while j > 0 && tail[j - 1].to_lowercase().contains("automatically deny") {
+        j -= 1;
+    }
+    let reason = if j > 0 && !tail[j - 1].starts_with('\u{2502}') { tail[j - 1] } else { tail[i] };
+    reason.chars().take(160).collect()
+}
+
+/// The command a yolo lane may have approved on its behalf: Some only when the
+/// drawn prompt is the "runs rm and could not be checked" safety prompt and
+/// option 1 reads Yes. The text is the boxed command, for the audit log.
+pub fn yolo_auto_yes_command(raw: &str) -> Option<String> {
+    let reason = prompt_line(raw)?.to_lowercase();
+    if !(reason.contains("could not be checked") && reason.contains(" rm ")) {
+        return None;
+    }
+    let clean = crate::backend::adapter::strip_ansi(raw);
+    let lines: Vec<&str> = clean.lines().map(str::trim).collect();
+    if !lines.iter().any(|l| l.starts_with('\u{276f}') && l.contains("1. Yes")) {
+        return None;
+    }
+    let cmd: Vec<&str> = lines.iter().filter_map(|l| l.strip_prefix('\u{2502}')).map(str::trim).collect();
+    Some(cmd.join(" ").chars().take(600).collect())
+}
+
+/// AMUX_YOLO_AUTO_YES (default on; "0" turns it off), from the lane's scope
+/// first, then the server env.
+pub fn yolo_auto_yes_on(scoped: Option<&str>) -> bool {
+    let v = scoped.map(str::to_string).or_else(|| std::env::var("AMUX_YOLO_AUTO_YES").ok());
+    !matches!(v.as_deref().map(str::trim), Some("0" | "false" | "no" | "off"))
+}
+
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub line: String,
+    pub since: f64,
+    pub last_seen: f64,
+    warned_at: f64,
+    alerted: bool,
+}
+
+fn seen() -> &'static Mutex<HashMap<String, Seen>> {
+    static S: std::sync::OnceLock<Mutex<HashMap<String, Seen>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// The prompt a lane is blocked on now, with when it was first seen.
+pub fn current(lane: &str) -> Option<(String, f64)> {
+    let map = seen().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(lane).map(|s| (s.line.clone(), s.since))
+}
+
+/// Record what the pane shows now. Returns (prompt line, first seen) while the
+/// lane is blocked, and clears the record when the prompt is gone.
+pub fn observe(lane: &str, raw: Option<&str>, now: f64) -> Option<(String, f64)> {
+    let mut map = seen().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(line) = raw.and_then(prompt_line) else {
+        map.remove(lane);
+        return None;
+    };
+    let entry = map.entry(lane.to_string()).or_insert_with(|| Seen {
+        line: line.clone(),
+        since: now,
+        last_seen: now,
+        warned_at: 0.0,
+        alerted: false,
+    });
+    // Digits never make a prompt a different prompt (counters, timers).
+    let same = |a: &str, b: &str| a.chars().filter(|c| !c.is_ascii_digit()).eq(b.chars().filter(|c| !c.is_ascii_digit()));
+    if !same(&entry.line, &line) {
+        *entry = Seen { line: line.clone(), since: now, last_seen: now, warned_at: 0.0, alerted: false };
+    }
+    entry.last_seen = now;
+    if now - entry.warned_at >= 600.0 {
+        entry.warned_at = now;
+        tracing::warn!(session = lane, age_s = (now - entry.since) as i64, prompt = %line, measured = true,
+            n_considered = 1, verdict = "lane_blocked_on_permission_prompt",
+            "lane is blocked on a Claude Code permission prompt; amux does not answer it");
+    }
+    Some((line, entry.since))
+}
+
+/// Whether the lane was seen blocked within the last two minutes, for the
+/// steering stall line's `blocked_now`.
+pub fn blocked_now(lane: &str, now: f64) -> bool {
+    let map = seen().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(lane).is_some_and(|s| now - s.last_seen <= 120.0)
+}
+
+fn alert_after_s() -> f64 {
+    std::env::var("AMUX_PROMPT_BLOCK_ALERT_S").ok().and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(600.0)
+}
+
+/// Blocks old enough to report and not yet reported, marked reported.
+pub fn take_due(now: f64) -> Vec<(String, Seen)> {
+    let threshold = alert_after_s();
+    let mut map = seen().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for (lane, s) in map.iter_mut() {
+        if !s.alerted && now - s.last_seen <= 120.0 && now - s.since >= threshold {
+            s.alerted = true;
+            out.push((lane.clone(), s.clone()));
+        }
+    }
+    out
+}
+
+/// One message to the lane's hub per prompt that has blocked the lane past
+/// the threshold. A lane with no hub is logged, not routed.
+pub async fn alert_due(state: &crate::api::AppState) -> usize {
+    let now = crate::config::now_f64();
+    let home = crate::config::amux_home();
+    let mut sent = 0;
+    for (lane, s) in take_due(now) {
+        let mins = ((now - s.since) / 60.0).round() as i64;
+        let hub = crate::api::contract::lane_setting(&home, &lane, "AMUX_CONTRACT_HUB")
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .filter(|v| !v.is_empty() && *v != lane);
+        let Some(hub) = hub else {
+            tracing::warn!(session = %lane, age_min = mins, prompt = %s.line, measured = true, n_considered = 1,
+                verdict = "prompt_block_alert_unrouted", "a lane is blocked on a permission prompt and has no hub to tell");
+            continue;
+        };
+        let text = format!(
+            "[amux] {lane} has been blocked on a Claude Code permission prompt for {mins} min: \"{}\". \
+             amux does not answer permission prompts; someone with access to the lane must.",
+            s.line
+        );
+        match crate::api::session_verbs::steer_enqueue(state, &hub, &text, "prompt-block", "harness:prompt-block").await {
+            Ok(_) => {
+                sent += 1;
+                tracing::warn!(session = %lane, hub = %hub, age_min = mins, measured = true, n_considered = 1,
+                    verdict = "prompt_block_alert_sent", "told the hub a lane is blocked on a permission prompt");
+            }
+            Err(e) => tracing::warn!(session = %lane, hub = %hub, error = ?e, measured = true, n_considered = 1,
+                verdict = "prompt_block_alert_failed", "could not tell the hub a lane is blocked on a permission prompt"),
+        }
+    }
+    sent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SUBAGENT_PROMPT: &str = "\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+ Bash command \u{b7} from the general-purpose agent
+ Run shell command
+\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}
+ \u{2502} ZB_SHA=$(git rev-parse HEAD) bash -c 'rm -f \"${ZS:?}\"'
+\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}
+ This shell -c script runs rm and could not be checked
+
+ Do you want to proceed?
+ \u{276f} 1. Yes
+   2. No
+
+ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+x ctrl+k twice to stop background agents";
+
+    /// The frame on mixpeek-dev, 2026-11-01: the worker's name rule under the
+    /// footer, background agents running.
+    const NAME_RULE_BELOW: &str = "\
+ \u{2502} VC_MODE=check bash vc_body.sh | head
+\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}
+This shell -c script runs rm and could not be checked
+Do you want to proceed?
+ \u{276f} 1. Yes
+   2. No
+ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+x ctrl+k twice to stop background agents
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} mixpeek-cicd \u{2500}";
+
+    #[test]
+    fn chrome_under_the_footer_does_not_hide_a_live_prompt() {
+        assert_eq!(prompt_line(NAME_RULE_BELOW).as_deref(), Some("This shell -c script runs rm and could not be checked"));
+        assert!(yolo_auto_yes_command(NAME_RULE_BELOW).is_some());
+        let with_bar = format!("{NAME_RULE_BELOW}\n\u{23f5}\u{23f5} bypass permissions on");
+        assert!(prompt_line(&with_bar).is_some(), "the footer outranks the bar");
+        let answered = format!("{NAME_RULE_BELOW}\n\u{276f} \n\u{2500}\u{2500}\u{2500}");
+        assert_eq!(prompt_line(&answered), None, "a composer below it means the prompt is history");
+    }
+
+    const PLAIN_PROMPT: &str = "\
+\u{23fa} Bash(rm -rf build)
+
+Do you want to proceed?
+\u{276f} 1. Yes
+  2. No, and tell Claude what to do differently";
+
+    const SCROLLBACK_ONLY: &str = "\
+Do you want to proceed?
+\u{276f} 1. Yes
+  2. No
+\u{23fa} Done, removed the build dir.
+\u{2733} Baked for 12s
+
+\u{276f}
+\u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+
+    #[test]
+    fn a_countdown_line_is_not_the_reason_and_does_not_restart_the_block() {
+        let screen = |t: &str| format!("\u{23fa} Bash(git grep -l probe origin/main)\n\u{26a0} Claude Code will automatically deny this request in {t}, to avoid blocking progress on an unattended session\nDo you want to proceed?\n\u{276f} 1. Yes\n  2. No\nEsc to cancel");
+        assert_eq!(prompt_line(&screen("1:59")).as_deref(), Some("\u{23fa} Bash(git grep -l probe origin/main)"));
+        let lane = "countdown-lane";
+        let (_, first) = observe(lane, Some(&screen("1:59")), 1000.0).unwrap();
+        let (_, later) = observe(lane, Some(&screen("0:30")), 1090.0).unwrap();
+        assert_eq!(first, later, "the same prompt keeps its first-seen time");
+    }
+
+    #[test]
+    fn output_printed_after_an_answered_prompt_means_it_is_no_longer_live() {
+        let answered = format!("{SUBAGENT_PROMPT}\nprobe: received key [1], continuing");
+        assert_eq!(prompt_line(&answered), None, "a prompt with output below it was already answered");
+        assert_eq!(yolo_auto_yes_command(&answered), None, "never answer the same prompt twice");
+        assert!(prompt_line(SUBAGENT_PROMPT).is_some(), "the footer as last line is a live prompt");
+        assert!(prompt_line(PLAIN_PROMPT).is_some(), "an option as last line is a live prompt");
+    }
+
+    #[test]
+    fn only_the_rm_safety_prompt_is_eligible_for_yolo_auto_yes() {
+        let cmd = yolo_auto_yes_command(SUBAGENT_PROMPT).expect("the rm safety prompt is eligible");
+        assert!(cmd.contains("rm -f"), "the approved command is logged: {cmd}");
+        assert_eq!(yolo_auto_yes_command(PLAIN_PROMPT), None, "an ordinary permission prompt stays the human's");
+        assert_eq!(yolo_auto_yes_command(SCROLLBACK_ONLY), None, "an answered prompt is never re-answered");
+        let no_yes = SUBAGENT_PROMPT.replace("1. Yes", "1. Allow once");
+        assert_eq!(yolo_auto_yes_command(&no_yes), None, "option 1 must read Yes");
+        assert!(yolo_auto_yes_on(None) || std::env::var("AMUX_YOLO_AUTO_YES").is_ok());
+        assert!(!yolo_auto_yes_on(Some("0")));
+        assert!(yolo_auto_yes_on(Some("1")));
+    }
+
+    #[test]
+    fn a_drawn_permission_prompt_names_its_reason_line() {
+        assert_eq!(prompt_line(SUBAGENT_PROMPT).as_deref(), Some("This shell -c script runs rm and could not be checked"));
+        assert_eq!(prompt_line(PLAIN_PROMPT).as_deref(), Some("\u{23fa} Bash(rm -rf build)"));
+        assert_eq!(prompt_line(SCROLLBACK_ONLY), None, "a prompt in scrollback above the status bar is answered history");
+        assert_eq!(prompt_line("\u{276f}\n? for shortcuts"), None);
+    }
+
+    #[test]
+    fn a_block_is_dated_from_first_sight_warned_once_and_alerted_once() {
+        let lane = "pb-test-lane";
+        let (_, since) = observe(lane, Some(SUBAGENT_PROMPT), 1000.0).unwrap();
+        assert_eq!(since, 1000.0);
+        assert_eq!(observe(lane, Some(SUBAGENT_PROMPT), 1300.0).unwrap().1, 1000.0, "the first sighting dates the block");
+        assert!(blocked_now(lane, 1350.0));
+        assert!(take_due(1500.0).iter().all(|(l, _)| l != lane), "not due before the threshold");
+        observe(lane, Some(SUBAGENT_PROMPT), 1700.0);
+        assert!(take_due(1700.0).iter().any(|(l, _)| l == lane), "due past the threshold");
+        observe(lane, Some(SUBAGENT_PROMPT), 1800.0);
+        assert!(take_due(1800.0).iter().all(|(l, _)| l != lane), "one alert per prompt");
+        assert!(observe(lane, Some("\u{276f}\n? for shortcuts"), 1900.0).is_none());
+        assert!(!blocked_now(lane, 1900.0), "an answered prompt clears the block");
+    }
+}

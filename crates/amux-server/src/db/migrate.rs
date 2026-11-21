@@ -23,7 +23,7 @@ struct Migration {
     sql: &'static str,
 }
 
-/// Recorded names that are known to be an earlier name for the SAME migration.
+/// Recorded names that are safe predecessors of the registered migration.
 ///
 /// A version/name mismatch normally means a migration was skipped and remains
 /// a startup error. This one is different and was already proven/documented in
@@ -31,15 +31,20 @@ struct Migration {
 /// stale `0029_` filename prefix to `0035_` without changing its schema work.
 /// Keeping that fact executable prevents every healthy boot from raising a
 /// false migration-collision alarm while preserving the alarm for every
-/// unrecognized mismatch.
+/// unrecognized mismatch. Versions 82/83 were assigned independently on the
+/// project-lifecycle branch. Migration 85 is an idempotent union of both
+/// histories, so either deployed history converges before the server uses the
+/// schema.
 const MIGRATION_NAME_ALIASES: &[(i64, &str, &str)] = &[
     (35, "0029_regenerable_samples", "0035_regenerable_samples"),
+    (82, "0082_project_execution", "0082_nudge_budget"),
+    (83, "0083_project_attempts", "0083_project_execution"),
 ];
 
 fn known_name_alias(version: i64, recorded: &str, registered: &str) -> bool {
-    MIGRATION_NAME_ALIASES.iter().any(|(v, old, new)| {
-        *v == version && *old == recorded && *new == registered
-    })
+    MIGRATION_NAME_ALIASES
+        .iter()
+        .any(|(v, old, new)| *v == version && *old == recorded && *new == registered)
 }
 
 // Embedded at compile time so the binary is self-contained (single-artifact
@@ -463,6 +468,442 @@ const MIGRATIONS: &[Migration] = &[
         name: "0081_invariant_incident_episode",
         sql: include_str!("../../migrations/0081_invariant_incident_episode.sql"),
     },
+    Migration {
+        version: 82,
+        name: "0082_nudge_budget",
+        sql: include_str!("../../migrations/0082_nudge_budget.sql"),
+    },
+    Migration {
+        version: 83,
+        name: "0083_project_execution",
+        sql: include_str!("../../migrations/0083_project_execution.sql"),
+    },
+    Migration {
+        version: 84,
+        name: "0084_project_attempts",
+        sql: include_str!("../../migrations/0084_project_attempts.sql"),
+    },
+    Migration {
+        version: 85,
+        name: "0085_project_migration_collision_reconcile",
+        sql: include_str!("../../migrations/0085_project_migration_collision_reconcile.sql"),
+    },
+    Migration {
+        version: 86,
+        name: "0086_steering_message_receipts",
+        sql: include_str!("../../migrations/0086_steering_message_receipts.sql"),
+    },
+    Migration {
+        version: 87,
+        name: "0087_worker_type",
+        sql: include_str!("../../migrations/0087_worker_type.sql"),
+    },
+    Migration {
+        version: 88,
+        name: "0088_window_stats_indexes",
+        sql: include_str!("../../migrations/0088_window_stats_indexes.sql"),
+    },
+    Migration {
+        version: 89,
+        name: "0089_board_signals",
+        sql: include_str!("../../migrations/0089_board_signals.sql"),
+    },
+    Migration {
+        version: 90,
+        name: "0090_schedule_run_shell_output",
+        sql: include_str!("../../migrations/0090_schedule_run_shell_output.sql"),
+    },
+    Migration {
+        version: 91,
+        name: "0091_cmd_history_repeat_of",
+        sql: include_str!("../../migrations/0091_cmd_history_repeat_of.sql"),
+    },
+    Migration {
+        version: 92,
+        name: "0092_pinned_notes",
+        sql: include_str!("../../migrations/0092_pinned_notes.sql"),
+    },
+    Migration {
+        version: 93,
+        name: "0093_standing_approvals",
+        sql: include_str!("../../migrations/0093_standing_approvals.sql"),
+    },
+    Migration {
+        version: 94,
+        name: "0094_trace_archive",
+        sql: include_str!("../../migrations/0094_trace_archive.sql"),
+    },
+    Migration {
+        version: 95,
+        name: "0095_request_log_client",
+        sql: include_str!("../../migrations/0095_request_log_client.sql"),
+    },
+    Migration {
+        version: 96,
+        name: "0096_skill_usage",
+        sql: include_str!("../../migrations/0096_skill_usage.sql"),
+    },
+    Migration {
+        version: 97,
+        name: "0097_steering_delay_after_idle",
+        sql: include_str!("../../migrations/0097_steering_delay_after_idle.sql"),
+    },
+    Migration {
+        version: 98,
+        name: "0098_chatgpt_app_oauth",
+        sql: include_str!("../../migrations/0098_chatgpt_app_oauth.sql"),
+    },
+    Migration {
+        version: 99,
+        name: "0099_location_history",
+        sql: include_str!("../../migrations/0099_location_history.sql"),
+    },
+    Migration {
+        version: 100,
+        name: "0100_location_raw",
+        sql: include_str!("../../migrations/0100_location_raw.sql"),
+    },
+    Migration {
+        version: 101,
+        name: "0101_location_place_names",
+        sql: include_str!("../../migrations/0101_location_place_names.sql"),
+    },
+    Migration {
+        version: 102,
+        name: "0102_schedule_run_queue_id",
+        sql: include_str!("../../migrations/0102_schedule_run_queue_id.sql"),
+    },
+    Migration {
+        version: 103,
+        name: "0103_card_contracts",
+        sql: include_str!("../../migrations/0103_card_contracts.sql"),
+    },
+    Migration {
+        version: 104,
+        name: "0104_card_contract_amended",
+        sql: include_str!("../../migrations/0104_card_contract_amended.sql"),
+    },
+    Migration {
+        version: 105,
+        name: "0105_card_contract_deploy",
+        sql: include_str!("../../migrations/0105_card_contract_deploy.sql"),
+    },
+    Migration {
+        version: 106,
+        name: "0106_card_contract_review",
+        sql: include_str!("../../migrations/0106_card_contract_review.sql"),
+    },
+    Migration {
+        version: 107,
+        name: "0107_card_contract_left_undone",
+        sql: include_str!("../../migrations/0107_card_contract_left_undone.sql"),
+    },
+    Migration {
+        version: 108,
+        name: "0108_done_lines",
+        sql: include_str!("../../migrations/0108_done_lines.sql"),
+    },
+    Migration {
+        version: 109,
+        name: "0109_prod_change_notices",
+        sql: include_str!("../../migrations/0109_prod_change_notices.sql"),
+    },
+    Migration {
+        version: 110,
+        name: "0110_land_queue",
+        sql: include_str!("../../migrations/0110_land_queue.sql"),
+    },
+    Migration {
+        version: 111,
+        name: "0111_session_events_type_index",
+        sql: include_str!("../../migrations/0111_session_events_type_index.sql"),
+    },
+    Migration {
+        version: 112,
+        name: "0112_card_contract_prereview",
+        sql: include_str!("../../migrations/0112_card_contract_prereview.sql"),
+    },
+    Migration {
+        version: 113,
+        name: "0113_card_prereviews",
+        sql: include_str!("../../migrations/0113_card_prereviews.sql"),
+    },
+    Migration {
+        version: 114,
+        name: "0114_review_capacity",
+        sql: include_str!("../../migrations/0114_review_capacity.sql"),
+    },
+
+    Migration {
+        version: 115,
+        name: "0115_steering_retention_index",
+        sql: include_str!("../../migrations/0115_steering_retention_index.sql"),
+    },
+    Migration {
+        version: 116,
+        name: "0116_issues_updated_integer",
+        sql: include_str!("../../migrations/0116_issues_updated_integer.sql"),
+    },
+    Migration {
+        version: 117,
+        name: "0117_skills_created",
+        sql: include_str!("../../migrations/0117_skills_created.sql"),
+    },
+    Migration {
+        version: 118,
+        name: "0118_conversations",
+        sql: include_str!("../../migrations/0118_conversations.sql"),
+    },
+    Migration {
+        version: 119,
+        name: "0119_history_fts",
+        sql: include_str!("../../migrations/0119_history_fts.sql"),
+    },
+    Migration {
+        version: 120,
+        name: "0120_schedule_failure_notice",
+        sql: include_str!("../../migrations/0120_schedule_failure_notice.sql"),
+    },
+    Migration {
+        version: 121,
+        name: "0121_mdai_run_usage",
+        sql: include_str!("../../migrations/0121_mdai_run_usage.sql"),
+    },
+    Migration {
+        version: 122,
+        name: "0122_steering_deliver_at",
+        sql: include_str!("../../migrations/0122_steering_deliver_at.sql"),
+    },
+    Migration {
+        version: 123,
+        name: "0123_file_opens",
+        sql: include_str!("../../migrations/0123_file_opens.sql"),
+    },
+    Migration {
+        version: 124,
+        name: "0124_pinned_notes_groups",
+        sql: include_str!("../../migrations/0124_pinned_notes_groups.sql"),
+    },
+    Migration {
+        version: 125,
+        name: "0125_schedule_lifecycle",
+        sql: include_str!("../../migrations/0125_schedule_lifecycle.sql"),
+    },
+    Migration {
+        version: 126,
+        name: "0126_land_queue_guard_overrides",
+        sql: include_str!("../../migrations/0126_land_queue_guard_overrides.sql"),
+    },
+    Migration {
+        version: 127,
+        name: "0127_board_cdc_all_rendered_columns",
+        sql: include_str!("../../migrations/0127_board_cdc_all_rendered_columns.sql"),
+    },
+    Migration {
+        version: 128,
+        name: "0128_map_store",
+        sql: include_str!("../../migrations/0128_map_store.sql"),
+    },
+    Migration {
+        version: 129,
+        name: "0129_claude_account_usage",
+        sql: include_str!("../../migrations/0129_claude_account_usage.sql"),
+    },
+    Migration {
+        version: 130,
+        name: "0130_signal_subscriptions",
+        sql: include_str!("../../migrations/0130_signal_subscriptions.sql"),
+    },
+    Migration {
+        version: 131,
+        name: "0131_worker_resource_samples",
+        sql: include_str!("../../migrations/0131_worker_resource_samples.sql"),
+    },
+    Migration {
+        version: 132,
+        name: "0132_token_ledger_task_session_ts_index",
+        sql: include_str!("../../migrations/0132_token_ledger_task_session_ts_index.sql"),
+    },
+    Migration {
+        version: 133,
+        name: "0133_layout_presets_scope",
+        sql: include_str!("../../migrations/0133_layout_presets_scope.sql"),
+    },
+    Migration {
+        version: 134,
+        name: "0134_social_posts",
+        sql: include_str!("../../migrations/0134_social_posts.sql"),
+    },
+    Migration {
+        version: 135,
+        name: "0135_schedule_pass_check",
+        sql: include_str!("../../migrations/0135_schedule_pass_check.sql"),
+    },
+    Migration {
+        version: 136,
+        name: "0136_bridge",
+        sql: include_str!("../../migrations/0136_bridge.sql"),
+    },
+    Migration {
+        version: 137,
+        name: "0137_messages_threads",
+        sql: include_str!("../../migrations/0137_messages_threads.sql"),
+    },
+    Migration {
+        version: 138,
+        name: "0138_social_queue",
+        sql: include_str!("../../migrations/0138_social_queue.sql"),
+    },
+    Migration {
+        version: 139,
+        name: "0139_remove_projects",
+        sql: include_str!("../../migrations/0139_remove_projects.sql"),
+    },
+    Migration {
+        version: 140,
+        name: "0140_conversation_channels",
+        sql: include_str!("../../migrations/0140_conversation_channels.sql"),
+    },
+    Migration {
+        version: 141,
+        name: "0141_schedule_when",
+        sql: include_str!("../../migrations/0141_schedule_when.sql"),
+    },
+    Migration {
+        version: 142,
+        name: "0142_issues_source_ref_index",
+        sql: include_str!("../../migrations/0142_issues_source_ref_index.sql"),
+    },
+    Migration {
+        version: 143,
+        name: "0143_schedule_runs_running_index",
+        sql: include_str!("../../migrations/0143_schedule_runs_running_index.sql"),
+    },
+    Migration {
+        version: 144,
+        name: "0144_conversation_pins",
+        sql: include_str!("../../migrations/0144_conversation_pins.sql"),
+    },
+    Migration {
+        version: 145,
+        name: "0145_lease_generations",
+        sql: include_str!("../../migrations/0145_lease_generations.sql"),
+    },
+    Migration {
+        version: 146,
+        name: "0146_one_live_session",
+        sql: include_str!("../../migrations/0146_one_live_session.sql"),
+    },
+    Migration {
+        version: 147,
+        name: "0147_invariant_episode_occurrences",
+        sql: include_str!("../../migrations/0147_invariant_episode_occurrences.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "0148_board_light_rows_covering",
+        sql: include_str!("../../migrations/0148_board_light_rows_covering.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "0149_message_pins",
+        sql: include_str!("../../migrations/0149_message_pins.sql"),
+    },
+    Migration {
+        version: 150,
+        name: "0150_land_queue_composed_evidence",
+        sql: include_str!("../../migrations/0150_land_queue_composed_evidence.sql"),
+    },
+    Migration {
+        version: 151,
+        name: "0151_board_planning_covering",
+        sql: include_str!("../../migrations/0151_board_planning_covering.sql"),
+    },
+    Migration {
+        version: 152,
+        name: "0152_decision_digest",
+        sql: include_str!("../../migrations/0152_decision_digest.sql"),
+    },
+    Migration {
+        version: 153,
+        name: "0153_land_red",
+        sql: include_str!("../../migrations/0153_land_red.sql"),
+    },
+    Migration {
+        version: 154,
+        name: "0154_issues_session_status",
+        sql: include_str!("../../migrations/0154_issues_session_status.sql"),
+    },
+    Migration {
+        version: 155,
+        name: "0155_goal_samples",
+        sql: include_str!("../../migrations/0155_goal_samples.sql"),
+    },
+    Migration {
+        version: 156,
+        name: "0156_directives",
+        sql: include_str!("../../migrations/0156_directives.sql"),
+    },
+    Migration {
+        version: 157,
+        name: "0157_event_subscriptions",
+        sql: include_str!("../../migrations/0157_event_subscriptions.sql"),
+    },
+    Migration {
+        version: 158,
+        name: "0158_calls",
+        sql: include_str!("../../migrations/0158_calls.sql"),
+    },
+    Migration {
+        version: 159,
+        name: "0159_intent",
+        sql: include_str!("../../migrations/0159_intent.sql"),
+    },
+    Migration {
+        version: 160,
+        name: "0160_intent_on_primitives",
+        sql: include_str!("../../migrations/0160_intent_on_primitives.sql"),
+    },
+    Migration {
+        version: 161,
+        name: "0161_ledger",
+        sql: include_str!("../../migrations/0161_ledger.sql"),
+    },
+    Migration {
+        version: 162,
+        name: "0162_trace",
+        sql: include_str!("../../migrations/0162_trace.sql"),
+    },
+    Migration {
+        version: 163,
+        name: "0163_cli_telemetry",
+        sql: include_str!("../../migrations/0163_cli_telemetry.sql"),
+    },
+    Migration {
+        version: 164,
+        name: "0164_ledger_checkpoints",
+        sql: include_str!("../../migrations/0164_ledger_checkpoints.sql"),
+    },
+    Migration {
+        version: 165,
+        name: "0165_approval_cards",
+        sql: include_str!("../../migrations/0165_approval_cards.sql"),
+    },
+    Migration {
+        version: 166,
+        name: "0166_schedule_authority",
+        sql: include_str!("../../migrations/0166_schedule_authority.sql"),
+    },
+    Migration {
+        version: 167,
+        name: "0167_audit_governance",
+        sql: include_str!("../../migrations/0167_audit_governance.sql"),
+    },
+    Migration {
+        version: 168,
+        name: "0168_sso_mfa_scim",
+        sql: include_str!("../../migrations/0168_sso_mfa_scim.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -529,9 +970,8 @@ pub fn pending(conn: &Connection) -> Vec<&'static str> {
 /// and, unlike a substring of one hardcoded layout, does not need revisiting
 /// the next time the fleet moves its build directory.
 fn is_cargo_target_build(exe: &std::path::Path) -> bool {
-    exe.components().any(|c| {
-        matches!(c.as_os_str().to_str(), Some("debug") | Some("release"))
-    })
+    exe.components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some("debug") | Some("release")))
 }
 
 /// True when `db_path` is the fleet's real database, `$HOME/.amux/amux.db`.
@@ -644,7 +1084,11 @@ fn truthy_env(key: &str) -> bool {
 /// same migration re-checked on a later boot (the ordinary, non-colliding
 /// case — every version this binary has ever successfully applied hits this
 /// path on every subsequent startup, and must stay silent).
-fn version_collision_warning(version: i64, expected_name: &str, recorded_name: &str) -> Option<String> {
+fn version_collision_warning(
+    version: i64,
+    expected_name: &str,
+    recorded_name: &str,
+) -> Option<String> {
     if recorded_name == expected_name || known_name_alias(version, recorded_name, expected_name) {
         return None;
     }
@@ -774,6 +1218,13 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
         }
     }
     report_renumbered_migrations(conn);
+    // Tables ensured at their point of use (not in a numbered migration) are
+    // ensured here too, so the schema is complete after the FIRST boot. Lazily,
+    // task_attempts appeared only once a runtime job first touched it, so a
+    // re-open changed the table set and the nightly "migrations apply to a
+    // populated database" gate failed (AMUX-5374). IF NOT EXISTS keeps the
+    // version-collision protection attempts.rs documents.
+    crate::db::attempts::ensure_table(conn)?;
     Ok(())
 }
 
@@ -830,7 +1281,10 @@ pub(crate) fn renumbered_migrations(conn: &Connection) -> Vec<(i64, String, Stri
 fn report_renumbered_migrations(conn: &Connection) {
     let found = renumbered_migrations(conn);
     if found.is_empty() {
-        tracing::info!(renumbered_migrations = 0, "migration version/name binding checked");
+        tracing::info!(
+            renumbered_migrations = 0,
+            "migration version/name binding checked"
+        );
         return;
     }
     for (version, recorded, registered) in &found {
@@ -948,8 +1402,7 @@ mod registration_guard {
             on_disk.len()
         );
 
-        let mut registered: Vec<String> =
-            MIGRATIONS.iter().map(|m| m.name.to_owned()).collect();
+        let mut registered: Vec<String> = MIGRATIONS.iter().map(|m| m.name.to_owned()).collect();
         registered.sort();
 
         let unregistered: Vec<&String> =
@@ -1007,6 +1460,119 @@ mod registration_guard {
 mod tests {
     use super::*;
 
+    fn apply_history_through(conn: &Connection, through: i64) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _amux_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL,
+                duration_ms INTEGER
+            );",
+        )
+        .unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= through) {
+            apply_one(conn, migration.sql).unwrap();
+            conn.execute(
+                "INSERT INTO _amux_migrations(version,name,applied_at,duration_ms) VALUES(?1,?2,'test',0)",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Either 0082/0083 history converges, and 0139 then removes the project
+    /// columns while keeping what the main line still uses.
+    fn assert_reconciled_project_schema(conn: &Connection) {
+        for (table, column, want) in [
+            ("group_config", "execution_policy", false),
+            ("group_config", "execution_rev", false),
+            ("issues", "project_group", false),
+            ("issues", "execution_state", false),
+            ("cmd_history", "project_group", false),
+            ("steering_queue", "sender", true),
+        ] {
+            let present: bool = conn
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name=?1)"
+                    ),
+                    [column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, want, "{table}.{column}");
+        }
+        let view: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='legacy_execution_issues')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!view, "the project view is dropped with its column");
+        let nudge: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='board_drive_nudge_budget')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            nudge,
+            "the main-line nudge budget must survive reconciliation"
+        );
+    }
+
+    #[test]
+    fn current_main_history_upgrades_through_the_project_removal() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, 82);
+        apply_all(&mut conn).unwrap();
+        assert_reconciled_project_schema(&conn);
+        assert!(renumbered_migrations(&conn).is_empty());
+    }
+
+    #[test]
+    fn deployed_project_branch_history_converges_without_collision_or_missing_main_schema() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_history_through(&conn, 81);
+        apply_one(
+            &conn,
+            include_str!("../../migrations/0083_project_execution.sql"),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _amux_migrations(version,name,applied_at,duration_ms) VALUES(82,'0082_project_execution','test',0)",
+            [],
+        )
+        .unwrap();
+        apply_one(
+            &conn,
+            include_str!("../../migrations/0084_project_attempts.sql"),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _amux_migrations(version,name,applied_at,duration_ms) VALUES(83,'0083_project_attempts','test',0)",
+            [],
+        )
+        .unwrap();
+
+        apply_all(&mut conn).unwrap();
+        assert_reconciled_project_schema(&conn);
+        assert!(renumbered_migrations(&conn).is_empty());
+        let recorded: String = conn
+            .query_row(
+                "SELECT name FROM _amux_migrations WHERE version=82",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, "0082_project_execution",
+            "deployed history remains immutable"
+        );
+    }
+
     /// AF-353: a version whose recorded name is no longer the registered one
     /// must be REPORTED, and a clean database must stay quiet.
     ///
@@ -1045,7 +1611,11 @@ mod tests {
         .unwrap();
 
         let found = renumbered_migrations(&conn);
-        assert_eq!(found.len(), 1, "expected exactly the one mismatch: {found:?}");
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly the one mismatch: {found:?}"
+        );
         assert_eq!(found[0].0, MIGRATIONS[0].version);
         assert_eq!(found[0].1, "0001_under_its_old_name", "the RECORDED name");
         assert_eq!(found[0].2, registered, "the REGISTERED name");
@@ -1072,11 +1642,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            version_collision_warning(
-                35,
-                "0035_regenerable_samples",
-                "0029_regenerable_samples",
-            ),
+            version_collision_warning(35, "0035_regenerable_samples", "0029_regenerable_samples",),
             None,
             "the documented rename performed the same schema work"
         );
@@ -1170,18 +1736,31 @@ mod tests {
         apply_all(&mut conn).unwrap();
 
         let (name, duration): (String, Option<i64>) = conn
-            .query_row("SELECT name, duration_ms FROM _amux_migrations WHERE version = ?1", [target], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT name, duration_ms FROM _amux_migrations WHERE version = ?1",
+                [target],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(name, "some_other_branchs_migration", "the colliding row must be left exactly as found");
-        assert_eq!(duration, Some(1), "not re-timed — it was never actually re-run");
+        assert_eq!(
+            name, "some_other_branchs_migration",
+            "the colliding row must be left exactly as found"
+        );
+        assert_eq!(
+            duration,
+            Some(1),
+            "not re-timed — it was never actually re-run"
+        );
 
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM _amux_migrations", [], |r| r.get(0))
             .unwrap();
         // Every real migration except the one whose version collided.
-        assert_eq!(n as usize, super::MIGRATIONS.len(), "every non-colliding migration still applied");
+        assert_eq!(
+            n as usize,
+            super::MIGRATIONS.len(),
+            "every non-colliding migration still applied"
+        );
 
         let has_col: bool = conn
             .query_row("SELECT COUNT(*) FROM pragma_table_info('telegram_mappings') WHERE name = 'last_relayed_hash'", [], |r| {
@@ -1189,7 +1768,10 @@ mod tests {
             })
             .map(|n| n > 0)
             .unwrap();
-        assert!(!has_col, "the colliding migration's actual SQL must never have run");
+        assert!(
+            !has_col,
+            "the colliding migration's actual SQL must never have run"
+        );
     }
 
     #[test]
@@ -1242,19 +1824,41 @@ mod tests {
         // Re-run the shipped body. ADDCOL is idempotent; the UPDATE is the part
         // under test. Reading it from the same include_str the registry uses
         // means this cannot drift from what production applies.
-        apply_one(&conn, super::MIGRATIONS.iter().find(|m| m.version == 31).unwrap().sql).unwrap();
+        apply_one(
+            &conn,
+            super::MIGRATIONS
+                .iter()
+                .find(|m| m.version == 31)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
 
         let at = |id: &str| -> Option<i64> {
-            conn.query_row("SELECT closed_at FROM issues WHERE id = ?1", [id], |r| r.get(0))
-                .unwrap()
+            conn.query_row("SELECT closed_at FROM issues WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
         };
 
         // 1787220000 = 2026-08-20T10:00:00Z. The microseconds and the +00:00
         // offset are parsed by strftime, which is the assumption the migration
         // rests on — asserted here rather than trusted.
-        assert_eq!(at("C-CLOSED"), Some(1787220000), "a closed card recovers its real close time");
-        assert_eq!(at("C-REOPEN"), None, "a card that is open NOW must not be backfilled from an old close");
-        assert_eq!(at("C-REAPED"), None, "no journal row survives for it: NULL means NOT RECORDED, never a guess");
+        assert_eq!(
+            at("C-CLOSED"),
+            Some(1787220000),
+            "a closed card recovers its real close time"
+        );
+        assert_eq!(
+            at("C-REOPEN"),
+            None,
+            "a card that is open NOW must not be backfilled from an old close"
+        );
+        assert_eq!(
+            at("C-REAPED"),
+            None,
+            "no journal row survives for it: NULL means NOT RECORDED, never a guess"
+        );
         assert_eq!(
             at("C-TWICE"),
             Some(1787389200),
@@ -1263,7 +1867,15 @@ mod tests {
 
         // Idempotent: the migration is guarded by `closed_at IS NULL`, so a
         // second run must not disturb what the first wrote.
-        apply_one(&conn, super::MIGRATIONS.iter().find(|m| m.version == 31).unwrap().sql).unwrap();
+        apply_one(
+            &conn,
+            super::MIGRATIONS
+                .iter()
+                .find(|m| m.version == 31)
+                .unwrap()
+                .sql,
+        )
+        .unwrap();
         assert_eq!(at("C-CLOSED"), Some(1787220000));
         assert_eq!(at("C-TWICE"), Some(1787389200));
     }
@@ -1282,7 +1894,11 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         apply_all(&mut conn).unwrap();
         let missing: i64 = conn
-            .query_row("SELECT COUNT(*) FROM _amux_migrations WHERE duration_ms IS NULL", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM _amux_migrations WHERE duration_ms IS NULL",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(
             missing, 0,
@@ -1292,20 +1908,27 @@ mod tests {
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM _amux_migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(n as usize, super::MIGRATIONS.len(), "and every migration must be recorded at all");
+        assert_eq!(
+            n as usize,
+            super::MIGRATIONS.len(),
+            "and every migration must be recorded at all"
+        );
     }
 
     #[test]
     fn addcol_can_be_used_by_the_same_migration() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, n INTEGER);").unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, n INTEGER);")
+            .unwrap();
         conn.execute("INSERT INTO t VALUES ('a', 7)", []).unwrap();
         apply_one(
             &conn,
             "-- ADDCOL: t doubled INTEGER\nUPDATE t SET doubled = n * 2;",
         )
         .expect("a migration that adds a column and populates it must apply");
-        let got: i64 = conn.query_row("SELECT doubled FROM t WHERE id='a'", [], |r| r.get(0)).unwrap();
+        let got: i64 = conn
+            .query_row("SELECT doubled FROM t WHERE id='a'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(got, 14, "the plain SQL must run AFTER the column exists");
     }
 
@@ -1322,7 +1945,10 @@ mod tests {
     #[test]
     fn team_migration_preserves_every_legacy_scope_without_widening_access() {
         let conn = Connection::open_in_memory().unwrap();
-        for migration in MIGRATIONS.iter().filter(|migration| migration.version <= 59) {
+        for migration in MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= 59)
+        {
             apply_one(&conn, migration.sql).unwrap();
         }
         conn.execute(
@@ -1340,7 +1966,10 @@ mod tests {
         )
         .unwrap();
 
-        let migration = MIGRATIONS.iter().find(|migration| migration.version == 60).unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 60)
+            .unwrap();
         apply_one(&conn, migration.sql).unwrap();
 
         let rows: Vec<(String, String, String)> = {
@@ -1360,7 +1989,11 @@ mod tests {
             vec![
                 ("member-global".into(), "global".into(), "".into()),
                 ("member-group".into(), "group".into(), "research".into()),
-                ("member-worker".into(), "worker".into(), "tubescience".into()),
+                (
+                    "member-worker".into(),
+                    "worker".into(),
+                    "tubescience".into()
+                ),
             ]
         );
         let invite_scope: (String, String) = conn
@@ -1397,23 +2030,33 @@ mod guard_tests {
     #[test]
     fn any_profile_dir_reads_as_a_cargo_build_whatever_the_target_dir_is() {
         // A per-session checkout dir (banned, but must still be caught).
-        assert!(is_cargo_target_build(Path::new("/Users/x/Dev/amux/target/debug/amux-server")));
-        assert!(is_cargo_target_build(Path::new("/Users/x/Dev/amux/target/release/amux-server")));
+        assert!(is_cargo_target_build(Path::new(
+            "/Users/x/Dev/amux/target/debug/amux-server"
+        )));
+        assert!(is_cargo_target_build(Path::new(
+            "/Users/x/Dev/amux/target/release/amux-server"
+        )));
         // THE MANDATED SHARED DIR — the case that was unguarded. A `cargo run`
         // here is exactly the working-tree-against-live-DB hazard.
         assert!(
-            is_cargo_target_build(Path::new("/Users/x/.amux/rust-build-target/debug/amux-server")),
+            is_cargo_target_build(Path::new(
+                "/Users/x/.amux/rust-build-target/debug/amux-server"
+            )),
             "the build dir every session is told to use must be guarded, not exempt"
         );
         assert!(is_cargo_target_build(Path::new(
             "/Users/x/.amux/rust-build-target/release/amux-server"
         )));
         // Any OTHER target dir, because the next move must not need a code change.
-        assert!(is_cargo_target_build(Path::new("/tmp/whatever-42/debug/deps/amux_server-abc")));
+        assert!(is_cargo_target_build(Path::new(
+            "/tmp/whatever-42/debug/deps/amux_server-abc"
+        )));
 
         // The two paths that actually boot a server, both of which must stay
         // exempt or the fleet cannot start with a pending migration.
-        assert!(!is_cargo_target_build(Path::new("/Users/x/.local/bin/amux-server-rs")));
+        assert!(!is_cargo_target_build(Path::new(
+            "/Users/x/.local/bin/amux-server-rs"
+        )));
         assert!(
             !is_cargo_target_build(Path::new("/usr/local/bin/amux-server-rs")),
             "the cloud image's path — CMD [\"amux-server-rs\"] off /usr/local/bin"
@@ -1445,7 +2088,10 @@ mod guard_tests {
         let home = PathBuf::from("/Users/x");
         assert!(is_live_db(Path::new("/Users/x/.amux/amux.db"), Some(&home)));
         assert!(!is_live_db(Path::new("/tmp/scratch/amux.db"), Some(&home)));
-        assert!(!is_live_db(Path::new("/Users/x/.amux/other.db"), Some(&home)));
+        assert!(!is_live_db(
+            Path::new("/Users/x/.amux/other.db"),
+            Some(&home)
+        ));
         // No HOME at all: cannot prove it is live, so do not block.
         assert!(!is_live_db(Path::new("/Users/x/.amux/amux.db"), None));
     }
@@ -1496,8 +2142,10 @@ mod guard_tests {
     #[test]
     fn it_actually_refuses_a_pending_migration_against_the_live_db() {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-            panic!("HOME unset — this test cannot express its precondition, \
-                    which is a broken test, not a passing one");
+            panic!(
+                "HOME unset — this test cannot express its precondition, \
+                    which is a broken test, not a passing one"
+            );
         };
         // A cargo-target-shaped path, supplied rather than inherited: the real
         // hazard is a binary built from a working tree, and that shape is a
@@ -1506,7 +2154,10 @@ mod guard_tests {
         // CARGO_TARGET_DIR=~/.amux/rust-build-target — the shared build dir the
         // workflow now standardises on — while the guard itself was correct.)
         let exe = PathBuf::from("/Users/someone/Dev/amux/target/debug/deps/amux_server-abc123");
-        assert!(is_cargo_target_build(&exe), "the fixture must be the shape the guard looks for");
+        assert!(
+            is_cargo_target_build(&exe),
+            "the fixture must be the shape the guard looks for"
+        );
 
         let live = home.join(".amux").join("amux.db");
         std::env::remove_var("AMUX_ALLOW_LIVE_DB");
@@ -1596,7 +2247,11 @@ mod cost_tests {
         let mut s = conn.prepare(&format!("EXPLAIN QUERY PLAN {stmt}")).ok()?;
         let rows = s
             .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(3)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(3)?,
+                ))
             })
             .ok()?
             .flatten()
@@ -1692,9 +2347,8 @@ mod cost_tests {
         }
         fn reads_table(stmt_upper: &str, table: &str) -> bool {
             let ids = identifiers(stmt_upper);
-            ids.windows(2).any(|w| {
-                matches!(w[0].as_str(), "FROM" | "JOIN") && w[1].as_str() == table
-            })
+            ids.windows(2)
+                .any(|w| matches!(w[0].as_str(), "FROM" | "JOIN") && w[1].as_str() == table)
         }
         fn mentions_column(stmt_upper: &str, column: &str) -> bool {
             identifiers(stmt_upper).iter().any(|t| t == column)
@@ -1715,9 +2369,7 @@ mod cost_tests {
                 dml_seen.push((offset, written_table(&t), t.clone()));
             }
             if t.starts_with("CREATE INDEX") || t.starts_with("CREATE UNIQUE INDEX") {
-                if let Some((idx_table, leading_column)) =
-                    indexed_table_and_leading_column(&t)
-                {
+                if let Some((idx_table, leading_column)) = indexed_table_and_leading_column(&t) {
                     for (d_off, written, dml) in &dml_seen {
                         if offset > *d_off
                             && written.as_deref() != Some(idx_table.as_str())
@@ -1735,6 +2387,22 @@ mod cost_tests {
         }
         bad
     }
+
+    /// Correlated scans that are bounded by construction, as (migration, plan
+    /// detail, why). Each entry must still match a plan, or the test fails, so
+    /// a stale exemption cannot hide a new offender under its name.
+    ///
+    /// 0060: `org_teams` is created empty by 0060 itself and then holds one
+    /// row per distinct legacy scope grant, so each member row scans tens of
+    /// teams at most. SQLite 3.46 reported this as `SCAN t USING INDEX` (the
+    /// primary key's autoindex, chosen for `ORDER BY id`), which this check
+    /// counted as indexed though it read the whole table too; 3.53 and later
+    /// report a plain `SCAN t`. Migrations are append-only, so 0060 stays.
+    const BOUNDED_CORRELATED_SCANS: &[(&str, &str, &str)] = &[(
+        "0060_org_teams",
+        "SCAN t",
+        "org_teams is created by 0060 and holds one row per distinct legacy grant",
+    )];
 
     /// Every migration, applied in order, with each one's DML plan-checked
     /// against the schema THAT MIGRATION LEAVES BEHIND — previous migrations
@@ -1756,6 +2424,7 @@ mod cost_tests {
         let mut offenders: Vec<String> = Vec::new();
         let mut explained = 0usize;
         let mut saw_the_0031_backfill = false;
+        let mut exemptions_used = vec![false; BOUNDED_CORRELATED_SCANS.len()];
 
         for m in MIGRATIONS {
             let tx = conn.transaction().unwrap();
@@ -1768,13 +2437,19 @@ mod cost_tests {
             tx.commit().unwrap();
 
             for stmt in dml(m.sql) {
-                let Some(rows) = plan(&conn, &stmt) else { continue };
+                let Some(rows) = plan(&conn, &stmt) else {
+                    continue;
+                };
                 explained += 1;
                 let sq = squash(&stmt);
                 if sq.starts_with("UPDATE issues SET closed_at") {
                     saw_the_0031_backfill = true;
                 }
                 for bad in unindexed_correlated_access(&rows) {
+                    if let Some(i) = BOUNDED_CORRELATED_SCANS.iter().position(|(n, d, _)| *n == m.name && *d == bad) {
+                        exemptions_used[i] = true;
+                        continue;
+                    }
                     offenders.push(format!(
                         "{}: `{}` runs once per outer row with no index\n    statement: {}",
                         m.name,
@@ -1801,6 +2476,9 @@ mod cost_tests {
              that held the database for 186 seconds, and this check exists to see it."
         );
 
+        for (used, (name, detail, why)) in exemptions_used.iter().zip(BOUNDED_CORRELATED_SCANS) {
+            assert!(*used, "exemption ({name}, `{detail}`: {why}) matched no plan; remove it rather than keep a name that hides nothing");
+        }
         assert!(
             offenders.is_empty(),
             "a migration would full-scan a table once per outer row, which is how 0031 held \
@@ -1859,7 +2537,11 @@ mod cost_tests {
             CREATE INDEX idx_events_entity
                 ON _amux_state_events(entity_type, entity_id);";
         let bad = late_read_side_indexes("0031-planted", incident);
-        assert_eq!(bad.len(), 1, "the real late read-side index must still fail: {bad:?}");
+        assert_eq!(
+            bad.len(),
+            1,
+            "the real late read-side index must still fail: {bad:?}"
+        );
         assert!(bad[0].contains("_AMUX_STATE_EVENTS(ENTITY_TYPE"), "{bad:?}");
     }
 

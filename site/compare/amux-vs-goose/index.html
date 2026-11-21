@@ -1,16 +1,16 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
   <title>amux vs Goose (Block) 2026: AI Agent Fleet vs Single Agent — amux</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="amux vs Goose (by Block) 2026 comparison. Goose is a single open-source AI coding agent with MCP tool support. amux runs a fleet of parallel agents — Claude Code, Codex, and Gemini CLI — with self-healing, kanban, and a web dashboard. Both open source. Different problems solved.">
+  <meta name="description" content="amux vs Goose (by Block) 2026 comparison. Goose is a single open-source AI coding agent with MCP tool support. amux runs a fleet of parallel agents — Claude Code, Codex, and Gemini CLI — with usage-limit and reboot recovery, kanban, and a web dashboard. Both open source. Different problems solved.">
   <meta name="keywords" content="amux vs goose, goose alternative 2026, block goose AI coding agent, goose vs claude code orchestrator, open source AI agent comparison, goose block ai agent, ai agent fleet vs single agent">
   <link rel="canonical" href="https://amux.io/compare/amux-vs-goose/">
   <meta property="og:title" content="amux vs Goose (Block) 2026: AI Agent Fleet vs Single Agent — amux">
-  <meta property="og:description" content="Goose (by Block) runs one AI coding agent. amux runs dozens in parallel — with self-healing, a shared kanban board, and a web + mobile dashboard. Both open source.">
+  <meta property="og:description" content="Goose (by Block) runs one AI coding agent. amux runs dozens in parallel — with usage-limit and reboot recovery, a shared kanban board, and a web + mobile dashboard. Both open source.">
   <meta property="og:url" content="https://amux.io/compare/amux-vs-goose/">
   <meta property="og:image" content="https://amux.io/og-image.png">
   <meta property="og:type" content="article">
@@ -20,35 +20,51 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Compare","item":"https://amux.io/compare/"},{"@type":"ListItem","position":3,"name":"amux vs Goose","item":"https://amux.io/compare/amux-vs-goose/"}]}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"amux vs Goose (Block) 2026: AI Agent Fleet vs Single Agent","description":"Detailed comparison of amux (AI agent fleet control plane) and Goose by Block (single-agent AI coding assistant). Both open source, different architectural goals.","url":"https://amux.io/compare/amux-vs-goose/","datePublished":"2026-08-04","dateModified":"2026-08-04","author":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}}}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is the main difference between amux and Goose?","acceptedAnswer":{"@type":"Answer","text":"Goose (by Block) is a single AI coding agent — you run one instance, give it a task, it works. amux is an AI agent fleet control plane — you run 10, 20, or 50 agents in parallel, all coordinated through a shared board, web dashboard, and REST API. Goose solves 'how do I run one agent well.' amux solves 'how do I run many agents together without chaos.'"}},{"@type":"Question","name":"Does Goose support parallel agents?","acceptedAnswer":{"@type":"Answer","text":"No. Goose is designed as a single-agent system. You can run multiple Goose processes manually in separate terminals, but there is no shared coordination layer — no shared task board, no fleet visibility, no self-healing watchdog, no inter-agent messaging. amux was built specifically to solve the multi-agent coordination problem."}},{"@type":"Question","name":"Can amux run Goose agents?","acceptedAnswer":{"@type":"Answer","text":"Not natively. amux manages Claude Code, Codex (OpenAI), and Gemini CLI (Antigravity) runtimes via tmux. Goose uses its own runtime and extension system. They do not currently integrate. If you want a fleet of Goose-like MCP-capable agents, the closest amux analog is running Claude Code sessions with MCP configured via mcp.json."}},{"@type":"Question","name":"Which is better for solo developers?","acceptedAnswer":{"@type":"Answer","text":"Goose is simpler for a solo developer who wants one agent handling tasks interactively. amux is better for solo developers who want to run multiple agents in parallel — one fixing bugs while another writes tests while a third does code review — all from a single web dashboard they can monitor from their phone."}},{"@type":"Question","name":"Which is open source?","acceptedAnswer":{"@type":"Answer","text":"Both. Goose is Apache 2.0 licensed, published by Block (formerly Square). amux is MIT + Commons Clause licensed, published by Mixpeek. Both can be self-hosted."}},{"@type":"Question","name":"What is Goose's MCP support vs amux's tool system?","acceptedAnswer":{"@type":"Answer","text":"Goose is built around the Model Context Protocol (MCP) — you extend its capabilities by adding MCP servers, and it supports any MCP-compatible model provider. amux uses Claude Code's native tool system (which also has MCP support via mcp.json) and extends it with fleet-level capabilities: shared board, inter-agent messaging, browser automation, and scheduler. Goose optimizes for tool variety; amux optimizes for agent scale."}},{"@type":"Question","name":"Can I use amux and Goose together?","acceptedAnswer":{"@type":"Answer","text":"Yes. Use Goose for interactive single-agent tasks where MCP tool variety matters (e.g., connecting to a custom data source via MCP). Use amux for parallel workloads requiring fleet coordination, self-healing, mobile monitoring, or overnight unattended operation. They target different workflow shapes and do not compete directly."}}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"amux vs Goose (Block) 2026: AI Agent Fleet vs Single Agent","description":"Detailed comparison of amux (AI agent fleet control plane) and Goose by Block (single-agent AI coding assistant). Both open source, different architectural goals.","url":"https://amux.io/compare/amux-vs-goose/","datePublished":"2026-08-04","dateModified":"2026-09-26","author":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}}}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is the main difference between amux and Goose?","acceptedAnswer":{"@type":"Answer","text":"Goose (by Block) is a single AI coding agent — you run one instance, give it a task, it works. amux is an AI agent fleet control plane — you run 10, 20, or 50 agents in parallel, all coordinated through a shared board, web dashboard, and REST API. Goose solves 'how do I run one agent well.' amux solves 'how do I run many agents together without chaos.'"}},{"@type":"Question","name":"Does Goose support parallel agents?","acceptedAnswer":{"@type":"Answer","text":"No. Goose is designed as a single-agent system. You can run multiple Goose processes manually in separate terminals, but there is no shared coordination layer — no shared task board, no fleet visibility, no recovery layer, no inter-agent messaging. amux was built specifically to solve the multi-agent coordination problem."}},{"@type":"Question","name":"Can amux run Goose agents?","acceptedAnswer":{"@type":"Answer","text":"Not natively. amux manages Claude Code, Codex (OpenAI), and Gemini CLI (Antigravity) runtimes via tmux. Goose uses its own runtime and extension system. They do not currently integrate. If you want a fleet of Goose-like MCP-capable agents, the closest amux analog is running Claude Code sessions with MCP configured via mcp.json."}},{"@type":"Question","name":"Which is better for solo developers?","acceptedAnswer":{"@type":"Answer","text":"Goose is simpler for a solo developer who wants one agent handling tasks interactively. amux is better for solo developers who want to run multiple agents in parallel — one fixing bugs while another writes tests while a third does code review — all from a single web dashboard they can monitor from their phone."}},{"@type":"Question","name":"Which is open source?","acceptedAnswer":{"@type":"Answer","text":"Both. Goose is Apache 2.0 licensed, published by Block (formerly Square). amux is MIT + Commons Clause licensed, published by Mixpeek. Both can be self-hosted."}},{"@type":"Question","name":"What is Goose's MCP support vs amux's tool system?","acceptedAnswer":{"@type":"Answer","text":"Goose is built around the Model Context Protocol (MCP) — you extend its capabilities by adding MCP servers, and it supports any MCP-compatible model provider. amux uses Claude Code's native tool system (which also has MCP support via mcp.json) and extends it with fleet-level capabilities: shared board, inter-agent messaging, browser automation, and scheduler. Goose optimizes for tool variety; amux optimizes for agent scale."}},{"@type":"Question","name":"Can I use amux and Goose together?","acceptedAnswer":{"@type":"Answer","text":"Yes. Use Goose for interactive single-agent tasks where MCP tool variety matters (e.g., connecting to a custom data source via MCP). Use amux for parallel workloads requiring fleet coordination, usage-limit and reboot recovery, mobile monitoring, or overnight unattended operation. They target different workflow shapes and do not compete directly."}}]}</script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">&rsaquo;</span> <a href="/compare/">Compare</a> <span class="sep">&rsaquo;</span> <span>amux vs Goose</span></div>
 
-    <!-- EXP-007 GitHub CTA -->
-    <div style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.25);border-radius:10px;padding:1.1rem 1.6rem;margin-bottom:1.5rem;display:flex;align-items:center;gap:1.2rem;flex-wrap:wrap;">
-      <div style="flex:1;min-width:200px;font-size:0.9rem;color:var(--fg);">Evaluating AI agent tools? amux runs an entire fleet &mdash; self-healing, mobile dashboard, open source.</div>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="posthog?.capture('exp007_compare_github_cta_click',{page:window.location.pathname})" style="display:inline-flex;align-items:center;gap:0.4rem;background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.4);color:#a5b4fc;padding:0.5rem 1.1rem;border-radius:6px;font-weight:600;font-size:0.88rem;text-decoration:none;white-space:nowrap;">Try amux free &mdash; &#9733; on GitHub</a>
-    </div>
 
-    <h1>amux vs Goose (Block) 2026</h1>
-    <p class="subtitle">Both open source. Goose is a single AI coding agent. amux runs a fleet of them in parallel &mdash; with self-healing, a shared kanban board, and a web + mobile dashboard.</p>
+    <h1>amux vs Goose (Block) — September 2026</h1>
+    <p class="subtitle">Both open source. Goose is a single AI coding agent with an MCP extension ecosystem. amux runs a fleet of them in parallel — with usage-limit and reboot recovery, a shared kanban board, and a web + mobile dashboard.</p>
+    <p style="font-size:0.82rem;color:var(--muted);margin-top:-0.5rem">Updated September 2026</p>
 
     <p style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1rem 1.4rem;font-size:0.88rem;margin:1.5rem 0;"><strong>Short answer:</strong> If you want one agent to help you work, use Goose (or Claude Code directly). If you want 10&ndash;50 agents working in parallel on separate tasks while you sleep, use amux. They solve different problems and can be used together.</p>
 
@@ -64,77 +80,77 @@
       <tbody>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Parallel agents</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Dozens in parallel (Claude Code, Codex, Gemini CLI)</td>
-          <td style="padding:0.65rem;color:#f87171;">&#10007; Single-agent design; no fleet coordination</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Dozens in parallel (Claude Code, Codex, Gemini CLI)</td>
+          <td style="padding:0.65rem;color:var(--c-red);">&#10007; Single-agent design; no fleet coordination</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">LLM providers</td>
           <td style="padding:0.65rem;">Claude Code, OpenAI Codex, Gemini CLI (Antigravity)</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">Multi-provider: Anthropic, OpenAI, Google, Ollama, 10+ via extension</td>
+          <td style="padding:0.65rem;color:var(--c-green);">Multi-provider: Anthropic, OpenAI, Google, Ollama, 10+ via extension</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Tool / extension system</td>
           <td style="padding:0.65rem;">Claude Code native tools + amux Skills (custom slash commands)</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">MCP protocol (broad ecosystem); Extensions (Goose-native)</td>
+          <td style="padding:0.65rem;color:var(--c-green);">MCP protocol (broad ecosystem); Extensions (Goose-native)</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Web dashboard</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Full web UI — sessions, board, cost, files, CRM, scheduler</td>
-          <td style="padding:0.65rem;color:#f87171;">&#10007; CLI and desktop app only; no web dashboard</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Full web UI — sessions, board, cost, files, CRM, scheduler</td>
+          <td style="padding:0.65rem;color:var(--c-red);">&#10007; CLI and desktop app only; no web dashboard</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Mobile management</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; iOS app (App Store) + PWA; manage fleet from phone</td>
-          <td style="padding:0.65rem;color:#f87171;">&#10007; No mobile interface</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; iOS app (App Store) + PWA; manage fleet from phone</td>
+          <td style="padding:0.65rem;color:var(--c-red);">&#10007; No mobile interface</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
-          <td style="padding:0.65rem;font-weight:600;">Self-healing watchdog</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Auto-compact on context overflow, restart on crash, replay last message</td>
-          <td style="padding:0.65rem;color:#f87171;">&#10007; Manual recovery; no watchdog</td>
+          <td style="padding:0.65rem;font-weight:600;">Recovery</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Resumes after usage limits; workers return after a macOS reboot; stall alerts</td>
+          <td style="padding:0.65rem;color:var(--c-red);">&#10007; Manual recovery; no stall alerts</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Kanban board + task coordination</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Shared board with atomic SQLite CAS claiming; REST API for agents</td>
-          <td style="padding:0.65rem;color:#f87171;">&#10007; No multi-agent coordination layer</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Shared board with atomic SQLite CAS claiming; REST API for agents</td>
+          <td style="padding:0.65rem;color:var(--c-red);">&#10007; No multi-agent coordination layer</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Inter-agent messaging</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; 1:1 channels with @mentions; REST API send/peek</td>
-          <td style="padding:0.65rem;color:#f87171;">&#10007; Not supported</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; 1:1 channels with @mentions; REST API send/peek</td>
+          <td style="padding:0.65rem;color:var(--c-red);">&#10007; Not supported</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Activity log (request/response)</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Full payload logging — searchable, per tool call</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Full payload logging — searchable, per tool call</td>
           <td style="padding:0.65rem;">Session transcript only</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Scheduler</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Cron-style scheduler with per-session prompts</td>
-          <td style="padding:0.65rem;color:#f87171;">&#10007; No scheduler; external cron required</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Cron-style scheduler with per-session prompts</td>
+          <td style="padding:0.65rem;color:var(--c-red);">&#10007; No scheduler; external cron required</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Cost tracking</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Per-session and per-task token cost, cached vs non-cached</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Per-session and per-task token cost, cached vs non-cached</td>
           <td style="padding:0.65rem;">Basic token usage logging</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">Browser automation</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Live Chrome with saved auth profiles; multi-agent composition</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Live Chrome with saved auth profiles; multi-agent composition</td>
           <td style="padding:0.65rem;">Via MCP or Playwright extension</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">CRM / email built in</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">&#10003; Contacts, interaction logs, Gmail API integration</td>
-          <td style="padding:0.65rem;color:#f87171;">&#10007; Not included</td>
+          <td style="padding:0.65rem;color:var(--c-green);">&#10003; Contacts, interaction logs, Gmail API integration</td>
+          <td style="padding:0.65rem;color:var(--c-red);">&#10007; Not included</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border);">
           <td style="padding:0.65rem;font-weight:600;">License</td>
           <td style="padding:0.65rem;">MIT + Commons Clause (free, self-hosted)</td>
-          <td style="padding:0.65rem;color:#6ee7b7;">Apache 2.0 (fully permissive)</td>
+          <td style="padding:0.65rem;color:var(--c-green);">Apache 2.0 (fully permissive)</td>
         </tr>
         <tr>
           <td style="padding:0.65rem;font-weight:600;">Architecture</td>
-          <td style="padding:0.65rem;">Single Rust binary, zero dependencies beyond python3 + tmux</td>
+          <td style="padding:0.65rem;">Single Rust binary, zero dependencies beyond tmux</td>
           <td style="padding:0.65rem;">Go binary + extension system; multi-component</td>
         </tr>
       </tbody>
@@ -151,7 +167,7 @@
     <h2>When to use amux</h2>
     <ul>
       <li><strong>You want to run parallel agents.</strong> 10 agents working different tasks simultaneously, coordinated through a shared board — that is the amux use case. There is no Goose equivalent for this.</li>
-      <li><strong>You want overnight unattended operation.</strong> Self-healing watchdog, stall detection, auto-restart, resume dialog handling, rate-limit management, and mobile alerts are all built in. Goose has none of these.</li>
+      <li><strong>You want overnight unattended operation.</strong> Stall detection, usage-limit resume, workers that return after a macOS reboot, and mobile alerts are all built in. Goose has none of these.</li>
       <li><strong>You manage from your phone.</strong> amux has a native iOS app and installable PWA. Monitor your fleet, approve pull requests, and steer agents from anywhere. Goose has no mobile interface.</li>
       <li><strong>You want a control plane beyond code.</strong> amux includes a kanban board, notes, CRM, Gmail integration, browser automation, cron scheduler, and cost tracking — the full stack for running a software business with AI agents.</li>
       <li><strong>You prefer Claude Code.</strong> amux is purpose-built for Claude Code fleet management (with Codex and Gemini CLI support added). If Claude Code is your primary agent, amux is the right orchestration layer.</li>
@@ -161,10 +177,20 @@
     <p>Goose and amux target different workflow shapes and do not directly compete. A natural split:</p>
     <ul>
       <li><strong>Interactive exploration:</strong> Goose &mdash; one agent, your IDE, back-and-forth conversation, MCP tools for data access</li>
-      <li><strong>Parallel execution:</strong> amux &mdash; task decomposition → board → fleet of agents → each claims and executes → amux monitors and self-heals</li>
-      <li><strong>Overnight automation:</strong> amux &mdash; agents scheduled, context managed, stalls auto-recovered, morning summary pushed to your phone</li>
+      <li><strong>Parallel execution:</strong> amux &mdash; task decomposition → board → fleet of agents → each claims and executes → amux monitors and flags stalls</li>
+      <li><strong>Overnight automation:</strong> amux &mdash; agents scheduled, stalls flagged, usage limits resumed, morning summary pushed to your phone</li>
     </ul>
     <p>You might use Goose to explore a codebase or prototype a solution, then hand the breakdown to an amux fleet to execute in parallel. The output of Goose exploration becomes the input to amux's task board.</p>
+
+    <h2>What's new in amux — September 2026</h2>
+    <p>Recent amux additions that widen the fleet/orchestration gap:</p>
+    <ul>
+      <li><strong>Browser automation: observe &rarr; act &rarr; verify loop.</strong> Live Chrome sessions now ground every browser action against the real DOM state before and after execution, preventing ghost clicks and stale-element errors in multi-step automation workflows.</li>
+      <li><strong>Deploy-wake (AMUX-5239).</strong> Workers whose commits just went live in CI are woken automatically — agents that pushed a branch and went idle now resume without a manual "continue" prompt.</li>
+      <li><strong>Named clearance signals.</strong> A card can declare <code>amux signal wait CARD signal-name</code>. Any session raises it with <code>amux signal raise signal-name</code>, and all waiting cards unblock immediately — cleaner cross-agent dependencies than polling or manual messaging.</li>
+      <li><strong>Host pressure guard.</strong> When the host CPU or memory is constrained, amux backs off scheduled automations and renices runaway processes — prevents the fleet from OOM-killing itself during heavy parallel runs.</li>
+      <li><strong>Idle re-prompt (AMUX-5236).</strong> If a session ends its turn with an unfulfilled forward promise ("I'll handle this next"), amux re-prompts it once — stalled sessions no longer pile up silently.</li>
+    </ul>
 
     <h2>Decision guide</h2>
     <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin:1.5rem 0;">
@@ -217,10 +243,10 @@
     <h2>FAQ</h2>
 
     <h3>What is the main difference between amux and Goose?</h3>
-    <p>Goose is a single AI coding agent with an MCP extension ecosystem. amux is an AI agent fleet control plane &mdash; it runs dozens of Claude Code, Codex, or Gemini CLI sessions in parallel with shared coordination, self-healing, and a web + mobile dashboard. Goose solves "how do I run one agent well." amux solves "how do I run many agents together."</p>
+    <p>Goose is a single AI coding agent with an MCP extension ecosystem. amux is an AI agent fleet control plane &mdash; it runs dozens of Claude Code, Codex, or Gemini CLI sessions in parallel with shared coordination, usage-limit and reboot recovery, and a web + mobile dashboard. Goose solves "how do I run one agent well." amux solves "how do I run many agents together."</p>
 
     <h3>Does Goose support parallel agents?</h3>
-    <p>No. Goose is designed as a single-agent system. You can run multiple Goose processes manually, but there is no shared coordination layer &mdash; no shared task board, no fleet visibility, no self-healing. amux was built specifically for the multi-agent coordination problem.</p>
+    <p>No. Goose is designed as a single-agent system. You can run multiple Goose processes manually, but there is no shared coordination layer &mdash; no shared task board, no fleet visibility, no recovery layer. amux was built specifically for the multi-agent coordination problem.</p>
 
     <h3>Can amux run Goose agents?</h3>
     <p>Not natively. amux manages Claude Code, Codex, and Gemini CLI runtimes via tmux. Goose uses its own runtime. For MCP-capable agents in amux, configure Claude Code sessions with <code>mcp.json</code> pointing at your MCP servers &mdash; you get the same tool extensibility with amux's fleet coordination on top.</p>
@@ -234,55 +260,28 @@
     <h3>Can I use amux and Goose together?</h3>
     <p>Yes. Use Goose for interactive single-agent work where MCP tool variety matters. Use amux for parallel fleet execution, overnight unattended runs, and mobile monitoring. They target different workflow shapes and complement each other naturally.</p>
 
-    <div class="cta-box"><h3>Run an AI engineering team with amux</h3><p>Open-source AI agent fleet control plane. Claude Code, Codex, and Gemini CLI sessions, all from one dashboard. Self-healing built in. Free, MIT licensed, single Rust binary.</p><pre><code>brew install mixpeek/amux/amux
+    <div class="cta-box"><h3>Run an AI engineering team with amux</h3><p>Open-source AI agent fleet control plane. Claude Code, Codex, and Gemini CLI sessions, all from one dashboard. Usage-limit and reboot recovery built in. Free, MIT + Commons Clause, single Rust binary.</p><pre><code>curl -fsSL https://amux.io/install.sh | bash
 amux register myproject --dir ~/Dev/myproject --yolo
 amux serve  # &rarr; https://localhost:8824</code></pre><a class="btn btn-primary" href="https://github.com/mixpeek/amux">View amux on GitHub ★</a></div>
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>
 </html>

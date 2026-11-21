@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -20,7 +20,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -37,7 +36,7 @@
     "@context": "https://schema.org",
     "@type": "DefinedTerm",
     "name": "AI Agent Fleet",
-    "description": "An AI agent fleet is a collection of AI coding or automation agents running in parallel under a shared control plane. The fleet shares a task queue (kanban board), coordination layer, monitoring dashboard, and self-healing watchdog. An AI engineering team running Claude Code, Codex, or Gemini CLI agents at scale is an example of an AI agent fleet.",
+    "description": "An AI agent fleet is a collection of AI coding or automation agents running in parallel under a shared control plane. The fleet shares a task queue (kanban board), coordination layer, monitoring dashboard, and recovery from usage limits and stalls. An AI engineering team running Claude Code, Codex, or Gemini CLI agents at scale is an example of an AI agent fleet.",
     "url": "https://amux.io/glossary/ai-agent-fleet/",
     "inDefinedTermSet": "https://amux.io/glossary/"
   }
@@ -64,7 +63,7 @@
         "name": "What is an AI agent fleet?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "An AI agent fleet is a group of AI coding or automation agents — such as Claude Code, Codex CLI, or Gemini CLI instances — running in parallel under a shared control plane. The fleet has a common task queue, coordination layer, monitoring dashboard, and self-healing watchdog. A solo developer running 10 Claude Code agents overnight to generate tests across a codebase is operating an AI agent fleet."
+          "text": "An AI agent fleet is a group of AI coding or automation agents — such as Claude Code, Codex CLI, or Gemini CLI instances — running in parallel under a shared control plane. The fleet has a common task queue, coordination layer, monitoring dashboard, and recovery from usage limits and stalls. A solo developer running 10 Claude Code agents overnight to generate tests across a codebase is operating an AI agent fleet."
         }
       },
       {
@@ -72,7 +71,7 @@
         "name": "How is an AI agent fleet different from a single AI agent?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "A single AI agent runs one task at a time and requires a human present to restart it if it crashes or hits a context limit. An AI agent fleet runs many tasks in parallel across multiple agents, uses a shared task queue to prevent duplication, heals automatically from crashes and context overflows, and supports remote monitoring from a phone or dashboard while the fleet runs unattended overnight."
+          "text": "A single AI agent runs one task at a time and requires a human present to restart it if it crashes or hits a context limit. An AI agent fleet runs many tasks in parallel across multiple agents, uses a shared task queue to prevent duplication, resumes after usage limits and flags stalled work, and supports remote monitoring from a phone or dashboard while the fleet runs unattended overnight."
         }
       },
       {
@@ -80,7 +79,7 @@
         "name": "What does a fleet control plane do?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "A fleet control plane launches, monitors, and self-heals agent sessions. It provides: a shared task board so agents claim work without duplication; an inter-agent messaging layer so sessions can coordinate and delegate; a self-healing watchdog that detects context overflows, crashes, and stuck prompts; a web and mobile dashboard for real-time monitoring and steering; and built-in tooling (scheduler, email, CRM, browser automation) to run full business workflows alongside coding agents."
+          "text": "A fleet control plane launches, monitors, and recovers agent sessions. It provides: a shared task board so agents claim work without duplication; an inter-agent messaging layer so sessions can coordinate and delegate; recovery that resumes agents after usage limits and alerts you to stalled work; a web and mobile dashboard for real-time monitoring and steering; and built-in tooling (scheduler, email, CRM, browser automation) to run full business workflows alongside coding agents."
         }
       },
       {
@@ -96,7 +95,7 @@
         "name": "What is the difference between an AI agent fleet and an orchestrator?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "An orchestrator is a component that coordinates what agents do — dispatching tasks, routing outputs, managing dependencies. A fleet is the collection of agents plus the control plane that manages them end to end: launch, monitoring, self-healing, task coordination, inter-agent messaging, and human oversight. amux is a fleet control plane that includes an orchestrator (the board and messaging layer) as one of its components."
+          "text": "An orchestrator is a component that coordinates what agents do — dispatching tasks, routing outputs, managing dependencies. A fleet is the collection of agents plus the control plane that manages them end to end: launch, monitoring, recovery, task coordination, inter-agent messaging, and human oversight. amux is a fleet control plane that includes an orchestrator (the board and messaging layer) as one of its components."
         }
       },
       {
@@ -110,18 +109,39 @@
     ]
   }
   </script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
@@ -137,29 +157,17 @@
     <h1>AI Agent Fleet</h1>
     <p class="subtitle">
       A collection of AI coding or automation agents running in parallel under a shared control plane —
-      with a common task queue, inter-agent coordination, self-healing, and remote monitoring.
+      with a common task queue, inter-agent coordination, recovery, and remote monitoring.
     </p>
     <p style="color:var(--muted);font-size:0.85rem">Published: August 27, 2026</p>
 
     <!-- EXP-065: ai-agent-fleet glossary top-of-page green CTA -->
-    <div style="background:linear-gradient(135deg,#064e3b,#065f46);border:1px solid #059669;border-radius:10px;padding:1.25rem 1.5rem;margin:1.5rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem"
-         data-exp="EXP-065">
-      <div>
-        <div style="font-weight:600;color:#d1fae5;font-size:1rem;margin-bottom:0.25rem">Run an AI engineering team from one dashboard</div>
-        <div style="color:#a7f3d0;font-size:0.875rem">amux is the open-source fleet control plane for Claude Code, Codex, and Gemini CLI — self-healing, kanban board, phone monitoring. MIT licensed, 367+ stars.</div>
-      </div>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener"
-         onclick="if(window.posthog) posthog.capture('exp065_ai_agent_fleet_glossary_cta_click', {page: window.location.pathname})"
-         style="display:inline-flex;align-items:center;gap:0.5rem;background:#059669;color:#fff;text-decoration:none;padding:0.625rem 1.25rem;border-radius:8px;font-size:0.9rem;font-weight:600;white-space:nowrap;flex-shrink:0">
-        View amux on GitHub ★
-      </a>
-    </div>
 
-    <div style="background:var(--surface-2,#1a1f2e);border-left:3px solid var(--accent,#6ee7b7);padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0">
+    <div style="background:var(--surface-2,var(--panel));border-left:3px solid var(--accent,var(--c-green));padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0">
       <strong>Definition:</strong> An AI agent fleet is a group of AI coding or automation agents —
       such as Claude Code, OpenAI Codex CLI, or Gemini CLI instances — running in parallel under a
       shared control plane. The fleet has a common task queue, coordination layer, monitoring
-      dashboard, and self-healing watchdog. Running 10 Claude Code agents overnight to generate
+      dashboard, and recovery from usage limits and stalls. Running 10 Claude Code agents overnight to generate
       tests across a codebase, each claiming tasks from a shared kanban board, is an example of
       operating an AI agent fleet.
     </div>
@@ -205,9 +213,9 @@
           <td>SQLite-backed kanban board with atomic compare-and-swap claiming</td>
         </tr>
         <tr>
-          <td><strong>Self-healing watchdog</strong></td>
-          <td>A process that monitors agent health, detects context overflows and crashes, and restarts or compacts sessions automatically</td>
-          <td>Built-in watchdog with auto-compact, crash restart, and stuck-prompt detection</td>
+          <td><strong>Recovery</strong></td>
+          <td>The part that keeps agents going through known interruptions and alerts a human about the rest</td>
+          <td>Usage-limit resume at the provider's reset, reboot recovery on macOS, stall detection with owner alerts</td>
         </tr>
         <tr>
           <td><strong>Monitoring and oversight</strong></td>
@@ -249,13 +257,13 @@
         </tr>
         <tr>
           <td><strong>Agent fleet</strong></td>
-          <td>Multiple agents running in parallel with shared coordination, self-healing, and a monitoring layer</td>
+          <td>Multiple agents running in parallel with shared coordination, recovery, and a monitoring layer</td>
           <td>10 Claude Code agents claiming tasks from an amux board overnight</td>
-          <td>Full lifecycle: launch, coordinate, heal, monitor</td>
+          <td>Full lifecycle: launch, coordinate, recover, monitor</td>
         </tr>
         <tr>
           <td><strong>Fleet control plane</strong></td>
-          <td>The software layer that manages the entire fleet lifecycle — sessions, board, watchdog, messaging, oversight</td>
+          <td>The software layer that manages the entire fleet lifecycle — sessions, board, recovery, messaging, oversight</td>
           <td>amux</td>
           <td>Everything above plus human oversight interface</td>
         </tr>
@@ -275,22 +283,22 @@
 
     <p>
       Beyond throughput, a fleet adds resilience. When one agent hits its context limit or
-      encounters an error, the self-healing watchdog handles recovery automatically.
-      Overnight runs complete without a human sitting at the desk. The next morning you review
-      the results, not the crash logs.
+      pauses at a usage limit, amux resumes it at the provider's reset, and stall detection
+      alerts you to anything stuck. The next morning you review the results and the few
+      sessions that were flagged.
     </p>
 
     <h2>How amux manages an AI agent fleet</h2>
 
     <p>
-      amux is the open-source control plane for running an AI agent fleet from a single
+      amux is the self-hosted control plane for running an AI agent fleet from a single
       dashboard or your phone. When you use amux, your fleet gets:
     </p>
 
     <ul>
       <li><strong>Parallel agent sessions</strong> — launch 1 to 50+ Claude Code, Codex, or Gemini CLI sessions headlessly in tmux, each isolated in its own project directory</li>
       <li><strong>Shared kanban board</strong> — post tasks before a run; agents claim them with atomic SQLite compare-and-swap so no two sessions take the same job</li>
-      <li><strong>Self-healing watchdog</strong> — auto-compacts on context overflow, restarts on crash, replays the last message on stuck prompts; your fleet runs overnight without human intervention</li>
+      <li><strong>Recovery</strong> — delivery is held through usage limits and resumes at the provider's reset; on macOS every worker comes back in its own conversation after a reboot; stall detection surfaces stuck work and alerts you. Restarting a crashed agent process is not built into the server.</li>
       <li><strong>Inter-agent messaging</strong> — sessions send and receive messages via REST API, coordinate handoffs, and delegate sub-tasks through named @worker channels</li>
       <li><strong>Session cloning</strong> — duplicate any live session to run parallel prompt experiments, compare outputs, then pick the better result and discard the other</li>
       <li><strong>Mobile oversight</strong> — the iOS app and installable PWA give you live fleet visibility, steering messages, and approval gates from anywhere</li>
@@ -301,7 +309,7 @@
 
     <p>
       Most developers start with 3–5 agents and scale up as they gain confidence in the
-      fleet's self-healing behavior. The practical ceiling on a single machine is memory: each
+      fleet's unattended behavior. The practical ceiling on a single machine is memory: each
       Claude Code session uses roughly 200–400 MB, so a MacBook Pro with 32 GB of RAM can
       comfortably sustain 10–15 agents without swapping. A Linux server with 64 GB can run 30–50+.
     </p>
@@ -337,33 +345,33 @@
     <dl style="display:grid;gap:1.5rem">
       <div>
         <dt style="font-weight:600;margin-bottom:0.35rem">What is an AI agent fleet?</dt>
-        <dd style="color:var(--fg-mute,#8892a4);line-height:1.6">
+        <dd style="color:var(--fg-mute,var(--fg-mute));line-height:1.6">
           A group of AI coding or automation agents running in parallel under a shared control plane.
-          The fleet shares a task queue, coordination layer, self-healing watchdog, and monitoring
+          The fleet shares a task queue, coordination layer, recovery from usage limits and stalls, and monitoring
           dashboard. A solo developer running 10 Claude Code agents overnight to generate tests across
           a codebase is operating an AI agent fleet.
         </dd>
       </div>
       <div>
         <dt style="font-weight:600;margin-bottom:0.35rem">How is a fleet different from a single agent?</dt>
-        <dd style="color:var(--fg-mute,#8892a4);line-height:1.6">
-          A single agent processes tasks serially and requires human presence to restart on failure.
-          A fleet processes tasks in parallel across many agents, claims work from a shared board to
-          prevent duplication, heals automatically from crashes and context overflows, and runs
+        <dd style="color:var(--fg-mute,var(--fg-mute));line-height:1.6">
+          A single agent runs one task at a time and requires a human present to restart it if it crashes or hits a context limit.
+          A fleet runs many tasks in parallel across multiple agents, uses a shared task queue to
+          prevent duplication, resumes after usage limits and flags stalled work, and runs
           unattended overnight with remote monitoring from a phone.
         </dd>
       </div>
       <div>
         <dt style="font-weight:600;margin-bottom:0.35rem">What does a fleet control plane do?</dt>
-        <dd style="color:var(--fg-mute,#8892a4);line-height:1.6">
-          A fleet control plane launches, monitors, and self-heals agent sessions. It provides a
-          shared task board, inter-agent messaging, a self-healing watchdog, and a web and mobile
+        <dd style="color:var(--fg-mute,var(--fg-mute));line-height:1.6">
+          A fleet control plane launches, monitors, and recovers agent sessions. It provides a
+          shared task board, inter-agent messaging, recovery that resumes agents after usage limits and alerts you to stalled work, and a web and mobile
           dashboard. amux is a fleet control plane for Claude Code, Codex CLI, and Gemini CLI fleets.
         </dd>
       </div>
       <div>
         <dt style="font-weight:600;margin-bottom:0.35rem">How many agents can a fleet run?</dt>
-        <dd style="color:var(--fg-mute,#8892a4);line-height:1.6">
+        <dd style="color:var(--fg-mute,var(--fg-mute));line-height:1.6">
           Fleet size is bounded by host memory (each agent uses 200–400 MB) and API rate limits from
           the model provider. A MacBook Pro with 32 GB can run 10–15 agents; a Linux server with 64 GB
           can run 30–50+. amux itself imposes no session count cap.
@@ -372,7 +380,7 @@
       </div>
       <div>
         <dt style="font-weight:600;margin-bottom:0.35rem">Can a fleet run different AI runtimes together?</dt>
-        <dd style="color:var(--fg-mute,#8892a4);line-height:1.6">
+        <dd style="color:var(--fg-mute,var(--fg-mute));line-height:1.6">
           Yes. amux supports mixed-runtime fleets where Claude Code, Codex CLI, and Gemini CLI agents
           run side-by-side, sharing the same board and messaging layer. Different runtimes can be
           assigned to different task types based on their strengths. See the
@@ -381,9 +389,9 @@
       </div>
       <div>
         <dt style="font-weight:600;margin-bottom:0.35rem">What is the difference between a fleet and an orchestrator?</dt>
-        <dd style="color:var(--fg-mute,#8892a4);line-height:1.6">
+        <dd style="color:var(--fg-mute,var(--fg-mute));line-height:1.6">
           An orchestrator routes tasks to agents and manages dependencies. A fleet is the full
-          collection of agents plus the control plane — launch, monitoring, self-healing, task
+          collection of agents plus the control plane — launch, monitoring, recovery, task
           coordination, inter-agent messaging, and human oversight. amux is a fleet control plane that
           includes an orchestration layer (the board and messaging system) as one of its components.
         </dd>
@@ -404,11 +412,11 @@
     <div class="cta-box">
       <h3>Run your AI agent fleet with amux</h3>
       <p>
-        Open-source control plane for Claude Code, Codex CLI, and Gemini CLI fleets.
-        Self-healing, shared kanban board, web dashboard, and iOS app.
-        MIT licensed. Install in under 2 minutes.
+        Self-hosted control plane for Claude Code, Codex CLI, and Gemini CLI fleets.
+        Usage-limit resume, shared kanban board, web dashboard, and iOS app.
+        MIT + Commons Clause. Install in under 2 minutes.
       </p>
-      <pre><code>brew install mixpeek/amux/amux
+      <pre><code>curl -fsSL https://amux.io/install.sh | bash
 amux register myproject --dir ~/Dev/myproject
 amux start myproject
 amux serve  # → https://localhost:8824</code></pre>
@@ -420,51 +428,24 @@ amux serve  # → https://localhost:8824</code></pre>
          style="margin-left:0.5rem">Download iOS App</a>
     </div>
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Glossary</div>
-          <ul>
-            <li><a href="/glossary/agent-multiplexer/">Agent multiplexer</a></li>
-            <li><a href="/glossary/ai-agent-control-plane/">AI agent control plane</a></li>
-            <li><a href="/glossary/ai-agent-fleet/">AI agent fleet</a></li>
-            <li><a href="/glossary/">All terms</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>
 </html>

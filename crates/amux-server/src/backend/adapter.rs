@@ -148,7 +148,11 @@ const GEMINI_PATTERNS: &[&str] = &[P_GEMINI_QUOTA_EXCEEDED, P_GEMINI_QUOTA_REACH
 /// reading HEALTHY while the agent was hard-stopped until Aug 27). The
 /// Python deliberately does NOT lift a reset time from it — that is the
 /// wrong-provider-reset bug — so `reset_at` stays `None` here too.
-const P_CODEX_USAGE_LIMIT: &str = r"(?is)You've hit your usage limit\..{0,160}?(?:Codex|ChatGPT)"; // py 6304
+///
+/// Both apostrophes: Codex has written "You’ve" (curly) since openai/codex
+/// 8c72f2ff56 (2026-09-09); the straight one is the older wording. Matching
+/// only the straight one missed every current Codex limit.
+const P_CODEX_USAGE_LIMIT: &str = r"(?is)You['’]ve hit your usage limit\..{0,160}?(?:Codex|ChatGPT)"; // py 6304
 
 const CODEX_PATTERNS: &[&str] = &[P_CODEX_USAGE_LIMIT];
 
@@ -205,7 +209,10 @@ lazy_re!(RE_CODEX_USAGE_LIMIT, P_CODEX_USAGE_LIMIT);
 // ● U+25CF accepted: live `tmux capture-pane` renders one glyph, the peek
 // endpoint the other — fixtures matched while live panes did not until both
 // were listed (py 6927-6934, AMUX-2111).
-lazy_re!(RE_LIMIT_ACTIVITY, r"^(?:[⏺●]\s|❯\s*\[\d|Ran \d+ shell command)"); // py 6934
+lazy_re!(
+    RE_LIMIT_ACTIVITY,
+    r"^(?:[⏺●]\s|❯\s*\[\d|Ran \d+ shell command)"
+); // py 6934
 
 // Loose 5xx form, used only to COUNT occurrences once the anchored form
 // made the decision (py 6370-6373): one blip vs a wedged retry loop.
@@ -262,7 +269,9 @@ pub(crate) fn claude_background_agents_waiting(line: &str) -> bool {
     // are indented by the TUI; trimming first would turn quoted frame text into
     // provider chrome.
     let line = line.trim_end();
-    let Some(first) = line.chars().next() else { return false };
+    let Some(first) = line.chars().next() else {
+        return false;
+    };
     // Claude's known spinner cycle. The old whole-dingbat range included `❯`,
     // the input-prompt glyph, so a user typing the exact sentence was itself
     // classified as a live agent.
@@ -286,20 +295,24 @@ pub(crate) fn claude_background_agents_waiting(line: &str) -> bool {
 /// a later completed-turn marker is the terminal edge for every older wait,
 /// while a newer wait still wins over a completion from the preceding turn.
 /// Raw lines are retained so pasted/indented replicas cannot become chrome.
-fn claude_background_wait_verdict(raw: &str) -> (bool, bool) {
+pub(crate) fn claude_background_wait_verdict(raw: &str) -> (bool, bool) {
     let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
     for line in lines[lines.len().saturating_sub(12)..].iter().rev() {
         let line = line.trim_end();
         if claude_background_agents_waiting(line) {
             return (true, false);
         }
-        let Some(first) = line.chars().next() else { continue };
+        let Some(first) = line.chars().next() else {
+            continue;
+        };
         let provider_chrome = matches!(
             first,
             '*' | '\u{b7}' | '\u{2722}' | '\u{2733}' | '\u{2736}' | '\u{273b}' | '\u{273d}'
         );
         if provider_chrome && RE_COMPLETED_TURN.is_match(&line[first.len_utf8()..]) {
-            let older_wait_seen = lines.iter().any(|candidate| claude_background_agents_waiting(candidate));
+            let older_wait_seen = lines
+                .iter()
+                .any(|candidate| claude_background_agents_waiting(candidate));
             return (false, older_wait_seen);
         }
     }
@@ -307,7 +320,23 @@ fn claude_background_wait_verdict(raw: &str) -> (bool, bool) {
 }
 
 pub(crate) fn claude_background_agents_working(raw: &str) -> bool {
-    claude_background_wait_verdict(raw).0
+    // The current footer survives a parent Stop while a Bash job runs. Only
+    // accept provider chrome after the last prompt, never quoted scrollback.
+    let footer = raw.rsplit_once('❯').map(|(_, footer)| footer).unwrap_or("");
+    let shells = footer.lines().any(|line| {
+        let line = line.trim();
+        (line.starts_with('⏸') || line.starts_with('⏵'))
+            && line.split('·').any(|part| {
+                let mut words = part.split_whitespace();
+                words
+                    .next()
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .is_some_and(|n| n > 0)
+                    && matches!(words.next(), Some("shell" | "shells"))
+                    && words.next().is_none()
+            })
+    });
+    shells || claude_background_wait_verdict(raw).0
 }
 
 pub(crate) fn claude_background_wait_superseded(raw: &str) -> bool {
@@ -404,7 +433,10 @@ impl TerminalAdapter {
         };
         // Events are applied in order. A resting composer beneath an error or
         // quota warning is chrome, not a later state transition to Waiting.
-        if events.iter().any(|e| matches!(e, WorkerEvent::RateLimited(_) | WorkerEvent::Failed(_))) {
+        if events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::RateLimited(_) | WorkerEvent::Failed(_)))
+        {
             events.retain(|e| !matches!(e, WorkerEvent::Waiting(w) if w.reason == "idle_prompt"));
             // Credit menus can also expose a real selector. Keep that evidence,
             // but apply the provider failure after it so the durable state does
@@ -483,7 +515,10 @@ fn last_n_raw_lines(clean: &str, n: usize) -> String {
 }
 
 fn nonempty_trimmed(text: &str) -> Vec<&str> {
-    text.lines().map(str::trim).filter(|l| !l.is_empty()).collect()
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// A composer/echoed-prompt line, which must never be read as UI chrome:
@@ -498,6 +533,17 @@ fn is_dingbat_lead(s: &str) -> bool {
     matches!(s.chars().next(), Some(c) if ('\u{2700}'..='\u{27bf}').contains(&c) || c == '\u{b7}')
 }
 
+lazy_re!(RE_SPINNER_TIMER, r"\((\d+h )?(\d+m )?\d+s\b");
+
+/// Claude's `*` spinner phase. `*` also starts a markdown bullet, so unlike
+/// the dingbat glyphs it counts only with the spinner's shape: … plus the
+/// elapsed-time parenthetical. This is the `*` half of
+/// session_verbs::is_plain_spinner_line (AMUX-3426); `·` keeps its looser
+/// rule here.
+fn is_asterisk_spinner(s: &str) -> bool {
+    s.starts_with('*') && s.contains('\u{2026}') && RE_SPINNER_TIMER.is_match(s)
+}
+
 /// A provider authentication failure that leaves the CLI drawn at an input
 /// prompt but unable to accept work. The leading solid square is Codex's own
 /// error marker and is load-bearing: matching the sentence alone would flag a
@@ -507,21 +553,25 @@ fn is_dingbat_lead(s: &str) -> bool {
 /// `■ Your access token could not be refreshed because you have since logged
 /// out or signed in to another account. Please sign in again.`
 fn auth_failure_state(clean: &str) -> Option<String> {
-    nonempty_trimmed(clean).iter().rev().take(12).find_map(|line| {
-        let trimmed = line.trim();
-        if !trimmed.starts_with('■') {
-            return None;
-        }
-        let low = trimmed.to_ascii_lowercase();
-        let refresh_failed = low.contains("access token could not be refreshed")
-            || low.contains("authentication token could not be refreshed")
-            || low.contains("failed to refresh authentication token");
-        let login_required = low.contains("please sign in again")
-            || low.contains("please log in again")
-            || low.contains("signed out")
-            || low.contains("logged out");
-        (refresh_failed && login_required).then(|| trimmed.to_string())
-    })
+    nonempty_trimmed(clean)
+        .iter()
+        .rev()
+        .take(12)
+        .find_map(|line| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('■') {
+                return None;
+            }
+            let low = trimmed.to_ascii_lowercase();
+            let refresh_failed = low.contains("access token could not be refreshed")
+                || low.contains("authentication token could not be refreshed")
+                || low.contains("failed to refresh authentication token");
+            let login_required = low.contains("please sign in again")
+                || low.contains("please log in again")
+                || low.contains("signed out")
+                || low.contains("logged out");
+            (refresh_failed && login_required).then(|| trimmed.to_string())
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -543,18 +593,28 @@ fn auth_failure_state(clean: &str) -> Option<String> {
 pub(crate) fn claude_auto_resume_banner(raw: &str) -> Option<String> {
     let clean = strip_ansi(raw);
     let lines = nonempty_trimmed(&clean);
-    let bar = lines.iter().rposition(|line| {
-        line.contains("⏵⏵") || line.contains("bypass permissions on")
-    })?;
+    let bar = lines
+        .iter()
+        .rposition(|line| line.contains("⏵⏵") || line.contains("bypass permissions on"))?;
     if lines.len() - bar > 5 || lines[bar].contains("esc to interrupt") {
         return None;
     }
-    let start = lines[..bar].iter().rposition(|line| *line == "❯")
-        .map(|i| i + 1).unwrap_or_else(|| bar.saturating_sub(8));
+    let start = lines[..bar]
+        .iter()
+        .rposition(|line| *line == "❯")
+        .map(|i| i + 1)
+        .unwrap_or_else(|| bar.saturating_sub(8));
     let footer = lines[start..bar].join(" ");
     let warning = footer.find("⚠ Usage limit reached")?;
     let warning = &footer[warning..];
-    if warning.contains("· continuing automatically at ") && warning.contains("esc to cancel") {
+    // Claude's current footer splits the reset warning and capitalized
+    // continuation across lines. The same composer/chrome anchors still own it.
+    let normalized = warning.to_ascii_lowercase();
+    // 2026-10-20 Claude Code also words it "limit resets 1pm / Continuing
+    // shortly · esc to cancel" once the reset is near or past.
+    if (normalized.contains("continuing automatically at ") || normalized.contains("continuing shortly"))
+        && normalized.contains("esc to cancel")
+    {
         Some(warning.to_string())
     } else {
         None
@@ -572,7 +632,10 @@ fn live_limit_region(clean: &str) -> String {
         }
     }
     if let Some(b) = input_box {
-        if lines[b + 1..].iter().any(|l| RE_LIMIT_ACTIVITY.is_match(l.trim())) {
+        if lines[b + 1..]
+            .iter()
+            .any(|l| RE_LIMIT_ACTIVITY.is_match(l.trim()))
+        {
             input_box = None;
         }
     }
@@ -610,7 +673,10 @@ fn api_error_region(clean: &str) -> (String, Vec<String>) {
         }
     }
     if let Some(b) = input_box {
-        if lines[b + 1..].iter().any(|l| RE_LIMIT_ACTIVITY.is_match(l.trim())) {
+        if lines[b + 1..]
+            .iter()
+            .any(|l| RE_LIMIT_ACTIVITY.is_match(l.trim()))
+        {
             input_box = None; // echo, not the live box (py 6416-6427)
         }
     }
@@ -659,7 +725,9 @@ fn api_budget_gated(clean: &str) -> Option<String> {
     if marker.is_empty() || !RE_API_BUDGET_MARKER.is_match(&marker) {
         return None;
     }
-    RE_API_BUDGET_PHRASE.is_match(&lines.concat()).then_some(marker)
+    RE_API_BUDGET_PHRASE
+        .is_match(&lines.concat())
+        .then_some(marker)
 }
 
 /// (code, occurrences, marker line) when a transient 5xx is the session's
@@ -682,13 +750,19 @@ fn api_error_state(clean: &str) -> Option<(String, usize, String)> {
 #[derive(Debug)]
 enum TuiState {
     Active,
-    Waiting { reason: &'static str, detail: String },
+    Waiting {
+        reason: &'static str,
+        detail: String,
+    },
     Idle,
     Unknown,
 }
 
 fn waiting(reason: &'static str, detail: &str) -> TuiState {
-    TuiState::Waiting { reason, detail: detail.to_string() }
+    TuiState::Waiting {
+        reason,
+        detail: detail.to_string(),
+    }
 }
 
 /// Port of `_detect_claude_status` (py 18479-18624). Deviation, on purpose:
@@ -725,7 +799,7 @@ fn claude_tui_state(clean: &str) -> TuiState {
         if is_prompt_line(s) {
             continue;
         }
-        if is_dingbat_lead(s) && s.contains('…') {
+        if (is_dingbat_lead(s) && s.contains('…')) || is_asterisk_spinner(s) {
             return TuiState::Active;
         }
         if s.starts_with("Running…") || RE_READING_FILES.is_match(s) {
@@ -764,7 +838,11 @@ fn claude_tui_state(clean: &str) -> TuiState {
 
     // Step 2: last 12 lines bottom-up for the most recent signal
     // (py 18540-18578).
-    let current = ne.iter().rposition(|s| *s == "❯").map(|i| &ne[i..]).unwrap_or(&ne);
+    let current = ne
+        .iter()
+        .rposition(|s| *s == "❯")
+        .map(|i| &ne[i..])
+        .unwrap_or(&ne);
     for s in current.iter().rev().take(12) {
         let sl = s.to_lowercase();
         if !is_prompt_line(s) && is_dingbat_lead(s) {
@@ -850,7 +928,7 @@ fn claude_ui_visible(clean: &str) -> bool {
         }
     }
     for l in ne.iter().rev().take(12) {
-        if !is_prompt_line(l) && is_dingbat_lead(l) {
+        if !is_prompt_line(l) && (is_dingbat_lead(l) || is_asterisk_spinner(l)) {
             return true; // dingbat-prefixed status line (py 8245-8250)
         }
     }
@@ -883,7 +961,12 @@ fn scan_claude(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     let tail12 = last_n_raw_lines(clean, 12);
     let tail30 = last_n_raw_lines(clean, 30);
     if let Some(banner) = claude_auto_resume_banner(clean) {
-        return vec![rate_limited(RateLimitKind::SubscriptionCap, None, provider, banner)];
+        return vec![rate_limited(
+            RateLimitKind::SubscriptionCap,
+            None,
+            provider,
+            banner,
+        )];
     }
     let state = claude_tui_state(clean);
 
@@ -949,7 +1032,9 @@ fn scan_claude(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
                 // Menu: the option line must be the region's LAST line —
                 // position, not just phrasing, makes the render real
                 // (py 7213-7258).
-                let menu_gate = live_ne.last().is_some_and(|l| RE_CREDIT_MENU_OPT.is_match(l))
+                let menu_gate = live_ne
+                    .last()
+                    .is_some_and(|l| RE_CREDIT_MENU_OPT.is_match(l))
                     && RE_CREDIT_MENU_PROSE.is_match(&last6);
                 // Spend menu: clean-screen tail, since the live region cuts
                 // AT its highlighted row (py 7272-7287).
@@ -990,7 +1075,12 @@ fn scan_claude(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
         // (py 6375-6382, 7334-7356). Kind Unknown: the provider states a
         // reset instant, not which quota window tripped (Invariant 20:
         // never invent what was not reported).
-        events.push(rate_limited(RateLimitKind::Unknown, Some(ts), provider, marker));
+        events.push(rate_limited(
+            RateLimitKind::Unknown,
+            Some(ts),
+            provider,
+            marker,
+        ));
     }
     if let Some((code, n, marker)) = api_error_state(clean) {
         // 5xx: server-side and immediately retryable — the correct bulk
@@ -1020,7 +1110,10 @@ fn scan_claude(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     // process is gone, not how (Invariant 20: never invent a code that was
     // not reported).
     if events.is_empty() && at_shell_prompt(clean) {
-        events.push(WorkerEvent::Exited(ExitStatus { code: None, signal: None }));
+        events.push(WorkerEvent::Exited(ExitStatus {
+            code: None,
+            signal: None,
+        }));
     }
 
     events
@@ -1028,31 +1121,61 @@ fn scan_claude(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
 
 /// Current provider-owned picker, excluding quoted options above a newer
 /// composer. Model names/effort do not determine whether input is required.
-fn provider_picker_reason(clean: &str, provider: &str) -> Option<&'static str> {
+pub(crate) fn provider_picker_reason(clean: &str, provider: &str) -> Option<&'static str> {
     let lines = nonempty_trimmed(clean);
+    if matches!(provider, "codex" | "ollama")
+        && lines.last().is_some_and(|line| {
+            *line == "Press t to trust all; enter to review hooks; esc to close"
+        })
+        && lines.contains(&"Lifecycle hooks from config and enabled plugins.")
+    {
+        return Some("hook_trust_prompt");
+    }
     let lines = &lines[lines.len().saturating_sub(12)..];
     let selected = lines.iter().rposition(|line| match provider {
         "codex" | "ollama" => codex_picker_option(line),
-        "gemini" => line.strip_prefix("│ ● ").and_then(|rest| rest.split_once('.'))
+        "gemini" => line
+            .strip_prefix("│ ● ")
+            .and_then(|rest| rest.split_once('.'))
             .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())),
         _ => false,
     })?;
-    if lines[selected + 1..].iter().any(|line| {
-        is_prompt_line(line) || line.contains("Type your message")
-    }) { return None; }
-    let tail = lines.join(" ").to_lowercase();
-    if provider != "gemini" && !tail.contains("press enter to continue")
-        && !tail.contains("enter to select") && !tail.contains("esc to cancel") {
+    if lines[selected + 1..]
+        .iter()
+        .any(|line| is_prompt_line(line) || line.contains("Type your message"))
+    {
         return None;
     }
-    Some(if tail.contains("trust") && tail.contains("directory") { "trust_prompt" }
-        else if tail.contains("allow execution") || tail.contains("approve") || tail.contains("do you want to proceed") { "permission_prompt" }
-        else { "user_input" })
+    let tail = lines.join(" ").to_lowercase();
+    if provider != "gemini"
+        && !tail.contains("press enter to continue")
+        && !tail.contains("press enter to confirm")
+        && !tail.contains("enter to select")
+        && !tail.contains("esc to cancel")
+    {
+        return None;
+    }
+    Some(if tail.contains("hooks need review") {
+        "hook_trust_prompt"
+    } else if tail.contains("trust") && tail.contains("directory") {
+        "trust_prompt"
+    } else if tail.contains("allow execution")
+        || tail.contains("approve")
+        || tail.contains("do you want to proceed")
+    {
+        "permission_prompt"
+    } else {
+        "user_input"
+    })
 }
 
 fn codex_picker_option(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("› ") else { return false; };
-    let Some((number, _)) = rest.split_once('.') else { return false; };
+    let Some(rest) = line.strip_prefix("› ") else {
+        return false;
+    };
+    let Some((number, _)) = rest.split_once('.') else {
+        return false;
+    };
     !number.is_empty() && number.chars().all(|c| c.is_ascii_digit())
 }
 
@@ -1068,7 +1191,12 @@ fn scan_gemini(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
         } else {
             RateLimitKind::Unknown
         };
-        events.push(rate_limited(kind, None, provider, m.as_str().trim().to_string()));
+        events.push(rate_limited(
+            kind,
+            None,
+            provider,
+            m.as_str().trim().to_string(),
+        ));
     } else if let Some(m) = RE_GEMINI_QUOTA_EXCEEDED.find(&tail30) {
         events.push(rate_limited(
             RateLimitKind::Unknown,
@@ -1078,7 +1206,10 @@ fn scan_gemini(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
         ));
     }
     if let Some(reason) = provider_picker_reason(clean, "gemini") {
-        events.push(WorkerEvent::Waiting(WaitReason { reason: reason.into(), detail: None }));
+        events.push(WorkerEvent::Waiting(WaitReason {
+            reason: reason.into(),
+            detail: None,
+        }));
         return events;
     }
     // Status (py 18694-18709): "esc to cancel" renders only DURING
@@ -1106,13 +1237,52 @@ fn scan_gemini(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
 /// short-circuit idle/trust) and [`TerminalAdapter::generating`] (which the
 /// clock-holding caller uses to mint the turn that makes the worker Active).
 fn codex_model_bar(line: &str) -> bool {
-    let Some((identity, location)) = line.rsplit_once('\u{b7}') else {
+    let Some((identity, remainder)) = line.split_once('\u{b7}') else {
         return false;
     };
-    let location = location.trim();
+    // Current Codex adds a session label AFTER its location. The final
+    // segment is no longer necessarily the path; model/effort stay open-ended.
+    let location = remainder.split('\u{b7}').next().unwrap_or("").trim();
     let identity_parts = identity.split_whitespace().count();
     identity_parts >= 2
         && (location == "~" || location.starts_with("~/") || location.starts_with('/'))
+}
+
+/// Codex's hint row under the model bar (0.163+): `? for shortcuts`,
+/// optionally followed by a warnings notice such as `⚠ 2 warnings · f2 to
+/// view`. Anchored at the start of the row so prose that merely mentions
+/// shortcuts does not qualify.
+fn codex_footer_hint_row(line: &str) -> bool {
+    let low = line.trim().to_ascii_lowercase();
+    if !low.starts_with("? for shortcuts") {
+        return false;
+    }
+    let rest = low["? for shortcuts".len()..].trim();
+    rest.is_empty() || rest.starts_with('\u{26a0}') || rest.contains("f2 to view")
+}
+
+/// A row under a Codex model bar that is not a known hint row: the provider
+/// changed its footer again. Logged once an hour per row text, so a sweep sees
+/// the drift before customers report queued messages that never deliver.
+fn codex_footer_drift(row: &str) {
+    let row: String = row.chars().take(120).collect();
+    let key = format!("codex-footer-drift:{row}");
+    if crate::log_dedupe::first_this_bucket(&key, crate::log_dedupe::hour_bucket(now_secs())) {
+        tracing::warn!(
+            measured = true,
+            n_considered = 1,
+            verdict = "codex_footer_unrecognized",
+            row = %row,
+            "a row under the Codex model bar is not a known hint row; the pane is not read as Codex, so queued input waits for a boundary it cannot see"
+        );
+    }
+}
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 fn codex_active_status_line(line: &str) -> bool {
@@ -1167,7 +1337,26 @@ fn codex_structured_active_line_clean(clean: &str) -> Option<Option<&str>> {
     // Provider identity must be the CURRENT footer, not a Codex-looking frame
     // pasted into another provider's prompt. The model/path bar is Codex's
     // final non-empty row and its prompt glyph is `›` (not Claude's `❯`).
-    let model_i = tail.len().checked_sub(1).filter(|i| codex_model_bar(tail[*i]))?;
+    //
+    // Codex 0.163 paints one more row UNDER the model bar: `? for shortcuts`
+    // and, when it has any, `⚠ 2 warnings · f2 to view`. Requiring the bar to
+    // be the very last row made every such frame read as "not Codex", so an
+    // idle lane never reached a delivery boundary and a new Cloud customer's
+    // first task sat queued forever (C6-2, 2026-10-18). Only that one
+    // recognised hint row may follow the bar; anything else still refuses, so
+    // a pasted Codex frame above another provider's footer stays foreign.
+    let last = tail.len().checked_sub(1)?;
+    let model_i = if codex_model_bar(tail[last]) {
+        last
+    } else if last > 0 && codex_model_bar(tail[last - 1]) {
+        if !codex_footer_hint_row(tail[last]) {
+            codex_footer_drift(tail[last]);
+            return None;
+        }
+        last - 1
+    } else {
+        return None;
+    };
     let prompt_i = tail[..model_i].iter().rposition(|s| s.starts_with('›'))?;
     // Current Codex paints the active row immediately before its disabled
     // prompt. Older builds painted it immediately after the submitted prompt,
@@ -1176,9 +1365,7 @@ fn codex_structured_active_line_clean(clean: &str) -> Option<Option<&str>> {
     if prompt_i > 0 && codex_active_status_line(tail[prompt_i - 1]) {
         return Some(Some(tail[prompt_i - 1]));
     }
-    if prompt_i + 1 == model_i.saturating_sub(1)
-        && codex_active_status_line(tail[prompt_i + 1])
-    {
+    if prompt_i + 1 == model_i.saturating_sub(1) && codex_active_status_line(tail[prompt_i + 1]) {
         return Some(Some(tail[prompt_i + 1]));
     }
     Some(None)
@@ -1196,7 +1383,9 @@ fn codex_background_status_line(line: &str) -> bool {
 }
 
 fn codex_generating(clean: &str) -> bool {
-    if provider_picker_reason(clean, "codex").is_some() { return false; }
+    if provider_picker_reason(clean, "codex").is_some() {
+        return false;
+    }
     codex_generation_state_clean(clean).unwrap_or(false)
 }
 
@@ -1225,6 +1414,15 @@ pub(crate) fn codex_pane_background_working(captured: &str) -> bool {
         .is_some_and(codex_background_status_line)
 }
 
+/// Is Codex's usage-limit message among the last lines of the pane? The same
+/// pattern `scan_codex` uses, scoped to the bottom of the frame so a limit
+/// quoted further up in scrollback does not count.
+pub(crate) fn codex_usage_limit_on_screen(pane: &str) -> bool {
+    let clean = strip_ansi(pane);
+    let lines: Vec<_> = clean.trim_end().lines().collect();
+    RE_CODEX_USAGE_LIMIT.is_match(&lines[lines.len().saturating_sub(12)..].join("\n"))
+}
+
 fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     let mut events = Vec::new();
     let tail30 = last_n_raw_lines(clean, 30);
@@ -1241,7 +1439,10 @@ fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
         ));
     }
     if let Some(reason) = provider_picker_reason(clean, "codex") {
-        events.push(WorkerEvent::Waiting(WaitReason { reason: reason.into(), detail: None }));
+        events.push(WorkerEvent::Waiting(WaitReason {
+            reason: reason.into(),
+            detail: None,
+        }));
         return events;
     }
     // Active: "• Working (Xs • esc to interrupt)" (py 18591-18599). The active
@@ -1474,10 +1675,8 @@ mixpeek$ ";
 ⏺ Finished dev profile target(s) in 12.4s
 ⏺ All 34 tests passed; no warnings.";
 
-    const FX_GEMINI_QUOTA: &str =
-        "✦ Quota exceeded for quota metric 'Requests' of Gemini 2.5 Pro";
-    const FX_GEMINI_DAILY: &str =
-        "✦ You have reached your daily quota limit for Gemini 2.5 Pro.";
+    const FX_GEMINI_QUOTA: &str = "✦ Quota exceeded for quota metric 'Requests' of Gemini 2.5 Pro";
+    const FX_GEMINI_DAILY: &str = "✦ You have reached your daily quota limit for Gemini 2.5 Pro.";
     const FX_GEMINI_IDLE: &str = "\
 │ Type your message
 gemini-2.5-pro";
@@ -1487,6 +1686,11 @@ gemini-2.5-pro";
     // Banner shape from the AMUX-2088 incident (py 6296-6300).
     const FX_CODEX_LIMIT: &str = "\
 ■ You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing) or try again in 4 days 2 hours.";
+    // Codex's own wording since openai/codex 8c72f2ff56 (2026-09-09): a
+    // CURLY apostrophe. Copied from
+    // codex-rs/protocol/src/error.rs `UsageLimitReachedError` (Pro plans).
+    const FX_CODEX_LIMIT_CURLY: &str = "\
+■ You\u{2019}ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Nov 18th, 2026 4:59 PM.";
     const FX_CODEX_IDLE: &str = "\
 › implement {feature}
   gpt-5.5 xhigh · ~/Dev/amux";
@@ -1516,6 +1720,16 @@ gemini-2.5-pro";
     }
 
     #[test]
+    fn native_hook_review_table_is_an_input_boundary_until_closed() {
+        let pane = "Hooks\nLifecycle hooks from config and enabled plugins.\n⚠ 10 hooks need review before they can run.\nPreToolUse 1 0 1 Before a tool executes\nPress t to trust all; enter to review hooks; esc to close";
+        assert_eq!(
+            provider_picker_reason(pane, "codex"),
+            Some("hook_trust_prompt")
+        );
+        assert_eq!(provider_picker_reason(&format!("{pane}\n›"), "codex"), None);
+    }
+
+    #[test]
     fn strip_ansi_leaves_plain_text_alone() {
         let plain = "❯ ordinary text · with unicode ⏺ and $dollars";
         assert_eq!(strip_ansi(plain), plain);
@@ -1525,7 +1739,10 @@ gemini-2.5-pro";
 
     #[test]
     fn pattern_counts_per_provider() {
-        assert_eq!(rate_limit_patterns(&ProviderId::new("claude-code")).len(), 16);
+        assert_eq!(
+            rate_limit_patterns(&ProviderId::new("claude-code")).len(),
+            16
+        );
         assert_eq!(rate_limit_patterns(&ProviderId::new("claude")).len(), 16);
         assert_eq!(rate_limit_patterns(&ProviderId::new("gemini")).len(), 2);
         assert_eq!(rate_limit_patterns(&ProviderId::new("codex")).len(), 1);
@@ -1556,9 +1773,9 @@ gemini-2.5-pro";
         for provider in ["claude-code", "gemini", "codex", "ollama"] {
             for pat in rate_limit_patterns(&ProviderId::new(provider)) {
                 let re = Regex::new(pat).unwrap_or_else(|e| panic!("{pat} failed to compile: {e}"));
-                let hit = corpus.iter().any(|fx| {
-                    re.is_match(fx) || fx.lines().any(|l| re.is_match(l.trim()))
-                });
+                let hit = corpus
+                    .iter()
+                    .any(|fx| re.is_match(fx) || fx.lines().any(|l| re.is_match(l.trim())));
                 assert!(hit, "pattern has no positive fixture: {pat}");
             }
         }
@@ -1620,7 +1837,11 @@ gemini-2.5-pro";
         let rl = limits(&ev);
         assert_eq!(rl.len(), 1, "{ev:?}");
         assert_eq!(rl[0].kind, RateLimitKind::Credit);
-        assert!(rl[0].raw.as_deref().unwrap().contains("Adjust monthly spend limit"));
+        assert!(rl[0]
+            .raw
+            .as_deref()
+            .unwrap()
+            .contains("Adjust monthly spend limit"));
     }
 
     #[test]
@@ -1645,10 +1866,16 @@ gemini-2.5-pro";
         let ev = adapter("claude-code").scan(FX_API_529);
         let fs = failures(&ev);
         assert_eq!(fs.len(), 1, "{ev:?}");
-        assert!(fs[0].retryable, "5xx is immediately retryable (py 6367-6369)");
+        assert!(
+            fs[0].retryable,
+            "5xx is immediately retryable (py 6367-6369)"
+        );
         assert!(fs[0].reason.contains("529"));
         assert!(fs[0].reason.contains("2 occurrence(s)"), "{}", fs[0].reason);
-        assert!(limits(&ev).is_empty(), "a 5xx is a failure, not a rate limit");
+        assert!(
+            limits(&ev).is_empty(),
+            "a 5xx is a failure, not a rate limit"
+        );
     }
 
     #[test]
@@ -1674,7 +1901,10 @@ gemini-2.5-pro";
         assert_eq!(rl[0].kind, RateLimitKind::Credit);
         assert_eq!(rl[0].reset_at, None, "402 carries no reset (py 6395-6399)");
         assert!(rl[0].raw.as_deref().unwrap().contains("402"));
-        assert!(failures(&ev).is_empty(), "402 is a gate, not a transient failure");
+        assert!(
+            failures(&ev).is_empty(),
+            "402 is a gate, not a transient failure"
+        );
     }
 
     // -- Claude: waiting / idle / crash -------------------------------------
@@ -1684,6 +1914,32 @@ gemini-2.5-pro";
         let ev = adapter("claude-code").scan(FX_PERMISSION_PROMPT);
         assert_eq!(waiting_reasons(&ev), vec!["permission_prompt"], "{ev:?}");
         assert!(limits(&ev).is_empty());
+    }
+
+    // gs12-mvs, 2026-10-07 ~08:00-09:00Z: a SUBAGENT's Bash call raised a
+    // permission prompt under a boxed command, despite bypass permissions.
+    // The lane read "active" for about an hour with steering queued behind it.
+    const FX_SUBAGENT_PERMISSION_PROMPT: &str = "\
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+ Bash command \u{b7} from the general-purpose agent
+ Run shell command
+\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}
+ \u{2502} D=/tmp/x; cd $D && cargo test --locked --lib gm170 2>&1 | grep \"test result\"
+ \u{2502} ZB_SHA=$(git rev-parse HEAD) bash -c 'ZS=$(mktemp ./zbclip.XXXX); bash $ZS; rm -f \"${ZS:?}\"' 2>&1 | tail -3
+\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}\u{254c}
+ This shell -c script runs rm and could not be checked
+
+ Do you want to proceed?
+ \u{276f} 1. Yes
+   2. No
+
+ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+x ctrl+k twice to stop background agents";
+
+    #[test]
+    fn a_subagent_permission_prompt_under_a_boxed_command_is_waiting() {
+        let ev = adapter("claude-code").scan(FX_SUBAGENT_PERMISSION_PROMPT);
+        let w = waiting_reasons(&ev);
+        assert!(!w.is_empty(), "a lane blocked on a permission prompt is waiting, not active: {ev:?}");
     }
 
     #[test]
@@ -1704,7 +1960,10 @@ gemini-2.5-pro";
         let ev = adapter("claude-code").scan(FX_SHELL_PROMPT);
         assert_eq!(
             ev,
-            vec![WorkerEvent::Exited(ExitStatus { code: None, signal: None })],
+            vec![WorkerEvent::Exited(ExitStatus {
+                code: None,
+                signal: None
+            })],
             "Invariant 20: the shell prompt proves the process is gone, not how"
         );
     }
@@ -1741,7 +2000,10 @@ gemini-2.5-pro";
     fn unknown_provider_scans_empty_even_on_matching_text() {
         for frame in [FX_WEEKLY, FX_CODEX_AUTH] {
             let ev = adapter("a-provider-from-2031").scan(frame);
-            assert!(ev.is_empty(), "unknown providers need explicit pattern knowledge: {ev:?}");
+            assert!(
+                ev.is_empty(),
+                "unknown providers need explicit pattern knowledge: {ev:?}"
+            );
         }
     }
 
@@ -1778,6 +2040,40 @@ gemini-2.5-pro";
     }
 
     #[test]
+    fn codex_usage_limit_in_current_wording_is_seen() {
+        for p in ["codex", "ollama"] {
+            let ev = adapter(p).scan(FX_CODEX_LIMIT_CURLY);
+            let rl = limits(&ev);
+            assert_eq!(rl.len(), 1, "{p}: {ev:?}");
+            assert_eq!(
+                rl[0].reset_at, None,
+                "{p}: still no reset lifted from the text"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_usage_limit_on_screen_reads_the_bottom_of_the_frame() {
+        let idle = "\n\u{203a} Ask Codex to do anything\n\n  gpt-5.5 xhigh \u{b7} ~/Dev/amux\n\n\n";
+        assert!(codex_usage_limit_on_screen(&format!(
+            "{FX_CODEX_LIMIT_CURLY}{idle}"
+        )));
+        assert!(
+            codex_usage_limit_on_screen(&format!("{FX_CODEX_LIMIT}{idle}")),
+            "the older wording"
+        );
+        let scrolled = format!(
+            "{FX_CODEX_LIMIT_CURLY}\n{}{idle}",
+            "\u{2022} ran cargo test\n".repeat(12)
+        );
+        assert!(
+            !codex_usage_limit_on_screen(&scrolled),
+            "a limit in scrollback is over"
+        );
+        assert!(!codex_usage_limit_on_screen(FX_CODEX_IDLE));
+    }
+
+    #[test]
     fn codex_idle_prompt() {
         let ev = adapter("codex").scan(FX_CODEX_IDLE);
         assert_eq!(waiting_reasons(&ev), vec!["idle_prompt"], "{ev:?}");
@@ -1787,8 +2083,15 @@ gemini-2.5-pro";
     fn codex_auth_failure_is_failed_not_idle() {
         let ev = adapter("codex").scan(FX_CODEX_AUTH);
         let fs = failures(&ev);
-        assert_eq!(fs.len(), 1, "the live auth wall must produce one failure: {ev:?}");
-        assert!(!fs[0].retryable, "sign-in requires a person; retrying cannot repair it");
+        assert_eq!(
+            fs.len(),
+            1,
+            "the live auth wall must produce one failure: {ev:?}"
+        );
+        assert!(
+            !fs[0].retryable,
+            "sign-in requires a person; retrying cannot repair it"
+        );
         assert!(fs[0].reason.contains("Please sign in again"));
         assert!(
             waiting_reasons(&ev).is_empty(),
@@ -1800,7 +2103,10 @@ gemini-2.5-pro";
     fn quoted_codex_auth_text_is_not_a_failure() {
         let frame = "› Explain the sentence: Your access token could not be refreshed. Please sign in again.\n\n  gpt-5.5 xhigh · ~/Dev/amux";
         let ev = adapter("codex").scan(frame);
-        assert!(failures(&ev).is_empty(), "a user prompt quoting the error is not UI chrome: {ev:?}");
+        assert!(
+            failures(&ev).is_empty(),
+            "a user prompt quoting the error is not UI chrome: {ev:?}"
+        );
         assert_eq!(waiting_reasons(&ev), vec!["idle_prompt"]);
     }
 
@@ -1826,7 +2132,10 @@ Running 1 shell command · 5s…
 
 ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 2 agents                /rc failed";
         let st = claude_tui_state(frame);
-        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+        assert!(
+            matches!(st, TuiState::Active),
+            "expected Active, got {st:?}"
+        );
     }
 
     #[test]
@@ -1840,7 +2149,10 @@ Running 1 shell command · 5s…
                      \u{203a}\n\n\
                      \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents \u{b7} \u{2193} to manage";
         let st = claude_tui_state(frame);
-        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+        assert!(
+            matches!(st, TuiState::Active),
+            "expected Active, got {st:?}"
+        );
     }
 
     #[test]
@@ -1873,7 +2185,10 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(!claude_background_agents_working(frame));
         assert!(claude_background_wait_superseded(frame));
         let st = claude_tui_state(frame);
-        assert!(matches!(st, TuiState::Idle), "later completion must own the frame, got {st:?}");
+        assert!(
+            matches!(st, TuiState::Idle),
+            "later completion must own the frame, got {st:?}"
+        );
 
         let next_turn = format!(
             "{frame}\n\u{2733} Waiting for 2 background agents to finish\n\u{276f}\n\u{23f5}\u{23f5} bypass permissions on"
@@ -1889,7 +2204,10 @@ CLAUDE-POSTFIX-COMPLETE
         // claude-fable-5 uses « as its spinner prefix instead of a dingbat.
         let frame = "« Quantumizing… (10s · ↓ 84 tokens)\n\n⏵⏵ bypass permissions on";
         let st = claude_tui_state(frame);
-        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+        assert!(
+            matches!(st, TuiState::Active),
+            "expected Active, got {st:?}"
+        );
     }
 
     #[test]
@@ -1899,7 +2217,58 @@ CLAUDE-POSTFIX-COMPLETE
         // glyph appears in ~1/6 of frames.
         let frame = "\u{b7} Thinking\u{2026}\n\n\u{23f5}\u{23f5} bypass permissions on";
         let st = claude_tui_state(frame);
-        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+        assert!(
+            matches!(st, TuiState::Active),
+            "expected Active, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn asterisk_spinner_frame_is_active() {
+        // Claude Code's spinner cycles through ·✢✶✻✽*. `*` is outside the
+        // dingbat range too, so a capture landing on that phase read a
+        // generating turn as idle here, as AMUX-3426 fixed in
+        // detect_claude_status. Recognised by shape: … plus the timer.
+        let frame = "\
+  some output text
+* Befuddling\u{2026} (21m 48s \u{b7} \u{2193} 15.0k tokens)
+
+\u{276f}
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+        let st = claude_tui_state(frame);
+        assert!(
+            matches!(st, TuiState::Active),
+            "expected Active, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn asterisk_markdown_bullet_with_ellipsis_is_not_a_spinner() {
+        // A prose bullet quoting an ellipsis has no elapsed-time suffix, so
+        // a finished turn that printed one must not read as generating.
+        let frame = "\
+* Loading the config\u{2026} then retrying
+* Done
+
+\u{276f}
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle)";
+        let st = claude_tui_state(frame);
+        assert!(
+            !matches!(st, TuiState::Active),
+            "a bullet is not a spinner, got {st:?}"
+        );
+    }
+
+    #[test]
+    fn asterisk_spinner_frame_is_not_read_as_an_exited_cli() {
+        // Active on the `*` phase means no Waiting event, so the dead-CLI
+        // check runs; a tool-output line ending in `%` must not make it fire.
+        let frame = "  \u{23bf}  coverage: 100%\n\
+                     * Befuddling\u{2026} (21m 48s \u{b7} \u{2193} 15.0k tokens)";
+        let ev = adapter("claude-code").scan(frame);
+        assert!(ev.is_empty(), "{ev:?}");
     }
 
     #[test]
@@ -1911,7 +2280,10 @@ CLAUDE-POSTFIX-COMPLETE
 \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
   \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents";
         let st = claude_tui_state(frame);
-        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+        assert!(
+            matches!(st, TuiState::Active),
+            "expected Active, got {st:?}"
+        );
     }
 
     // -- Ollama --------------------------------------------------------------
@@ -1925,7 +2297,10 @@ CLAUDE-POSTFIX-COMPLETE
     #[test]
     fn ollama_codex_usage_limit_is_detected() {
         let ev = adapter("ollama").scan(FX_CODEX_LIMIT);
-        assert!(!limits(&ev).is_empty(), "codex usage-limit must be detected on ollama workers");
+        assert!(
+            !limits(&ev).is_empty(),
+            "codex usage-limit must be detected on ollama workers"
+        );
     }
 
     #[test]

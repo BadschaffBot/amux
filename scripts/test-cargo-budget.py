@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import signal
 import subprocess
@@ -36,6 +37,73 @@ class CargoBudgetTests(unittest.TestCase):
         with contextlib.redirect_stderr(output):
             rc = budget.supervise([sys.executable, '-c', source], [self.target], **options)
         return rc, output.getvalue()
+
+    def make_profile(self, name, megabytes):
+        directory = self.target / name
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / 'artifact').write_bytes(b'\0' * (megabytes * 1024 * 1024))
+        return directory
+
+    def test_a_release_build_is_not_refused_because_debug_grew(self):
+        """AMUX-4945. The second half of the 2026-09-22 deploy deadlock.
+
+        rust-auto-build.sh only ever builds --release. Measured that day: total
+        72GB, debug/ 66GB, release/ 1.4GB, free disk 103GB throughout. A release
+        build needing ~1.4GB of warm cache was refused because a profile it
+        neither reads nor writes had grown large, and the refusal could never
+        clear itself: refusing a build does not shrink debug/.
+        """
+        self.make_profile('debug', 4)
+        self.make_profile('release', 1)
+
+        rc, log = self.run_budget('import sys; sys.exit(0)',
+                                  max_target=2 * 1024**2, profile='release')
+        self.assertEqual(rc, 0, 'a release build must not be refused for debug/: ' + log)
+
+        # The CONTROL, and the half that must not rot: the budget still refuses
+        # when the profile THIS build uses is the one over the limit. Without
+        # this, gating on nothing at all would satisfy the assertion above.
+        rc, log = self.run_budget('import sys; sys.exit(0)',
+                                  max_target=2 * 1024**2, profile='debug')
+        self.assertEqual(rc, 75, 'an over-budget debug build must still refuse: ' + log)
+        self.assertIn('"reason": "target_size"', log)
+
+    def test_an_over_budget_total_is_announced_and_names_the_dominant_profile(self):
+        """`reason='target_size'` named the symptom and could not say WHICH.
+
+        An operator could not tell "your build is too big" from "someone else's
+        test artifacts are too big". The total being over budget is real and
+        wants a RECLAIM, so passing silently would hide a growing directory the
+        way the old refusal hid which directory.
+        """
+        self.make_profile('debug', 4)
+        self.make_profile('release', 1)
+        rc, log = self.run_budget('import sys; sys.exit(0)',
+                                  max_target=2 * 1024**2, profile='release')
+        self.assertEqual(rc, 0, log)
+        scoped = [json.loads(line) for line in log.splitlines()
+                  if '"cargo_budget_profile_scoped"' in line]
+        self.assertEqual(len(scoped), 1, 'the over-budget total must be announced: ' + log)
+        self.assertEqual(scoped[0]['dominant'], 'debug')
+        self.assertEqual(scoped[0]['profile'], 'release')
+        self.assertGreater(scoped[0]['total_bytes'], scoped[0]['profile_bytes'])
+        self.assertIn('debug', scoped[0]['by_profile'])
+
+    def test_profile_dir_reads_the_subdirectory_cargo_will_actually_use(self):
+        """Pure, so the mapping is pinned without building anything."""
+        self.assertEqual(budget.profile_dir(['cargo', 'build', '--release']), 'release')
+        self.assertEqual(budget.profile_dir(['cargo', 'build', '-r']), 'release')
+        self.assertEqual(budget.profile_dir(['cargo', 'test']), 'debug')
+        self.assertEqual(budget.profile_dir(['cargo', 'build', '--profile=bench']), 'bench')
+        self.assertEqual(budget.profile_dir(['cargo', 'build', '--profile', 'bench']), 'bench')
+        # cargo writes the `dev` profile to debug/, which is the one name where
+        # the flag and the directory disagree.
+        self.assertEqual(budget.profile_dir(['cargo', 'build', '--profile', 'dev']), 'debug')
+        self.assertEqual(budget.profile_dir(['/usr/local/bin/cargo', 'build']), 'debug')
+        # NOT a cargo command: gate on the whole directory, which is the old
+        # behaviour and the safe direction to be wrong in.
+        self.assertIsNone(budget.profile_dir(['python3', '-c', 'pass']))
+        self.assertIsNone(budget.profile_dir([]))
 
     def test_success_and_failure_exit_codes_survive(self):
         for expected in (0, 7):
@@ -172,10 +240,10 @@ class CargoBudgetTests(unittest.TestCase):
         real = budget.disk_usage
         calls = []
 
-        def once_then_timeout(targets):
+        def once_then_timeout(targets, profile=None):
             calls.append(1)
             if len(calls) == 1:
-                return real(targets)
+                return real(targets, profile)
             raise subprocess.TimeoutExpired(['du'], 20)
 
         with patch.object(budget, 'disk_usage', side_effect=once_then_timeout):
@@ -344,6 +412,79 @@ class CargoBudgetTests(unittest.TestCase):
         self.assertIn('must be a positive integer', invalid.stderr)
 
 
+    def run_wrapper(self, host_mb, **extra):
+        bindir = self.base / 'bin'
+        bindir.mkdir(exist_ok=True)
+        fake = bindir / 'cargo'
+        fake.write_text('#!' + sys.executable + '\nimport os,json\nprint(json.dumps({k:v for k,v in os.environ.items() if k.startswith("AMUX_CARGO_")}))\n')
+        fake.chmod(0o755)
+        env = {k:v for k,v in os.environ.items() if not k.startswith(('CARGO_', 'AMUX_CARGO_', 'RUST_TEST_'))}
+        env.update(HOME=str(self.base), PATH=str(bindir) + os.pathsep + os.environ['PATH'],
+                   AMUX_CARGO_HOST_MB=str(host_mb), **extra)
+        result = subprocess.run(['bash', str(ROOT / 'safe-cargo.sh'), 'check'], env=env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout), result.stderr
+
+    def test_a_small_host_runs_one_build_capped_below_its_memory(self):
+        data, err = self.run_wrapper(7745)
+        self.assertEqual(data['AMUX_CARGO_MAX_CONCURRENT'], '1')
+        self.assertIn('verdict=cargo_host_sized measured=true', err)
+        # 70% of 7745 MB. Under systemd the kernel holds RAM to that and the
+        # sampled budget backs it up at RAM plus swap.
+        if 'verdict=cargo_scope_capped' in err:
+            self.assertIn('kernel stops the build at 6583 MB RAM + 2710 MB swap', err)
+            rss = 5421 * 3 // 2
+        else:
+            rss = 5421
+        self.assertEqual(data['AMUX_CARGO_MAX_RSS_MB'], str(rss))
+        self.assertIn('"max_rss_bytes": %d' % (rss * 1024**2), err)
+
+    def test_a_large_host_keeps_two_builds_and_the_12_gb_ceiling(self):
+        data, err = self.run_wrapper(65536)
+        self.assertNotIn('AMUX_CARGO_MAX_CONCURRENT', data)
+        self.assertEqual(data['AMUX_CARGO_MAX_RSS_MB'], '18432' if 'cargo_scope_capped' in err else '12288')
+
+    def test_an_explicit_setting_outranks_the_host_size(self):
+        data, err = self.run_wrapper(7745, AMUX_CARGO_MAX_CONCURRENT='3', AMUX_CARGO_MAX_RSS_MB='2048')
+        self.assertEqual(data['AMUX_CARGO_MAX_CONCURRENT'], '3')
+        self.assertEqual(data['AMUX_CARGO_MAX_RSS_MB'], '3072' if 'cargo_scope_capped' in err else '2048')
+
+    @unittest.skipUnless(Path('/proc/self/oom_score_adj').exists(), 'Linux only')
+    @unittest.skipUnless(os.path.isdir('/run/systemd/system') and shutil.which('systemd-run'),
+                         'needs a systemd user session (Linux)')
+    def test_a_build_past_its_budget_finishes_and_a_runaway_is_named_oom_killed(self):
+        # The sandbox's deploy link is one 5.5 GB rustc on a 7.7 GB host, past
+        # the 70% budget; the kill line used to sit at that budget and failed
+        # every deploy (2026-10-28). Scaled down to a 512 MB "host": budget
+        # 358 MB, killed at 435 MB of RAM plus 179 MB of swap.
+        def build(megabytes):
+            bindir = self.base / 'bin'
+            bindir.mkdir(exist_ok=True)
+            fake = bindir / 'cargo'
+            fake.write_text('#!' + sys.executable + '\nimport subprocess,sys\n'
+                            'sys.exit(101 if subprocess.run([sys.executable, "-c", '
+                            '"b = bytearray(%d * 1024 * 1024); b[::4096] = b\'x\' * len(b[::4096])"]).returncode else 0)\n' % megabytes)
+            fake.chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if not k.startswith(('CARGO_', 'AMUX_CARGO_', 'RUST_TEST_'))}
+            env.update(HOME=str(self.base), PATH=str(bindir) + os.pathsep + os.environ['PATH'], AMUX_CARGO_HOST_MB='512')
+            return subprocess.run(['bash', str(ROOT / 'safe-cargo.sh'), 'check'], env=env,
+                                  capture_output=True, text=True, timeout=120)
+        past_budget = build(380)
+        self.assertIn('kernel stops the build at 435 MB RAM + 179 MB swap', past_budget.stderr)
+        self.assertEqual(past_budget.returncode, 0, past_budget.stderr)
+        self.assertNotIn('cargo_oom_killed', past_budget.stderr)
+        runaway = build(1200)
+        self.assertNotEqual(runaway.returncode, 0)
+        self.assertIn('"verdict": "cargo_oom_killed"', runaway.stderr, 'the log must say the kernel killed it')
+
+    def test_the_build_is_the_first_thing_the_kernel_kills(self):
+        seen = self.base / 'adj'
+        rc, _ = self.run_budget("open(%r, 'w').write(open('/proc/self/oom_score_adj').read())" % str(seen))
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen.read_text().strip(), '900')
+
+
 class BuildRetryTests(unittest.TestCase):
     def test_normal_workspace_cache_is_kept_and_oversized_cache_is_selected(self):
         with tempfile.TemporaryDirectory(prefix='amux-budget-cache.') as directory:
@@ -361,13 +502,14 @@ class BuildRetryTests(unittest.TestCase):
                 AMUX_RS_DISK_CLEAR_ONLY='1', AMUX_RS_DISK_CLEAR_DRYRUN='1',
                 AMUX_RS_BUILD_LOG=str(base / 'build.log'))
             env.pop('AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB', None)
-            for gb in (20, 33):
+            # 36G is one warm workspace test build: it must survive.
+            for gb in (20, 36, 45):
                 (base / 'build.log').unlink(missing_ok=True)
                 subprocess.run(['bash', str(ROOT / 'rust-auto-build.sh')],
                                env=env | dict(FIXTURE_TARGET_KB=str(gb * 1024**2)),
                                check=True, capture_output=True, timeout=20)
                 log = (base / 'build.log').read_text()
-                self.assertEqual('DEBUG ARTIFACTS' in log, gb > 32, log)
+                self.assertEqual('DEBUG ARTIFACTS' in log, gb > 44, log)
                 self.assertEqual(marker.read_text(), 'warm cache')
 
     def test_failed_inputs_back_off_changed_inputs_retry_and_success_clears(self):
@@ -393,7 +535,9 @@ class BuildRetryTests(unittest.TestCase):
             commit()
             env = os.environ | dict(HOME=str(base), AMUX_REPO=str(repo), ATTEMPTS=str(trace),
                 AMUX_RS_BUILD_STAMP=str(base / 'stamp'), AMUX_RS_BUILD_LOG=str(base / 'build.log'),
-                AMUX_RS_ACTIVATION_REF='HEAD', AMUX_BUILD_MIN_FREE_GB='0', AMUX_BUILD_FAILURE_RETRY_SECS='900')
+                AMUX_RS_ACTIVATION_REF='HEAD', AMUX_BUILD_MIN_FREE_GB='0', AMUX_BUILD_FAILURE_RETRY_SECS='900',
+                # The stub server is a few bytes; bfc81b6d5 refuses one under 1 MB.
+                AMUX_DEPLOY_MIN_BIN_BYTES='0')
             def run():
                 subprocess.run(['bash', str(ROOT / 'rust-auto-build.sh')], env=env,
                                check=True, capture_output=True, timeout=30)
@@ -409,7 +553,9 @@ class BuildRetryTests(unittest.TestCase):
             self.assertEqual(trace.read_text().count('attempt'), 2)
             # Changed actual build inputs retry immediately, then reset failure.
             source.write_text('fixed')
-            stub.write_text('#!/bin/sh\necho attempt >> "$ATTEMPTS"\nmkdir -p "$CARGO_TARGET_DIR/release"\nprintf "#!/bin/sh\\nexit 0\\n" > "$CARGO_TARGET_DIR/release/amux-server"\nchmod +x "$CARGO_TARGET_DIR/release/amux-server"\n')
+            # Output dir the way cargo picks it: --profile NAME, else --release
+            # (the builder moved to --profile deploy in 217d7243).
+            stub.write_text('#!/bin/sh\necho attempt >> "$ATTEMPTS"\nout=release; prev=\nfor a in "$@"; do [ "$prev" = --profile ] && out="$a"; prev="$a"; done\nmkdir -p "$CARGO_TARGET_DIR/$out"\nprintf "#!/bin/sh\\nexit 0\\n" > "$CARGO_TARGET_DIR/$out/amux-server"\nchmod +x "$CARGO_TARGET_DIR/$out/amux-server"\n')
             commit()
             run()
             self.assertEqual(trace.read_text().count('attempt'), 3)

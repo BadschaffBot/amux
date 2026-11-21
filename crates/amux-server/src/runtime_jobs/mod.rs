@@ -25,21 +25,17 @@
 //! DB row. If you find yourself wanting a hybrid, one of the two lists above
 //! tells you which properties your job actually needs.
 //!
-//! # DUAL-SCHEDULER SAFETY (critical while the strangler fig is live)
+//! # Firing and shadow mode
 //!
-//! The Python server on :8822 keeps running and OWNS schedule firing. Both
-//! servers read/write the SAME `schedules` / `schedule_runs` rows, so two
-//! live firing loops would double-deliver every schedule. Therefore:
+//! The Python server that once owned schedule firing is gone (792ce1f), so
+//! the Rust firing loop is ON by default. `AMUX_RS_SCHEDULER=0` (or
+//! `false`/`off`/`no`) selects SHADOW MODE:
 //!
-//! - The Rust firing loop ships DISABLED. `AMUX_RS_SCHEDULER=1` in the
-//!   environment enables real firing; anything else means SHADOW MODE.
 //! - In shadow mode [`scheduler::run_scheduler`] still computes next-run
 //!   times and, for every schedule that comes due, records what it WOULD
 //!   have fired as an `_amux_state_events` row with entity type
 //!   `Other("schedule_shadow")` — one event per (schedule, occurrence),
-//!   deduped in memory. It touches NEITHER `schedules` nor `schedule_runs`,
-//!   so Python's loop is entirely undisturbed. Phase 11 validation compares
-//!   these shadow events against Python's actual `schedule_runs` fires.
+//!   deduped in memory. It touches NEITHER `schedules` nor `schedule_runs`.
 //! - The CRUD API (`api::schedules`) is always live — creates, edits,
 //!   deletes and audit rows are shared state both servers agree on. The ONE
 //!   exception is run-now: with firing disabled it answers 409
@@ -51,34 +47,77 @@ pub mod autofix;
 pub mod board_drain;
 pub mod board_drive;
 pub mod board_hygiene;
-pub mod message_capture;
+pub mod browser_login_sync;
+pub mod connector_maintenance;
+pub mod social_metrics;
+pub mod social_publish;
 pub mod browser_reaper;
+pub mod search_ingest;
+pub mod computer_reaper;
+pub mod zombie_reaper;
+pub mod capture_reconcile;
 pub mod cdc_poller;
 pub mod codex_ledger;
-pub mod gemini_ledger;
 pub mod commit_mention_notes;
 pub mod context_health;
-pub mod status_history;
+pub mod subscription_relaunch;
+pub mod converse_retention;
+pub mod contract_watch;
+pub mod land_queue;
+pub mod deploy_wake;
+pub mod memory_dream;
 pub mod disk_watch;
+pub mod decision_digest;
+pub mod directive;
+pub mod email_approval_digest;
+pub mod email_scheduled_send;
+pub mod needs_input_auto;
 pub(crate) mod executor;
+pub mod gemini_ledger;
 pub mod heartbeat;
+pub mod goal_check;
+pub mod goal_keeper;
+pub mod task_titles;
+pub mod desc_refresh;
+pub mod email_events;
+pub mod linkedin_events;
+pub mod event_dispatch;
+pub mod host_guard;
 pub mod host_metrics;
+mod log_retention;
 pub mod mac_health;
 mod memory_consumers;
+pub mod message_capture;
+pub mod model_catalog_refresh;
 pub mod pane_size;
+pub mod worktree_hygiene;
+mod poll_watch;
 /// The live registry of the jobs below — see [`registry`] for why it is
 /// derived from the spawn sites rather than declared alongside them.
+pub mod receipts;
 pub mod recordings_transcribe;
+pub mod recordings_live;
 pub mod registry;
-mod poll_watch;
 pub mod scheduler;
+pub mod shell_detached;
+pub mod schedule_failure;
+pub mod schedule_wake;
+/// Owner card for queued messages held behind a composer draft (called from
+/// the steering loop, not a periodic job of its own).
+pub mod draft_hold;
+pub mod schedule_check;
+pub mod schedule_lifecycle;
+pub mod episodes;
+pub mod status_history;
 pub mod storage;
-mod log_retention;
+pub mod trace_archive;
+pub mod ledger_checkpoint;
 pub mod tailnet_watch;
 pub mod telegram_poll;
 pub mod telegram_relay;
-pub mod tunnel;
 pub mod token_ledger;
+pub mod tunnel;
+pub mod worker_resources;
 
 pub use scheduler::{
     firing_enabled, run_scheduler, scheduler_tick, DueRuns, DurableSchedule, ExprParseError,
@@ -194,7 +233,11 @@ pub(crate) fn fleet_isolation_reason(name: &str) -> Option<String> {
 /// [`spawn_periodic`] with a raw `Duration`, for sub-second internal ticks
 /// (and for tests, which drive real ~tens-of-ms intervals — the workspace
 /// tokio has no `test-util`, so there is no paused clock to lean on).
-pub fn spawn_periodic_every<F, Fut>(name: impl Into<String>, interval: Duration, mut f: F) -> PeriodicTask
+pub fn spawn_periodic_every<F, Fut>(
+    name: impl Into<String>,
+    interval: Duration,
+    mut f: F,
+) -> PeriodicTask
 where
     F: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -225,7 +268,11 @@ where
         // makes the job visible. Kept as a completed handle so PeriodicTask's
         // shape is unchanged for callers.
         let handle = tokio::spawn(async {});
-        return PeriodicTask { name, interval, handle };
+        return PeriodicTask {
+            name,
+            interval,
+            handle,
+        };
     }
 
     // VISIBILITY IS NOT OPTIONAL, and it is not the job's responsibility.
@@ -237,8 +284,9 @@ where
     // recorded by the SPAWNER: a job cannot forget to report, and cannot
     // report a tick it did not run. See registry's docs for the three loops
     // that were dead for hours with nothing visible anywhere.
+    registry::register(&name, "periodic", Some(interval), None);
     let job_id = name.clone();
-    let handle = executor::spawn(async move {
+    let handle = executor::spawn_for(&name, async move {
         let mut tick = tokio::time::interval(interval);
         // Delay, not Burst: a run that overshoots must not be "paid back"
         // with a rapid-fire catch-up volley (the spin-catcher lesson — a
@@ -269,11 +317,15 @@ where
                 }
             }
             registry::tick_start(&job_id);
-            poll_watch::watch(&job_id, f()).await;
-            registry::tick_end(&job_id);
+            if registry::guard_job(&job_id, async { poll_watch::watch(&job_id, f()).await }).await {
+                registry::tick_end(&job_id);
+            } else {
+                let failures = registry::snapshot().iter().find(|j| j.id == job_id).map(|j| j.consecutive_failures).unwrap_or(1);
+                tokio::time::sleep(registry::recovery_delay(interval, failures)).await;
+            }
         }
     });
-    registry::register(&name, "periodic", Some(interval), Some(handle.abort_handle()));
+    registry::set_abort(&name, handle.abort_handle());
     PeriodicTask {
         name,
         interval,
@@ -284,6 +336,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn periodic_consumer_recovers_constructor_and_poll_panics_without_losing_its_registry() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let job = spawn_periodic_every("supervision-periodic-test", Duration::from_millis(20), move || {
+            let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_ne!(n, 0, "injected constructor failure");
+            async move { assert_ne!(n, 1, "injected poll failure"); }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry::snapshot().iter().any(|r| r.id == "supervision-periodic-test" && r.recoveries == 1) { break; }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        let row = registry::snapshot().into_iter().find(|r| r.id == "supervision-periodic-test").unwrap();
+        assert_eq!((row.failures, row.consecutive_failures, row.recoveries), (2, 0, 1));
+        assert!(!job.is_finished());
+        job.abort();
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -343,8 +417,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let nf = fast.load(Ordering::SeqCst);
         let ns = slow.load(Ordering::SeqCst);
-        assert!(nf >= 8, "fast task starved by slow one: {nf} ticks in 400ms");
-        assert!((1..=2).contains(&ns), "slow task should be mid-first-run: {ns}");
+        assert!(
+            nf >= 8,
+            "fast task starved by slow one: {nf} ticks in 400ms"
+        );
+        assert!(
+            (1..=2).contains(&ns),
+            "slow task should be mid-first-run: {ns}"
+        );
         tf.abort();
         ts.abort();
     }
@@ -376,6 +456,8 @@ mod tests {
             ("heartbeat.rs", include_str!("heartbeat.rs")),
             ("status_history.rs", include_str!("status_history.rs")),
             ("board_hygiene.rs", include_str!("board_hygiene.rs")),
+            ("email_events.rs", include_str!("email_events.rs")),
+            ("linkedin_events.rs", include_str!("linkedin_events.rs")),
         ];
         // The control first: this cell is worthless unless the literal it looks
         // for is one these files COULD contain, so prove the deriver produces
@@ -389,8 +471,10 @@ mod tests {
                 continue;
             }
             let stem = name.trim_end_matches(".rs");
-            let mut cands: Vec<String> =
-                vec![per_job_disable_var(&stem.replace('_', "-")), per_job_disable_var(stem)];
+            let mut cands: Vec<String> = vec![
+                per_job_disable_var(&stem.replace('_', "-")),
+                per_job_disable_var(stem),
+            ];
             cands.sort();
             cands.dedup();
             for cand in cands {
@@ -412,7 +496,10 @@ mod tests {
         // with '-' turned into '_'. These two are the fleet-driving jobs AF-69
         // exists to keep a test server from running.
         assert_eq!(per_job_disable_var("pane_size"), "AMUX_PANE_SIZE_SECS");
-        assert_eq!(per_job_disable_var("ghost-rescue"), "AMUX_GHOST_RESCUE_SECS");
+        assert_eq!(
+            per_job_disable_var("ghost-rescue"),
+            "AMUX_GHOST_RESCUE_SECS"
+        );
     }
 
     /// The isolation predicate WITH its negative controls, exercised without
@@ -448,7 +535,8 @@ mod tests {
         // is "off", not "on"), and a non-0 interval must NOT disable - otherwise
         // AMUX_BOARD_DRIVE_SECS=20 would silently kill a healthy loop.
         assert_eq!(
-            isolation_reason_with("pane_size", |k| (k == "AMUX_ISOLATED").then(|| "0".to_string())),
+            isolation_reason_with("pane_size", |k| (k == "AMUX_ISOLATED")
+                .then(|| "0".to_string())),
             None
         );
         assert_eq!(
@@ -517,7 +605,10 @@ mod tests {
             .find(|s| s.id == name)
             .expect("an isolated job must still appear in /api/system-jobs");
         assert_eq!(row.ticks, 0);
-        assert_eq!(row.disabled_reason.as_deref(), Some("AMUX_AF69_ISOLATED_PROBE_SECS=0"));
+        assert_eq!(
+            row.disabled_reason.as_deref(),
+            Some("AMUX_AF69_ISOLATED_PROBE_SECS=0")
+        );
 
         iso.abort();
         std::env::remove_var(&var);

@@ -7,7 +7,11 @@ test('LC-CREATE-FOCUS: delayed dialog focus cannot redirect directory text into 
     (window as any).openCreate();
     const name=document.getElementById('create-name') as HTMLInputElement;
     name.value='lc-focus-worker';
-    (document.getElementById('create-dir') as HTMLInputElement).focus();
+    // The dialog seeds this from the Files tab's folder, which an earlier spec
+    // in the same shard may have set: this test is about focus, not that seed.
+    const dir=document.getElementById('create-dir') as HTMLInputElement;
+    dir.value='';
+    dir.focus();
   });
   await page.clock.fastForward(150);
   await expect(page.locator('#create-dir')).toBeFocused();
@@ -18,7 +22,12 @@ test('LC-CREATE-FOCUS: delayed dialog focus cannot redirect directory text into 
 
 test('LC-NAVIGATION: choosing a main tab cancels a delayed restoration of the old worker',async({page})=>{
   await boot(page);
+  // Paused, not just installed: an installed clock still runs at wall speed, so
+  // on a slow WebKit the 200ms restore fired before the click landed and the
+  // opened overlay (correctly) covered the tab bar. Pausing makes the click
+  // land inside the delay, which is the case this test names (AMUX-5373).
   await page.clock.install();
+  await page.clock.pauseAt(Date.now()+1000);
   await page.evaluate(()=>{
     sessionStorage.setItem('peekState',JSON.stringify({session:'lc-old-worker',tab:'terminal'}));
     (window as any)._restoreScreen();

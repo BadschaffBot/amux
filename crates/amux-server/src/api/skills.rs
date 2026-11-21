@@ -21,15 +21,16 @@ pub fn routes() -> Router<AppState> {
     // (app.js:23784, 23799) against a GET-only route, so Save toasted "Save
     // failed" and Delete did nothing — a dead editor, shipped and unnoticed
     // because a 405 in a fetch is silent unless someone reads the toast.
-    Router::new()
-        .route("/", get(list_skills))
-        .route("/{name}", get(get_skill).post(save_skill).delete(delete_skill))
+    Router::new().route("/", get(list_skills)).route("/usage", get(skill_usage)).route(
+        "/{name}",
+        get(get_skill).post(save_skill).delete(delete_skill),
+    ).route("/{name}/examples", get(super::skill_examples::get_examples))
 }
 
 /// Shared name rule — one predicate, three handlers. `get_skill` had it
 /// inline; a second copy in each writer is how the read and the write start
 /// disagreeing about what a valid name is.
-fn bad_name(name: &str) -> bool {
+pub(super) fn bad_name(name: &str) -> bool {
     name.is_empty() || name.contains('/') || name.contains("..")
 }
 
@@ -57,6 +58,83 @@ fn frontmatter_fields(text: &str) -> (String, String) {
     (desc, hint)
 }
 
+/// GET /api/skills/usage[?days=N]: how often each skill was invoked, from
+/// Claude Code transcripts (the model's Skill calls and typed slash commands;
+/// AMUX-5340). `n` is all time, `recent` the last `days` (default 30). Keys are
+/// the bare name, lowercase, no leading slash. Each skill also carries
+/// `workers` (window counts by amux worker) and the response carries `daily`
+/// (window counts per UTC day, zero-filled) for the Skills tab's chart.
+async fn skill_usage(State(state): State<AppState>, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> Response {
+    let days: i64 = q.get("days").and_then(|d| d.parse().ok()).filter(|d: &i64| *d > 0).unwrap_or(30).min(366);
+    let since = chrono::Utc::now().timestamp() - days * 86_400;
+    let read = state.store.read_async(move |conn| {
+        let backfill: Option<String> = conn
+            .query_row("SELECT value FROM prefs WHERE key='skill_usage_backfill_v1'", [], |r| r.get(0))
+            .ok();
+        let mut st = conn.prepare(
+            "SELECT skill, COUNT(*), SUM(ts >= ?1), SUM(source='model'), SUM(source='user'), MAX(ts) \
+             FROM skill_usage GROUP BY skill",
+        )?;
+        let rows = st
+            .query_map([since], |r| {
+                Ok((r.get::<_, String>(0)?, json!({
+                    "n": r.get::<_, i64>(1)?, "recent": r.get::<_, i64>(2)?,
+                    "model": r.get::<_, i64>(3)?, "user": r.get::<_, i64>(4)?, "last_ts": r.get::<_, i64>(5)?,
+                })))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows: serde_json::Map<String, serde_json::Value> = rows.into_iter().collect();
+        // Per-worker counts inside the window, for the Skills tab's worker
+        // filter. `session` is empty for invocations backfilled from
+        // transcripts that predate per-worker capture; that bucket stays ""
+        // so the filter can say "unattributed" rather than hide it.
+        let mut st = conn.prepare(
+            "SELECT skill, session, COUNT(*) FROM skill_usage WHERE ts >= ?1 GROUP BY skill, session",
+        )?;
+        let per = st
+            .query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (skill, session, n) in per {
+            if let Some(obj) = rows.get_mut(&skill).and_then(|v| v.as_object_mut()) {
+                let w = obj.entry("workers").or_insert_with(|| json!({}));
+                w[session] = json!(n);
+            }
+        }
+        // Invocations per UTC day across the window, zero-filled so a quiet
+        // day reads as 0 rather than as a missing bar. The first bucket is
+        // the (partial) day containing `since`, so the series sums to exactly
+        // the per-skill `recent` counts above.
+        let mut st = conn.prepare(
+            "SELECT ts / 86400, COUNT(*) FROM skill_usage WHERE ts >= ?1 GROUP BY ts / 86400",
+        )?;
+        let by_day: std::collections::HashMap<i64, i64> = st
+            .query_map([since], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let today = chrono::Utc::now().timestamp() / 86_400;
+        let daily: Vec<serde_json::Value> = ((since / 86_400)..=today)
+            .map(|d| {
+                let date = chrono::DateTime::from_timestamp(d * 86_400, 0)
+                    .map(|t| t.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                json!({"day": date, "n": by_day.get(&d).copied().unwrap_or(0)})
+            })
+            .collect();
+        Ok((backfill, rows, daily))
+    }).await;
+    match read {
+        Ok((backfill, rows, daily)) => Json(json!({
+            "measured": true,
+            "n_considered": rows.len(),
+            "window_days": days,
+            "backfill": backfill,
+            "daily": daily,
+            "skills": rows,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"measured": false, "why_unmeasured": e.to_string()}))).into_response(),
+    }
+}
+
 async fn list_skills(State(state): State<AppState>) -> Response {
     let conn = match state.store.read() {
         Ok(c) => c,
@@ -64,23 +142,56 @@ async fn list_skills(State(state): State<AppState>) -> Response {
     };
     // Tolerate the table being absent (a fresh Rust-only AMUX_HOME): an
     // empty list is the truthful answer, not a 500.
-    let mut out = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT name, content FROM skills ORDER BY name") {
-        if let Ok(rows) =
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        {
-            for (name, content) in rows.flatten() {
-                let (description, hint) = frontmatter_fields(&content);
-                out.push(json!({ "name": name, "description": description, "hint": hint }));
+    let rows = table_skill_rows(&conn);
+    // Release the reader before the per-skill file stats below.
+    drop(conn);
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|(name, content, created)| {
+            let (description, hint) = frontmatter_fields(&content);
+            let mut times = command_file_times(&name);
+            // The table knows when the skill was first saved; the file does
+            // not (temp + rename resets its birth time on every save).
+            if created > 0 {
+                times.insert("created_at".into(), json!(created));
+            } else {
+                times.remove("created_at");
             }
-        }
-    }
+            with_times(json!({ "name": name, "description": description, "hint": hint }), times)
+        })
+        .collect();
     Json(serde_json::Value::Array(out)).into_response()
+}
+
+/// The Skills tab's Save: an upsert whose `created` is set on the first save
+/// only, so an edit keeps the skill's creation time.
+const SAVE_SKILL_SQL: &str = "INSERT INTO skills (name, content, created) VALUES (?1, ?2, CAST(strftime('%s','now') AS INTEGER)) \
+     ON CONFLICT(name) DO UPDATE SET content=excluded.content";
+
+/// (name, content, created) for every table skill. `created` is 0 when the
+/// skill predates the column, or on a table without it.
+fn table_skill_rows(conn: &rusqlite::Connection) -> Vec<(String, String, i64)> {
+    let with = conn.prepare("SELECT name, content, created FROM skills ORDER BY name").and_then(|mut s| {
+        s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    });
+    if let Ok(rows) = with {
+        return rows;
+    }
+    conn.prepare("SELECT name, content FROM skills ORDER BY name")
+        .and_then(|mut s| {
+            s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, 0i64)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default()
 }
 
 async fn get_skill(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     if name.is_empty() || name.contains('/') {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid name" })))
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid name" })),
+        )
             .into_response();
     }
     let conn = match state.store.read() {
@@ -88,7 +199,9 @@ async fn get_skill(State(state): State<AppState>, Path(name): Path<String>) -> R
         Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     };
     let row: Option<String> = conn
-        .query_row("SELECT content FROM skills WHERE name=?1", [&name], |r| r.get(0))
+        .query_row("SELECT content FROM skills WHERE name=?1", [&name], |r| {
+            r.get(0)
+        })
         .ok();
     match row {
         Some(content) => Json(json!({ "name": name, "content": content })).into_response(),
@@ -154,21 +267,214 @@ const BUILTIN_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/voice", "Toggle voice dictation"),
 ];
 
-fn command_dirs() -> Vec<std::path::PathBuf> {
-    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+/// Claude Code's config directory: `CLAUDE_CONFIG_DIR` when set (Claude Code
+/// reads it the same way), else `~/.claude`. The e2e harness sets it so a
+/// test that saves a skill never writes into the developer's real commands.
+fn claude_config_dir() -> std::path::PathBuf {
+    match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(d) if !d.trim().is_empty() => std::path::PathBuf::from(d),
+        _ => std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude"),
+    }
+}
+
+/// When the skill's command file was created and last edited (unix seconds),
+/// for the Skills tab's "Recently created/edited" sorts. Creation time is the
+/// filesystem's birth time where it records one; otherwise only `modified_at`
+/// is known and `created_at` is absent rather than guessed.
+fn file_times(path: &std::path::Path) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let secs = |t: std::io::Result<std::time::SystemTime>| {
+        t.ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+    };
+    if let Ok(md) = std::fs::metadata(path) {
+        if let Some(c) = secs(md.created()) {
+            out.insert("created_at".into(), json!(c));
+        }
+        if let Some(m) = secs(md.modified()) {
+            out.insert("modified_at".into(), json!(m));
+        }
+    }
+    out
+}
+
+fn command_file_times(name: &str) -> serde_json::Map<String, Value> {
+    command_dirs()
+        .into_iter()
+        .map(|d| d.join(format!("{name}.md")))
+        .find(|p| p.exists())
+        .map(|p| file_times(&p))
+        .unwrap_or_default()
+}
+
+/// Merge extra keys into a JSON object row.
+fn with_times(mut row: Value, times: serde_json::Map<String, Value>) -> Value {
+    if let Some(obj) = row.as_object_mut() {
+        obj.extend(times);
+    }
+    row
+}
+
+pub(super) fn command_dirs() -> Vec<std::path::PathBuf> {
     vec![
-        home.join(".claude").join("commands"),
-        std::path::PathBuf::from(".").join(".claude").join("commands"),
+        claude_config_dir().join("commands"),
+        std::path::PathBuf::from(".")
+            .join(".claude")
+            .join("commands"),
     ]
 }
 
-async fn list_slash_commands() -> Response {
+/// Where a skill saved in the Skills tab becomes runnable. Claude Code reads
+/// `/name` from `~/.claude/commands/<name>.md`, never from the amux `skills`
+/// table, so a skill that only lived in the table could be edited in the UI
+/// but neither offered in the composer's `/` list nor run (AA-40).
+pub(crate) fn user_commands_dir() -> std::path::PathBuf {
+    command_dirs().swap_remove(0)
+}
+
+/// Write `<dir>/<name>.md` through a temp file and a rename, so Claude Code
+/// never reads a half-written command.
+pub(crate) fn write_command_file(
+    dir: &std::path::Path,
+    name: &str,
+    content: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{name}.md"));
+    let tmp = dir.join(format!(".{name}.md.amux-tmp"));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Boot reconcile: every table skill with no command file gets one. Create
+/// only: an existing file may carry edits made outside amux, and the table
+/// does not know which copy is newer. Returns (created, considered).
+pub(crate) fn materialize_missing(
+    conn: &rusqlite::Connection,
+    dir: &std::path::Path,
+) -> (usize, usize) {
+    let Ok(mut stmt) = conn.prepare("SELECT name, content FROM skills") else {
+        return (0, 0);
+    };
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    else {
+        return (0, 0);
+    };
+    let (mut created, mut considered) = (0, 0);
+    for (name, content) in rows.flatten() {
+        considered += 1;
+        if bad_name(&name) || dir.join(format!("{name}.md")).exists() {
+            continue;
+        }
+        match write_command_file(dir, &name, &content) {
+            Ok(_) => created += 1,
+            Err(e) => tracing::warn!(skill = %name, error = %e, verdict = "skill_command_file_unwritten",
+                "a Skills-tab skill has no command file, so Claude Code cannot run it"),
+        }
+    }
+    (created, considered)
+}
+
+/// Skills amux itself ships, from the repo's `skills/` (Ethan, 2026-10-24:
+/// "a skill that is baked into amux which can be used for anybody"). Every
+/// install gets them as Claude Code commands without copying a file by hand.
+///
+/// Ethan, 2026-10-27: "add these skills to amux core": slop, iterate, codex,
+/// muse, imessage, pr-merge, e2e-test, and the new worker-audit.
+pub(crate) const SHIPPED_COMMANDS: &[(&str, &str)] = &[
+    ("amux-contribute", include_str!("../../../../skills/amux-contribute.md")),
+    ("slop", include_str!("../../../../skills/slop.md")),
+    ("iterate", include_str!("../../../../skills/iterate.md")),
+    ("codex", include_str!("../../../../skills/codex.md")),
+    ("muse", include_str!("../../../../skills/muse.md")),
+    ("imessage", include_str!("../../../../skills/imessage.md")),
+    ("pr-merge", include_str!("../../../../skills/pr-merge.md")),
+    ("e2e-test", include_str!("../../../../skills/e2e-test.md")),
+    ("worker-audit", include_str!("../../../../skills/worker-audit.md")),
+    // Ethan, 2026-11-03: "an amux-wide skill that sets up the scaffolding ...
+    // for any large goal".
+    ("big-goal", include_str!("../../../../skills/big-goal.md")),
+    // Ethan, 2026-11-05: "amux tools are the default for any sort of
+    // publishing of apps/pages". A skill reaches isolated workers too, which
+    // get no launch rules and so never see worker_links_guide.
+    ("amux-publish", include_str!("../../../../skills/amux-publish.md")),
+    // Governance PR 21: access reviews, evidence packs and incident timelines
+    // from the ledger, traces and commits. Read-only; it recommends.
+    ("compliance", include_str!("../../../../skills/compliance.md")),
+];
+
+/// The frontmatter line that lets amux keep a shipped command current. A user
+/// who edits their copy deletes it, and from then on the copy is theirs.
+const MANAGED_MARKER: &str = "amux-managed: true";
+
+/// Boot install of SHIPPED_COMMANDS: write each one that is missing, or that
+/// still carries MANAGED_MARKER and differs from this build's copy. A file
+/// without the marker is never touched. Returns (written, considered).
+pub(crate) fn install_shipped(dir: &std::path::Path, shipped: &[(&str, &str)]) -> (usize, usize) {
+    let mut written = 0;
+    for (name, content) in shipped {
+        let path = dir.join(format!("{name}.md"));
+        let write = match std::fs::read_to_string(&path) {
+            Err(_) => true,
+            Ok(cur) => cur != *content && cur.lines().any(|l| l.trim() == MANAGED_MARKER),
+        };
+        if !write {
+            continue;
+        }
+        match write_command_file(dir, name, content) {
+            Ok(_) => written += 1,
+            Err(e) => tracing::warn!(skill = %name, error = %e, verdict = "shipped_skill_unwritten",
+                "a skill amux ships could not be installed, so Claude Code cannot run it"),
+        }
+    }
+    (written, shipped.len())
+}
+
+/// Table skills as composer entries, for any name no command file claimed.
+fn table_skill_commands(conn: &rusqlite::Connection) -> Vec<(String, String)> {
+    let Ok(mut stmt) = conn.prepare("SELECT name, content FROM skills ORDER BY name") else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .map(|(name, content)| (format!("/{name}"), frontmatter_fields(&content).0))
+        .collect()
+}
+
+async fn list_slash_commands(State(state): State<AppState>) -> Response {
+    let mut cmds = file_slash_commands();
+    if let Ok(conn) = state.store.read() {
+        let mut seen: std::collections::BTreeSet<String> = cmds
+            .iter()
+            .filter_map(|c| c["cmd"].as_str().map(str::to_string))
+            .collect();
+        for (cmd, desc) in table_skill_commands(&conn) {
+            if seen.insert(cmd.clone()) {
+                let times = command_file_times(cmd.trim_start_matches('/'));
+                cmds.push(with_times(json!({ "cmd": cmd, "desc": desc, "source": "table" }), times));
+            }
+        }
+    }
+    Json(serde_json::Value::Array(cmds)).into_response()
+}
+
+fn file_slash_commands() -> Vec<serde_json::Value> {
     let mut cmds: Vec<serde_json::Value> = BUILTIN_SLASH_COMMANDS
         .iter()
-        .map(|(c, d)| json!({ "cmd": c, "desc": d }))
+        // `source` says where each entry came from, so a client never has to
+        // guess with its own copy of the builtin list (the Skills tab filed
+        // /add-dir, /agents, /context... under "Project commands" that way).
+        .map(|(c, d)| json!({ "cmd": c, "desc": d, "source": "builtin" }))
         .collect();
-    let mut seen: std::collections::BTreeSet<String> =
-        BUILTIN_SLASH_COMMANDS.iter().map(|(c, _)| c.to_string()).collect();
+    let mut seen: std::collections::BTreeSet<String> = BUILTIN_SLASH_COMMANDS
+        .iter()
+        .map(|(c, _)| c.to_string())
+        .collect();
     for dir in command_dirs() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -195,10 +501,10 @@ async fn list_slash_commands() -> Response {
                 .ok()
                 .map(|t| frontmatter_fields(&t).0)
                 .unwrap_or_default();
-            cmds.push(json!({ "cmd": name, "desc": desc }));
+            cmds.push(with_times(json!({ "cmd": name, "desc": desc, "source": "file" }), file_times(&f)));
         }
     }
-    Json(serde_json::Value::Array(cmds)).into_response()
+    cmds
 }
 
 async fn get_slash_command(Path(name): Path<String>) -> Response {
@@ -222,12 +528,54 @@ mod tests {
 
     #[tokio::test]
     async fn slash_commands_do_not_offer_claude_diff() {
-        let response = list_slash_commands().await;
-        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap();
+        let response = Json(serde_json::Value::Array(file_slash_commands())).into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
         let commands: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let commands = commands.as_array().unwrap();
         assert!(!commands.iter().any(|c| c["cmd"] == "/diff"));
         assert!(commands.iter().any(|c| c["cmd"] == "/context"));
+        assert!(
+            commands.iter().any(|c| c["cmd"] == "/context" && c["source"] == "builtin"),
+            "a Claude Code builtin is labelled as one"
+        );
+        assert!(commands.iter().all(|c| c["source"].is_string()), "every entry names its source");
+    }
+
+    #[tokio::test]
+    async fn usage_reports_daily_series_and_workers() {
+        let state = crate::api::standing_approvals::tests::test_state();
+        let now = chrono::Utc::now().timestamp();
+        state
+            .store
+            .write(move |c| {
+                for (i, (skill, session, ago)) in [("slop", "gtm", 0), ("slop", "", 0), ("slop", "gtm", 86_400), ("loop", "amux", 40 * 86_400)]
+                    .iter()
+                    .enumerate()
+                {
+                    c.execute(
+                        "INSERT INTO skill_usage (record_uuid, skill, source, session, ts) VALUES (?1,?2,'user',?3,?4)",
+                        rusqlite::params![format!("r{i}"), skill, session, now - ago],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let resp = skill_usage(State(state), axum::extract::Query([("days".to_string(), "7".to_string())].into())).await;
+        let bytes = axum::body::to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let daily = v["daily"].as_array().unwrap();
+        assert!(daily.len() == 7 || daily.len() == 8, "one zero-filled row per day of the window: {}", daily.len());
+        let total: i64 = daily.iter().map(|d| d["n"].as_i64().unwrap()).sum();
+        assert_eq!(total, 3, "the 40-day-old call is outside");
+        let recent: i64 = v["skills"].as_object().unwrap().values().map(|s| s["recent"].as_i64().unwrap()).sum();
+        assert_eq!(total, recent, "the chart total and the per-skill window counts agree");
+        assert_eq!(daily.last().unwrap()["n"], 2);
+        assert_eq!(v["skills"]["slop"]["workers"]["gtm"], 2);
+        assert_eq!(v["skills"]["slop"]["workers"][""], 1, "unattributed calls stay visible");
+        assert!(v["skills"]["loop"].get("workers").is_none(), "no window calls, no workers");
+        assert_eq!(v["skills"]["loop"]["n"], 1);
     }
 
     #[test]
@@ -240,9 +588,15 @@ mod tests {
 
     #[test]
     fn frontmatter_absent_yields_empties() {
-        assert_eq!(frontmatter_fields("no frontmatter here"), (String::new(), String::new()));
+        assert_eq!(
+            frontmatter_fields("no frontmatter here"),
+            (String::new(), String::new())
+        );
         // An unterminated block parses nothing (Python: find("---", 3) < 0).
-        assert_eq!(frontmatter_fields("---\ndescription: x"), (String::new(), String::new()));
+        assert_eq!(
+            frontmatter_fields("---\ndescription: x"),
+            (String::new(), String::new())
+        );
     }
 }
 
@@ -255,9 +609,17 @@ async fn save_skill(
     Json(body): Json<Value>,
 ) -> Response {
     if bad_name(&name) {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid name" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid name" })),
+        )
+            .into_response();
     }
-    let content = body.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+    let content = body
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     // An empty body would silently blank a skill the user can no longer see the
     // text of — the same shape as the board's blanked-desc hazard. Refuse it.
     if content.trim().is_empty() {
@@ -267,28 +629,47 @@ async fn save_skill(
         )
             .into_response();
     }
+    let file_content = content.clone();
     let n2 = name.clone();
     let write = state
         .store
         .write_async(move |conn| {
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, content TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS skills (name TEXT PRIMARY KEY, content TEXT NOT NULL, \
+                 updated INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL DEFAULT 0)",
                 [],
             )?;
-            conn.execute(
-                "INSERT INTO skills (name, content) VALUES (?1, ?2) \
-                 ON CONFLICT(name) DO UPDATE SET content=excluded.content",
-                rusqlite::params![n2, content],
-            )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            conn.execute(SAVE_SKILL_SQL, rusqlite::params![n2, content])?;
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await;
     match write {
-        Ok(_) => Json(json!({ "ok": true, "name": name })).into_response(),
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
-                .into_response()
+        Ok(_) => {
+            // The table row is what the Skills tab edits; the command file is
+            // what Claude Code runs and what the composer's `/` list reads.
+            // Report both, so a skill that saved but cannot run says so.
+            super::skill_examples::prewarm(name.clone(), file_content.clone());
+            match write_command_file(&user_commands_dir(), &name, &file_content) {
+                Ok(path) => Json(json!({ "ok": true, "name": name,
+                    "command_file": path.display().to_string() }))
+                .into_response(),
+                Err(e) => {
+                    tracing::warn!(skill = %name, error = %e, verdict = "skill_command_file_unwritten",
+                        "saved a skill but could not write its command file, so Claude Code cannot run it");
+                    Json(json!({ "ok": true, "name": name, "command_file": null,
+                        "command_file_error": e.to_string() }))
+                    .into_response()
+                }
+            }
         }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -297,7 +678,11 @@ async fn save_skill(
 /// distinguished from a real removal.
 async fn delete_skill(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     if bad_name(&name) {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid name" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid name" })),
+        )
+            .into_response();
     }
     let n2 = name.clone();
     let slot = std::sync::Arc::new(std::sync::Mutex::new(0usize));
@@ -307,18 +692,35 @@ async fn delete_skill(State(state): State<AppState>, Path(name): Path<String>) -
         .write_async(move |conn| {
             let n = conn.execute("DELETE FROM skills WHERE name=?1", rusqlite::params![n2])?;
             *slot_w.lock().expect("slot") = n;
-            Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+            Ok(crate::db::WriteOutcome {
+                applied: n > 0,
+                events: vec![],
+            })
         })
         .await;
     match write {
         Ok(_) => {
             let n = *slot.lock().expect("slot");
-            Json(json!({ "ok": true, "name": name, "deleted": n > 0 })).into_response()
-        }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+            // Deleting in the Skills tab removes the runnable command too, or
+            // the skill would vanish from the tab and keep answering to /name.
+            let path = user_commands_dir().join(format!("{name}.md"));
+            let file_removed = match std::fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    tracing::warn!(skill = %name, error = %e, verdict = "skill_command_file_not_removed",
+                        "deleted a skill but its command file remains, so /name still runs");
+                    false
+                }
+            };
+            Json(json!({ "ok": true, "name": name, "deleted": n > 0, "command_file_removed": file_removed }))
                 .into_response()
         }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -326,13 +728,139 @@ async fn delete_skill(State(state): State<AppState>, Path(name): Path<String>) -
 mod write_tests {
     use super::*;
 
+    fn table(rows: &[(&str, &str)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE skills (name TEXT PRIMARY KEY, content TEXT NOT NULL)", [])
+            .unwrap();
+        for (n, c) in rows {
+            conn.execute("INSERT INTO skills (name, content) VALUES (?1, ?2)", [n, c]).unwrap();
+        }
+        conn
+    }
+
+    /// AA-40: a skill saved in the Skills tab must exist where Claude Code
+    /// reads commands, or `/name` is neither offered nor runnable.
+    #[test]
+    fn a_table_skill_without_a_command_file_gets_one_and_an_edited_file_is_kept() {
+        let dir = std::env::temp_dir().join(format!("amux-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kept.md"), "edited outside amux").unwrap();
+        let conn = table(&[("pr-merge", "---\ndescription: Merge a PR\n---\nbody"), ("kept", "table copy"), ("../x", "never")]);
+
+        assert_eq!(materialize_missing(&conn, &dir), (1, 3));
+        assert_eq!(std::fs::read_to_string(dir.join("pr-merge.md")).unwrap(), "---\ndescription: Merge a PR\n---\nbody");
+        assert_eq!(std::fs::read_to_string(dir.join("kept.md")).unwrap(), "edited outside amux");
+        assert!(!dir.join("../x.md").exists());
+        assert_eq!(materialize_missing(&conn, &dir), (0, 3), "idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shipped skill is installed, kept current while it carries the marker,
+    /// and left alone once the user has made it theirs.
+    #[test]
+    fn shipped_skills_install_update_and_respect_a_user_copy() {
+        let dir = std::env::temp_dir().join(format!("amux-shipped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let v1 = "---\ndescription: x\namux-managed: true\n---\nv1";
+        let v2 = "---\ndescription: x\namux-managed: true\n---\nv2";
+        assert_eq!(install_shipped(&dir, &[("s", v1)]), (1, 1), "missing: written");
+        assert_eq!(install_shipped(&dir, &[("s", v1)]), (0, 1), "same: untouched");
+        assert_eq!(install_shipped(&dir, &[("s", v2)]), (1, 1), "managed and stale: updated");
+        assert_eq!(std::fs::read_to_string(dir.join("s.md")).unwrap(), v2);
+        std::fs::write(dir.join("s.md"), "---\ndescription: mine\n---\nmine").unwrap();
+        assert_eq!(install_shipped(&dir, &[("s", v1)]), (0, 1), "marker removed: the copy is the user's");
+        assert_eq!(std::fs::read_to_string(dir.join("s.md")).unwrap(), "---\ndescription: mine\n---\nmine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The core set the owner asked for ships, each from its own skills/ file.
+    #[test]
+    fn the_core_skills_ship() {
+        let names: Vec<&str> = SHIPPED_COMMANDS.iter().map(|(n, _)| *n).collect();
+        for want in ["slop", "iterate", "codex", "muse", "imessage", "pr-merge", "e2e-test", "worker-audit", "big-goal", "amux-publish"] {
+            assert!(names.contains(&want), "{want} is not shipped: {names:?}");
+        }
+        let audit = SHIPPED_COMMANDS.iter().find(|(n, _)| *n == "worker-audit").unwrap().1;
+        assert!(audit.contains("workers=") && audit.contains("READ-ONLY"), "worker-audit takes workers= and stays read-only");
+        let publish = SHIPPED_COMMANDS.iter().find(|(n, _)| *n == "amux-publish").unwrap().1;
+        let desc = frontmatter_fields(publish).0;
+        assert!(desc.contains("Netlify") && desc.contains("amux publish"),
+            "the description is what makes a worker load it before an outside host: {desc}");
+    }
+
+    /// Governance PR 21: the compliance skill ships, names the three CLI reads
+    /// it is built on, and stays read-only and honest about unmeasured data.
+    #[test]
+    fn the_compliance_skill_ships_read_only() {
+        let c = SHIPPED_COMMANDS.iter().find(|(n, _)| *n == "compliance").expect("compliance is not shipped").1;
+        for verb in ["amux compliance access-review", "amux compliance timeline", "amux compliance evidence"] {
+            assert!(c.contains(verb), "the skill does not name {verb}");
+        }
+        assert!(c.contains("Read-only") && c.contains("measured"), "the skill must stay read-only and read `measured`");
+    }
+
+    /// The shipped copy carries the marker and a description, or it would be
+    /// frozen at its first install and listed blank in the `/` menu.
+    #[test]
+    fn every_shipped_skill_is_managed_and_described() {
+        for (name, content) in SHIPPED_COMMANDS {
+            assert!(!bad_name(name), "{name}");
+            assert!(content.lines().any(|l| l.trim() == MANAGED_MARKER), "{name} lacks {MANAGED_MARKER}");
+            assert!(!frontmatter_fields(content).0.is_empty(), "{name} has no description");
+        }
+    }
+
+    #[test]
+    fn a_table_skill_keeps_its_first_save_time_across_edits() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE skills (name TEXT PRIMARY KEY, content TEXT NOT NULL, updated INTEGER NOT NULL DEFAULT 0)", []).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0117_skills_created.sql")).unwrap();
+        let save = |c: &str| conn.execute(SAVE_SKILL_SQL, rusqlite::params!["s", c]).unwrap();
+        save("v1");
+        let first = table_skill_rows(&conn)[0].2;
+        assert!(first > 0, "the first save records when");
+        conn.execute("UPDATE skills SET created = created - 1000", []).unwrap();
+        save("v2");
+        let row = &table_skill_rows(&conn)[0];
+        assert_eq!((row.1.as_str(), row.2), ("v2", first - 1000), "an edit keeps the creation time");
+        let old = table(&[("x", "y")]);
+        assert_eq!(table_skill_rows(&old)[0].2, 0, "a table without the column reads 0, never fails");
+    }
+
+    #[test]
+    fn a_command_file_reports_when_it_was_edited() {
+        let dir = std::env::temp_dir().join(format!("amux-skill-times-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.md");
+        std::fs::write(&f, "x").unwrap();
+        let t = file_times(&f);
+        let now = chrono::Utc::now().timestamp();
+        let m = t["modified_at"].as_i64().unwrap();
+        assert!((now - m).abs() < 60, "modified_at {m} vs now {now}");
+        if let Some(c) = t.get("created_at") {
+            assert!(c.as_i64().unwrap() <= m);
+        }
+        assert!(file_times(&dir.join("missing.md")).is_empty(), "no file, no invented times");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn table_skills_are_offered_as_slash_commands_with_their_description() {
+        let conn = table(&[("pr-merge", "---\ndescription: Merge a PR\n---\nbody")]);
+        assert_eq!(table_skill_commands(&conn), vec![("/pr-merge".to_string(), "Merge a PR".to_string())]);
+    }
+
     /// The name rule is shared by read and both writes. A writer with its own
     /// copy is how a path that GET rejects becomes one POST accepts.
     #[test]
     fn the_name_rule_rejects_what_would_escape_the_key_space() {
         assert!(bad_name(""), "empty");
         assert!(bad_name("a/b"), "a slash would address another route");
-        assert!(bad_name(".."), "traversal-shaped names never reach the table");
+        assert!(
+            bad_name(".."),
+            "traversal-shaped names never reach the table"
+        );
         assert!(bad_name("../etc/passwd"));
         assert!(!bad_name("my-skill"));
         assert!(!bad_name("my_skill.v2"));

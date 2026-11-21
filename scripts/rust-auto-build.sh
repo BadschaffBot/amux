@@ -33,16 +33,238 @@ LOCK="${AMUX_RS_BUILD_LOCK:-$HOME/.amux/rust-build.lock}"
 # it — the lock would leak on every run and the second invocation would be
 # blocked forever. Everything that needs unwinding goes here.
 cleanup() {
-  if [ -n "${WORK:-}" ]; then
+  if [ -n "${WORK:-}" ] && [ -z "${WORK_STABLE:-}" ]; then
     git -C "$REPO" worktree remove --force "$WORK" 2>/dev/null || true
     rm -rf "$WORK"
   fi
   [ -n "${BUILD_OUT:-}" ] && rm -f "$BUILD_OUT"
   [ -n "${INSTALL_TMP:-}" ] && rm -f "$INSTALL_TMP"
   [ -n "${LOCK_HELD:-}" ] && rm -rf "$LOCK"
+  [ -n "${HB_PID:-}" ] && { kill "$HB_PID" 2>/dev/null || true; }
   return 0   # a falsey last test must not make the trap itself fail under set -e
 }
 trap cleanup EXIT
+
+# Shell schedule runs still running that started within the last $1 seconds,
+# as comma-joined schedule ids (empty when none, or when the server cannot
+# be read: an unreadable scheduler must not hold deploys).
+shell_runs_in_flight() {
+  local window="$1"
+  curl -sk --max-time 5 "${AMUX_RS_RUNS_URL:-$(server_api_base)/api/schedules/runs?limit=200}" 2>/dev/null \
+    | python3 -c '
+import json,sys,time
+try: rows=json.load(sys.stdin)
+except Exception: raise SystemExit
+w=float(sys.argv[1]); now=time.time()
+# A cron-fired run carries delivery=null until it finishes; only a manual run
+# is stamped "shell" up front. Matching "shell" alone saw no scheduled run at
+# all: SCHED-465 was killed by the 03:19 deploy on 2026-10-16 with zero holds.
+ids=[r.get("schedule_id","?") for r in rows if isinstance(r,dict) and r.get("status")=="running"
+     and r.get("delivery") in ("shell", None) and now-(r.get("ran_at") or 0) < w]
+print(",".join(sorted(set(ids))))' "$window" 2>/dev/null || true
+}
+
+# Wait for the server to report $1 live, for $2 seconds; sets $waited and
+# returns 0 once it does. The server can hold adoption of a new binary while a
+# shell schedule run is in flight, for up to AMUX_ADOPT_SHELL_DEFER_MAX_S
+# (lib.rs SELF_ADOPT). That defaults to 0 since shell runs survive a restart
+# (runtime_jobs/shell_detached.rs, cicd-two-minutes item 1); this wait honours
+# whatever the server is set to. Rolling back at $2 during that hold threw
+# away good builds: 6 rollbacks from 2026-10-30 to 11-02, c71df3ef9 among
+# them while SCHED-662 ran. So past $2 the wait goes on while a shell run is
+# in flight, up to $2 plus the hold, and says so once.
+# Seconds since the push of $1, from the time the activation authority read off
+# its first workflow run (~/.amux/ci-pushed-at), or "unmeasured". push_to_live_s
+# counts from the commit, which is before the land gate ran.
+from_push_s() {
+  local at; at=$(cat "${AMUX_CI_PUSHED_AT_DIR:-$HOME/.amux/ci-pushed-at}/$1" 2>/dev/null)
+  case "$at" in ''|*[!0-9]*) echo unmeasured ;; *) echo $(( $(date +%s) - at )) ;; esac
+}
+
+# One JSON line per deploy for the server to report (GET /api/pull
+# push_to_live): the seconds from the push, or null when unmeasured.
+record_deploy_latency() { # <sha> <from_push_s> <kind: restamp|compiled|prebuilt>
+  local v="$2"; case "$v" in ''|*[!0-9]*) v=null ;; esac
+  printf '{"sha":"%s","at":%s,"from_push_s":%s,"kind":"%s"}\n' "$1" "$(date +%s)" "$v" "${3:-unknown}" \
+    >> "${AMUX_DEPLOY_LATENCY_LOG:-$HOME/.amux/deploy-latency.jsonl}" 2>/dev/null || true
+}
+
+wait_live_identity() {
+  local sha="$1" limit="$2" hold="${AMUX_ADOPT_SHELL_DEFER_MAX_S:-0}" said=0 runs="" released=0
+  local grace="${AMUX_ADOPT_POST_HOLD_GRACE_S:-120}"
+  case "$hold" in ''|*[!0-9]*) hold=0 ;; esac
+  case "$grace" in ''|*[!0-9]*) grace=120 ;; esac
+  waited=0
+  while :; do
+    if measure_live_identity && [ -n "$live" ]; then
+      case "$sha" in "$live"*) return 0 ;; esac
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      [ "$waited" -lt $((limit + hold)) ] || return 1
+      if [ "$released" = 0 ]; then
+        # Re-read the scheduler every 15s, not every second.
+        if [ $(( (waited - limit) % 15 )) = 0 ]; then runs=$(shell_runs_in_flight $((limit + hold))); fi
+        if [ -z "$runs" ]; then
+          [ "$said" = 1 ] || return 1
+          # THE RUN THAT HELD ADOPTION HAS JUST ENDED. The server adopts on its
+          # next tick, so judging health in the same second called a good build
+          # unhealthy: e5cc110cb on 2026-11-04 was rolled back at 405s, the
+          # moment SCHED-706 finished, and the hold that followed pinned deploys
+          # for 31 hours. Give the adoption its tick, then judge.
+          released=1; limit=$waited; hold=$grace
+          echo "== ACTIVATION HOLD RELEASED sha=$sha: no shell run in flight after ${waited}s; allowing ${grace}s for adoption verdict=activation_wait_post_hold"
+        fi
+      fi
+      if [ "$said" = 0 ]; then
+        said=1
+        echo "== ACTIVATION WAIT EXTENDED sha=$sha: not live after ${limit}s while shell run(s) $runs hold adoption; waiting up to $((limit + hold))s verdict=activation_wait_shell_hold"
+      fi
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+}
+
+# THE BASH CLI SHIPS WITH THE SERVER IT TALKS TO. This builder installs only
+# amux-server; the bash `amux` in ~/.local/bin and /usr/local/bin was copied
+# once by install.sh and then went stale. Measured 2026-09-27: the server
+# answered /api/approvals/standing while `amux approvals` said "unknown
+# command", and a day earlier the start-through-server launch fix sat on
+# origin for hours while every worker restart still used the old CLI.
+#
+# `amux` is not a build input (the stamp key covers crates/ and Cargo.*), so a
+# CLI-only commit never triggers a rebuild. This runs on every authorized tick
+# instead: take `amux` from the sha this builder is authorized to activate,
+# syntax-check it, and rename it over each installed REGULAR-FILE copy whose
+# bytes differ. rename(2) gives a new inode, so a running `amux` finishes on
+# the bytes it started with. Symlinks and absent copies are left alone.
+sync_bash_cli() {
+  local sha="$1" tmp dest
+  [ "${AMUX_CLI_SYNC:-1}" = "0" ] && return 0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/amux-cli-sync.XXXXXX")" || return 0
+  if ! git -C "$REPO" show "${sha}:amux" > "$tmp" 2>/dev/null || ! bash -n "$tmp" 2>/dev/null; then
+    echo "== $(date '+%F %T') CLI SYNC SKIPPED sha=$sha verdict=bash_cli_sync_invalid (git show or bash -n failed)" >> "$LOG"
+    rm -f "$tmp"; return 0
+  fi
+  chmod 0755 "$tmp"
+  for dest in "${AMUX_CLI_INSTALL:-$HOME/.local/bin/amux}" /usr/local/bin/amux; do
+    [ -f "$dest" ] && [ ! -L "$dest" ] && [ -w "$(dirname "$dest")" ] || continue
+    cmp -s "$tmp" "$dest" && continue
+    if cp "$tmp" "${dest}.new.$$" && chmod 0755 "${dest}.new.$$" && mv -f "${dest}.new.$$" "$dest"; then
+      echo "== $(date '+%F %T') CLI SYNCED sha=$sha dest=$dest verdict=bash_cli_synced" >> "$LOG"
+    else
+      rm -f "${dest}.new.$$"
+      echo "== $(date '+%F %T') CLI SYNC FAILED sha=$sha dest=$dest verdict=bash_cli_sync_failed" >> "$LOG"
+    fi
+  done
+  rm -f "$tmp"
+}
+
+# THE LAUNCHER SHIPS THROUGH THE SAME GATE. launchd runs a COPY of
+# scripts/rust-auto-build-authority.sh that only install.sh wrote, so a change
+# to how commits are elected (the CI gate, 2026-10-15) never reached the timer.
+# Replace an existing regular-file copy by rename when the elected bytes differ;
+# the running launcher finishes on the inode it started with.
+sync_authority_launcher() {
+  local sha="$1" dest tmp
+  dest="${AMUX_AUTHORITY_INSTALL:-$HOME/.amux/bin/amux-build-authority}"
+  [ -f "$dest" ] && [ ! -L "$dest" ] && [ -w "$(dirname "$dest")" ] || return 0
+  tmp="$(mktemp "$(dirname "$dest")/.authority.XXXXXX")" || return 0
+  if ! git -C "$REPO" show "${sha}:scripts/rust-auto-build-authority.sh" > "$tmp" 2>/dev/null || ! bash -n "$tmp" 2>/dev/null; then
+    echo "== $(date '+%F %T') AUTHORITY LAUNCHER SYNC SKIPPED sha=$sha verdict=authority_launcher_invalid" >> "$LOG"
+    rm -f "$tmp"; return 0
+  fi
+  if cmp -s "$tmp" "$dest"; then rm -f "$tmp"; printf '%s\n' "$sha" > "${dest}.sha" 2>/dev/null || true; return 0; fi
+  # NEVER INSTALL AN OLDER LAUNCHER (2026-10-24). The elected sha is often an
+  # older green commit held back behind a red main, and its launcher can predate
+  # the installed one. That reverted the 300-deep CI gate to 40 twice in one
+  # morning, after which the gate found no green commit and nothing deployed.
+  # ${dest}.sha records where the installed copy came from; when the elected sha
+  # is an ancestor of it, the installed launcher is the newer one and stays.
+  local have
+  have=$(cat "${dest}.sha" 2>/dev/null || true)
+  if [ -n "$have" ] && [ "$have" != "$sha" ] \
+     && git -C "$REPO" merge-base --is-ancestor "$sha" "$have" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "== $(date '+%F %T') AUTHORITY LAUNCHER KEPT installed=$have is newer than elected sha=$sha verdict=authority_launcher_newer_kept" >> "$LOG"
+    return 0
+  fi
+  if chmod 0755 "$tmp" && mv -f "$tmp" "$dest"; then
+    printf '%s\n' "$sha" > "${dest}.sha" 2>/dev/null || true
+    echo "== $(date '+%F %T') AUTHORITY LAUNCHER SYNCED sha=$sha dest=$dest verdict=authority_launcher_synced" >> "$LOG"
+  else
+    rm -f "$tmp"
+    echo "== $(date '+%F %T') AUTHORITY LAUNCHER SYNC FAILED sha=$sha verdict=authority_launcher_sync_failed" >> "$LOG"
+  fi
+}
+
+# Existing worker helpers also ship on authorized ticks without a Rust rebuild.
+# Replace only existing regular files: no settings changes or isolated-worker
+# hook enrollment. Read exact elected bytes, validate and verify the rename.
+sync_observed_edits_hooks() {
+  local sha="$1" half rel dest tmp mode verdict
+  for half in pre post orchestrate; do
+    mode=0755; verdict=observed_hook
+    if [ "$half" = orchestrate ]; then
+      rel=".claude/commands/orchestrate.md"
+      dest="${AMUX_CLAUDE_COMMAND_DIR:-$HOME/.claude/commands}/orchestrate.md"
+      mode=0644; verdict=orchestration_command
+    else
+      rel="scripts/claude-hooks/observed-edits-${half}.py"
+      dest="${AMUX_OBSERVED_HOOK_DIR:-$HOME/.amux/hooks}/observed-edits-${half}.py"
+    fi
+    [ -f "$dest" ] && [ ! -L "$dest" ] && [ -w "$(dirname "$dest")" ] || continue
+    tmp="$(mktemp "$(dirname "$dest")/.observed-hook.XXXXXX")" || continue
+    if ! git -C "$REPO" show "${sha}:${rel}" > "$tmp" 2>/dev/null \
+       || { [ "$half" != orchestrate ] && ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" 2>/dev/null; }; then
+      echo "== WORKER HELPER SYNC FAILED sha=$sha half=$half verdict=${verdict}_source_invalid" >> "$LOG"
+      rm -f "$tmp"; continue
+    fi
+    if cmp -s "$tmp" "$dest"; then rm -f "$tmp"; continue; fi
+    if chmod "$mode" "$tmp" && mv -f "$tmp" "$dest" \
+       && git -C "$REPO" show "${sha}:${rel}" | cmp -s - "$dest"; then
+      echo "== WORKER HELPER SYNCED sha=$sha half=$half verdict=${verdict}_synced" >> "$LOG"
+    else
+      echo "== WORKER HELPER SYNC FAILED sha=$sha half=$half verdict=${verdict}_sync_failed" >> "$LOG"
+    fi
+    rm -f "$tmp"
+  done
+}
+
+# The repo's own git hooks follow the activated commit too (AF-1129). A landed
+# change to scripts/git-hooks/ reached nothing until someone reran
+# install-hooks.sh: .git/hooks/pre-push sat at its Oct 29 bytes while main moved
+# on, so the pre-push script-tests leg ran only in fixtures. Only hooks already
+# installed are replaced, and a tracked core.hooksPath dir is the repo owner's.
+# ~/.amux/hooks stays with install-hooks.sh.
+sync_repo_git_hooks() {
+  local sha="$1" common dir name dest tmp
+  [ -z "$(git -C "$REPO" config core.hooksPath 2>/dev/null || true)" ] || return 0
+  common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  dir="$common/hooks"
+  for name in pre-commit pre-push post-commit prepare-commit-msg amux-staged-guard append-only-push-guard; do
+    dest="$dir/$name"
+    [ -f "$dest" ] && [ ! -L "$dest" ] && [ -w "$dir" ] || continue
+    tmp="$(mktemp "$dir/.repo-hook.XXXXXX")" || continue
+    if ! git -C "$REPO" show "${sha}:scripts/git-hooks/${name}" > "$tmp" 2>/dev/null; then
+      rm -f "$tmp"; continue
+    fi
+    if cmp -s "$tmp" "$dest"; then rm -f "$tmp"; continue; fi
+    if head -1 "$tmp" | grep -q python; then
+      python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" 2>/dev/null
+    else
+      bash -n "$tmp" 2>/dev/null
+    fi || {
+      echo "== REPO HOOK SYNC FAILED sha=$sha hook=$name verdict=repo_hook_source_invalid" >> "$LOG"
+      rm -f "$tmp"; continue
+    }
+    if chmod 0755 "$tmp" && mv -f "$tmp" "$dest"; then
+      echo "== REPO HOOK SYNCED sha=$sha hook=$name verdict=repo_hook_synced" >> "$LOG"
+    else
+      echo "== REPO HOOK SYNC FAILED sha=$sha hook=$name verdict=repo_hook_sync_failed" >> "$LOG"
+      rm -f "$tmp"
+    fi
+  done
+}
 
 # The sha that will actually be BUILT — the worktree below is created from
 # `rev-parse HEAD`. `$head` is a different thing: the last commit that touched
@@ -75,17 +297,27 @@ server_api_base() {
   local api
   api="${AMUX_URL:-}"
   if [ -z "$api" ] && [ -r "$HOME/.amux/endpoint.json" ]; then
-    api=$(python3 - "$HOME/.amux/endpoint.json" <<'PY' 2>/dev/null || true
-import json,sys
+    api=$(python3 - "$HOME/.amux/endpoint.json" "$LOG" <<'PY' 2>/dev/null || true
+import json,os,sys
 try:
     d=json.load(open(sys.argv[1]))
+    pid=d.get('pid')
+    if isinstance(pid,int) and pid > 0:
+        try:
+            os.kill(pid,0)
+        except ProcessLookupError:
+            with open(sys.argv[2],'a') as log:
+                log.write(f"== ENDPOINT OWNER EXITED pid={pid} measured=true action=use_configured_server\n")
+            raise SystemExit(0)
+        except PermissionError:
+            pass  # Alive, but owned by another account.
     print(d.get('canonical_url') or d.get('url') or d.get('endpoint') or '')
 except Exception:
     pass
 PY
 )
   fi
-  printf '%s\n' "${api:-https://localhost:8824}"
+  printf '%s\n' "${api:-https://localhost:${AMUX_RS_PORT:-8824}}"
 }
 
 # One measurement owns both the decision and its receipt. A later successful
@@ -102,12 +334,159 @@ import json,re,sys
 try:
     d=json.load(sys.stdin)
     commit=d.get("commit_full") or d.get("commit", "")
-    if not isinstance(commit,str) or not re.fullmatch(r"[0-9a-f]{12,40}",commit):
+    # A "-dirty" identity is a MEASURED image too: a server built from an
+    # uncommitted checkout. It passes through so the caller can tell a dirty
+    # build of the elected commit (defer) from a foreign one (rebuild).
+    if not isinstance(commit,str) or not re.fullmatch(r"[0-9a-f]{12,40}(-dirty)?",commit):
         raise ValueError("invalid commit")
     print(commit)
 except Exception:
     raise SystemExit(1)
 ' 2>/dev/null) || { identity_reason="invalid_commit"; return 1; }
+}
+
+# A COMMIT WITH NO COMPILE-INPUT CHANGE NEEDS NO COMPILE (2026-11-08).
+#
+# The server compiles its commit in, so a docs or scripts commit read as
+# "STAMP DRIFT" and rebuilt amux-server at the deploy profile: 80 to 185 s
+# measured, the largest share of push-to-live, for bytes identical to the ones
+# already running. 182 of 269 commits in the week to 2026-11-07 changed no
+# Rust source. The server now takes its commit from the receipt beside the
+# binary when the receipt names its own bytes (activation.rs `served`), and
+# re-executes when the receipt changes. So when nothing the compile reads has
+# changed since the installed bytes were compiled, write the receipt for the
+# new commit and let the server adopt it.
+#
+# "What the compile reads" is crates/, Cargo.*, the toolchain files and every
+# include_str!/include_bytes! target outside crates/ (scripts/ci-rust-key.mjs
+# lists them; the bash CLI and the hooks are among them). Any doubt compiles:
+# no receipt, a receipt for other bytes, a running server that does not read
+# receipts (no `build_commit` in /health) or runs other bytes, an unreadable
+# include list, or an earlier restamp of this commit that was not adopted.
+# AMUX_RS_RESTAMP=0 turns it off.
+#
+# The dashboard (crates/amux-dashboard/static/) is compiled in by rust-embed,
+# but nothing else the compile reads depends on it. When it is the only
+# compile input that changed, its files at this commit are copied to a
+# snapshot directory (AMUX_RS_DASHBOARD_SNAPSHOTS, one per git tree) and the
+# receipt names it as `dashboard_dir`; the server serves that directory
+# instead of its embedded copy. This needs a server that reports
+# `dashboard_source` in /health, and a server that cannot read the snapshot
+# reports its compiled commit, which reads here as not adopted: the receipt is
+# restored and the same run compiles.
+DASH_STATIC=crates/amux-dashboard/static
+# Keep the snapshot being served and the three newest others (a rollback
+# target); a snapshot is about 12 MB.
+prune_dashboard_snapshots() {
+  local keep="$1" d n=0
+  [ -d "$DASH_SNAPSHOTS" ] || return 0
+  for d in $(ls -1t "$DASH_SNAPSHOTS" 2>/dev/null); do
+    [ "$DASH_SNAPSHOTS/$d" = "$keep" ] && continue
+    n=$((n + 1))
+    [ "$n" -le 3 ] && continue
+    rm -rf "${DASH_SNAPSHOTS:?}/${d:?}"
+    echo "== DASHBOARD SNAPSHOT PRUNED $d verdict=dashboard_snapshot_pruned"
+  done
+}
+DASH_SNAPSHOTS="${AMUX_RS_DASHBOARD_SNAPSHOTS:-$HOME/.amux/dashboard-snapshots}"
+restamp_without_compile() {
+  local sha="$1" stamped body compiled dash_cap extra changed others dash_tree="" dash_dir="" tmp_snap
+  local paths=()
+  [ "${AMUX_RS_RESTAMP:-1}" = 1 ] || { echo "== RESTAMP OFF sha=$sha (AMUX_RS_RESTAMP=0) verdict=restamp_off"; return 1; }
+  if [ -f "${STAMP}.restamp_failed" ] && [ "$(cat "${STAMP}.restamp_failed" 2>/dev/null)" = "$sha" ]; then
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: an earlier restamp of it was not adopted; compiling verdict=restamp_retry_compiles"
+    return 1
+  fi
+  body=$(curl -sk --max-time 4 "${AMUX_RS_HEALTH_URL:-$(server_api_base)/api/health}" 2>/dev/null) || {
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: /health unreadable verdict=restamp_unmeasured"; return 1; }
+  compiled=$(python3 - "$INSTALL" "${INSTALL}.identity.json" "$body" <<'PYRESTAMP' 2>&1
+import hashlib,json,re,sys
+try:
+    d=json.load(open(sys.argv[2]))
+except (OSError,ValueError):
+    raise SystemExit('no readable receipt')
+with open(sys.argv[1],'rb') as f: build=hashlib.sha256(f.read()).hexdigest()[:16]
+if d.get('build')!=build: raise SystemExit('the receipt is not for the installed binary')
+try: h=json.loads(sys.argv[3])
+except ValueError: raise SystemExit('/health is not JSON')
+if 'build_commit' not in h: raise SystemExit('the running server does not read receipts')
+if h.get('build')!=build: raise SystemExit('the running server is not the installed binary')
+c=d.get('compiled_at') or d.get('sha','')
+if not re.fullmatch(r'[0-9a-f]{40}',c): raise SystemExit('the receipt names no compiled commit')
+print(c, 'dash' if 'dashboard_source' in h else 'nodash')
+PYRESTAMP
+) || { echo "== RESTAMP NOT APPLICABLE sha=$sha: $compiled verdict=restamp_not_applicable"; return 1; }
+  dash_cap=${compiled#* }; compiled=${compiled%% *}
+  extra=$(cd "$REPO" && node scripts/ci-rust-key.mjs --json --rustc none 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+if d.get("unresolved"): raise SystemExit(1)
+print("\n".join(sorted({i["path"] for i in d["includes"] if not i["path"].startswith("crates/")})))') || {
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: the include list is unreadable (scripts/ci-rust-key.mjs) verdict=restamp_includes_unmeasured"; return 1; }
+  while IFS= read -r p; do [ -n "$p" ] && paths+=("$p"); done <<EOF
+$extra
+EOF
+  git -C "$REPO" cat-file -e "${compiled}^{commit}" 2>/dev/null || {
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: compiled commit $compiled is not in $REPO verdict=restamp_not_applicable"; return 1; }
+  changed=$(git -C "$REPO" diff --name-only "$compiled" "$sha" -- crates Cargo.toml Cargo.lock rust-toolchain rust-toolchain.toml .cargo ${paths[@]+"${paths[@]}"} 2>&1) || {
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: diff failed verdict=restamp_not_applicable"; return 1; }
+  others=$(printf '%s\n' "$changed" | grep -v "^$DASH_STATIC/" | grep -v '^$' || true)
+  if [ -n "$others" ]; then
+    echo "== RESTAMP NOT APPLICABLE sha=$sha: compile inputs changed since $compiled ($(printf '%s' "$others" | head -3 | tr '\n' ' ')) verdict=restamp_inputs_changed"
+    return 1
+  fi
+  # The dashboard at this commit, when it is not the one compiled in.
+  dash_tree=$(git -C "$REPO" rev-parse -q --verify "$sha:$DASH_STATIC" 2>/dev/null || true)
+  if [ -n "$dash_tree" ] && [ "$dash_tree" != "$(git -C "$REPO" rev-parse -q --verify "$compiled:$DASH_STATIC" 2>/dev/null)" ]; then
+    case "$dash_cap" in
+      dash) ;;
+      *) echo "== RESTAMP NOT APPLICABLE sha=$sha: the dashboard changed and the running server cannot serve a snapshot (no dashboard_source in /health) verdict=restamp_dashboard_unsupported"; return 1 ;;
+    esac
+    dash_dir="$DASH_SNAPSHOTS/$dash_tree"
+    if [ ! -d "$dash_dir" ]; then
+      tmp_snap="$DASH_SNAPSHOTS/.tmp.$$"
+      rm -rf "${tmp_snap:?}"; mkdir -p "$tmp_snap"
+      if ! git -C "$REPO" archive "$sha" "$DASH_STATIC" | tar -x -C "$tmp_snap" \
+         || ! mv "$tmp_snap/$DASH_STATIC" "$dash_dir"; then
+        rm -rf "${tmp_snap:?}"
+        echo "== RESTAMP NOT APPLICABLE sha=$sha: the dashboard snapshot could not be written to $dash_dir verdict=restamp_dashboard_unwritable"; return 1
+      fi
+      rm -rf "${tmp_snap:?}"
+    fi
+  fi
+  # Local until it is live: a re-stamp that is not adopted must not leave its
+  # fields (dashboard_dir, restamped) in the receipt the compile writes next.
+  stamped=$(python3 - "${INSTALL}.identity.json" "$PROV_JSON" "$head" "$compiled" "$dash_dir" <<'PYSTAMP'
+import json,sys
+old=json.load(open(sys.argv[1])); new=json.loads(sys.argv[2])
+new.update(build=old['build'], trigger=sys.argv[3], compiled_at=sys.argv[4], restamped=True)
+if sys.argv[5]: new['dashboard_dir']=sys.argv[5]
+print(json.dumps(new))
+PYSTAMP
+) || return 1
+  cp -p "${INSTALL}.identity.json" "${INSTALL}.identity.json.rollback"
+  printf '%s\n' "$stamped" > "${INSTALL}.identity.json.new.$$"
+  mv -f "${INSTALL}.identity.json.new.$$" "${INSTALL}.identity.json"
+  if [ -n "$dash_dir" ]; then
+    echo "== ACTIVATION RESTAMPED identity=$stamped: only the dashboard changed since $compiled; serving snapshot $dash_dir (${#paths[@]} includes outside crates/ checked) verdict=activation_restamped dashboard=snapshot"
+  else
+    echo "== ACTIVATION RESTAMPED identity=$stamped: no compile input changed since $compiled (${#paths[@]} includes outside crates/ checked) verdict=activation_restamped"
+  fi
+  if wait_live_identity "$sha" "${AMUX_ACTIVATION_HEALTH_S:-300}"; then
+    echo "$head" > "$STAMP"
+    date +%s > "${STAMP}.adopted_at"
+    PROV_JSON=$stamped
+    printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
+    rm -f "${INSTALL}.identity.json.rollback"
+    prune_dashboard_snapshots "$dash_dir"
+    echo "== ACTIVATION HEALTHY sha=$sha after ${waited}s push_to_live_s=$(( $(date +%s) - $(git -C "$REPO" log -1 --format=%ct "$sha" 2>/dev/null || date +%s) )) from_push_s=$(from_push_s "$sha") restamped=1 verdict=activation_healthy"
+    record_deploy_latency "$sha" "$(from_push_s "$sha")" restamp
+    return 0
+  fi
+  mv -f "${INSTALL}.identity.json.rollback" "${INSTALL}.identity.json"
+  echo "$sha" > "${STAMP}.restamp_failed"
+  echo "== !! ACTIVATION RESTAMP UNADOPTED sha=$sha: not live after ${waited}s; the receipt is restored; compiling now verdict=activation_restamp_unadopted"
+  return 1
 }
 
 activation_authorized() {
@@ -151,6 +530,19 @@ fi
 mkdir -p "$(dirname "$LOCK")"
 if ! mkdir "$LOCK" 2>/dev/null; then
   owner=$(cat "$LOCK/pid" 2>/dev/null || echo "")
+  # An EMPTY pid file is a holder between its mkdir and its pid write (the
+  # prebuild writes the pid one step after mkdir), not a dead one: breaking
+  # it there ran two builds and let the disk guard's rm race a live build
+  # (implicit state machines inventory 2026-10-31, #22). Empty counts as
+  # stale only once the lock is over a minute old.
+  # GNU form first (AF-1125): on Linux `stat -f` is filesystem mode, prints a
+  # "File: ..." block into lock_mtime, and the arithmetic below then aborts on
+  # `File: unbound variable`. BSD `stat -c` fails with nothing on stdout.
+  lock_mtime=$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null || echo 0)
+  if [ -z "$owner" ] && [ $(( $(date +%s) - lock_mtime )) -lt 60 ]; then
+    echo "== $(date '+%F %T') SKIP $built_sha — lock just taken, its pid not written yet verdict=build_lock_young" >> "$LOG"
+    exit 0
+  fi
   if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
     # Log the contention rather than exiting silently: a skip that leaves no
     # trace is indistinguishable from a cycle that found nothing to do, and
@@ -178,11 +570,70 @@ if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" != "1" ] \
   if ! activation_authorized; then
     exit 0
   fi
+  sync_bash_cli "$built_sha"
+  sync_authority_launcher "$built_sha"
+  sync_observed_edits_hooks "$built_sha"
+  sync_repo_git_hooks "$built_sha"
+  # ADOPTION COOLDOWN: batch rapid commits from multiple lanes into fewer
+  # rebuilds. Each self-adoption kills all SSE connections (6-12s of
+  # "Worker updates unavailable" on every client). With 28 lanes committing
+  # independently, the builder was firing 50 times/day. This skips a tick
+  # when a successful adoption happened recently, letting the next tick
+  # build the accumulated changes in one pass.
+  COOLDOWN_S="${AMUX_RS_BUILD_COOLDOWN:-120}"
+  COOLDOWN_FILE="${STAMP}.adopted_at"
+  if [ "$head" != "$last" ] && [ -f "$COOLDOWN_FILE" ] && [ "$COOLDOWN_S" -gt 0 ] 2>/dev/null; then
+    adopted_at=$(cat "$COOLDOWN_FILE" 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    elapsed=$(( now_epoch - adopted_at ))
+    if [ "$elapsed" -lt "$COOLDOWN_S" ]; then
+      remaining=$(( COOLDOWN_S - elapsed ))
+      echo "== $(date '+%F %T') COOLDOWN $built_sha — last adoption ${elapsed}s ago, waiting ${remaining}s more (cooldown=${COOLDOWN_S}s)" >> "$LOG"
+      exit 0
+    fi
+  fi
+  # A DEPLOY USED TO WAIT FOR AN IN-FLIGHT SHELL SCHEDULE (RCA self
+  # 20261015-182512): a restart closed a shell run's output pipes and the run
+  # was recorded "server restarted before the shell result was recorded". A
+  # shell run is now a detached process the next server adopts
+  # (runtime_jobs/shell_detached.rs), so the hold defaults to 0 and a deploy
+  # waits for nothing (cicd-two-minutes item 1: this held 16 of 109 deploys,
+  # up to 530s). AMUX_RS_SHELL_DEFER_MAX_S=<s> brings it back.
+  if [ "$head" != "$last" ]; then
+    SHELL_DEFER_MAX_S="${AMUX_RS_SHELL_DEFER_MAX_S:-0}"
+    SHELL_DEFER_FILE="${STAMP}.shell_defer_since"
+    in_flight=""
+    if [ "$SHELL_DEFER_MAX_S" -gt 0 ] 2>/dev/null; then in_flight=$(shell_runs_in_flight "$SHELL_DEFER_MAX_S"); fi
+    if [ -n "$in_flight" ] && [ "$SHELL_DEFER_MAX_S" -gt 0 ] 2>/dev/null; then
+      now_epoch=$(date +%s)
+      since=$(cat "$SHELL_DEFER_FILE" 2>/dev/null || echo "$now_epoch")
+      [ -f "$SHELL_DEFER_FILE" ] || echo "$now_epoch" > "$SHELL_DEFER_FILE"
+      held=$(( now_epoch - since ))
+      if [ "$held" -lt "$SHELL_DEFER_MAX_S" ]; then
+        echo "== $(date '+%F %T') SHELL-RUN DEFER $built_sha — shell schedule run(s) in flight: $in_flight; held ${held}s of ${SHELL_DEFER_MAX_S}s verdict=activation_deferred_shell_run" >> "$LOG"
+        exit 0
+      fi
+      echo "== $(date '+%F %T') SHELL-RUN DEFER EXPIRED $built_sha — still in flight after ${held}s: $in_flight; deploying verdict=activation_shell_defer_expired" >> "$LOG"
+    fi
+    rm -f "$SHELL_DEFER_FILE"
+  fi
   if [ "$head" = "$last" ]; then
     if ! measure_live_identity; then
       echo "== $(date '+%F %T') !! ACTIVATION IDENTITY UNMEASURED expected=$built_sha trigger=$head $identity_reason measured=false action=defer — unavailable health is not evidence of image drift" >> "$LOG"
       exit 0
     fi
+    # A dirty build of the ELECTED commit is someone's local experiment on the
+    # right base: leave it. A dirty build of any OTHER commit pinned the live
+    # server 176 commits behind main for an hour on 2026-10-02 (62a149c3-dirty),
+    # because it used to read as unmeasured and defer forever. It is drift.
+    case "$live" in
+      *-dirty)
+        case "$built_sha" in
+          "${live%-dirty}"*)
+            echo "== $(date '+%F %T') !! ACTIVATION IDENTITY DIRTY expected=$built_sha live=$live same_commit=true measured=true action=defer" >> "$LOG"
+            exit 0 ;;
+        esac ;;
+    esac
     case "$built_sha" in
       "$live"*)
         echo "== $(date '+%F %T') ACTIVATION IDENTITY MATCH expected=$built_sha live=$live measured=true action=skip" >> "$LOG"
@@ -203,7 +654,8 @@ PYINSTALLED
           echo "== $(date '+%F %T') !! ACTIVATION AWAITING ADOPTION expected=$built_sha live=$live installed_match=true measured=true action=skip_rebuild" >> "$LOG"
           exit 0
         fi
-        echo "== $(date '+%F %T') !! ACTIVATION STAMP DRIFT $built_sha live=$live measured=true action=rebuild — measured foreign image" >> "$LOG" ;;
+        echo "== $(date '+%F %T') !! ACTIVATION STAMP DRIFT $built_sha live=$live measured=true action=rebuild — measured foreign image" >> "$LOG"
+        RESTAMP_CANDIDATE=1 ;;
     esac
   fi
 fi
@@ -316,6 +768,15 @@ if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" = "1" ]; then
   exit 0
 fi
 
+# Every gate above has run (authority, cooldown, shell defer, overlap).
+# A crates/ commit can still be one that only changed the dashboard. A
+# disk-clear diagnostic run never installs anything, so it never re-stamps.
+[ "$head" != "$last" ] && RESTAMP_CANDIDATE=1
+[ "${AMUX_RS_DISK_CLEAR_ONLY:-}" = 1 ] && RESTAMP_CANDIDATE=0
+if [ "${RESTAMP_CANDIDATE:-0}" = 1 ] && restamp_without_compile "$built_sha" >> "$LOG" 2>&1; then
+  exit 0
+fi
+
 {
   # BUILT sha first, trigger second, and both LABELLED. This line printed `$head`
   # — the stamp key, i.e. the last commit that touched the build inputs — which
@@ -342,10 +803,44 @@ fi
     case "$failed_at" in ''|*[!0-9]*) failed_at=0 ;; esac
   fi
   retry_now=$(date +%s)
+  # ROLLED BACK (AMUX_ACTIVATION_ROLLBACK, below): that commit built but did not
+  # come up healthy. Retrying it on the failure cooldown would take the server
+  # down again every 15 minutes, so it is held until the build inputs move.
+  rolled_head=''
+  [ -r "${STAMP}.rolled_back" ] && read -r rolled_head _ < "${STAMP}.rolled_back" || true
+  # A hold whose commit has the SAME build inputs as the binary that was put
+  # back (the stamp names the inputs of what is installed) protects nothing:
+  # the restored binary is that code. Such a hold only clears when crates/ next
+  # changes, which held deploys from 2026-11-04 05:53Z for 31 hours while every
+  # newer main commit touched only scripts and docs. Clear it, and say so.
+  if [ -n "$rolled_head" ] && [ "$rolled_head" = "$head" ] && [ "$last" = "$head" ]; then
+    rm -f "${STAMP}.rolled_back"
+    echo "== WARN activation_rollback_hold_cleared trigger=$head: the restored binary was built from the same inputs, so holding this commit protects nothing verdict=activation_rollback_hold_same_inputs"
+    rolled_head=''
+  fi
+  if [ "${AMUX_RS_DISK_CLEAR_ONLY:-0}" != 1 ] && [ -n "$rolled_head" ] && [ "$rolled_head" = "$head" ]; then
+    echo "== activation_rollback_hold trigger=$head: rolled back as unhealthy; waiting for a newer commit verdict=activation_rollback_hold"
+    exit 0
+  fi
   if [ "${AMUX_RS_DISK_CLEAR_ONLY:-0}" != 1 ] && [ "$failed_head" = "$head" ] \
       && [ "$failed_at" -le "$retry_now" ] && [ "$((retry_now - failed_at))" -lt "$retry_s" ]; then
     echo "== cargo_build_backoff trigger=$head retry_in_s=$((retry_s - retry_now + failed_at))"
     exit 0
+  fi
+  # WAIT FOR THE BINARY ANOTHER HOST IS BUILDING (Z4). With a prebuilt directory set,
+  # the build host is compiling this sha too, and a local compile here is the one that
+  # OOMs on the sandbox. Each pass that finds no binary yet comes back on the next one,
+  # for at most AMUX_DEPLOY_PREBUILT_WAIT_S (600); past that it compiles here and says so.
+  if [ -n "${AMUX_DEPLOY_PREBUILT_DIR:-}" ] && [ "${AMUX_RS_DISK_CLEAR_ONLY:-0}" != 1 ] \
+     && [ ! -s "$AMUX_DEPLOY_PREBUILT_DIR/$built_sha/amux-server" ]; then
+    _pw="${STAMP}.prebuilt_wait.$built_sha"
+    [ -f "$_pw" ] || date +%s > "$_pw"
+    _waited=$(( $(date +%s) - $(cat "$_pw" 2>/dev/null || date +%s) ))
+    if [ "$_waited" -lt "${AMUX_DEPLOY_PREBUILT_WAIT_S:-600}" ]; then
+      echo "== $(date '+%F %T') waiting ${_waited}s for the prebuilt binary of $built_sha verdict=deploy_prebuilt_waiting"
+      exit 0
+    fi
+    echo "== WARN no prebuilt binary for $built_sha after ${_waited}s; compiling here verdict=deploy_prebuilt_timeout"
   fi
   echo "== $(date '+%F %T') building $built_sha (trigger: $head, previous stamp: ${last:-none})"
   if [ "$on_main" != "yes" ]; then
@@ -428,24 +923,58 @@ fi
     local root="$1" candidate="$2" result
     # Existing deterministic test seam may force a refusal, never bypass a real
     # process/lock check by setting the override empty.
-    if [ -n "${AMUX_BUILD_PEER_PIDS_OVERRIDE:-}" ]; then
-      echo "== WARN cargo_reclaim_deferred DEFERRED: peer build(s) in flight (pid $AMUX_BUILD_PEER_PIDS_OVERRIDE); retry after builds finish."
+    RECLAIM_DEFERRED=1
+    # Test seam: a peer that "finishes" when the test deletes this file.
+    local peer_override="${AMUX_BUILD_PEER_PIDS_OVERRIDE:-}"
+    if [ -n "${AMUX_BUILD_PEER_PIDS_FILE:-}" ] && [ -s "$AMUX_BUILD_PEER_PIDS_FILE" ]; then
+      peer_override=$(cat "$AMUX_BUILD_PEER_PIDS_FILE")
+    fi
+    if [ -n "$peer_override" ]; then
+      [ "${RECLAIM_QUIET:-0}" = 1 ] || echo "== WARN cargo_reclaim_deferred DEFERRED: peer build(s) in flight (pid $peer_override); retry after builds finish."
       return 0
     fi
     local guard_cmd=(python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$root" --path "$candidate")
     [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" != 1 ] || guard_cmd+=(--dry-run)
+    RECLAIM_LAST=""
     if result=$("${guard_cmd[@]}"); then
+      RECLAIM_DEFERRED=0
       echo "== cargo_reclaim_result path=$candidate $result"
     else
-      echo "== WARN cargo_reclaim_deferred DEFERRED path=$candidate $result; retry after builds finish."
+      RECLAIM_LAST="$result"
+      [ "${RECLAIM_QUIET:-0}" = 1 ] || echo "== WARN cargo_reclaim_deferred DEFERRED path=$candidate $result; retry after builds finish."
     fi
   }
+  # One try per builder run lost every time on 2026-10-27: a lane ran cargo
+  # back to back, the debug lock was held at each 60s run, and debug/ grew to
+  # 64G while the Mac fell to 5.8G free. Retrying the same guarded clear every
+  # 2s found a gap within minutes. So while debug/ is over its cap, keep
+  # trying for a bounded window (it delays this run's build by at most that
+  # window, and only while the cache is oversized). The guard still decides:
+  # nothing is cleared while a build holds the target.
+  reclaim_debug_with_retries() { # <root> <path>
+    local tries=0 window=${AMUX_BUILD_RECLAIM_WINDOW_S:-45} poll=${AMUX_BUILD_RECLAIM_POLL_S:-2} started=$SECONDS
+    while :; do
+      tries=$((tries+1))
+      RECLAIM_QUIET=1 reclaim_target "$1" "$2"
+      [ "$RECLAIM_DEFERRED" = 1 ] || { echo "== cargo_reclaim_retry verdict=cleared attempts=$tries waited_s=$((SECONDS-started))"; return 0; }
+      [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" != 1 ] || break
+      [ $((SECONDS-started)) -lt "$window" ] || break
+      sleep "$poll"
+    done
+    echo "== WARN cargo_reclaim_deferred DEFERRED path=$2 attempts=$tries waited_s=$((SECONDS-started)) verdict=cargo_reclaim_retry_exhausted last=${RECLAIM_LAST:-peer override}; the guard refused for the whole window, the next run retries."
+  }
+  # The cap must sit ABOVE one workspace test build (33-36G measured
+  # 2026-11-14). At 32 every builder run after a land gate cleared it, the
+  # next gate rebuilt all of it cold, and the host's free space swung ~35G per
+  # cycle, which the disk tick escalated three times as an 18-20G/h burn
+  # (RCAs 20261114-032649, -122821). 44 keeps the warm build and stays under
+  # the 64G AMUX_CARGO_MAX_TARGET_GB with deploy/ and release/ beside it.
   DEBUG_DIR="$HOME/.amux/rust-build-target/debug"
   if [ -d "$DEBUG_DIR" ]; then
     DEBUG_GB=$(du -sk "$DEBUG_DIR" 2>/dev/null | awk '{print int($1/1048576)}')
-    if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-32}" ]; then
+    if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-44}" ]; then
       echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR. Clearing eligible artifacts only after the Cargo safety guard permits it."
-      reclaim_target "$HOME/.amux/rust-build-target" "$DEBUG_DIR"
+      reclaim_debug_with_retries "$HOME/.amux/rust-build-target" "$DEBUG_DIR"
     fi
   fi
 
@@ -484,10 +1013,42 @@ fi
 
   # Build from a clean, committed snapshot: a worktree of HEAD, so nobody's
   # uncommitted edits (or a mid-edit broken tree) can poison the deploy.
-  WORK=$(mktemp -d /tmp/amux-rs-build.XXXXXX)
-  git -C "$REPO" worktree add --detach "$WORK" "$(git -C "$REPO" rev-parse HEAD)" >/dev/null
-  # Shared target dir: incremental rebuilds (~15s) instead of cold ones
-  # (~3min) — the worktree isolates SOURCE, the cache is content-keyed.
+  #
+  # ONE STABLE BUILD DIRECTORY, reset to the commit each time (2026-09-27).
+  # This used to be a fresh `mktemp -d` worktree per build, and the comment
+  # here claimed the shared target dir made that incremental. It did not:
+  # cargo keys workspace crates by their source PATH, so a new directory
+  # recompiled amux-server from scratch every deploy (5m45s to 9m40s
+  # measured). A stable directory, hard-reset and cleaned to the committed
+  # snapshot, keeps the same isolation from anyone's uncommitted edits and
+  # lets the `deploy` profile rebuild only what changed (14s to 63s).
+  # Falls back to a throwaway worktree if the stable one cannot be prepared.
+  BUILD_SHA="$(git -C "$REPO" rev-parse HEAD)"
+  STABLE="${AMUX_DEPLOY_SRC:-$HOME/.amux/deploy-build-src}"
+  if [ -d "$STABLE" ] && git -C "$STABLE" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+      && git -C "$STABLE" reset -q --hard && git -C "$STABLE" clean -qfdx \
+      && git -C "$STABLE" checkout -q --detach "$BUILD_SHA"; then
+    WORK="$STABLE"; WORK_STABLE=1
+  else
+    rm -rf "${STABLE:?}"; git -C "$REPO" worktree prune 2>/dev/null || true
+    if git -C "$REPO" worktree add --detach "$STABLE" "$BUILD_SHA" >/dev/null 2>&1; then
+      WORK="$STABLE"; WORK_STABLE=1
+    else
+      echo "== stable build dir $STABLE unavailable; building in a throwaway worktree (cold, slow)"
+      WORK=$(mktemp -d /tmp/amux-rs-build.XXXXXX)
+      git -C "$REPO" worktree add --detach "$WORK" "$BUILD_SHA" >/dev/null
+    fi
+  fi
+  [ "$(git -C "$WORK" rev-parse HEAD)" = "$BUILD_SHA" ] || { echo "== build dir is not at $BUILD_SHA; refusing"; exit 1; }
+  # The deploy profile's output. The remote-build path produces a release
+  # binary at the release path, so it sets BUILT_BIN to that below.
+  # The deploy build's own target directory, shared with rust-prebuild.sh,
+  # which already honoured AMUX_DEPLOY_TARGET_DIR while this hardcoded the
+  # fleet's directory: cargo locks a whole target directory, so a lane's
+  # `cargo test` there held a deploy compile (423 s against a usual 130 s,
+  # 2026-11-12). Default unchanged.
+  DEPLOY_TARGET="${AMUX_DEPLOY_TARGET_DIR:-$HOME/.amux/rust-build-target}"
+  BUILT_BIN="$DEPLOY_TARGET/deploy/amux-server"
   # CAPTURE THE WHOLE BUILD, THEN DECIDE WHAT TO KEEP (AMUX-2927).
   #
   # This was `cargo build ... 2>&1 | tail -3`, and on a FAILURE cargo's last
@@ -517,11 +1078,72 @@ fi
   # cost it was built to avoid. The fallback is LOGGED, never silent — see
   # AMUX-48's frustrations.md entry for why a silent wrong-path here would
   # cost exactly what it already cost once.
+  # THE DEPLOY PROFILE ONLY PAYS OFF WITH ITS OWN SETTINGS (2026-09-27).
+  # safe-cargo defaults CARGO_INCREMENTAL=0 and CARGO_BUILD_JOBS=2 for routine
+  # fleet checks. The env var overrides `incremental = true` in
+  # [profile.deploy], and a 2-slot jobserver runs its 256 codegen units two at
+  # a time, so a one-crate rebuild measured 14-63s by hand took 7m50s-8m31s
+  # here. On a Mac the builder takes every core; elsewhere it keeps
+  # safe-cargo's default unless AMUX_DEPLOY_JOBS says otherwise, because the
+  # small Linux box is memory-bound. safe-cargo's RSS budget still applies.
+  if [ -n "${AMUX_DEPLOY_JOBS:-}" ]; then
+    DEPLOY_JOBS="$AMUX_DEPLOY_JOBS"
+  elif [ "$(uname -s)" = Darwin ]; then
+    # Absolute path: this script's PATH (line 17) omits /usr/sbin, and a bare
+    # `sysctl` silently fell back to 2 on the first live run (dd36d783, 355s).
+    DEPLOY_JOBS="$(/usr/sbin/sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    if [ -z "$DEPLOY_JOBS" ]; then
+      DEPLOY_JOBS=2
+      echo "== WARN deploy_jobs_fallback could not read the core count; building with jobs=2"
+    fi
+  else
+    DEPLOY_JOBS="${CARGO_BUILD_JOBS:-2}"
+  fi
+  # NICED, so the fleet's own work wins the CPU when they contend
+  # (mixpeek-override, 2026-10-03 13:08Z: rustc at ~810% CPU and nice 0 beside
+  # a 13-member land hold at load 50-60 on 28 cores). An idle host still gives
+  # the build every core, so a quiet deploy is no slower. AMUX_DEPLOY_NICE
+  # (default 10; 0 disables).
+  DEPLOY_NICE="${AMUX_DEPLOY_NICE:-10}"
+  DEPLOY_T0=$(date +%s)
+  echo "== deploy build settings incremental=1 jobs=$DEPLOY_JOBS nice=$DEPLOY_NICE load=$(/usr/sbin/sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || cut -d' ' -f1 /proc/loadavg 2>/dev/null)"
+  # A HEARTBEAT WHILE CARGO RUNS (AMUX-6530). The build writes to $BUILD_OUT,
+  # so a long one left this log silent: on 2026-10-28 a 21-minute build under
+  # load 70 read as a dead builder (deploy.builder_is_ticking, 600 s budget),
+  # 1171 failures since 09-20. One line per AMUX_BUILD_HEARTBEAT_S while the
+  # build runs; the loop also exits on its own if this script is gone.
+  _builder_pid=$$
+  ( while sleep "${AMUX_BUILD_HEARTBEAT_S:-60}"; do
+      kill -0 "$_builder_pid" 2>/dev/null || exit 0
+      echo "== deploy build running elapsed_s=$(( $(date +%s) - DEPLOY_T0 )) verdict=deploy_build_running"
+    done ) &
+  HB_PID=$!
   BUILD_OK=0
-  if [ -n "${AMUX_REMOTE_BUILD_HOST:-}" ]; then
+  # A BINARY ANOTHER HOST ALREADY BUILT FOR THIS COMMIT (docs/design/cicd-two-minutes.md,
+  # Z4). The sandbox cannot compile main at all: one rustc peaks at 6.8 GB against its
+  # 6.5 GB limit at any job count. mixpeek-dev builds each main commit from a warm cache
+  # (43 to 46 s) and pushes it here through scripts/amux-prebuilt-receive.sh. It is used
+  # only for this exact sha, only when it is a real executable, and it goes through the
+  # same install, identity stamp, health check and rollback as a local build. Absent, the
+  # build below runs as before.
+  PREBUILT="${AMUX_DEPLOY_PREBUILT_DIR:+$AMUX_DEPLOY_PREBUILT_DIR/$built_sha/amux-server}"
+  if [ -n "$PREBUILT" ] && [ -f "$PREBUILT" ] && [ -x "$PREBUILT" ] \
+     && [ "$(wc -c < "$PREBUILT" | tr -d ' ')" -gt 1048576 ]; then
+    mkdir -p "$DEPLOY_TARGET/deploy"
+    cp -f "$PREBUILT" "$DEPLOY_TARGET/deploy/amux-server.prebuilt.$$" \
+      && mv -f "$DEPLOY_TARGET/deploy/amux-server.prebuilt.$$" "$DEPLOY_TARGET/deploy/amux-server" \
+      && BUILD_OK=1 && BUILT_BIN="$DEPLOY_TARGET/deploy/amux-server" && DEPLOY_KIND=prebuilt
+    echo "== deploy build used the prebuilt binary for $built_sha ($(wc -c < "$PREBUILT" | tr -d ' ') bytes) ok=$BUILD_OK verdict=deploy_prebuilt_used" | tee -a "$BUILD_OUT"
+  elif [ -n "$PREBUILT" ]; then
+    echo "== deploy build: no prebuilt binary for $built_sha in $AMUX_DEPLOY_PREBUILT_DIR; compiling here verdict=deploy_prebuilt_missing"
+  fi
+  if [ "$BUILD_OK" = 1 ]; then
+    :
+  elif [ -n "${AMUX_REMOTE_BUILD_HOST:-}" ]; then
     if "$REPO/scripts/rust-remote-build.sh" "$WORK" \
-        "$HOME/.amux/rust-build-target/release/amux-server" > "$BUILD_OUT" 2>&1; then
+        "$DEPLOY_TARGET/release/amux-server" > "$BUILD_OUT" 2>&1; then
       BUILD_OK=1
+      BUILT_BIN="$DEPLOY_TARGET/release/amux-server"
     else
       { echo "== remote build on '$AMUX_REMOTE_BUILD_HOST' failed, falling back to local:"; \
         cat "$BUILD_OUT"; } > "${BUILD_OUT}.remote" 2>&1
@@ -530,20 +1152,67 @@ fi
       # this script's — this unit already gets one via systemd (defense in
       # depth for the case where rust-auto-build.sh is invoked directly
       # from an interactive pane instead of via the timer).
-      if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" "$REPO/scripts/safe-cargo.sh" build --release -p amux-server) >> "$BUILD_OUT" 2>&1; then
+      if (cd "$WORK" && CARGO_TARGET_DIR="$DEPLOY_TARGET" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) >> "$BUILD_OUT" 2>&1; then
         BUILD_OK=1
       fi
     fi
   else
-    if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" "$REPO/scripts/safe-cargo.sh" build --release -p amux-server) > "$BUILD_OUT" 2>&1; then
+    if (cd "$WORK" && CARGO_TARGET_DIR="$DEPLOY_TARGET" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) > "$BUILD_OUT" 2>&1; then
       BUILD_OK=1
     fi
+  fi
+  # A STALE INCREMENTAL CACHE FAILS THE LINK, NOT THE COMPILE (AF-1012). On
+  # 2026-10-29 two green commits in a row (496d9cff6, ed0421bf3) failed to
+  # deploy with "ld: symbol(s) not found" for a function that compiles fine,
+  # and backoff retried the same cache every ~13 minutes: the server stayed
+  # 11 commits behind until the amux_server incremental trees were cleared by
+  # hand. Clear them through the target guard (it defers while another build
+  # holds the target) and build once more; dependency caches stay.
+  if [ "$BUILD_OK" = 0 ] && grep -aqE 'symbol\(s\) not found|Undefined symbols for architecture|undefined reference to' "$BUILD_OUT"; then
+    echo "== WARN deploy link failed on unresolved symbols; clearing the amux_server incremental trees and retrying once verdict=deploy_incremental_link_retry"
+    for _inc in "$DEPLOY_TARGET/deploy/incremental"/amux_server-*; do
+      [ -d "$_inc" ] || continue
+      python3 "$REPO/scripts/cargo-target-guard.py" clear --target "$DEPLOY_TARGET" --path "$_inc" 2>&1 | sed 's/^/== /' || true
+    done
+    if (cd "$WORK" && CARGO_TARGET_DIR="$DEPLOY_TARGET" CARGO_INCREMENTAL=1 CARGO_BUILD_JOBS="$DEPLOY_JOBS" nice -n "$DEPLOY_NICE" "$REPO/scripts/safe-cargo.sh" build --profile deploy -p amux-server) >> "$BUILD_OUT" 2>&1; then
+      BUILD_OK=1
+    fi
+    echo "== deploy_incremental_link_retry ok=$BUILD_OK"
   fi
   # Explicit exit-code-derived flag, NOT a file-existence check: a stale
   # binary from an earlier successful build sitting at this same path would
   # make `[ -x ... ]` true even after a genuine failure, silently
   # re-installing old code and reporting success — the exact "wrong answer,
   # not wrong-looking" shape ethos rule 4 exists to catch.
+  # Under set -e: a heartbeat that already exited makes `kill` fail, and
+  # `wait` on a killed one returns 143. Either would abort the deploy itself.
+  kill "$HB_PID" 2>/dev/null || true; wait "$HB_PID" 2>/dev/null || true; HB_PID=
+  DEPLOY_ELAPSED=$(( $(date +%s) - DEPLOY_T0 ))
+  # NEVER INSTALL A STAND-IN. A real amux-server is over 100 MB; the builder tests'
+  # fake cargo writes a 35-byte script, and one landed in the Mac's real deploy
+  # directory on 2026-11-12 (3283eeb11). Anything under 1 MB is a failed build.
+  if [ "$BUILD_OK" = 1 ] && [ "$(wc -c < "$BUILT_BIN" 2>/dev/null | tr -d ' ' || echo 0)" -le "${AMUX_DEPLOY_MIN_BIN_BYTES:-1048576}" ]; then
+    echo "== ERROR deploy build produced $(wc -c < "$BUILT_BIN" 2>/dev/null | tr -d ' ' || echo 0) bytes at $BUILT_BIN, not a server; refusing to install it verdict=deploy_binary_too_small"
+    BUILD_OK=0
+  fi
+  echo "== deploy build elapsed_s=$DEPLOY_ELAPSED ok=$BUILD_OK jobs=$DEPLOY_JOBS"
+  # Cargo says when another build holds the target directory; that wait is
+  # part of elapsed_s, and BUILD_OUT is deleted, so name it here.
+  if grep -q "Blocking waiting for file lock" "$BUILD_OUT" 2>/dev/null; then
+    echo "== WARN deploy build waited for another cargo on $DEPLOY_TARGET (set AMUX_DEPLOY_TARGET_DIR to give deploys their own) verdict=deploy_build_lock_wait"
+  fi
+  # A slow build is the regression this block exists to prevent, and nothing
+  # else would say so: the deploy still lands, just minutes late.
+  if [ "$BUILD_OK" = 1 ] && [ "$DEPLOY_ELAPSED" -gt "${AMUX_DEPLOY_SLOW_S:-180}" ]; then
+    echo "== WARN deploy_build_slow elapsed_s=$DEPLOY_ELAPSED threshold_s=${AMUX_DEPLOY_SLOW_S:-180} jobs=$DEPLOY_JOBS incremental=1 (a cold cache or a dependency bump is expected to be slow once)"
+  fi
+  # Disk RCA 20261011-112249: cargo never deletes an incremental tree whose
+  # fingerprint a profile or toolchain change superseded (four amux_server
+  # trees, 9 GB of them dead). Drop the trees of crates this build rewrote.
+  if [ "$BUILD_OK" = 1 ]; then
+    bash "$REPO/scripts/prune-superseded-incremental.sh" \
+      "$DEPLOY_TARGET/deploy/incremental" "$DEPLOY_T0" 2>&1 | sed 's/^/== /' || true
+  fi
   if [ "$BUILD_OK" = 1 ]; then
     tail -3 "$BUILD_OUT"
     # Build the complete replacement beside the live executable, including its
@@ -555,7 +1224,7 @@ fi
     # EX_CONFIG until somebody manually re-registers the agent. From a phone the
     # symptom is simply that the canonical Tailscale URL stays offline.
     INSTALL_TMP="${INSTALL}.new.$$"
-    install -m 0755 "$HOME/.amux/rust-build-target/release/amux-server" "$INSTALL_TMP"
+    install -m 0755 "$BUILT_BIN" "$INSTALL_TMP"
     # STABLE CODE IDENTITY, or say why there is not one (AMUX-3527).
     #
     # cargo/rustc emit a LINKER-SIGNED ADHOC binary: `Signature=adhoc`,
@@ -614,10 +1283,17 @@ fi
 import hashlib,json,sys
 with open(sys.argv[1], 'rb') as f:
     build=hashlib.file_digest(f, 'sha256').hexdigest()[:16] if hasattr(hashlib, 'file_digest') else hashlib.sha256(f.read()).hexdigest()[:16]
-d=json.loads(sys.argv[2]); d.update(build=build, trigger=sys.argv[3])
+d=json.loads(sys.argv[2]); d.update(build=build, trigger=sys.argv[3], compiled_at=d['sha'])
 print(json.dumps(d))
 PYIDENTITY
 )
+    # AMUX_ACTIVATION_ROLLBACK=1 (amux Cloud, which deploys main's tip without
+    # waiting for CI): keep what is live, so a build that installs but does not
+    # come up healthy is put back below.
+    if [ "${AMUX_ACTIVATION_ROLLBACK:-1}" = 1 ] && [ -f "$INSTALL" ]; then
+      cp -p "$INSTALL" "${INSTALL}.rollback" 2>/dev/null || rm -f "${INSTALL}.rollback"
+      if [ -f "${INSTALL}.identity.json" ]; then cp -p "${INSTALL}.identity.json" "${INSTALL}.identity.json.rollback"; else rm -f "${INSTALL}.identity.json.rollback"; fi
+    fi
     # Publish identity before the executable. Readers require its hash to
     # match the candidate, so neither half of the rename pair can lie.
     printf '%s\n' "$PROV_JSON" > "${INSTALL}.identity.json.new.$$"
@@ -644,6 +1320,7 @@ PYIDENTITY
     fi
     INSTALL_TMP=""
     echo "$head" > "$STAMP"
+    date +%s > "${STAMP}.adopted_at"
     rm -f "${STAMP}.failed"
     printf '%s\n' "$PROV_JSON" > "$PROV_FILE" 2>/dev/null || true
     echo "== ACTIVATION INSTALLED identity=$PROV_JSON"
@@ -652,6 +1329,36 @@ PYIDENTITY
     # failure branch below it is left alone, so it keeps naming the last good
     # build — which is exactly what that branch says is still running.
     echo "== installation action=$install_action; running server will verify identity before adoption"
+    if [ "${AMUX_ACTIVATION_ROLLBACK:-1}" = 1 ] && [ "$install_action" = replaced ] && [ -f "${INSTALL}.rollback" ]; then
+      limit="${AMUX_ACTIVATION_HEALTH_S:-300}"; waited=0; healthy=0
+      case "$limit" in ''|*[!0-9]*) limit=300 ;; esac
+      if wait_live_identity "$built_sha" "$limit"; then healthy=1; fi
+      if [ "$healthy" = 1 ]; then
+        echo "== ACTIVATION HEALTHY sha=$built_sha after ${waited}s push_to_live_s=$(( $(date +%s) - $(git -C "$WORK" log -1 --format=%ct "$built_sha" 2>/dev/null || date +%s) )) from_push_s=$(from_push_s "$built_sha") verdict=activation_healthy"
+        record_deploy_latency "$built_sha" "$(from_push_s "$built_sha")" "${DEPLOY_KIND:-compiled}"
+        rm -f "${INSTALL}.rollback" "${INSTALL}.identity.json.rollback" "${STAMP}.rolled_back"
+      else
+        # Identity before the executable, the same order as the install.
+        if [ -f "${INSTALL}.identity.json.rollback" ]; then mv -f "${INSTALL}.identity.json.rollback" "${INSTALL}.identity.json"; else rm -f "${INSTALL}.identity.json"; fi
+        mv -f "${INSTALL}.rollback" "$INSTALL"
+        if [ -n "$last" ]; then echo "$last" > "$STAMP"; else rm -f "$STAMP"; fi
+        rb_next="this commit is held until a newer one"
+        if [ "$last" = "$head" ]; then
+          rb_next="this commit is retried after the ${retry_s}s build backoff, not held"
+          # Same build inputs as the binary just restored: the code is not what
+          # failed, so do not hold it until crates/ changes (see
+          # activation_rollback_hold_same_inputs). Retry on the bounded build
+          # backoff instead, so a server that never adopts is not rebuilt
+          # every tick.
+          printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.failed"
+          echo "== WARN activation_unadopted_same_inputs sha=$built_sha trigger=$head: not held; retried after the ${retry_s}s backoff, since the restored binary is the same code verdict=activation_unadopted_same_inputs"
+        else
+          printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.rolled_back"
+        fi
+        echo "== !! ACTIVATION ROLLED BACK sha=$built_sha: the server did not report it healthy within ${waited}s" \
+             "(live: ${live:-unmeasured}); the previous binary is back and $rb_next verdict=activation_rolled_back"
+      fi
+    fi
   else
     printf '%s %s\n' "$head" "$(date +%s)" > "${STAMP}.failed"
     echo "== BUILD FAILED for $head — running server keeps the last good build"

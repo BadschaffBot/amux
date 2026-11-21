@@ -18,8 +18,17 @@
 
 pub mod brex;
 pub mod browser;
+pub mod browser_login_sync;
+pub mod browser_logins;
 pub mod calendar;
+pub mod computer;
 pub mod email;
+pub mod local_mailbox;
+pub(crate) mod at_rest;
+pub(crate) mod oauth_store;
+pub(crate) mod secure_store;
+pub mod gcal_sync;
+pub mod mixpeek;
 
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -128,7 +137,10 @@ impl IntegrationRegistry {
         // Calendar CRUD + iCal generation are pure DB/CPU: available.
         self.set("calendar", IntegrationState::Available);
         self.set("crm", IntegrationState::Available);
-        if std::env::var("AMUX_S3_BUCKET").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        if std::env::var("AMUX_S3_BUCKET")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
             self.set(
                 "calendar_s3",
                 IntegrationState::Unavailable {
@@ -139,7 +151,10 @@ impl IntegrationRegistry {
                 },
             );
         }
-        if std::env::var("LIGHTFIELD_API_KEY").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        if std::env::var("LIGHTFIELD_API_KEY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        {
             self.set(
                 "crm_sync",
                 IntegrationState::Unavailable {
@@ -183,11 +198,15 @@ mod tests {
         // A real failure downgrades; the reason travels with the state.
         reg.set(
             "email",
-            IntegrationState::Unavailable { reason: "invalid_grant: token revoked".into() },
+            IntegrationState::Unavailable {
+                reason: "invalid_grant: token revoked".into(),
+            },
         );
         assert_eq!(
             reg.get("email"),
-            Some(IntegrationState::Unavailable { reason: "invalid_grant: token revoked".into() })
+            Some(IntegrationState::Unavailable {
+                reason: "invalid_grant: token revoked".into()
+            })
         );
         // Recovery is a plain set back to Available.
         reg.set("email", IntegrationState::Available);
@@ -198,15 +217,28 @@ mod tests {
     fn snapshot_shape_for_health() {
         let reg = IntegrationRegistry::new();
         reg.set("calendar", IntegrationState::Available);
-        reg.set("calendar_s3", IntegrationState::Unavailable { reason: "no publisher".into() });
-        reg.set("email", IntegrationState::Degraded { reason: "unverified".into() });
+        reg.set(
+            "calendar_s3",
+            IntegrationState::Unavailable {
+                reason: "no publisher".into(),
+            },
+        );
+        reg.set(
+            "email",
+            IntegrationState::Degraded {
+                reason: "unverified".into(),
+            },
+        );
         let snap = reg.snapshot();
         assert_eq!(snap["calendar"], json!({ "state": "available" }));
         assert_eq!(
             snap["calendar_s3"],
             json!({ "state": "unavailable", "reason": "no publisher" })
         );
-        assert_eq!(snap["email"], json!({ "state": "degraded", "reason": "unverified" }));
+        assert_eq!(
+            snap["email"],
+            json!({ "state": "degraded", "reason": "unverified" })
+        );
         // Available omits reason entirely — nothing to explain.
         assert!(snap["calendar"].get("reason").is_none());
     }

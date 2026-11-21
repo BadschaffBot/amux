@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 
 class Deferred(Exception):
@@ -33,6 +34,57 @@ def lease_path(target):
     return target.parent / ('.' + target.name + '.reclaim.lock')
 
 
+# A DEFERRAL STREAK ON THE SAME CONDITION IS A WEDGE, NOT A PAUSE (AMUX-4944).
+#
+# The deferral logs with measured:true and a real pid, so it reads as the guard
+# working. Nothing counted CONSECUTIVE deferrals, so 243 identical refusals
+# looked exactly like one and the fleet's deploys were dark for days before
+# anyone asked why their own work was not live.
+WEDGE_STREAK = int(os.environ.get('AMUX_CARGO_GUARD_WEDGE_STREAK', '10'))
+
+
+def streak_path(target):
+    return target.parent / ('.' + target.name + '.reclaim.streak')
+
+
+def bump_streak(targets, reason, now=None):
+    """Consecutive deferrals for the SAME reason, as a count.
+
+    Keyed on the reason text, so a DIFFERENT blocker resets it: a new pid is a
+    new condition, and calling that a continuing wedge would be the same class
+    of lie as not counting at all. Both fields are computed from stored state;
+    neither can disagree with the run that produced it.
+    """
+    if not targets:
+        return None
+    path = streak_path(sorted(targets)[0])
+    now = int(time.time()) if now is None else now
+    try:
+        previous = json.loads(path.read_text())
+    except (OSError, ValueError):
+        previous = {}
+    if previous.get('reason') == reason:
+        count = int(previous.get('count', 0)) + 1
+        since = int(previous.get('since', now))
+    else:
+        count, since = 1, now
+    try:
+        path.write_text(json.dumps({'reason': reason, 'count': count, 'since': since}))
+    except OSError:
+        pass  # an unwritable streak file must never fail the reclaim itself
+    return {'deferral_streak': count, 'streak_since': since,
+            'wedged': count >= WEDGE_STREAK}
+
+
+def clear_streak(targets):
+    """A reclaim that got through ends the streak: the condition cleared."""
+    for target in targets:
+        try:
+            streak_path(target).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def open_lock(path, shared=False, wait=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -41,8 +93,40 @@ def open_lock(path, shared=False, wait=False):
                     | (0 if wait else fcntl.LOCK_NB))
     except OSError:
         os.close(fd)
-        raise Deferred('lock busy or unmeasured: ' + str(path))
+        raise Deferred('lock busy or unmeasured: ' + str(path) + lock_holders(path))
     return fd
+
+
+def lock_holders(path):
+    """Who has the lock open, as `; held by pid 8462 tmux (01:38:50)`.
+
+    The lease is inherited on purpose, so a daemon a build or test starts keeps
+    it after cargo exits. Six leaked private tmux servers held it for 1.5 h on
+    2026-10-30 behind a bare "lock busy" (AF-1067). Holders that are not cargo,
+    rustc or a test binary are the ones to look at.
+    """
+    try:
+        # Bounded: this only explains a deferral and must not stretch it.
+        out = subprocess.run(['lsof', '-t', '--', str(path)], capture_output=True,
+                             text=True, timeout=3).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return '; holders unmeasured (lsof unavailable or slow)'
+    pids = [p for p in out if p.isdigit()]
+    if not pids:
+        return '; no holder found by lsof'
+    try:
+        rows = subprocess.run(['ps', '-o', 'pid=,etime=,comm=', '-p', ','.join(pids[:8])],
+                              capture_output=True, text=True, timeout=3).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError):
+        rows = []
+    held = []
+    for row in rows:
+        parts = row.split(None, 2)
+        if len(parts) == 3:
+            held.append('pid %s %s (%s)' % (parts[0], os.path.basename(parts[2].strip()), parts[1]))
+    held = held or ['pid ' + p for p in pids[:8]]
+    more = ' and %d more' % (len(pids) - 8) if len(pids) > 8 else ''
+    return '; held by ' + ', '.join(held) + more
 
 
 def native_locks(target):
@@ -100,25 +184,152 @@ def process_executable(pid, command, *, linux=None, proc_root=Path('/proc'),
     return executable
 
 
-def active_processes(targets):
+# A BUILD EXITS; A DAEMON DOES NOT (AMUX-4944).
+#
+# Anything older than this that merely LIVES under a target dir is not treated
+# as an in-flight build. Compilers are exempt by name below: a long compile is
+# still a compile. Deliberately generous — the longest build recorded on this
+# hardware is 26m48s (CLAUDE.md) and the CI lib suite is ~7m — so no real build
+# is near it, while the process that deadlocked the fleet had been up for days.
+#
+# RESIDUAL EXPOSURE, stated rather than hidden: an UNWRAPPED build older than
+# this would no longer defer cleanup. Anything started through `guard run`
+# holds a shared lease fd that `exclusive()` blocks on regardless of age, so
+# the exposure is only a bare `cargo` invocation running over four hours.
+STALE_BUILD_AGE_S = int(os.environ.get('AMUX_CARGO_GUARD_MAX_BUILD_AGE_S', '14400'))
+
+
+def parse_etime(text):
+    """`ps -o etime` as seconds, or None when it does not parse.
+
+    `[[DD-]HH:]MM:SS`, the one format macOS and procps agree on — `etimes`
+    (seconds) is Linux-only and macOS `ps` rejects the keyword outright.
+
+    Pure and separate from the probe so the age rule can be pinned without
+    spawning a process that has been running for four hours.
+    """
+    days = 0
+    text = text.strip()
+    if '-' in text:
+        head, _, text = text.partition('-')
+        if not head.isdigit():
+            return None
+        days = int(head)
+    parts = text.split(':')
+    if not (2 <= len(parts) <= 3) or not all(p.isdigit() for p in parts):
+        return None
+    parts = [int(p) for p in parts]
+    hours, minutes, seconds = ([0] + parts) if len(parts) == 2 else parts
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+COMPILERS = ('cargo', 'rustc', 'rustdoc', 'clippy-driver')
+
+
+def build_target(name, argv, env):
+    """The target directory a compiler process writes into, or None if unknown.
+
+    AF-984/AF-983 (2026-10-28): the shared target sat at 69-77 GB all day
+    because any cargo or rustc ANYWHERE on the Mac deferred its purge, while
+    some lane was nearly always compiling into another target (a private one,
+    rust-build-target-amux-cloud). The native locks taken above already stop a
+    build in THIS target; a compiler writing elsewhere is no threat to it.
+
+    rustc, rustdoc and clippy-driver are told where to write with --out-dir
+    (cargo passes <target>/<profile>/deps); cargo's target is --target-dir or
+    CARGO_TARGET_DIR. Pure, so the rule is pinned without spawning compilers.
+    """
+    flag = '--target-dir' if name == 'cargo' else '--out-dir'
+    for i, arg in enumerate(argv):
+        if arg == flag and i + 1 < len(argv):
+            return Path(argv[i + 1])
+        if arg.startswith(flag + '='):
+            return Path(arg[len(flag) + 1:])
+    if name == 'cargo' and env.get('CARGO_TARGET_DIR'):
+        return Path(env['CARGO_TARGET_DIR'])
+    return None
+
+
+def process_argv_env(pid, linux=None, proc_root=Path('/proc')):
+    """argv and environment of one same-user process, or None when unreadable."""
+    linux = sys.platform.startswith('linux') if linux is None else linux
     try:
-        output = subprocess.run(['ps', '-A', '-ww', '-o', 'pid=,comm='],
+        if linux:
+            argv = (proc_root / pid / 'cmdline').read_bytes().split(b'\0')
+            environ = (proc_root / pid / 'environ').read_bytes().split(b'\0')
+            argv = [a.decode(errors='replace') for a in argv if a]
+            pairs = [e.decode(errors='replace') for e in environ if e]
+        else:
+            # macOS: -E appends the environment after the arguments. Paths on
+            # this Mac's targets carry no spaces; a split that finds no flag
+            # reads as unknown, which defers.
+            out = subprocess.run(['ps', '-E', '-ww', '-p', pid, '-o', 'command='],
+                                 capture_output=True, text=True, timeout=5).stdout.split()
+            if not out:
+                return None
+            argv, pairs = out, [t for t in out if '=' in t and not t.startswith('-')]
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return argv, dict(p.split('=', 1) for p in pairs if '=' in p)
+
+
+def writes_into(target, roots):
+    # resolve(): /tmp is /private/tmp on macOS, and one directory named two
+    # ways must still read as the same target.
+    target = Path(target).expanduser().resolve()
+    return any(overlaps(target, Path(root).resolve()) for root in roots)
+
+
+def active_processes(targets, read_process=process_argv_env):
+    try:
+        output = subprocess.run(['ps', '-A', '-ww', '-o', 'pid=,etime=,comm='],
                                 capture_output=True, text=True, check=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError) as error:
         raise Deferred('process probe unmeasured: ' + str(error)) from error
-    rows = [line.split(None, 1) for line in output.splitlines() if line.strip()]
-    if not rows or any(len(row) != 2 or not row[0].isdigit() for row in rows):
+    rows = [line.split(None, 2) for line in output.splitlines() if line.strip()]
+    if not rows or any(len(row) != 3 or not row[0].isdigit() for row in rows):
         raise Deferred('process probe unmeasured: empty or malformed ps output')
     active = []
-    for pid, command in rows:
+    stale = []
+    elsewhere = []
+    for pid, etime, command in rows:
         # Linux ps comm is truncated. Resolve same-user executable paths so a
         # directly launched test binary is protected after its Cargo parent exits.
         executable = process_executable(pid, command)
         if executable is None:
             continue
-        if executable.name in ('cargo', 'rustc', 'rustdoc', 'clippy-driver') or any(
-                executable == root or root in executable.parents for root in targets):
-            active.append(pid)
+        if executable.name in COMPILERS:
+            under_target = any(executable == root or root in executable.parents for root in targets)
+            seen = None if under_target else read_process(pid)
+            where = build_target(executable.name, *seen) if seen else None
+            # FAIL CLOSED: an unreadable process, or one whose target cannot be
+            # named, still defers. Only a compiler provably writing elsewhere
+            # is let through.
+            if where is not None and not writes_into(where, targets):
+                elsewhere.append((pid, executable.name, where))
+            else:
+                active.append(pid)
+            continue
+        if any(executable == root or root in executable.parents for root in targets):
+            age = parse_etime(etime)
+            # FAIL CLOSED on an unparseable age: ATE-92 made this refuse rather
+            # than delete a live build, and an unmeasured age is not evidence
+            # that the process is stale.
+            if age is None or age < STALE_BUILD_AGE_S:
+                active.append(pid)
+            else:
+                stale.append((pid, age, executable))
+    if elsewhere:
+        # SURFACED like the stale case: this judgement lets a reclaim through.
+        print('cargo_guard_compiler_elsewhere: not blocking, writes into another target '
+              + ', '.join('pid %s %s -> %s' % (p, n, w) for p, n, w in elsewhere),
+              file=sys.stderr)
+    if stale:
+        # SURFACED, not silently dropped: this is the judgement that unblocks
+        # the reclaim, so it has to be auditable in the builder log.
+        print('cargo_guard_stale_under_target: not treating as in-flight build(s) '
+              + ', '.join('pid %s age %ds %s' % (p, a, e) for p, a, e in stale),
+              file=sys.stderr)
     return active, len(rows)
 
 
@@ -193,6 +404,7 @@ def main():
     parser.add_argument('--destination')
     parser.add_argument('--protected-path', action='append', default=[])
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--exclusive-run', action='store_true', help='run a target-mutating command only when no consumer lease is held')
     # Parse command separately: argparse REMAINDER would swallow guard options.
     argsv = sys.argv[1:]
     command = []
@@ -208,7 +420,9 @@ def main():
             # Acquired inside the systemd scope, and inherited by cargo and its
             # children. No parent polling window between build and test binaries.
             for target in targets:
-                fd = open_lock(lease_path(target), shared=True, wait=True)
+                # cargo clean is a mutation too. A shared lease let it delete
+                # the next test executable after Cargo released its build lock.
+                fd = open_lock(lease_path(target), shared=not args.exclusive_run, wait=not args.exclusive_run)
                 os.set_inheritable(fd, True)
             os.execvp(command[0], command)
         if not args.path or (args.action == 'move' and not args.destination):
@@ -233,10 +447,13 @@ def main():
         result = mutate(args.action, Path(args.path),
                         Path(args.destination) if args.destination else None, targets,
                         [Path(p).resolve() for p in args.protected_path], args.dry_run, probe)
+        clear_streak(targets)
         print(json.dumps(result))
     except (Deferred, OSError) as error:
-        print(json.dumps({'verdict': 'cargo_reclaim_deferred', 'measured': getattr(error, 'measured', False),
-                          'n_considered': getattr(error, 'considered', 0), 'reason': str(error)}))
+        payload = {'verdict': 'cargo_reclaim_deferred', 'measured': getattr(error, 'measured', False),
+                   'n_considered': getattr(error, 'considered', 0), 'reason': str(error)}
+        payload.update(bump_streak(targets, str(error)) or {})
+        print(json.dumps(payload))
         return 75
     return 0
 

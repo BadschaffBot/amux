@@ -44,7 +44,7 @@ use serde_json::Value;
 /// One-line, bounded summary for `ProgressReport`/`ToolEvent` detail fields:
 /// first line only, capped at 120 chars. Events are headlines, not
 /// transcripts (Invariant 30).
-fn summarize(text: &str) -> String {
+pub(super) fn summarize(text: &str) -> String {
     let first = text.lines().next().unwrap_or("").trim();
     let mut out: String = first.chars().take(120).collect();
     if first.chars().count() > 120 {
@@ -56,8 +56,17 @@ fn summarize(text: &str) -> String {
 /// Best-effort human summary of a tool-call input object: prefer the fields
 /// that carry the action (a Bash `command`, an Edit `file_path`), fall back
 /// to compact JSON. Never the full payload — that goes to logs.
-fn tool_detail(input: &Value) -> Option<String> {
-    for key in ["command", "cmd", "description", "file_path", "path", "pattern", "query", "url"] {
+pub(super) fn tool_detail(input: &Value) -> Option<String> {
+    for key in [
+        "command",
+        "cmd",
+        "description",
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "url",
+    ] {
         if let Some(s) = input.get(key).and_then(Value::as_str) {
             if !s.trim().is_empty() {
                 return Some(summarize(s));
@@ -70,7 +79,7 @@ fn tool_detail(input: &Value) -> Option<String> {
 /// Does a provider error message describe a quota/rate limit? Used for Codex,
 /// whose limit errors arrive as free-text `error` events (real capture
 /// below: "You've hit your usage limit...").
-fn is_rate_limit_message(msg: &str) -> bool {
+pub(super) fn is_rate_limit_message(msg: &str) -> bool {
     let m = msg.to_lowercase();
     ["usage limit", "rate limit", "quota", "too many requests"]
         .iter()
@@ -179,7 +188,10 @@ pub fn translate_claude(line: &str, turn: &TurnId) -> Vec<WorkerEvent> {
         // `user` lines carry tool RESULTS — logs, not events (Invariant 30).
         Some("result") => {
             let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-            let subtype = v.get("subtype").and_then(Value::as_str).unwrap_or("unknown");
+            let subtype = v
+                .get("subtype")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             let text = v.get("result").and_then(Value::as_str).unwrap_or("");
             if !is_error && subtype == "success" {
                 let outcome = if text.trim().is_empty() {
@@ -443,6 +455,76 @@ pub fn translate_gemini(line: &str, turn: &TurnId) -> Vec<WorkerEvent> {
 }
 
 // ---------------------------------------------------------------------------
+// OpenCode: `opencode run --format json`
+// ---------------------------------------------------------------------------
+
+/// Translate one line of OpenCode's `run --format json` stream.
+///
+/// Shapes measured live on 2026-10-14 (opencode v2.0.28, Linux): every line is
+/// a JSON object with a top-level `type` and a stable `sessionID` (`ses_…`).
+/// Observed types: `step_start`, `text` (assistant text under `part.text`), and
+/// `error` — a quota failure arrives as
+/// `{"type":"error","error":{"type":"provider.quota","status":429,…}}`.
+///
+/// Unknown types translate to NO events (forward-compatibility, Invariant 8)
+/// and a malformed line never panics. There is no explicit turn-end line yet,
+/// so the reader closes the turn on process exit (the shared behavior for a
+/// stream that ends without a result event).
+pub fn translate_opencode(line: &str, _turn: &TurnId) -> Vec<WorkerEvent> {
+    let Ok(v) = serde_json::from_str::<Value>(line) else {
+        return Vec::new();
+    };
+    match v.get("type").and_then(Value::as_str) {
+        Some("step_start") => vec![WorkerEvent::Started],
+        Some("text") => {
+            let text = v
+                .pointer("/part/text")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if text.trim().is_empty() {
+                return Vec::new();
+            }
+            vec![WorkerEvent::Progress(ProgressReport {
+                summary: summarize(text),
+                tokens_used: None,
+            })]
+        }
+        Some("error") => {
+            let err = v.get("error");
+            let msg = err
+                .and_then(|e| e.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            let status = err.and_then(|e| e.get("status")).and_then(Value::as_i64);
+            let etype = err
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if status == Some(429)
+                || etype.contains("quota")
+                || etype.contains("rate")
+                || is_rate_limit_message(msg)
+            {
+                // The window/kind is not machine-readable here; `Unknown` is
+                // the honest cell and `raw` keeps the provider's message.
+                vec![WorkerEvent::RateLimited(RateLimit {
+                    kind: RateLimitKind::Unknown,
+                    reset_at: None,
+                    provider: ProviderId::new("opencode"),
+                    raw: Some(msg.to_string()),
+                })]
+            } else {
+                vec![WorkerEvent::Failed(Failure {
+                    reason: msg.to_string(),
+                    retryable: true,
+                })]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Uniform TRANSCRIPT model (RR-0030 render path, AMUX-3201 slice 1).
 //
 // [`WorkerEvent`] above is TELEMETRY: one-line summaries capped at 120 chars,
@@ -548,11 +630,13 @@ fn strip_context_wrapper(text: &str) -> String {
     let mut t = remove_tag_block(text, "environment_context");
     t = remove_tag_block(&t, "user_instructions");
     let t = t.trim();
-    // Strip a single leading "[..]" time stamp, e.g. "[05:41 PM] do X".
-    if let Some(rest) = t.strip_prefix('[') {
-        if let Some(idx) = rest.find(']') {
-            return rest[idx + 1..].trim().to_string();
-        }
+    // Only a clock stamp is presentation metadata. Arbitrary bracketed owner
+    // text (e.g. [no-board] or [priority]) must survive the transcript view.
+    static STAMP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let stamp =
+        STAMP.get_or_init(|| regex::Regex::new(r"^\[\d{1,2}:\d{2}(?:\s*[AP]M)?\]\s*").unwrap());
+    if let Some(prefix) = stamp.find(t) {
+        return t[prefix.end()..].to_string();
     }
     t.to_string()
 }
@@ -621,13 +705,20 @@ pub(crate) fn output_text(payload: &Value) -> String {
     match payload.get("output") {
         Some(Value::String(s)) => clean_tool_output(s),
         Some(Value::Array(blocks)) => {
-            let text = blocks.iter().filter_map(|block| {
-                if matches!(block["type"].as_str(), Some("text" | "input_text" | "output_text")) {
-                    block["text"].as_str()
-                } else {
-                    None // Images are not terminal text or base64 scrollback.
-                }
-            }).collect::<Vec<_>>().join("\n");
+            let text = blocks
+                .iter()
+                .filter_map(|block| {
+                    if matches!(
+                        block["type"].as_str(),
+                        Some("text" | "input_text" | "output_text")
+                    ) {
+                        block["text"].as_str()
+                    } else {
+                        None // Images are not terminal text or base64 scrollback.
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             clean_tool_output(&text)
         }
         Some(other) => other
@@ -764,6 +855,21 @@ pub fn codex_rollout_transcript(lines: &[Value]) -> Vec<TranscriptEvent> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn raw_owner_bracketed_text_survives_transcript_projection() {
+        for text in [
+            "[no-board] Literal owner input",
+            "[priority] Keep this text",
+            "[1,2,3] example",
+        ] {
+            assert_eq!(super::strip_context_wrapper(text), text);
+        }
+        assert_eq!(
+            super::strip_context_wrapper("[05:41 PM] visible input"),
+            "visible input"
+        );
+    }
+
     // pub(crate): structured.rs's conformance tests replay these REAL
     // captured lines through the full spawn->read->translate path, so the
     // same fixture certifies both the translator and the protocol.
@@ -812,7 +918,10 @@ pub(crate) mod tests {
 
     #[test]
     fn claude_init_is_started() {
-        assert_eq!(translate_claude(CLAUDE_INIT, &turn()), vec![WorkerEvent::Started]);
+        assert_eq!(
+            translate_claude(CLAUDE_INIT, &turn()),
+            vec![WorkerEvent::Started]
+        );
     }
 
     #[test]
@@ -895,8 +1004,12 @@ pub(crate) mod tests {
     fn claude_error_result_is_failed_then_turn_completed() {
         let evs = translate_claude(CLAUDE_RESULT_ERROR, &turn());
         assert_eq!(evs.len(), 2);
-        assert!(matches!(&evs[0], WorkerEvent::Failed(f) if f.reason.contains("error_during_execution")));
-        assert!(matches!(&evs[1], WorkerEvent::TurnCompleted(r) if r.outcome == "error_during_execution"));
+        assert!(
+            matches!(&evs[0], WorkerEvent::Failed(f) if f.reason.contains("error_during_execution"))
+        );
+        assert!(
+            matches!(&evs[1], WorkerEvent::TurnCompleted(r) if r.outcome == "error_during_execution")
+        );
     }
 
     // -- Codex CLI 0.141.0 (REAL captures) ----------------------------------
@@ -970,7 +1083,9 @@ pub(crate) mod tests {
         let evs = translate_codex(CODEX_TURN_FAILED, &turn());
         assert_eq!(evs.len(), 2);
         assert!(matches!(&evs[0], WorkerEvent::RateLimited(_)));
-        assert!(matches!(&evs[1], WorkerEvent::TurnCompleted(r) if r.outcome.starts_with("failed:")));
+        assert!(
+            matches!(&evs[1], WorkerEvent::TurnCompleted(r) if r.outcome.starts_with("failed:"))
+        );
     }
 
     #[test]
@@ -1006,7 +1121,10 @@ pub(crate) mod tests {
 
     #[test]
     fn gemini_init_is_started() {
-        assert_eq!(translate_gemini(GEMINI_INIT, &turn()), vec![WorkerEvent::Started]);
+        assert_eq!(
+            translate_gemini(GEMINI_INIT, &turn()),
+            vec![WorkerEvent::Started]
+        );
     }
 
     #[test]
@@ -1062,6 +1180,60 @@ pub(crate) mod tests {
         assert!(matches!(&evs[1], WorkerEvent::TurnCompleted(r) if r.outcome == "error"));
     }
 
+    // -- OpenCode 2.0.28 (REAL captures, 2026-10-14) ------------------------
+
+    // REAL: `opencode run --format json --model opencode-go/deepseek-v4.1-flash "Reply with exactly one word: ready"`
+    pub(crate) const OPENCODE_STEP_START: &str = r#"{"type":"step_start","timestamp":1792020538172,"sessionID":"ses_ec340a338ffeqYv0Ij0TkzlBuv","part":{"id":"prt_13cbf633c001COCVxLpu1WOfMY","sessionID":"ses_ec340a338ffeqYv0Ij0TkzlBuv","messageID":"msg_13cbf5d46001SEqxY5t9QyR9qe","type":"step-start"}}"#;
+
+    // REAL, verbatim (the assistant's answer rides `part.text`).
+    pub(crate) const OPENCODE_TEXT: &str = r#"{"type":"text","timestamp":1792020538193,"sessionID":"ses_ec340a338ffeqYv0Ij0TkzlBuv","part":{"id":"prt_13cbf5d46001SEqxY5t9QyR9qe_text-0","sessionID":"ses_ec340a338ffeqYv0Ij0TkzlBuv","messageID":"msg_13cbf5d46001SEqxY5t9QyR9qe","type":"text","text":"ready","time":{"start":1792020536681,"end":1792020538193}}}"#;
+
+    // REAL shape; the provider message is shortened for readability (the real
+    // one is a multi-KB Google quota dump). The fields the translator reads
+    // (type/message/status) are verbatim.
+    pub(crate) const OPENCODE_ERROR_QUOTA: &str = r#"{"type":"error","timestamp":1792020525010,"sessionID":"ses_ec340d50effegUEUtkWwwquKzB","error":{"type":"provider.quota","message":"You exceeded your current quota, please check your plan and billing details.","status":429}}"#;
+
+    #[test]
+    fn opencode_step_start_is_started() {
+        assert_eq!(
+            translate_opencode(OPENCODE_STEP_START, &turn()),
+            vec![WorkerEvent::Started]
+        );
+    }
+
+    #[test]
+    fn opencode_text_is_progress() {
+        assert_eq!(
+            translate_opencode(OPENCODE_TEXT, &turn()),
+            vec![WorkerEvent::Progress(ProgressReport {
+                summary: "ready".into(),
+                tokens_used: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_quota_error_is_rate_limited() {
+        let evs = translate_opencode(OPENCODE_ERROR_QUOTA, &turn());
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            WorkerEvent::RateLimited(r) => {
+                assert_eq!(r.provider.as_str(), "opencode");
+                assert_eq!(r.kind, RateLimitKind::Unknown);
+                assert!(r.raw.is_some());
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opencode_unknown_and_malformed_lines_are_silent() {
+        // A forward-compatible type the translator does not know yet.
+        assert!(translate_opencode(r#"{"type":"step_finish","sessionID":"ses_x"}"#, &turn()).is_empty());
+        assert!(translate_opencode("not json", &turn()).is_empty());
+        assert!(translate_opencode("", &turn()).is_empty());
+    }
+
     // -- malformed input: no events, no panic (all providers) ---------------
 
     #[test]
@@ -1074,9 +1246,9 @@ pub(crate) mod tests {
             r#""a bare string""#,
             r#"{"no_type_field":true}"#,
             r#"{"type":"something_new_from_a_future_cli","payload":{}}"#,
-            r#"{"type":"assistant"}"#,          // missing message.content
-            r#"{"type":"item.completed"}"#,     // missing item
-            r#"{"type":"rate_limit_event"}"#,   // missing rate_limit_info
+            r#"{"type":"assistant"}"#,        // missing message.content
+            r#"{"type":"item.completed"}"#,   // missing item
+            r#"{"type":"rate_limit_event"}"#, // missing rate_limit_info
         ];
         let t = turn();
         for line in cases {
@@ -1120,7 +1292,10 @@ pub(crate) mod tests {
     const RO_AGENT_MSG_MIRROR: &str = r#"{"timestamp":"2026-05-02T21:41:21.660Z","type":"event_msg","payload":{"type":"agent_message","message":"I’ll first map the repo structure, current git state, docs, and test surface.","phase":"commentary"}}"#;
 
     fn rollout(lines: &[&str]) -> Vec<Value> {
-        lines.iter().map(|l| serde_json::from_str(l).unwrap()).collect()
+        lines
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
     }
 
     #[test]
@@ -1149,10 +1324,18 @@ pub(crate) mod tests {
             }
             other => panic!("expected User first, got {other:?}"),
         }
-        assert!(matches!(&evs[1], TranscriptEvent::Reasoning { text } if text.contains("Checking RESOURCES")));
-        assert!(matches!(&evs[2], TranscriptEvent::Assistant { text } if text.starts_with("I’ll first map")));
+        assert!(
+            matches!(&evs[1], TranscriptEvent::Reasoning { text } if text.contains("Checking RESOURCES"))
+        );
+        assert!(
+            matches!(&evs[2], TranscriptEvent::Assistant { text } if text.starts_with("I’ll first map"))
+        );
         match &evs[3] {
-            TranscriptEvent::Tool { tool, detail, output } => {
+            TranscriptEvent::Tool {
+                tool,
+                detail,
+                output,
+            } => {
                 assert_eq!(tool, "exec_command");
                 assert_eq!(detail.as_deref(), Some("git status --short --branch"));
                 // metadata preamble stripped; output correlated by call_id.

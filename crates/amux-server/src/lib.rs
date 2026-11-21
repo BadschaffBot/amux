@@ -4,11 +4,19 @@
 //! Module layout mirrors docs/rust-rebuild-plan.md §Crate structure. Modules
 //! land phase by phase; each `pub mod` line appears when its RR item starts.
 
+pub mod test_tempdirs;
+pub mod highlight;
 pub mod api;
 pub mod backend;
-pub mod config;
+pub mod bridge;
 mod cargo_target_guard;
+pub mod config;
+mod fanout_retirement;
+mod boot_watch;
+mod parent_watch;
+pub mod fanout_workspace;
 pub mod legacy_port;
+pub mod listener_handoff;
 pub mod log_dedupe;
 
 /// Should this process exec itself when its binary changes on disk? (AEAB-52)
@@ -26,7 +34,10 @@ pub mod log_dedupe;
 pub(crate) fn self_adopt_enabled() -> bool {
     match std::env::var("AMUX_NO_SELF_ADOPT") {
         Err(_) => true,
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "off" | "no"),
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
     }
 }
 
@@ -67,18 +78,27 @@ mod self_adopt_tests {
     fn self_adoption_is_on_by_default_and_off_only_when_asked() {
         let _g = lock();
         std::env::remove_var("AMUX_NO_SELF_ADOPT");
-        assert!(self_adopt_enabled(), "absent must mean ENABLED — production sets nothing");
+        assert!(
+            self_adopt_enabled(),
+            "absent must mean ENABLED — production sets nothing"
+        );
 
         for on in ["1", "true", "yes", "TRUE", " 1 "] {
             std::env::set_var("AMUX_NO_SELF_ADOPT", on);
-            assert!(!self_adopt_enabled(), "AMUX_NO_SELF_ADOPT={on:?} must disable");
+            assert!(
+                !self_adopt_enabled(),
+                "AMUX_NO_SELF_ADOPT={on:?} must disable"
+            );
         }
         // The reading-comprehension case: `=0` must NOT disable. A var whose name
         // is a negative and whose value is a negative is where an operator gets
         // it backwards, so it is pinned rather than left to intuition.
         for off in ["0", "false", "off", "no", ""] {
             std::env::set_var("AMUX_NO_SELF_ADOPT", off);
-            assert!(self_adopt_enabled(), "AMUX_NO_SELF_ADOPT={off:?} must leave it ENABLED");
+            assert!(
+                self_adopt_enabled(),
+                "AMUX_NO_SELF_ADOPT={off:?} must leave it ENABLED"
+            );
         }
         std::env::remove_var("AMUX_NO_SELF_ADOPT");
     }
@@ -88,19 +108,23 @@ mod self_adopt_tests {
         assert_eq!(boot_provenance(false, false), BootProvenance::FirstBoot);
         assert_eq!(boot_provenance(true, true), BootProvenance::SelfAdopted);
         assert_eq!(boot_provenance(true, false), BootProvenance::SelfAdopted);
-        assert_eq!(boot_provenance(false, true), BootProvenance::UnannouncedRestart);
+        assert_eq!(
+            boot_provenance(false, true),
+            BootProvenance::UnannouncedRestart
+        );
     }
 }
+pub mod activation;
 pub mod db;
 pub mod integrations;
 pub mod invariants;
 pub mod opencode;
 pub mod orchestrator;
-pub mod reconciliation;
 pub mod provider;
 pub mod push;
+pub mod reconciliation;
 pub mod runtime_jobs;
-pub mod activation;
+pub mod search_firehose;
 pub mod tls;
 
 use std::sync::Arc;
@@ -116,32 +140,73 @@ pub fn build_hash() -> String {
     // (AF-911 / AMUX-4744). A replaced executable is a candidate until exec;
     // activation::Candidate still hashes those on-disk candidates separately.
     static RUNNING_BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    RUNNING_BUILD.get_or_init(|| {
-        let measured = std::env::current_exe().ok()
-            .and_then(|exe| activation::file_build_hash(&exe).ok());
-        match measured {
-            Some(build) => {
-                tracing::info!(verdict="running_build_measured", %build, measured=true,
+    RUNNING_BUILD
+        .get_or_init(|| {
+            let measured = std::env::current_exe()
+                .ok()
+                .and_then(|exe| activation::file_build_hash(&exe).ok());
+            match measured {
+                Some(build) => {
+                    tracing::info!(verdict="running_build_measured", %build, measured=true,
                     "running executable identity measured once for this process");
-                build
+                    build
+                }
+                None => {
+                    tracing::warn!(
+                        verdict = "running_build_unmeasured",
+                        measured = false,
+                        "running executable unreadable; using package version identity"
+                    );
+                    format!("v{}", env!("CARGO_PKG_VERSION"))
+                }
             }
-            None => {
-                tracing::warn!(verdict="running_build_unmeasured", measured=false,
-                    "running executable unreadable; using package version identity");
-                format!("v{}", env!("CARGO_PKG_VERSION"))
-            }
-        }
-    }).clone()
+        })
+        .clone()
+}
+
+/// Stack for every runtime worker thread. Tokio's default is 2 MiB, and a debug
+/// build's board-drive pass overflowed it on `amux-maintenance` once tmux calls
+/// went over the control connection (3126420d3): "thread 'amux-maintenance' has
+/// overflowed its stack", aborting the server in the harness-recovery pool and
+/// conversation-recycle scenarios. `AMUX_THREAD_STACK_MB` overrides it.
+fn worker_stack_bytes() -> usize {
+    std::env::var("AMUX_THREAD_STACK_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb >= 2)
+        .unwrap_or(8)
+        * 1024
+        * 1024
 }
 
 pub fn run() {
+    // Before any thread or child exists: a handed-over listener arrives with
+    // close-on-exec cleared, and every process spawned before adopt_or_bind
+    // (gh, bash, pgrep from boot jobs) would otherwise hold port 8824.
+    listener_handoff::seal_inherited();
+    let stack = worker_stack_bytes();
     let maintenance = tokio::runtime::Builder::new_multi_thread()
         .thread_name("amux-maintenance")
+        .thread_stack_size(stack)
         .enable_all()
         .build()
         .expect("maintenance runtime");
     runtime_jobs::executor::install(maintenance.handle().clone());
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // AF-1006: board-drive and orchestrator-runtime hold a thread for seconds
+    // per tick; two threads of their own keep that off the shared pool.
+    let heavy = tokio::runtime::Builder::new_multi_thread()
+        .thread_name("amux-heavy-jobs")
+        .worker_threads(2)
+        .thread_stack_size(stack)
+        .enable_all()
+        .build()
+        .expect("heavy-job runtime");
+    runtime_jobs::executor::install_heavy(heavy.handle().clone());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(stack)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     rt.block_on(async_main());
 }
 
@@ -160,7 +225,11 @@ struct StoreConversationSink {
 impl opencode::structured::ConversationSink for StoreConversationSink {
     fn save(&self, worker: &amux_core::ids::WorkerId, family: &str, conversation_ref: &str) {
         let store = self.store.clone();
-        let (w, f, c) = (worker.to_string(), family.to_string(), conversation_ref.to_string());
+        let (w, f, c) = (
+            worker.to_string(),
+            family.to_string(),
+            conversation_ref.to_string(),
+        );
         tokio::spawn(async move {
             let (ww, ff, cc) = (w.clone(), f, c);
             let res = store
@@ -173,7 +242,10 @@ impl opencode::structured::ConversationSink for StoreConversationSink {
                              provider = ?2, conversation_ref = ?3, updated_at = ?4",
                         rusqlite::params![ww, ff, cc, chrono::Utc::now().to_rfc3339()],
                     )?;
-                    Ok(db::WriteOutcome { applied: false, events: vec![] })
+                    Ok(db::WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    })
                 })
                 .await;
             if let Err(e) = res {
@@ -193,7 +265,10 @@ impl opencode::structured::ConversationSink for StoreConversationSink {
                         "DELETE FROM _amux_conversations WHERE worker_id = ?1",
                         rusqlite::params![ww],
                     )?;
-                    Ok(db::WriteOutcome { applied: false, events: vec![] })
+                    Ok(db::WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    })
                 })
                 .await;
             if let Err(e) = res {
@@ -217,9 +292,8 @@ async fn async_main() {
     // Logs tab's raw view reads the server's own log. ANSI off so the file
     // (and the SPA's raw view) gets clean text. If the file cannot be
     // opened, stdout-only — logging setup must never stop the server.
-    let env_filter = || {
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
-    };
+    let env_filter =
+        || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     /// Is fd 1 the very file we just opened? See the call site for why this is
     /// (dev, ino) and not a path comparison. Non-unix has no `/dev/fd`, and no
     /// launchd either, so the tee is correct there.
@@ -285,7 +359,9 @@ async fn async_main() {
             // already-open fd and the path could be a symlink, a relative spelling
             // or a rotated file, so string comparison would silently miss.
             let dup = stdout_is_same_file(&f);
-            let sub = tracing_subscriber::fmt().with_env_filter(env_filter()).with_ansi(false);
+            let sub = tracing_subscriber::fmt()
+                .with_env_filter(env_filter())
+                .with_ansi(false);
             if dup {
                 sub.with_writer(Arc::new(f)).init()
             } else {
@@ -298,13 +374,45 @@ async fn async_main() {
                 "log writer configured (stdout suppressed when it is the same file — AMUX-2906)"
             );
         }
-        None => tracing_subscriber::fmt().with_env_filter(env_filter()).init(),
+        None => tracing_subscriber::fmt()
+            .with_env_filter(env_filter())
+            .init(),
     }
 
     let running_build = build_hash();
     tracing::info!(port = cfg.port, db = %cfg.db_path.display(), pid = std::process::id(),
-        commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
+        commit = %activation::served().full, build_commit = env!("AMUX_BUILD_COMMIT_FULL"), build = %running_build,
         self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok(), "starting amux-rust");
+    {
+        let dir = crate::api::session_verbs::tmux_fleet_shim_dir();
+        match crate::api::session_verbs::refresh_fleet_shims(&dir) {
+            Ok(true) => tracing::info!(dir = %dir.display(), measured = true, n_considered = 3, verdict = "fleet_shims_refreshed", "installed fleet shims match this build"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(dir = %dir.display(), error = %e, measured = false, n_considered = 0, verdict = "fleet_shims_refresh_failed", "installed fleet shims could not be refreshed; workers keep the old copies until a launch rewrites them"),
+        }
+    }
+    tracing::info!(stack_bytes = worker_stack_bytes(), measured = true, n_considered = 2,
+        verdict = "runtime_stack_configured", "runtime worker threads use this stack size");
+    // Resolve the dashboard source now, so an unreadable AMUX_DASHBOARD_DIR
+    // fails at startup instead of on the first page load, and say which
+    // bytes this process serves. Production never sets it (embedded).
+    if let Some(o) = amux_dashboard::dir_override() {
+        tracing::info!(verdict = "dashboard_assets_from_dir", dir = %o.dir.display(),
+            version = %o.version, embedded_version = amux_dashboard::ASSET_VER, measured = true,
+            n_considered = 1, "dashboard assets served from AMUX_DASHBOARD_DIR, not the embedded copy");
+    }
+    let home = cfg.amux_home.canonicalize().unwrap_or(cfg.amux_home.clone());
+    let temp = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    if home.starts_with(&temp)
+        || ["/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp"]
+            .iter()
+            .any(|root| home.starts_with(root))
+    {
+        tracing::warn!(home=%home.display(),db=%cfg.db_path.display(),measured=true,n_considered=1,
+            verdict="volatile_amux_home","Amux state is under a temporary directory; board history and worker metadata may disappear while the advertised server URL remains configured");
+    }
 
     // WAS THIS RESTART ANNOUNCED? (AF-176)
     //
@@ -319,6 +427,8 @@ async fn async_main() {
     // The outage length needs no new state: the request log's newest row is
     // when the fleet last got an answer. `env::var` is read BEFORE the runtime
     // starts so nothing can have cleared it.
+    boot_watch::start();
+    boot_watch::step("store_open");
     let self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok();
     // Read before Store::open creates the database. An absent store means
     // there cannot have been a predecessor to die; filesystem uncertainty
@@ -337,7 +447,9 @@ async fn async_main() {
             tracing::info!("boot: first database start — there is no predecessor to classify")
         }
         BootProvenance::SelfAdopted => {
-            tracing::info!("boot: self-adoption (the previous process exec'd this one deliberately)")
+            tracing::info!(
+                "boot: self-adoption (the previous process exec'd this one deliberately)"
+            )
         }
         BootProvenance::UnannouncedRestart => {
             tracing::warn!(
@@ -366,13 +478,18 @@ async fn async_main() {
     runtime_jobs::heartbeat::record_boot(&store, cfg.port);
     tracing::info!(target: "runtime", verdict = "maintenance_runtime_isolated",
         runtime_pool = runtime_jobs::executor::pool_name(), pid = std::process::id(),
-        commit = env!("AMUX_BUILD_COMMIT_FULL"),
+        commit = %activation::served().full,
         "registered maintenance jobs run on separate threads from HTTP and TLS");
 
     // Migration-rehearsal mode (Phase 11): open + migrate + report + exit.
     // Lets docs/rust-migration/migration-rehearsal.sh exercise the EXACT production
     // migration path against a DB copy without binding ports.
-    if cfg.env.get("AMUX_RS_MIGRATE_ONLY").map(|v| v == "1").unwrap_or(false) {
+    if cfg
+        .env
+        .get("AMUX_RS_MIGRATE_ONLY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         let conn = store.read().expect("read after migrate");
         let tables: i64 = conn
             .query_row(
@@ -412,7 +529,12 @@ async fn async_main() {
         tracing::info!(dir = %dir.display(), locks = ?removed, "cleaned stale Chrome profile locks");
     }
 
+    boot_watch::step("app_state");
     let reconciled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    api::human_proof::set_owner_credential_configured(auth_token.is_some());
+    // Governance PR 3: the secret a sign-in door or gateway returns for the
+    // owner (loopback_trust.rs). Minted once, 0600; harmless where no door uses it.
+    api::loopback_trust::init(&cfg.amux_home, cfg.env.get(api::loopback_trust::FRONT_DOOR_SECRET_ENV).map(String::as_str));
     let state = api::AppState {
         store: store.clone(),
         started: Instant::now(),
@@ -430,6 +552,7 @@ async fn async_main() {
     // fails if a bare `tokio::spawn` of a background loop reappears in this
     // file. The whole set is readable at `GET /api/system-jobs` and in the
     // dashboard's Scheduler tab under "System".
+    boot_watch::step("spawn_jobs");
     use runtime_jobs::registry as jobs;
     let secs = std::time::Duration::from_secs;
 
@@ -440,7 +563,7 @@ async fn async_main() {
     jobs::spawn_loop(
         jobs::ids::STEER_DELIVER,
         Some(secs(api::session_verbs::STEER_TICK_SECS)),
-        api::session_verbs::steer_deliver_loop(state.clone()),
+        { let state = state.clone(); move || api::session_verbs::steer_deliver_loop(state.clone()) },
     );
 
     // pipe-pane reconciler (AMUX-2671). `pipe-pane` is attached in
@@ -452,13 +575,21 @@ async fn async_main() {
     jobs::spawn_loop(
         jobs::ids::EMAIL_THEMES,
         Some(secs(api::email_intel::THEME_REFRESH_SECS)),
-        api::email_intel::theme_refresh_loop(),
+        api::email_intel::theme_refresh_loop,
+    );
+
+    // Memory curation (memory_dream.rs): asks a worker whose memory grew past
+    // AMUX_MEMORY_DREAM_KB to rewrite it, at most weekly.
+    jobs::spawn_loop(
+        jobs::ids::MEMORY_DREAM,
+        Some(secs(runtime_jobs::memory_dream::TICK_SECS)),
+        { let state = state.clone(); move || runtime_jobs::memory_dream::dream_loop(state.clone()) },
     );
 
     jobs::spawn_loop(
         jobs::ids::PIPE_RECONCILE,
         Some(secs(api::session_verbs::PIPE_RECONCILE_SECS)),
-        api::session_verbs::pipe_reconcile_loop(),
+        api::session_verbs::pipe_reconcile_loop,
     );
 
     // Continuous invariant checking (AMUX-2622). Spawned before the router
@@ -468,7 +599,7 @@ async fn async_main() {
     jobs::spawn_loop(
         jobs::ids::INVARIANTS,
         Some(secs(invariants::monitor::TICK_SECS)),
-        invariants::monitor::run(state.clone()),
+        { let state = state.clone(); move || invariants::monitor::run(state.clone()) },
     );
 
     // Ghost-rescue (AMUX-2629): the FALLBACK sweep for the keystroke delivery
@@ -481,11 +612,57 @@ async fn async_main() {
     // whose absence is why the outage went unnoticed for hours.
     drop(runtime_jobs::board_drive::spawn(state.clone()));
 
+    // RESUME STARTS A RESTART CUT OFF. Deploys exec() this process on every
+    // commit; a worker start (a large worktree checkout takes over a minute)
+    // that was mid-flight died with no retry. Delayed so tmux and the
+    // bootstrap loop are up first.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let n = crate::api::session_verbs::resume_interrupted_starts(&state).await;
+            tracing::info!(resumed = n, measured = true, "interrupted-start resume pass complete");
+            let r = crate::api::session_verbs::resume_interrupted_recycles(&state).await;
+            tracing::info!(resumed = r, measured = true, "interrupted-recycle resume pass complete");
+            // A release that changes the instructions every worker gets
+            // reaches the running ones too, not only their next start.
+            crate::api::session_verbs::refresh_changed_worker_contexts(&state).await;
+        });
+    }
+    // Chat workers have no tmux to outlive this exec(): report turns it cut
+    // off and resume their queued messages (api/chat_worker.rs).
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            crate::api::session_verbs::purge_stale_rules_from_memory();
+            let (workers, interrupted, resumed) =
+                crate::api::chat_worker::recover_all(&state).await;
+            let delegates = crate::api::chat_delegate::recover_all(&state).await;
+            if delegates > 0 {
+                tracing::info!(delegates, measured = true, n_considered = delegates,
+                    verdict = "chat_delegate_recovery_pass", "chat delegates re-attached after restart");
+            }
+            tracing::info!(workers, interrupted, resumed, measured = true, n_considered = workers,
+                verdict = "chat_recovery_pass", "chat worker restart recovery complete");
+            // A browser tab still on a pre-2026-09-30 client creates a
+            // `<worker>-chat` companion WORKER when Chat is turned on. The
+            // startup pass cannot see one made after it, so keep folding them
+            // into their worker's Chat tab until old tabs have reloaded. Each
+            // fold logs verdict=chat_companion_migrated.
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                crate::api::chat_worker::migrate_legacy_companions(&state).await;
+            }
+        });
+    }
     // Automatic accountability (AMUX-2990, Ethan: "the accountability shit needs
     // to be automatic"). Sweeps for lanes with human messages but no board card
     // and steers each to open one — server-side, so it reaches any group. One
     // nudge per lane per 24h. Held like board-drive so the loop is not dropped.
     drop(api::messages::accountability_spawn(state.clone()));
+    // Outcome threads (o:<id>) resolve their worker from this registry.
+    api::intent_store::load_registry(&state);
 
     // Pane-size restoration (AMUX-2634): a peek resizes the worker's tmux
     // window to the READER's viewport and tmux pins `window-size manual`, so
@@ -495,6 +672,8 @@ async fn async_main() {
     // repair at boot, then holds the line on a 20s sweep against an
     // expiring viewer lease.
     drop(runtime_jobs::pane_size::spawn());
+    // Phantom deletions in sparse worker worktrees (2026-09-30, gs12 workers).
+    drop(runtime_jobs::worktree_hygiene::spawn());
     // AUTOFIX (AMUX-2681) — notice, file, hand off. Runs in the SERVER, on
     // purpose: the thing that watches for breakage must not share fate with
     // the thing that breaks, so nothing in it touches a pane, a send or a turn
@@ -503,8 +682,27 @@ async fn async_main() {
     // exists. If every worker in the fleet is dead, the cards still get filed
     // and wait. Noticing is infrastructure; fixing is work.
     drop(runtime_jobs::autofix::spawn(state.clone()));
+    // MDAI runs cut off by the restart that started this process resume here.
+    boot_watch::step("mdai_resume");
+    crate::api::mdai::resume_interrupted(state.store.clone());
+    boot_watch::step("spawn_jobs_2");
     // AMUX-3579: enrol /api/board/commit-mentions, which had zero consumers.
     drop(runtime_jobs::commit_mention_notes::spawn(state.clone()));
+    // AMUX-5238: close auto-captured intake cards on cited evidence and tag
+    // the ones still open after 24h as unreconciled.
+    drop(runtime_jobs::capture_reconcile::spawn(state.clone()));
+    // AMUX-5240: one daily owner digest of pending outbound-email approvals.
+    drop(runtime_jobs::email_approval_digest::spawn(state.clone()));
+    drop(runtime_jobs::email_scheduled_send::spawn(state.clone()));
+    // Z15: daily digest of needsyou cards, dry run until the owner opts in.
+    drop(runtime_jobs::decision_digest::spawn(state.clone()));
+    drop(runtime_jobs::directive::spawn(state.clone()));
+    // AMUX-5301: approve new needs-input items the owner's policy covers.
+    drop(runtime_jobs::needs_input_auto::spawn(state.clone()));
+    // AMUX-5239: a lane that pushed and said "live in ~40 min" was never told
+    // when it was. This boot is that moment; tell the lanes whose commits it
+    // carries. One-shot, deduped per (lane, sha), AMUX_DEPLOY_WAKE=0 to stop.
+    runtime_jobs::deploy_wake::spawn(state.clone());
 
     // STORAGE RETENTION (AMUX-2700). Seven append-only tables and three cache
     // directories had no retention at all — not leaking, just working as
@@ -515,15 +713,39 @@ async fn async_main() {
     drop(runtime_jobs::heartbeat::spawn(store.clone()));
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
+    // Storage tiers: watched folders between the internal disk and a cold drive.
+    drop(crate::api::tiering::spawn(state.clone()));
+    crate::api::file_visits::spawn_seed(state.store.clone());
     drop(runtime_jobs::host_metrics::spawn(state.clone()));
+    drop(runtime_jobs::trace_archive::spawn(state.clone()));
+    drop(runtime_jobs::ledger_checkpoint::spawn(state.clone()));
+    // Encryption at rest (governance PR 18): seal any plain connector grant
+    // once per boot. Reads seal lazily too; this pass covers grants nothing reads.
+    tokio::task::spawn_blocking(|| {
+        crate::integrations::at_rest::migrate_home(&crate::config::amux_home());
+    });
+    drop(runtime_jobs::host_guard::spawn());
+    drop(runtime_jobs::worker_resources::spawn(state.clone()));
+    drop(runtime_jobs::goal_keeper::spawn(state.clone()));
+    drop(runtime_jobs::task_titles::spawn(state.clone()));
     // Record tab transcripts (AMUX-4624): the folder is the work list, so a
     // restart or a late model install resolves on the next tick.
     drop(runtime_jobs::recordings_transcribe::spawn(state.clone()));
+    drop(runtime_jobs::recordings_live::spawn(state.clone()));
     drop(runtime_jobs::tailnet_watch::spawn());
     // Telegram long-poll (idles with no error when TELEGRAM_BOT_TOKEN is
     // unset — see runtime_jobs::telegram_poll's module doc for why polling,
     // not a webhook).
     drop(runtime_jobs::telegram_poll::spawn(state.clone()));
+    // The chat bridge (bridge/mod.rs): replies back to the chat, and Discord's
+    // channel reads. WhatsApp and Slack arrive by webhook (api/bridge.rs).
+    drop(bridge::spawn(state.clone()));
+    drop(bridge::adapters::spawn_discord(state.clone()));
+    // The owner's WhatsApp self chat, read from the WhatsApp app on this Mac.
+    drop(bridge::whatsapp_app::spawn(state.clone()));
+    // The owner's own iMessage thread and email to themselves (bridge/self_chat.rs).
+    drop(bridge::imessage::spawn(state.clone()));
+    drop(bridge::email::spawn(state.clone()));
     // Auto-relay: send session replies back to Telegram when linked sessions respond
     // to Telegram-routed messages. Works for all workers without per-session configuration.
     drop(runtime_jobs::telegram_relay::spawn(state.clone()));
@@ -531,9 +753,67 @@ async fn async_main() {
     // worse than raw claude" was invisible for months is that nothing counted
     // how many times a lane's conversation had been summarized away.
     drop(runtime_jobs::context_health::spawn());
+    drop(runtime_jobs::subscription_relaunch::spawn(state.clone()));
+    // Example invocations for every skill, ready before the first `/`.
+    crate::api::skill_examples::spawn_warmer(state.clone());
+    // Recompose every lane's MEMORY.md once per boot (contract rule 13). A new
+    // binary may compose differently, and nothing else rewrites the files until
+    // a worker's identity changes: 2026-10-06 ~/Dev/mixpeek's file was still in
+    // the pre-budget shape (35.6 KB against a 12 KB budget) a day after the
+    // budget shipped, because only lanes' own pointer appends had touched it.
+    tokio::task::spawn_blocking(|| {
+        let n = crate::api::session_verbs::refresh_fleet_rosters();
+        tracing::info!(lanes = n, measured = true, n_considered = n, verdict = "memory_recomposed_at_boot",
+            "recomposed every live lane's MEMORY.md with this build's composer");
+    });
+    // AA-40: skills saved in the Skills tab before their command file was
+    // written on save exist only in the table, where Claude Code cannot run
+    // them. Give each one a file once per boot (create only). The skills amux
+    // itself ships (skills/amux-contribute.md) are installed first.
+    {
+        let st = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let dir = crate::api::skills::user_commands_dir();
+            let (written, n) = crate::api::skills::install_shipped(&dir, crate::api::skills::SHIPPED_COMMANDS);
+            tracing::info!(written, measured = true, n_considered = n, verdict = "shipped_skills_installed",
+                "installed or refreshed the skills amux ships (e.g. /amux-contribute)");
+            let Ok(conn) = st.store.read() else { return };
+            let (created, n) = crate::api::skills::materialize_missing(&conn, &dir);
+            tracing::info!(created, measured = true, n_considered = n, verdict = "skill_command_files_reconciled",
+                "gave every Skills-tab skill a command file Claude Code can run");
+        });
+    }
+    // Contract rules 2b and 3 (AH-377, AH-378): post-deploy checks and reviewers.
+    drop(runtime_jobs::contract_watch::spawn(state.clone()));
+    // Contract rule 5 (AH-380): the server-owned land queue.
+    drop(runtime_jobs::land_queue::spawn(state.clone()));
+    // Install the passive status observer BEFORE the listener binds, so a
+    // healthy /health implies the hook script is on disk. It used to arrive
+    // only on status_history's first tick (a spawn_blocking task), which can
+    // lose the race to /health: a server killed right after turning healthy
+    // left no native-status.py, and a provider hook firing while it was down
+    // had nothing to run (restart_persistence CI runs 38917609108,
+    // 38845948860: "python3: can't open file .../native-status.py"). The tick
+    // still repairs drift later; this makes the first install unconditional,
+    // including on servers where that job is disabled.
+    // A test harness killed before its teardown leaves this server orphaned
+    // under a temp AMUX_HOME, running every loop for nobody (CPU RCA
+    // 20261018-015302). It exits with its parent instead.
+    parent_watch::start(&config::amux_home());
+
+    if let Err(error) = api::native_status::ensure_observer(&config::amux_home()) {
+        tracing::warn!(%error, measured = false, n_considered = 1, verdict = "native_status_observer_startup_install_failed",
+            "passive observer could not be installed at startup; status_history's tick will retry");
+    }
+    api::native_status::ensure_claude_hooks_here();
     // AMUX-3761: a durable record of WHICH RULE decided each lane's status,
     // so "was that badge accurate?" is answerable after the screenshot arrives.
     drop(runtime_jobs::status_history::spawn(state.clone()));
+    drop(runtime_jobs::browser_login_sync::spawn());
+    drop(runtime_jobs::connector_maintenance::spawn(state.clone()));
+    drop(runtime_jobs::social_metrics::spawn(state.clone()));
+    drop(runtime_jobs::social_publish::spawn(state.clone()));
+    drop(runtime_jobs::episodes::spawn(state.clone()));
     // CDC poller (migration 0061): tails board_change_log so the catch-up
     // endpoint (/api/board/changes) stays current.
     drop(runtime_jobs::cdc_poller::spawn(state.clone()));
@@ -543,6 +823,13 @@ async fn async_main() {
     drop(runtime_jobs::token_ledger::spawn(state.clone()));
     drop(runtime_jobs::board_hygiene::spawn(state.clone()));
     drop(runtime_jobs::message_capture::spawn(state.clone()));
+    // Live model catalog (this task, 2026-09-23): probes each vendor's own
+    // list-models API when a key is configured, so /api/models and every
+    // ProviderAdapter::models() serve the vendor's real current list instead
+    // of only the hand-typed, dated fallback in provider::model_catalog.
+    drop(runtime_jobs::model_catalog_refresh::spawn());
+    // Converse tab: delete voice conversations past AMUX_CONVERSE_RETENTION_DAYS.
+    drop(runtime_jobs::converse_retention::spawn());
 
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call
@@ -557,13 +844,25 @@ async fn async_main() {
     // off. Delivery goes through `LiveDeliverer` — the one implementation, and
     // the same send path a human's message takes.
     {
+        let store = store.clone();
         let firing = runtime_jobs::firing_enabled();
+        // Say the mode once at boot. Shadow mode looks exactly like a working
+        // scheduler in the UI (schedules save, next_run advances on screen)
+        // while nothing ever runs, so the log is where a sweep can see it.
+        if firing {
+            tracing::info!(verdict = "scheduler_firing", "schedule firing is on");
+        } else {
+            tracing::warn!(
+                verdict = "scheduler_shadow_mode",
+                "AMUX_RS_SCHEDULER disables schedule firing; schedules are journaled, never run"
+            );
+        }
         let deliverer: std::sync::Arc<dyn runtime_jobs::scheduler::Deliverer> =
             std::sync::Arc::new(runtime_jobs::scheduler::LiveDeliverer::new(state.clone()));
         jobs::spawn_loop(
             jobs::ids::SCHEDULER,
             Some(secs(runtime_jobs::SCHEDULER_TICK_SECS)),
-            runtime_jobs::run_scheduler(store.clone(), firing, deliverer),
+            move || runtime_jobs::run_scheduler(store.clone(), firing, deliverer.clone()),
         );
     }
 
@@ -571,13 +870,23 @@ async fn async_main() {
     // spawned further down (after the listener is up) and now needs the store to
     // tell a lane its browser was released (AF-497).
     let reaper_store = state.store.clone();
+    // Read once at boot for the retired-Proxies note (MSG-95893).
+    let proxies_store = state.store.clone();
     api::board_intake::initialize();
     api::history_ask::initialize();
+    // After the helper model is installed: its first tick runs at once, and
+    // spawned earlier it found no model and logged desc_refresh_no_model.
+    drop(runtime_jobs::desc_refresh::spawn(state.clone()));
+    drop(runtime_jobs::event_dispatch::spawn(state.clone()));
+    drop(runtime_jobs::email_events::spawn(state.clone()));
+    drop(runtime_jobs::linkedin_events::spawn(state.clone()));
+    boot_watch::step("router");
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed
     // for localhost/IPs — Python-server parity (its _sni_cb), so the PWA's
     // service worker registers over https://<host>.ts.net:<port>.
+    boot_watch::step("tls");
     let server_config = tls::build_server_config(&cfg.tls_dir()).expect("tls material");
     let rustls_cfg =
         axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(server_config));
@@ -586,6 +895,7 @@ async fn async_main() {
     // AMUX_HERDR_SESSION names the herdr session hosting amux workspaces
     // (backend::backends_from_env — constructing it against a missing herdr
     // server would make every probe a failure report).
+    boot_watch::step("backends");
     let backends = backend::backends_from_env(&cfg.env);
     // Publish the backend set for API handlers (worker peek, AMUX-2613
     // gap 4): AppState is constructed at 40+ sites, so the accessor is a
@@ -599,9 +909,13 @@ async fn async_main() {
     // `_amux_conversations` (AMUX-2613 gap 2) so bootstrap re-hydrates them
     // after a restart — an in-memory-only ref is fiction (the D1 report-
     // table lesson: this process re-execs on every deploy).
-    let protocol = Arc::new(opencode::structured::StructuredCliProtocol::with_conversation_sink(
-        Arc::new(StoreConversationSink { store: store.clone() }),
-    ));
+    let protocol = Arc::new(
+        opencode::structured::StructuredCliProtocol::with_conversation_sink(Arc::new(
+            StoreConversationSink {
+                store: store.clone(),
+            },
+        )),
+    );
     opencode::set_process_protocol(protocol.clone());
 
     // Orchestrator runtime: reconcile once, then tick (RR-0041).
@@ -623,6 +937,7 @@ async fn async_main() {
         })
         .unwrap_or(amux_core::circuit::FleetState::Normal)
     };
+    boot_watch::step("orchestrator_runtime");
     let runtime = Arc::new(orchestrator::runtime::Runtime {
         store: store.clone(),
         backends: backends.clone(),
@@ -656,7 +971,11 @@ async fn async_main() {
         },
         fleet_state: std::sync::Mutex::new(durable_fleet_state),
         protocol: Some(protocol.clone() as Arc<dyn opencode::AgentProtocol>),
-        pickup_unowned: cfg.env.get("AMUX_RS_PICKUP_UNOWNED").map(|v| v == "1").unwrap_or(false),
+        pickup_unowned: cfg
+            .env
+            .get("AMUX_RS_PICKUP_UNOWNED")
+            .map(|v| v == "1")
+            .unwrap_or(false),
         // RR-0044b: staggered un-park interval after a provider rate-limit
         // reset (thundering-herd prevention).
         resume_stagger_secs: cfg
@@ -691,7 +1010,7 @@ async fn async_main() {
             jobs::spawn_loop(
                 jobs::ids::ORCH_RUNTIME,
                 Some(secs(orch_tick_secs)),
-                runtime.clone().run(),
+                move || runtime.clone().run(),
             );
         });
     }
@@ -709,10 +1028,8 @@ async fn async_main() {
     jobs::spawn_loop(
         jobs::ids::EVENT_PROCESSORS,
         Some(secs(orchestrator::events::SUPERVISE_SECS)),
-        orchestrator::events::run_event_processors(
-            store.clone(),
-            runtime.protocol.clone().expect("protocol constructed above"),
-        ),
+        { let store = store.clone(); let protocol = runtime.protocol.clone().expect("protocol constructed above");
+            move || orchestrator::events::run_event_processors(store.clone(), protocol.clone()) },
     );
 
     // Terminal scan loop (RR-0067): the fallback voice for hookless
@@ -727,7 +1044,11 @@ async fn async_main() {
         .get("AMUX_RS_SCAN_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(15);
-    jobs::spawn_loop(jobs::ids::SCAN, Some(secs(scan_secs.max(5))), scan.run(scan_secs));
+    jobs::spawn_loop(
+        jobs::ids::SCAN,
+        Some(secs(scan_secs.max(5))),
+        move || scan.clone().run(scan_secs),
+    );
 
     // Session bootstrap (backend::bootstrap): the spawn/registration glue
     // that turns the API's durable Starting/ended records into real backend
@@ -745,7 +1066,11 @@ async fn async_main() {
         .get("AMUX_RS_BOOTSTRAP_SECS")
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
-    jobs::spawn_loop(jobs::ids::BOOTSTRAP, Some(secs(boot_secs.max(1))), boot.run(boot_secs));
+    jobs::spawn_loop(
+        jobs::ids::BOOTSTRAP,
+        Some(secs(boot_secs.max(1))),
+        move || boot.clone().run(boot_secs),
+    );
 
     // Self-adoption (parity with the Python server's own-mtime watch): when
     // the INSTALLED binary changes underneath us — the builder agent just
@@ -808,26 +1133,73 @@ async fn async_main() {
              binary change (AEAB-52: a test harness pins its build on purpose)"
         );
     } else {
-        jobs::spawn_loop(jobs::ids::SELF_ADOPT, Some(secs(5)), async move {
-            let Ok(exe) = std::env::current_exe() else { return };
-            let Ok(meta) = std::fs::metadata(&exe) else { return };
-            let mut observed = meta.modified().ok();
+        jobs::spawn_loop(jobs::ids::SELF_ADOPT, Some(secs(5)), move || {
+            let running_build = running_build.clone();
+            async move {
+            let Ok(exe) = std::env::current_exe() else {
+                return;
+            };
+            if std::fs::metadata(&exe).is_err() {
+                return;
+            }
+            // The receipt is watched too: a deploy with no compile re-stamps it
+            // and leaves the binary as it is.
+            let receipt = activation::receipt_path(&exe);
+            let stamp = || (std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok()),
+                            std::fs::metadata(&receipt).ok().and_then(|m| m.modified().ok()));
+            let mut observed = stamp();
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            // An in-flight shell schedule run used to hold adoption (up to
+            // 900s), because an exec killed it. A shell run is now detached
+            // and adopted by the next process (runtime_jobs/shell_detached.rs),
+            // so the hold defaults to 0. AMUX_ADOPT_SHELL_DEFER_MAX_S=<s>
+            // brings it back if adoption ever has to be bypassed.
+            let defer_max = std::time::Duration::from_secs(
+                std::env::var("AMUX_ADOPT_SHELL_DEFER_MAX_S").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+            let mut defer_since: Option<std::time::Instant> = None;
+            let mut defer_logged: Option<std::time::Instant> = None;
             loop {
                 interval.tick().await;
                 jobs::tick(jobs::ids::SELF_ADOPT);
-                let current = std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok());
-                if current.is_some() && current != observed {
+                let current = stamp();
+                if current.0.is_some() && current != observed {
+                    let busy = runtime_jobs::scheduler::shell_runs_in_flight(defer_max);
+                    if !busy.is_empty() {
+                        let since = *defer_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() < defer_max {
+                            if defer_logged.is_none_or(|t| t.elapsed().as_secs() >= 60) {
+                                defer_logged = Some(std::time::Instant::now());
+                                tracing::info!(verdict = "adoption_deferred_shell_run", runs = ?busy,
+                                    held_s = since.elapsed().as_secs(), max_s = defer_max.as_secs(),
+                                    measured = true, n_considered = busy.len(),
+                                    "self-adoption held: a shell schedule run is in flight and an exec would kill it");
+                            }
+                            continue;
+                        }
+                        tracing::warn!(verdict = "adoption_shell_defer_expired", runs = ?busy,
+                            held_s = since.elapsed().as_secs(), measured = true, n_considered = busy.len(),
+                            "self-adoption proceeding: shell schedule runs still in flight after the hold cap");
+                    }
+                    defer_since = None;
+                    defer_logged = None;
                     let path = exe.clone();
-                    let candidate = match tokio::task::spawn_blocking(move || activation::Candidate::read(&path)).await {
+                    let candidate = match tokio::task::spawn_blocking(move || {
+                        activation::Candidate::read(&path)
+                    })
+                    .await
+                    {
                         Ok(Ok(candidate)) => candidate,
                         error => {
-                            tracing::warn!(verdict = "adoption_identity_unmeasured", ?error,
-                                pid = std::process::id(), "self-adoption deferred: cannot verify installed image");
+                            tracing::warn!(
+                                verdict = "adoption_identity_unmeasured",
+                                ?error,
+                                pid = std::process::id(),
+                                "self-adoption deferred: cannot verify installed image"
+                            );
                             continue;
                         }
                     };
-                    let running_commit = env!("AMUX_BUILD_COMMIT_FULL");
+                    let running_commit = activation::served().full.as_str();
                     if let Some(reason) = candidate.skip_reason(running_commit, &running_build) {
                         tracing::warn!(verdict = reason, pid = std::process::id(),
                             running_commit, running_build = %running_build,
@@ -838,6 +1210,7 @@ async fn async_main() {
                     }
                     tracing::info!(pid = std::process::id(), running_commit, running_build = %running_build,
                         candidate_commit = ?candidate.commit, candidate_build = %candidate.build,
+                        revision_only = candidate.build == running_build,
                         "binary changed on disk — exec'ing the new build in place (self-adoption, \
                          AMUX-3458: no exit means no launchd throttle window)"
                     );
@@ -846,14 +1219,19 @@ async fn async_main() {
                     // know whether it arrived by self-adoption or because the
                     // previous process died — and those look identical in the
                     // log: 28 starts on 2026-08-23, 27 of them routine.
-                    let err = std::os::unix::process::CommandExt::exec(
-                        std::process::Command::new(&exe).env("AMUX_SELF_ADOPTED", "1"),
-                    );
+                    let mut next = std::process::Command::new(&exe);
+                    next.env("AMUX_SELF_ADOPTED", "1");
+                    // Hand the listening socket to the new image so clients
+                    // never see the port closed (listener_handoff.rs).
+                    listener_handoff::prepare_exec(&mut next);
+                    let err = std::os::unix::process::CommandExt::exec(&mut next);
                     // Only reachable when exec FAILED. Fall back to the old
                     // exit-for-relaunch path — slower (throttle) but correct.
+                    listener_handoff::exec_failed();
                     tracing::warn!(%err, "exec failed — falling back to exit-for-relaunch");
                     std::process::exit(0);
                 }
+            }
             }
         });
     }
@@ -861,26 +1239,49 @@ async fn async_main() {
     // RELEASE IDLE BROWSERS (AMUX-3829, Ethan: "it should clean up
     // automatically after idle use"). Nothing reaped one before, which is how a
     // browser sat 18.1h with zero tabs and blocked him.
+    boot_watch::step("reapers");
     runtime_jobs::browser_reaper::spawn(reaper_store);
+
+    // STOP IDLE COMPUTER-USE SANDBOXES (AMUX-5300). Each is a 4 GB Docker
+    // desktop; idle, exited, duplicate and unowned ones are removed by label.
+    runtime_jobs::computer_reaper::spawn();
+
+    // REAP ORPHAN ZOMBIES (Mac RCA 2026-10-13: 616 unreaped children). A self-
+    // exec keeps the pid, so the previous build's children are ours to wait on.
+    runtime_jobs::zombie_reaper::spawn();
+
+    // SEARCH INDEX FOR LOGS AND TRANSCRIPTS. Incremental FTS5 ingest into
+    // ~/.amux/search-firehose.db; /api/log-search and /api/search read it.
+    runtime_jobs::search_ingest::spawn();
 
     // MAC PROCESS HEALTH (2026-08-30). Reaps orphaned Ray workers and logs
     // when the claude-process count exceeds the ceiling. Neither the browser
     // reaper nor disk_watch covers these.
     drop(runtime_jobs::mac_health::spawn());
 
-    // AUTO-START THE TUNNEL RELAY, and only with an explicit target port
-    // (AMUX-2888, py:78089). Both halves are required: a token alone would
-    // default the target to amux's OWN port, and this port has no request auth
-    // — publishing it is unauthenticated RCE on a YOLO lane. `maybe_boot_start`
-    // owns that decision and returns what it did, so the log records a fact
-    // rather than an intention.
+    // AUTO-START THE CHATGPT APP RELAY when the owner published the connector
+    // (AMUX-5396). `maybe_boot_start` owns that decision and returns what it
+    // did, so the log records a fact rather than an intention.
     //
     // Not a `spawn_loop`: it is a one-shot that ADOPTS the relay's own task
     // under `ids::TUNNEL` if it manages to start one.
-    tokio::spawn(async {
+    //
+    // The same shot notes saved Proxies-tab rows. That tab is retired
+    // (MSG-95893) and nothing reads the table any more; the rows are the
+    // owner's data, so they stay on disk and get one line saying so.
+    tokio::spawn(async move {
         let outcome = runtime_jobs::tunnel::maybe_boot_start().await;
-        if outcome != "no token" && outcome != "no AMUX_TUNNEL_PORT" {
+        if outcome != "no token" && outcome != "not published" {
             tracing::info!(outcome, "tunnel: boot autostart");
+        }
+        let saved = proxies_store
+            .read()
+            .ok()
+            .and_then(|c| c.query_row("SELECT COUNT(*) FROM proxies", [], |r| r.get::<_, i64>(0)).ok())
+            .unwrap_or(0);
+        if saved > 0 {
+            tracing::info!(saved, verdict = "retired_proxies_data_present",
+                "proxies: the Proxies tab is retired; its saved rows are kept on disk and no longer read (use the Apps tab)");
         }
     });
 
@@ -903,9 +1304,14 @@ async fn async_main() {
     //
     // tests/legacy_port_guard.rs fails the build if the retired address
     // reappears in code, scripts or e2e.
+    boot_watch::step("publish_endpoint");
     legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, None);
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    let addr = std::net::SocketAddr::new(cfg.bind, cfg.port);
+    if let Some(bad) = &cfg.bind_rejected {
+        tracing::warn!(value = %bad, fallback = %cfg.bind, verdict = "bind_value_rejected",
+            "AMUX_RS_BIND is not an IP address; binding the default instead");
+    }
     // HOW LONG AFTER `record_boot` DID WE ACTUALLY START SERVING (AMUX-3647).
     //
     // The card proposed a `ready_at` COLUMN on `_amux_request_log` so the
@@ -928,12 +1334,43 @@ async fn async_main() {
             "ready: binding the listener; no request can be stamped before this instant"
         );
     }
-    tracing::info!(%addr, "listening (https, plain-http redirected)");
+    // Inherited from the previous image on a self-adoption, so the port never
+    // closes across a rebuild; bound fresh on a cold start.
+    let (listener, listener_source) =
+        listener_handoff::adopt_or_bind(addr).expect("bind listener");
+    boot_watch::bound();
+    tracing::info!(%addr, listener_source, verdict = if listener_source == "inherited" {
+        "listener_inherited"
+    } else {
+        "listener_bound"
+    }, "listening (https, plain-http redirected)");
+    // The apps origin (api/static_files/apps_origin.rs): a second listener that
+    // serves only /app/<id>/, so an app inside amux never shares the dashboard's
+    // origin. A failure to bind is logged and leaves the dashboard serving.
+    if let Some(apps_port) = api::static_files::apps_origin::apps_port(cfg.port) {
+        let apps_addr = std::net::SocketAddr::new(addr.ip(), apps_port);
+        let apps_tls = rustls_cfg.clone();
+        // Each app also gets a port of its own, with the app at `/`
+        // (static_files/app_ports.rs); apps that had one are served again now.
+        api::static_files::app_ports::set_tls(addr.ip(), rustls_cfg.clone());
+        api::static_files::app_ports::resume();
+        tokio::spawn(async move {
+            tracing::info!(%apps_addr, measured = true, n_considered = 1, verdict = "apps_origin_listening",
+                "apps origin listening: /app/<id>/ only");
+            if let Err(error) = axum_server::bind_rustls(apps_addr, apps_tls)
+                .serve(api::apps_router().into_make_service())
+                .await
+            {
+                tracing::warn!(%apps_addr, %error, measured = true, n_considered = 1, verdict = "apps_origin_bind_failed",
+                    "the apps origin could not listen; apps inside amux will not open");
+            }
+        });
+    }
     let acceptor = tls::RedirectingAcceptor::new(
         axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg),
         format!("localhost:{}", cfg.port),
     );
-    axum_server::bind(addr)
+    axum_server::from_tcp(listener)
         .acceptor(acceptor)
         // with_connect_info: the auth middleware's localhost bypass (Python
         // parity) needs the PEER address; without this every request looks

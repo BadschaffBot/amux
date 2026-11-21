@@ -48,6 +48,12 @@ pub struct WorkerConfig {
     /// Group membership (Invariant 12). Mutable — moving groups is an
     /// `Immediate` re-scoping, not a new worker.
     pub group: Option<GroupId>,
+    /// Execution experience (ACW-1): selects the execution adapter and the
+    /// primary output renderer, nothing else. Absent in older payloads and
+    /// rows, which read as `coding`. Changing it swaps the adapter, so it is
+    /// `SessionRestart`, like `backend`.
+    #[serde(default)]
+    pub worker_type: crate::worker_type::WorkerTypeId,
 }
 
 /// What a worker is able to do — used by capability matching
@@ -239,7 +245,8 @@ pub struct ConfigChangeResult {
 ///   escalate for vars it knows feed process startup.)
 /// - `model` (same provider AND `caps.hot_model_switch`) -> `NextTurn`,
 ///   else `SessionRestart`.
-/// - `cwd` / `provider` / `backend` -> `SessionRestart` (all process-level).
+/// - `cwd` / `provider` / `backend` / `worker_type` -> `SessionRestart`
+///   (all process-level).
 ///
 /// When multiple fields change, the STRONGEST mode wins
 /// (`SessionRestart > NextTurn > Immediate`).
@@ -265,7 +272,11 @@ pub fn classify_config_change(
         mode = mode.max(model_mode);
     }
 
-    if old.cwd != new.cwd || old.provider != new.provider || old.backend != new.backend {
+    if old.cwd != new.cwd
+        || old.provider != new.provider
+        || old.backend != new.backend
+        || old.worker_type != new.worker_type
+    {
         mode = mode.max(ConfigApplyMode::SessionRestart);
     }
 
@@ -309,18 +320,20 @@ pub fn apply_config(
 ) -> (Worker, ConfigChangeResult) {
     let mode = classify_config_change(&worker.config, &new_config, caps);
 
-    let (session_replaced, old_session, new_session, state) =
-        match (mode, current_session) {
-            (ConfigApplyMode::SessionRestart, Some(old)) => {
-                let new = mint_replacement();
-                // A session that "replaces" itself would be a lie in the audit
-                // trail; ULID minting makes collision practically impossible,
-                // and this guards the tests' fixed-id world too.
-                debug_assert!(old != new, "replacement session id must differ from the old one");
-                (true, Some(old), Some(new), WorkerState::Starting)
-            }
-            (_, _) => (false, None, None, worker.state.clone()),
-        };
+    let (session_replaced, old_session, new_session, state) = match (mode, current_session) {
+        (ConfigApplyMode::SessionRestart, Some(old)) => {
+            let new = mint_replacement();
+            // A session that "replaces" itself would be a lie in the audit
+            // trail; ULID minting makes collision practically impossible,
+            // and this guards the tests' fixed-id world too.
+            debug_assert!(
+                old != new,
+                "replacement session id must differ from the old one"
+            );
+            (true, Some(old), Some(new), WorkerState::Starting)
+        }
+        (_, _) => (false, None, None, worker.state.clone()),
+    };
 
     let worker = Worker {
         id: worker.id, // moved, never rewritten — the only field with no path to change
@@ -358,6 +371,7 @@ mod tests {
 
     fn base_config() -> WorkerConfig {
         WorkerConfig {
+            worker_type: Default::default(),
             display_name: "backend".into(),
             name_aliases: vec![],
             cwd: "/Users/ethan/Dev/amux".into(),

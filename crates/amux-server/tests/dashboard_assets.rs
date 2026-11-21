@@ -9,10 +9,13 @@
 //!    program is valid JavaScript. A parse check is not a content check, and no
 //!    amount of care substitutes for one that can fail (ethos rule 7).
 //!
-//! 2. VERSION SKEW. CLAUDE.md requires `APP_VER` (app.js) and `CACHE` (sw.js)
-//!    to be bumped together — a browser holding the cached script otherwise
-//!    never receives the fix. That rule has lived only in prose, so the one
-//!    thing every client-side deploy depends on was enforced by memory.
+//! 2. VERSION SKEW. A browser holding the cached script only refetches when
+//!    `APP_VER` (app.js) and `CACHE` (sw.js) move. Both are now DERIVED: the
+//!    source carries the `__AMUX_ASSET_VER__` placeholder and the server stamps
+//!    a content hash of static/ into it at serve time (amux-dashboard build.rs).
+//!    The test pins that the placeholder is what the source holds; the
+//!    substitution itself is pinned through the router in
+//!    `dashboard_asset_version.rs`.
 //!
 //! These read the SAME files `static_files.rs` embeds at compile time, so a
 //! green run is about the bytes that actually ship.
@@ -23,8 +26,7 @@ fn asset(name: &str) -> String {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../amux-dashboard/static")
         .join(name);
-    std::fs::read_to_string(&p)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
 }
 
 /// `const NAME = '...'` / `"..."` — the two declarations this repo actually uses.
@@ -40,6 +42,139 @@ fn const_str(src: &str, name: &str) -> Option<String> {
     let body = &tail[1..];
     let end = body.find(quote)?;
     Some(body[..end].to_string())
+}
+
+/// A repo-root file, for gates that must compare the bundle against something
+/// outside the crate.
+fn repo_file(rel: &str) -> String {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+}
+
+/// Quoted identifiers inside the bracketed list beginning at `at`.
+fn bracket_names(src: &str, at: usize) -> Vec<String> {
+    let mut depth = 0usize;
+    let mut end = src.len();
+    for (i, ch) in src[at..].char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = at + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let mut rest = &src[at..end];
+    while let Some(q) = rest.find('\'') {
+        let after = &rest[q + 1..];
+        let Some(e) = after.find('\'') else { break };
+        let name = &after[..e];
+        if !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+            && !name.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            out.push(name.to_string());
+        }
+        rest = &after[e + 1..];
+    }
+    out
+}
+
+/// Every app.js function the node suite names, from both places it names them:
+/// the base list every fixture loads, and each `fixture([...])` call.
+fn names_required_by(src: &str) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for pat in ["for (const name of ", "fixture("] {
+        let mut from = 0;
+        while let Some(i) = src[from..].find(pat) {
+            let after = from + i + pat.len();
+            let open = after + src[after..].len() - src[after..].trim_start().len();
+            if src[open..].starts_with('[') {
+                names.extend(bracket_names(src, open));
+            }
+            from = after;
+        }
+    }
+    names
+}
+
+/// Is `name` declared at the TOP LEVEL of the bundle?
+///
+/// All four shapes the suite resolves, because it uses two helpers and the
+/// bundle uses two spellings: `code()` wants a FunctionDeclaration, which
+/// espree also reports for `async function`, and `declaration()` wants a
+/// VariableDeclaration. Matching only `function NAME(` reported 21 false
+/// missing on a suite that passes, which would have made this guard worse than
+/// none: a gate that cries wolf is one people learn to bypass.
+fn declares_top_level(app: &str, name: &str) -> bool {
+    ["function ", "async function ", "const ", "let ", "var "]
+        .iter()
+        .any(|kw| {
+            let needle = format!("{kw}{name}");
+            app.match_indices(&needle)
+                .filter(|(i, _)| *i == 0 || app.as_bytes()[i - 1] == b'\n')
+                .any(|(i, _)| {
+                    // A real boundary, so `const _geoFix` does not satisfy `_geoFi`.
+                    app[i + needle.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '$')
+                })
+        })
+}
+
+/// AMUX-4948: a function the node suite NAMES must exist in the shipped bundle.
+///
+/// 8460dd8e bumped APP_VER and landed tests for `_peekPollNow`,
+/// `_peekPollInFlight` and `_peekPollAgain`, none of which it implemented. The
+/// suite's own `assert.ok(node, 'shipped function exists: ' + name)` is exactly
+/// the right guard and it fired in exactly the wrong place: inside a fixture,
+/// in a node suite that runs AFTER the SPA static gate. That gate failed first
+/// and killed all four shards, so the real defect was invisible under it, and
+/// main stayed red for three days across four rounds of push-and-watch, each
+/// revealing a failure the previous one had masked.
+///
+/// This asks the same question in the fast gate, where a missing function costs
+/// seconds instead of a CI round. It does not replace the node assertion, which
+/// also EXECUTES the function; it only stops a bundle that cannot possibly
+/// satisfy it from reaching that far.
+#[test]
+fn every_function_the_node_suite_names_exists_in_the_bundle() {
+    let suite = repo_file("tests/dashboard-outage-recovery.mjs");
+    let app = asset("app.js");
+    let names = names_required_by(&suite);
+
+    // THE EXTRACTOR MUST HAVE READ SOMETHING. A rename of `fixture(` would
+    // otherwise leave this green over an empty set, which is the vacuous-guard
+    // shape this very card is about (ethos rule 7).
+    assert!(
+        names.len() >= 40,
+        "only {} name(s) extracted from the suite; the guard has stopped reading it \
+         (did `fixture(` or the base list get renamed?)",
+        names.len()
+    );
+
+    let missing: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !declares_top_level(&app, n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "tests/dashboard-outage-recovery.mjs names {} function(s) that app.js does not declare: \
+         {missing:?}. The node suite would die in its own fixture on \
+         `shipped function exists`, taking every assertion in that cell with it (AMUX-4948).",
+        missing.len()
+    );
 }
 
 #[test]
@@ -63,26 +198,37 @@ fn the_service_worker_still_contains_a_service_worker() {
         "SHELL_URLS",
         "caches.open",
     ] {
-        assert!(sw.contains(needle), "sw.js lost `{needle}` — a partial write, or a deletion nobody meant");
+        assert!(
+            sw.contains(needle),
+            "sw.js lost `{needle}` — a partial write, or a deletion nobody meant"
+        );
     }
 }
 
 #[test]
 fn the_app_bundle_still_contains_an_app() {
     let app = asset("app.js");
-    assert!(app.len() > 500_000, "app.js is {} bytes — far below the shipped bundle", app.len());
+    assert!(
+        app.len() > 500_000,
+        "app.js is {} bytes — far below the shipped bundle",
+        app.len()
+    );
     let html = asset("index.html");
-    assert!(html.len() > 50_000, "index.html is {} bytes — far below the shipped shell", html.len());
+    assert!(
+        html.len() > 50_000,
+        "index.html is {} bytes — far below the shipped shell",
+        html.len()
+    );
     // The SPA is unusable without these, and each has been broken by a delete
     // at least once in this repo's history.
     for needle in ["function openPeek", "function closePeek", "serviceWorker"] {
-        assert!(app.contains(needle) || html.contains(needle), "the SPA lost `{needle}`");
+        assert!(
+            app.contains(needle) || html.contains(needle),
+            "the SPA lost `{needle}`"
+        );
     }
 }
 
-/// CLAUDE.md: "Client JS changes need APP_VER and the CACHE version bumped
-/// together, or a browser holding the cached script never receives the fix."
-/// Enforced here rather than remembered.
 /// A WORKER BRANCH IS ISOLATION, NOT DELIVERY (AF-495).
 ///
 /// From the 2026-09-04 Doron session. His worker was off main with nothing
@@ -130,18 +276,25 @@ fn the_branch_popover_does_not_read_isolation_as_delivery() {
     );
 }
 
+/// Both version declarations carry the derived-version placeholder. A hand-
+/// written literal here would pin the version: the server would stamp nothing,
+/// the SW cache name would stop moving on deploys, and every pair of dashboard
+/// PRs would conflict on the line again.
 #[test]
-fn app_ver_and_the_sw_cache_version_agree() {
+fn app_ver_and_the_sw_cache_version_are_derived() {
+    let placeholder = amux_dashboard::ASSET_VER_PLACEHOLDER;
     let app_ver = const_str(&asset("app.js"), "APP_VER")
-        .expect("app.js must declare `const APP_VER = '<version>'`");
+        .expect("app.js must declare `const APP_VER = '__AMUX_ASSET_VER__'`");
     let cache = const_str(&asset("sw.js"), "CACHE")
-        .expect("sw.js must declare `const CACHE = 'amux-v<version>'`");
-
-    let expected = format!("amux-v{app_ver}");
+        .expect("sw.js must declare `const CACHE = 'amux-v__AMUX_ASSET_VER__'`");
     assert_eq!(
-        cache, expected,
-        "APP_VER ({app_ver}) and the sw.js CACHE ({cache}) disagree. Bump BOTH: a client \
-         holding the cached script never receives a fix shipped under a stale cache key."
+        app_ver, placeholder,
+        "app.js APP_VER must be the placeholder the server stamps, not a hand-bumped literal"
+    );
+    assert_eq!(
+        cache,
+        format!("amux-v{placeholder}"),
+        "sw.js CACHE must be `amux-v` + the placeholder, so it moves with APP_VER on every deploy"
     );
 }
 
@@ -164,7 +317,11 @@ fn every_dashboard_model_control_uses_the_shared_open_catalog() {
         app.contains("Custom model ID"),
         "future model ids have no open-string escape hatch"
     );
-    for duplicate in ["const claudeModels", "const codexModels", "const geminiModels"] {
+    for duplicate in [
+        "const claudeModels",
+        "const codexModels",
+        "const geminiModels",
+    ] {
         assert!(
             !app.contains(duplicate),
             "duplicated provider list returned: {duplicate}"
@@ -183,18 +340,43 @@ fn every_dashboard_model_control_uses_the_shared_open_catalog() {
 #[test]
 fn idle_ready_work_names_the_queue_and_keeps_real_stalls_distinct() {
     let app = asset("app.js");
-    let start = app.find("function _stalledChip(s)").expect("frontier chip renderer must exist");
+    let start = app
+        .find("function _stalledChip(s)")
+        .expect("frontier chip renderer must exist");
     let tail = &app[start..];
-    let end = tail.find("function updatePeekStatus()").expect("frontier chip must precede peek status");
+    let end = tail
+        .find("function updatePeekStatus()")
+        .expect("frontier chip must precede peek status");
     let chip = &tail[..end];
 
-    for required in ["readyCards: d.ready", "queued behind", "_openWorkQueue(", "worker-queue", "data-queue-retry"] {
-        assert!(app.contains(required), "queued-WIP rendering lost `{required}`");
+    for required in [
+        "readyCards: d.ready",
+        "queued behind",
+        "_openWorkQueue(",
+        "worker-queue",
+        "data-queue-retry",
+    ] {
+        assert!(
+            app.contains(required),
+            "queued-WIP rendering lost `{required}`"
+        );
     }
-    assert!(chip.contains("work-queued-chip"), "the holding card must be a semantic control");
-    assert!(chip.contains("queued-behind-wip"), "healthy WIP waits need a logged verdict");
-    assert!(chip.contains("'stalled'"), "the no-holding control must preserve real stalled detection");
-    assert!(chip.contains("no current work explains the block"), "stalled must say why it is alarming");
+    assert!(
+        chip.contains("work-queued-chip"),
+        "the holding card must be a semantic control"
+    );
+    assert!(
+        chip.contains("queued-behind-wip"),
+        "healthy WIP waits need a logged verdict"
+    );
+    assert!(
+        chip.contains("'stalled'"),
+        "the no-holding control must preserve real stalled detection"
+    );
+    assert!(
+        chip.contains("no current work explains the block"),
+        "stalled must say why it is alarming"
+    );
 }
 
 #[test]
@@ -214,40 +396,68 @@ fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
         "worker-action-menu-parity",
         "worker-file-entry",
     ] {
-        assert!(app.contains(required), "shared worker-action contract lost `{required}`");
+        assert!(
+            app.contains(required),
+            "shared worker-action contract lost `{required}`"
+        );
     }
-    let inventory_start = app.find("function _workerActionDefinitions(s)")
+    let inventory_start = app
+        .find("function _workerActionDefinitions(s)")
         .expect("shared worker-action inventory must exist");
     let inventory_tail = &app[inventory_start..];
-    let inventory_end = inventory_tail.find("function _renderWorkerActionMenu")
+    let inventory_end = inventory_tail
+        .find("function _renderWorkerActionMenu")
         .expect("the shared renderer must follow its inventory");
     let inventory = &inventory_tail[..inventory_end];
     // 29 SOURCE entries since 9af1c88b: `pause` and `resume` are the two arms of
     // one ternary, so the source carries both while a worker renders exactly one
     // of them. This counts the inventory in source, not the rendered menu.
+    // 30 with copy-worker-link (a /w/<worker> deep link, api/deep_links.rs).
     assert_eq!(
         inventory.matches("{ key: '").count(),
-        29,
-        "the shared worker-action inventory has 29 source entries (27 actions plus the pause/resume pair)"
+        30,
+        "the shared worker-action inventory has 30 source entries (28 actions plus the pause/resume pair)"
     );
 
-    let browse_start = app.find("function _browseWorkerFiles(name, source)")
+    let browse_start = app
+        .find("function _browseWorkerFiles(name, source)")
         .expect("canonical worker file entry must exist");
     let browse_tail = &app[browse_start..];
-    let browse_end = browse_tail.find("function _reportWorkerActionParity")
+    let browse_end = browse_tail
+        .find("function _reportWorkerActionParity")
         .expect("file entry must precede the parity diagnostic");
     let browse = &browse_tail[..browse_end];
-    assert!(browse.contains("openExplore(root, name)"), "worker file entry must use full Files route");
-    assert!(!browse.contains("togglePeekSplit"), "worker file entry must not retain the split-pane fork");
+    assert!(
+        browse.contains("openExplore(root, name)"),
+        "worker file entry must use full Files route"
+    );
+    assert!(
+        !browse.contains("togglePeekSplit"),
+        "worker file entry must not retain the split-pane fork"
+    );
     assert!(
         html.contains("_browseWorkerFiles(peekSession,'peek-directory')"),
         "the displayed directory must use the canonical worker file entry"
     );
-    assert_eq!(html.matches("id=\"peek-worker-menu-btn\"").count(), 1, "peek header action id must be unique");
-    assert_eq!(html.matches("id=\"peek-composer-more-btn\"").count(), 1, "peek composer action id must be unique");
-    assert_eq!(html.matches("id=\"peek-more-btn\"").count(), 0, "ambiguous duplicate peek-more-btn returned");
+    assert_eq!(
+        html.matches("id=\"peek-worker-menu-btn\"").count(),
+        1,
+        "peek header action id must be unique"
+    );
+    assert_eq!(
+        html.matches("id=\"peek-composer-more-btn\"").count(),
+        1,
+        "peek composer action id must be unique"
+    );
+    assert_eq!(
+        html.matches("id=\"peek-more-btn\"").count(),
+        0,
+        "ambiguous duplicate peek-more-btn returned"
+    );
     assert!(
-        css.contains(".peek-more-dropdown") && css.contains("overflow-y:auto") && css.contains("max-height:min(500px"),
+        css.contains(".peek-more-dropdown")
+            && css.contains("overflow-y:auto")
+            && css.contains("max-height:min(500px"),
         "the complete peek menu must remain scrollable on desktop and mobile"
     );
 }
@@ -263,7 +473,10 @@ fn board_worker_actions_group_wrapped_lines_under_their_timestamp() {
         .find("function _bdWorkerActivity(item)")
         .expect("worker activity parser must follow history parser");
     let parser = &rest[..end];
-    assert!(parser.contains("const grouped = []"), "parser no longer groups physical lines");
+    assert!(
+        parser.contains("const grouped = []"),
+        "parser no longer groups physical lines"
+    );
     assert!(
         parser.contains("grouped[grouped.length - 1].body += '\\n' + body.trim()"),
         "an untimestamped continuation must append to the preceding timestamped action"
@@ -290,7 +503,7 @@ fn messages_link_schedule_ids_to_the_scheduler() {
         "fetchSchedules()",
         "fetchSchedulerRuns()",
         "fetchSchedulerAudit()",
-        "openSchedModal(sid)",
+        "openSchedDetail(sid)",
         "function _linkifyScheduleIds(safeHtml)",
     ] {
         assert!(body.contains(needle), "schedule navigation lost `{needle}`");
@@ -405,7 +618,9 @@ fn cross_group_default_can_initialize_before_the_main_api_constant() {
         "referencing API before its declaration throws in the temporal dead zone and silently leaves the toggle off"
     );
     for needle in [
-        "saved.note || 'An explicit empty group or worker setting can deny this for that scope.'",
+        "saved.note || 'Workers may message only workers in a shared group. Direct owner input remains permitted.'",
+        "cb.disabled = d.editable === false",
+        "Messaging: shared groups only",
         "s.spans_groups_source",
         "s.spans_groups_reason",
         "refused (' + esc(source) + ' deny)",
@@ -431,8 +646,8 @@ fn all_worker_backlog_drain_is_a_persistent_settings_control() {
     }
     for needle in [
         "board-drain-default-checkbox",
-        "Auto-drain backlog for all workers",
-        "Default ON: when To Do is empty",
+        "Refill To Do from Backlog, all workers",
+        "It only takes effect on workers whose",
     ] {
         assert!(html.contains(needle), "worker settings lost `{needle}`");
     }
@@ -444,14 +659,36 @@ fn sse_message_invalidation_refreshes_each_visible_message_surface() {
     let start = app
         .find("if (key === 'messages')")
         .expect("SSE invalidation must recognize committed Messages writes");
-    let body = &app[start..start + 1100.min(app.len() - start)];
+    // The whole `{ ... }` block, by brace depth. A fixed 1100-char window broke
+    // when e53c57d5 added the uncertain-receipt recheck inside the block and
+    // pushed _loadCmdHistoryFromServer() past the cut, a red on a correct file.
+    let open = start + app[start..].find('{').expect("block opens");
+    let mut depth = 0usize;
+    let mut end = app.len();
+    for (i, ch) in app[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = open + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &app[start..end];
     for needle in [
         "_messagesLoad(true)",
         "_peekMessagesLoad()",
         "_loadCmdHistoryFromServer()",
         "_renderCmdHistoryList()",
     ] {
-        assert!(body.contains(needle), "message invalidation no longer refreshes `{needle}`");
+        assert!(
+            body.contains(needle),
+            "message invalidation no longer refreshes `{needle}`"
+        );
     }
 }
 
@@ -459,9 +696,9 @@ fn sse_message_invalidation_refreshes_each_visible_message_surface() {
 fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state() {
     let app = asset("app.js");
     let index = asset("index.html");
-    let helper_start = app
-        .find("function _runtimeBoardCardId(s)")
-        .expect("dashboard must derive the live doing card from the server's measured runtime truth");
+    let helper_start = app.find("function _runtimeBoardCardId(s)").expect(
+        "dashboard must derive the live doing card from the server's measured runtime truth",
+    );
     let helper_tail = &app[helper_start..];
     let helper_end = helper_tail
         .find("function _nudgeWorkersOnBoardChange()")
@@ -477,7 +714,10 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "c.status === 'doing'",
         "!c.deleted && !c.archived",
     ] {
-        assert!(helper.contains(needle), "live-card selection lost `{needle}`");
+        assert!(
+            helper.contains(needle),
+            "live-card selection lost `{needle}`"
+        );
     }
 
     let render_start = app
@@ -491,11 +731,16 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "_workerExecutionBadge(s, runtimeBoard)",
         "_activeTaskLink(s.name, displayTaskBoardId, displayTaskName)",
     ] {
-        assert!(render.contains(needle), "session card lost live board linkage `{needle}`");
+        assert!(
+            render.contains(needle),
+            "session card lost live board linkage `{needle}`"
+        );
     }
     // Execution badges are shared with worker details; verify the call above
     // and its implementation rather than demanding the old inline expression.
-    let badge_start = app.find("function _workerExecutionBadge(s, runtimeBoard)").unwrap();
+    let badge_start = app
+        .find("function _workerExecutionBadge(s, runtimeBoard, opts)")
+        .unwrap();
     let badge_tail = &app[badge_start..];
     let badge = &badge_tail[..badge_tail.find("function updatePeekStatus()").unwrap()];
     assert!(badge.contains("runtimeBoard.syncing") && badge.contains("_runtimeBoardSyncBadge()"));
@@ -544,18 +789,25 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         // describing the failure as lost functionality.
         "truth.verdict",
     ] {
-        assert!(app.contains(needle), "unattributed runtime lost its server-verdict treatment `{needle}`");
+        assert!(
+            app.contains(needle),
+            "unattributed runtime lost its server-verdict treatment `{needle}`"
+        );
     }
-    assert!(!app.contains(">card syncing</span>"),
-        "normal runtime attribution lag must not manufacture a card-syncing warning");
+    assert!(
+        !app.contains(">card syncing</span>"),
+        "normal runtime attribution lag must not manufacture a card-syncing warning"
+    );
     assert!(
         app.contains("verdict === 'active-conflicting-claims'")
             && app.contains("automatically reconciles multiple live task claims")
             && app.contains("status-badge waiting"),
         "competing live claims should stay internal while other unattributed idle states remain visible"
     );
-    assert!(!app.contains(">card conflict</span>"),
-        "claim reconciliation is harness work, not a human-facing status");
+    assert!(
+        !app.contains(">card conflict</span>"),
+        "claim reconciliation is harness work, not a human-facing status"
+    );
     assert!(
         !app.contains(">runtime/board split</span>"),
         "a recoverable task-link lag must not be presented as a red runtime failure"
@@ -569,11 +821,24 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         "if (status !== 'linked' || !cardId)",
         "_runtimeBoardSyncBadge()",
     ] {
-        assert!(app.contains(needle), "a stale poll may publish an unmeasured or stale card link without `{needle}`");
+        assert!(
+            app.contains(needle),
+            "a stale poll may publish an unmeasured or stale card link without `{needle}`"
+        );
     }
-    for rejected in ["no board task claimed", "board-unclaimed-mount", "_activeWithoutClaim"] {
-        assert!(!app.contains(rejected), "runtime activity must not manufacture the board pseudo-state `{rejected}`");
-        assert!(!index.contains(rejected), "the removed pseudo-state must not retain a dead mount `{rejected}`");
+    for rejected in [
+        "no board task claimed",
+        "board-unclaimed-mount",
+        "_activeWithoutClaim",
+    ] {
+        assert!(
+            !app.contains(rejected),
+            "runtime activity must not manufacture the board pseudo-state `{rejected}`"
+        );
+        assert!(
+            !index.contains(rejected),
+            "the removed pseudo-state must not retain a dead mount `{rejected}`"
+        );
     }
 }
 
@@ -591,7 +856,10 @@ fn idle_workers_explain_blocked_and_parked_board_work() {
         "backlog parked on human/trigger",
         "missing next action",
     ] {
-        assert!(helper.contains(needle), "board-drive explanation lost `{needle}`");
+        assert!(
+            helper.contains(needle),
+            "board-drive explanation lost `{needle}`"
+        );
     }
 
     let render_start = app
@@ -614,15 +882,25 @@ fn idle_workers_explain_blocked_and_parked_board_work() {
 /// comparison vacuous.
 #[test]
 fn the_version_parser_reads_real_values_and_rejects_junk() {
-    assert_eq!(const_str("const APP_VER = '1.2.3';", "APP_VER").as_deref(), Some("1.2.3"));
-    assert_eq!(const_str("const CACHE = \"amux-v1.2.3\";", "CACHE").as_deref(), Some("amux-v1.2.3"));
+    assert_eq!(
+        const_str("const APP_VER = '1.2.3';", "APP_VER").as_deref(),
+        Some("1.2.3")
+    );
+    assert_eq!(
+        const_str("const CACHE = \"amux-v1.2.3\";", "CACHE").as_deref(),
+        Some("amux-v1.2.3")
+    );
     // A trailing comment must not be swallowed into the value — app.js's real
     // line carries one ("// bump together with the sw.js CACHE version").
     assert_eq!(
         const_str("const APP_VER = '9.9.9';   // bump together", "APP_VER").as_deref(),
         Some("9.9.9")
     );
-    assert_eq!(const_str("const APP_VER = 5;", "APP_VER"), None, "unquoted is not a version");
+    assert_eq!(
+        const_str("const APP_VER = 5;", "APP_VER"),
+        None,
+        "unquoted is not a version"
+    );
     assert_eq!(const_str("nothing here", "APP_VER"), None);
 }
 
@@ -754,8 +1032,19 @@ fn a_shell_the_server_withheld_the_token_from_stops_reloading_and_says_so() {
     assert!(body.contains("_amuxAuthWithheldBanner"), "{body}");
     let banner = fn_body(&src, "_amuxAuthWithheldBanner");
     assert!(
-        banner.contains("?_token="),
-        "the banner must carry the ONE action that fixes this, not only the diagnosis"
+        !banner.contains("?_token="),
+        "the withheld-auth banner must not put the owner token in a URL"
+    );
+    assert!(
+        banner.contains("_openConnectionSecurity(event)")
+            && banner.contains("Connection &amp; security · Sign in"),
+        "the banner must open the secure Connect sign-in action, not only the diagnosis"
+    );
+    let open = fn_body(&src, "_openConnectionSecurity");
+    assert!(
+        open.contains("settings-menu") && open.contains("_settingsTab('integrations')")
+            && open.contains("connection-security") && open.contains("scrollIntoView"),
+        "clicking the withheld-auth action must take the user to the existing Connection security sign-in panel"
     );
     assert!(
         banner.contains("min-height:44px"),
@@ -782,8 +1071,10 @@ fn no_two_top_level_functions_in_app_js_share_a_name() {
                 None => continue,
             },
         };
-        let name: String =
-            rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
         if !name.is_empty() {
             *seen.entry(name).or_insert(0) += 1;
         }
@@ -800,10 +1091,16 @@ fn no_two_top_level_functions_in_app_js_share_a_name() {
     );
     // And a name known to be there, so a match that silently narrowed is caught
     // as well as one that broke outright.
-    assert!(seen.contains_key("renderBoard"), "extractor regressed: renderBoard not found");
+    assert!(
+        seen.contains_key("renderBoard"),
+        "extractor regressed: renderBoard not found"
+    );
 
-    let dupes: Vec<String> =
-        seen.iter().filter(|(_, n)| **n > 1).map(|(k, n)| format!("{k} ({n}x)")).collect();
+    let dupes: Vec<String> = seen
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(k, n)| format!("{k} ({n}x)"))
+        .collect();
     assert!(
         dupes.is_empty(),
         "two top-level functions share a name in app.js. Declarations HOIST, so the last one \
@@ -895,8 +1192,12 @@ fn board_detail_hydration_refreshes_authoritative_state_and_relations() {
 fn board_detail_leads_with_actionable_task_context() {
     let html = asset("index.html");
     let meta = html.find("id=\"bd-meta\"").expect("task context container");
-    let tabs = html.find("class=\"board-detail-tabs\"").expect("detail tabs");
-    let edit = html.find("id=\"bd-edit-fields\"").expect("edit-only fields");
+    let tabs = html
+        .find("class=\"board-detail-tabs\"")
+        .expect("detail tabs");
+    let edit = html
+        .find("id=\"bd-edit-fields\"")
+        .expect("edit-only fields");
     assert!(
         tabs < meta && meta < edit,
         "Details must lead with source, epic, gates and assets before edit-only controls"
@@ -943,7 +1244,10 @@ fn board_detail_leads_with_actionable_task_context() {
         assert!(app.contains(needle), "card detail omitted `{needle}`");
     }
     let summary = app.find("const summary = [").expect("work summary");
-    let assets = app[summary..].find("const artifacts = []").expect("asset section") + summary;
+    let assets = app[summary..]
+        .find("const artifacts = []")
+        .expect("asset section")
+        + summary;
     assert!(
         !app[summary..assets].contains("['Evidence', item.evidence]"),
         "raw shell evidence must not dominate the default card"
@@ -957,9 +1261,16 @@ fn group_suggestions_are_autocomplete_not_an_unprompted_wall() {
         .find("function _beTagInputUpdate(prefix)")
         .expect("tag autocomplete exists");
     let body = &app[start..start + 900.min(app.len() - start)];
-    let empty = body.find("if (!q) { el.innerHTML = ''; return; }").expect("empty-query guard");
-    let suggest = body.find("_tagSuggestions(prefix, q)").expect("typed suggestions remain");
-    assert!(empty < suggest, "the empty query must stop before fleet groups are suggested");
+    let empty = body
+        .find("if (!q) { el.innerHTML = ''; return; }")
+        .expect("empty-query guard");
+    let suggest = body
+        .find("_tagSuggestions(prefix, q)")
+        .expect("typed suggestions remain");
+    assert!(
+        empty < suggest,
+        "the empty query must stop before fleet groups are suggested"
+    );
 }
 
 #[test]
@@ -987,9 +1298,22 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
     );
 
     let app = asset("app.js");
+    // a4371f28 ("Hide unused harness configuration for raw workers"): an
+    // ISOLATED worker takes no harness automation, so its Configurations show
+    // only env and skin. Every other worker still sees every capability the
+    // server returns.
     assert!(
-        app.contains("const _visCaps = (lvl === 'worker') ? d.capabilities"),
-        "worker Configurations must show every capability returned by the server"
+        app.contains("const _visCaps = _visibleScopeCapabilities(lvl, sessions.find(s => s.name === w)?.isolated, d.capabilities);"),
+        "worker Configurations must filter capabilities through the one shared predicate"
+    );
+    let vis = app
+        .find("function _visibleScopeCapabilities(level, isolated, capabilities)")
+        .map(|i| &app[i..i + 300.min(app.len() - i)])
+        .expect("capability visibility predicate exists");
+    assert!(
+        vis.contains("level === 'worker' ? (isolated ? ['env', 'skin'] : null)")
+            && vis.contains("keys ? capabilities.filter(c => keys.includes(c.key)) : capabilities"),
+        "a non-isolated worker must see every capability; an isolated one only env and skin"
     );
     assert!(
         !app.contains("Edited where it lives"),
@@ -1001,7 +1325,7 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         "Runtime & model",
         "Permissions & communication",
         "Display & advanced",
-        "Task lifecycle",
+        "Board and this worker",
         "_workerConfigurationRow('name'",
         "_workerConfigurationRow('provider'",
         "_workerConfigurationRow('model'",
@@ -1012,11 +1336,10 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         "_scopeEditOpen(\\'",
         "skin: 'JSON object",
         "connectors: 'JSON object",
-        "Backlog → To Do",
-        "To Do → In Progress",
-        "Continue non-terminal work",
-        "Pickup / continue master",
-        "On by default; parked and human-owned cards stay put",
+        "Refill To Do from Backlog",
+        "Start To Do cards when idle",
+        "Keep going on unfinished cards",
+        "Board steers this worker",
         "Status availability and Board gates below define transition requirements",
         "external_email_allowed",
         "Send external email without approval",
@@ -1027,9 +1350,12 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         "auto_drain_backlog",
         "board_auto_pickup",
         "board_auto_continue",
-        "board_standing_orders",
+        "board_force_adherence",
     ] {
-        assert!(app.contains(&format!("field: '{field}'")), "missing runtime control for {field}");
+        assert!(
+            app.contains(&format!("field: '{field}'")),
+            "missing runtime control for {field}"
+        );
     }
     assert!(
         app.contains("if (!present.has(k)) out[k] = null"),
@@ -1039,10 +1365,14 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         app.contains("if (z && typeof z === 'object') return Object.keys(z).length > 0"),
         "nested skin/connector settings must not render as an unset configuration"
     );
+    // The way back to inherited configuration is the Scope tab: removing a
+    // worker-level row deletes that key (asserted just above). The Board tab's
+    // own Inherit button was removed on 2026-10-24 (Ethan: "we should have had
+    // one toggle for enable/disable board"), so it must not come back beside
+    // the switch.
     assert!(
-        app.contains("_workerBoardConfigurationSet(\\'")
-            && app.contains("\\',null)\">Inherit</button>"),
-        "worker overrides need an explicit path back to inherited configuration"
+        !app.contains("_boardOneSet(\\'' + escJs(name) + '\\',null)"),
+        "the Board tab is one switch; inherited configuration is reached from Scope"
     );
     let css = asset("app.css");
     for needle in [
@@ -1051,7 +1381,10 @@ fn worker_configurations_are_editable_from_backlog_through_terminal_states() {
         ".worker-config-row",
         "grid-template-columns:repeat(2,minmax(0,1fr))",
     ] {
-        assert!(css.contains(needle), "Configurations layout lost `{needle}`");
+        assert!(
+            css.contains(needle),
+            "Configurations layout lost `{needle}`"
+        );
     }
 }
 
@@ -1181,11 +1514,17 @@ fn global_banners_never_outrank_the_peek_overlay() {
     // as `.overlay` (z-index 100) and `#board-detail-overlay` (z-index 150) —
     // exactly the AF-390 hazard. A banner added under a NEW id needs adding
     // here too, or this test cannot see it.
-    let banner_ids =
-        ["no-apikey-banner", "org-banner", "org-invite-banner", "email-approvals-banner"];
+    let banner_ids = [
+        "no-apikey-banner",
+        "org-banner",
+        "org-invite-banner",
+        "email-approvals-banner",
+    ];
     for id in banner_ids {
         let needle = format!("id=\"{id}\" style=\"");
-        let start = html.find(&needle).unwrap_or_else(|| panic!("banner #{id} not found in index.html — did it move or get renamed?"));
+        let start = html.find(&needle).unwrap_or_else(|| {
+            panic!("banner #{id} not found in index.html — did it move or get renamed?")
+        });
         let tail = &html[start..];
         let tag_end = tail.find('>').expect("unterminated div tag");
         let style_attr = &tail[..tag_end];
@@ -1217,14 +1556,30 @@ fn workspace_invites_and_members_are_assigned_through_scoped_teams() {
     for needle in [
         "function openTeamEditor",
         "fetch('/api/org/teams')",
-        "JSON.stringify({email, team_id})",
-        "JSON.stringify({team_id})",
+        "JSON.stringify({email, team_id, grant_host_access: hostAck()})",
+        "JSON.stringify({team_id, grant_host_access: memberAck()})",
+        "grant_host_access:teamAck()",
         "_workspaceTeamScope",
     ] {
         assert!(app.contains(needle), "workspace team UI lost `{needle}`");
     }
-    for needle in ["Workspace access", "settings-teams-list", "+ Team", "+ Invite"] {
-        assert!(html.contains(needle), "workspace access shell lost `{needle}`");
+    // AMUX-5334: Global is host-level access, so the invite never preselects
+    // the Global "Everyone" team and the dialogs say what Global grants.
+    assert!(
+        !app.contains("_workspaceTeamOptions('team_global')"),
+        "the invite dialog preselects the Global team again (host-level access by default)"
+    );
+    assert!(app.contains("_HOST_ACCESS_TEXT") && app.contains("function _wireHostAccess"));
+    for needle in [
+        "Workspace access",
+        "settings-teams-list",
+        "+ Team",
+        "+ Invite",
+    ] {
+        assert!(
+            html.contains(needle),
+            "workspace access shell lost `{needle}`"
+        );
     }
     assert!(
         !app.contains("JSON.stringify({email, scope_level, scope_name})"),
@@ -1258,7 +1613,9 @@ fn the_phone_composer_keeps_input_and_actions_on_one_line() {
 #[test]
 fn the_worker_tab_customizer_is_the_grid_glyph() {
     let html = asset("index.html");
-    let i = html.find("id=\"peek-tab-customize\"").expect("the peek tab customizer button exists");
+    let i = html
+        .find("id=\"peek-tab-customize\"")
+        .expect("the peek tab customizer button exists");
     let btn = &html[i..];
     let end = btn.find("</button>").expect("the button closes");
     let inner = &btn[..end];
@@ -1267,7 +1624,10 @@ fn the_worker_tab_customizer_is_the_grid_glyph() {
         "the peek tab customizer must show the ⊞ glyph, not a word: got {:?}",
         &inner[inner.len().saturating_sub(24)..]
     );
-    assert!(!inner.contains("Tabs"), "the label \"Tabs\" is back on the peek tab customizer");
+    assert!(
+        !inner.contains("Tabs"),
+        "the label \"Tabs\" is back on the peek tab customizer"
+    );
 }
 
 /// A slow /send is not an offline /send. With a 10s client abort, every send
@@ -1278,18 +1638,22 @@ fn the_worker_tab_customizer_is_the_grid_glyph() {
 fn a_slow_send_has_a_bounded_outer_deadline() {
     let js = asset("app.js");
     let i = js.find("async function doSend(").expect("doSend exists");
-    let j = js[i..].find("async function doKeys(").expect("doKeys follows doSend");
+    let j = js[i..]
+        .find("async function doKeys(")
+        .expect("doKeys follows doSend");
     let body = &js[i..i + j];
     assert!(
         !body.contains("AbortSignal.timeout(10000)"),
         "doSend aborts at 10s again; on this host /send routinely exceeds that"
     );
-    assert!(body.contains("AbortSignal.timeout(90000)"), "doSend keeps a 90s ceiling for a hung server");
+    assert!(
+        body.contains("AbortSignal.timeout(90000)"),
+        "doSend keeps a 90s ceiling for a hung server"
+    );
     // Uncertain delivery must retain the original durable intent. The executable
     // dashboard-outage-recovery.mjs contract tests the real response path and
     // checkmark state, including a negative control restoring the old drop.
     // Receipt-only automatic retries are covered by e2e/outbox-acceptance-recovery.test.mjs.
-
 }
 
 /// A card-composer send must remove its sent attachments DURABLY (via
@@ -1301,7 +1665,9 @@ fn a_slow_send_has_a_bounded_outer_deadline() {
 #[test]
 fn a_card_send_clears_its_attachments_durably() {
     let js = asset("app.js");
-    let i = js.find("async function sendFromInput(").expect("sendFromInput exists");
+    let i = js
+        .find("async function sendFromInput(")
+        .expect("sendFromInput exists");
     let j = js[i..].find("\n}\n").map(|k| i + k).unwrap_or(js.len());
     let body = &js[i..j.min(i + 4000)];
     assert!(
@@ -1353,14 +1719,20 @@ fn reconnect_shows_the_sync_checklist() {
         js[so..so_end].contains("runSyncBanner(false)"),
         "reconnect must raise the sync banner non-quiet so the checklist is visible"
     );
-    // A multi-item batch shows even from a quiet caller. Uncertain sends are
-    // not counted toward the two (AMUX-4594): they stay in the replay list so
-    // they keep being re-checked, and counting them popped the checklist on
-    // every new send (Ethan, 2026-09-14: "this shouldn't be appearing when I
-    // send, too invasive").
+    // Superseded 2026-09-24 by two owner decisions: routine syncs stay in the
+    // connection pill ("this keeps popping up ... just keep it in the
+    // pending/live status at the top"), and a RECONNECT with a backlog raises
+    // the checklist on the home page ("bring the animation up that goes thru
+    // each one by one with check boxes ... on the homepage visible"). So the
+    // reconnect edge arms the auto flag, and the show rule honours it only
+    // outside a worker terminal, or when the pill was tapped.
     assert!(
-        js.contains("const show = !quiet || items.filter(i => !(i.type === 'queue' && _outboxUncertainMessage(i.item))).length >= 2;"),
-        "a 2+ item batch of non-uncertain items must show the checklist even when the caller is quiet"
+        js[so..so_end].contains("_syncBannerAuto = true;"),
+        "reconnect must arm the auto-show so the checklist appears on the home page"
+    );
+    assert!(
+        js.contains("const show = _syncBannerRequested || (_syncBannerAuto && !peekSession);"),
+        "the checklist shows on a pill tap, or on reconnect outside a worker terminal, and not for routine syncs"
     );
     // The per-item checkmark states must still exist.
     assert!(
@@ -1395,8 +1767,13 @@ fn the_mobile_settings_menu_escapes_the_sticky_header() {
     let css = asset("app.css");
     // Locate the actual selector and declarations. A character budget after
     // a prose marker failed as soon as the rationale exceeded that budget.
-    let rule = regex::Regex::new(r"(?s)@media\s*\(max-width:\s*600px\)\s*\{\s*\.settings-menu\s*\{([^}]+)").unwrap();
-    let captures = rule.captures(&css).expect("the mobile settings-menu rule must be present");
+    let rule = regex::Regex::new(
+        r"(?s)@media\s*\(max-width:\s*600px\)\s*\{\s*\.settings-menu\s*\{([^}]+)",
+    )
+    .unwrap();
+    let captures = rule
+        .captures(&css)
+        .expect("the mobile settings-menu rule must be present");
     let block = &captures[1];
     assert!(
         block.contains("position: fixed"),
@@ -1412,8 +1789,7 @@ fn the_mobile_settings_menu_escapes_the_sticky_header() {
 #[test]
 fn the_interaction_feedback_hub_is_hidden_from_the_header() {
     let css = asset("app.css");
-    let rule = regex::Regex::new(r"#interaction-feedback\s*\{[^}]*display:\s*none")
-        .unwrap();
+    let rule = regex::Regex::new(r"#interaction-feedback\s*\{[^}]*display:\s*none").unwrap();
     assert!(
         rule.is_match(&css),
         "the interaction-feedback hub must be hidden (#interaction-feedback{{display:none}}) \
@@ -1429,10 +1805,7 @@ fn the_interaction_feedback_hub_is_hidden_from_the_header() {
 #[test]
 fn the_tab_focus_ring_is_inset_so_it_is_not_clipped_into_blue_bars() {
     let css = asset("app.css");
-    let rule = regex::Regex::new(
-        r"(?s)\.tab-bar\s+button:focus-visible\s*\{([^}]*)\}",
-    )
-    .unwrap();
+    let rule = regex::Regex::new(r"(?s)\.tab-bar\s+button:focus-visible\s*\{([^}]*)\}").unwrap();
     let block = rule
         .captures(&css)
         .expect("a .tab-bar button:focus-visible rule must exist (AMUX-4475)");
@@ -1496,13 +1869,12 @@ fn the_toolbar_buttons_are_boxed_not_borderless() {
         "the notification bell must be a bordered box in the toolbar (AMUX-4475); got: {notif}"
     );
     // active + settings must be bordered boxes too.
-    let box_rule = regex::Regex::new(
-        r"\.header-row \.btn-active, \.header-row \.settings-btn \{[^}]*\}",
-    )
-    .unwrap()
-    .find(&css)
-    .map(|m| m.as_str().to_string())
-    .expect(".header-row .btn-active, .settings-btn rule must exist");
+    let box_rule =
+        regex::Regex::new(r"\.header-row \.btn-active, \.header-row \.settings-btn \{[^}]*\}")
+            .unwrap()
+            .find(&css)
+            .map(|m| m.as_str().to_string())
+            .expect(".header-row .btn-active, .settings-btn rule must exist");
     assert!(
         box_rule.contains("border:1px solid var(--border)"),
         "the active/settings toolbar buttons must be bordered boxes (AMUX-4475); got: {box_rule}"
@@ -1612,7 +1984,448 @@ fn the_ui_closed_statuses_match_the_servers_derivation() {
     // The two the old literals got wrong, named so a regression says which.
     assert!(from_js.contains(&"quarantined".to_string()), "{from_js:?}");
     assert!(from_js.contains(&"armed".to_string()), "{from_js:?}");
-    assert!(!from_js.contains(&"cancelled".to_string()), "cancelled is not a status: {from_js:?}");
+    assert!(
+        !from_js.contains(&"cancelled".to_string()),
+        "cancelled is not a status: {from_js:?}"
+    );
     // And the count is not a coincidence of two short lists.
     assert!(from_js.len() >= 5, "{from_js:?}");
+}
+
+/// AMUX-5011. `delivery='board'` means amux read the message as a work request
+/// and DELIBERATELY did not send its text to the lane. That value was missing
+/// from `_msgDeliveryChip`'s ladder, so it fell to the trailing arm and
+/// rendered as `direct?` over a tooltip saying the delivery path was not
+/// recorded. It was recorded, and it was the one path that delivers no text.
+///
+/// Ethan hit exactly that on MSG-68459: the row read `direct?`, he read it as
+/// sent, and reported the message as vanished. It had become AMUX-5008.
+///
+/// A source guard rather than a render test because this file is where the
+/// dashboard's shipped bytes are already checked, and the failure being
+/// guarded is the arm going missing again.
+/// AMUX-5020. A saved profile whose DIRECTORY is gone must not render as a
+/// normal signed-in one.
+///
+/// The registry keeps `domains` forever, so `⭐ PostHog (ethan-posthog) —
+/// us.posthog.com` is exactly what the picker drew for a profile with nothing
+/// behind it. Choosing it creates an empty directory and the session is logged
+/// out, with every visible field having said otherwise. Measured live: 11
+/// registry entries, 2 of them with no directory.
+///
+/// `last_used` cannot carry this, which is why the server grew `on_disk`: None
+/// there also means "created and never opened".
+/// AMUX-5033. A message from another Claude session read "Unclassified" in
+/// peek, directly above a block naming its sender in an attribute.
+///
+/// Ethan's constraint is that classification is the ONE thing peek may change,
+/// so a classifier that gives up on a message whose sender is written in the
+/// text is the defect. Claude Code delivers a peer message as the literal
+/// sentence "Another Claude session sent a message:" followed by a
+/// `<cross-session-message ... from-name="<lane>">` block. amux never sees it
+/// as a send, so no Messages row exists to match against and the row-matching
+/// path cannot classify it.
+/// AMUX-5030. A self-send is recorded as `session`, and `session` must stay in
+/// the classifier's allowlist or the row renders "Unclassified".
+///
+/// The server now writes a `cmd_history` row for `origin == name` (a lane
+/// sending to itself), which previously produced no row at all. That row's type
+/// is `session` deliberately: a new type would fall through `_msgKind`'s
+/// allowlist to `unknown`, which is the badge Ethan reported, so the fix would
+/// have traded an absent message for an unclassified one.
+#[test]
+fn the_type_a_self_send_is_recorded_under_is_one_the_classifier_knows() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _msgKind(e) {")
+        .expect("_msgKind is gone from the bundle");
+    let end = app[start..]
+        .find("\n}\n")
+        .map(|i| start + i + 3)
+        .expect("_msgKind has no closing brace");
+    let body = &app[start..end];
+
+    assert!(
+        body.contains("t === 'session'"),
+        "_msgKind no longer recognises 'session', so every peer AND self-send row \
+         renders Unclassified"
+    );
+    // The fallthrough must stay `unknown` rather than `human`: 355 rows once wore
+    // a Human badge that way (AMUX-3737), and a self-send is not a person.
+    assert!(
+        body.contains("return 'unknown';"),
+        "the allowlist's fallthrough is no longer 'unknown'; an unrecognised type \
+         must not be given a person's badge"
+    );
+}
+
+#[test]
+fn a_peer_message_from_another_claude_session_is_classified_not_unknown() {
+    let app = asset("app.js");
+    let start = app
+        .find("const _NON_HUMAN_PROMPT_MARKS = [")
+        .expect("_NON_HUMAN_PROMPT_MARKS is gone from the bundle");
+    let end = app[start..]
+        .find("\n];\n")
+        .map(|i| start + i + 4)
+        .expect("_NON_HUMAN_PROMPT_MARKS has no closing bracket");
+    let table = &app[start..end];
+
+    // MATCH THE ENTRY, NOT THE PROSE. The first draft of this test searched for
+    // the bare string and found it inside the comment directly above the entry,
+    // written in the same sitting — the self-matching trap ethos rule 7 names.
+    // A table ENTRY is `['<mark>', '<kind>'],`, so the leading `['` is what
+    // makes the needle an entry rather than a mention.
+    for mark in [
+        "['Another Claude session sent a message:'",
+        "['<cross-session-message'",
+    ] {
+        let at = match table.find(mark) {
+            Some(i) => i,
+            None => panic!(
+                "the marker table no longer lists {mark}, so a message from another \
+                 Claude session falls through to Unclassified"
+            ),
+        };
+        let line_end = table[at..].find('\n').map(|i| at + i).unwrap_or(table.len());
+        // Must map to `session`, the peer bucket. Landing it in `amux` would say
+        // the harness wrote it, which is a different and wrong claim.
+        assert!(
+            table[at..line_end].contains("'session'"),
+            "{mark} is classified as something other than 'session': {}",
+            &table[at..line_end]
+        );
+    }
+}
+
+#[test]
+fn the_profile_picker_marks_a_saved_profile_whose_directory_is_gone() {
+    let app = asset("app.js");
+    let start = app
+        .find("async function _bwLoadProfiles() {")
+        .expect("_bwLoadProfiles is gone from the bundle");
+    let end = app[start..]
+        .find("\n}\n")
+        .map(|i| start + i + 3)
+        .expect("_bwLoadProfiles has no closing brace");
+    let body = &app[start..end];
+
+    assert!(
+        body.contains("p.on_disk === false"),
+        "the picker no longer reads on_disk, so a profile with no directory renders \
+         exactly like a signed-in one"
+    );
+    assert!(
+        body.contains("starts logged out"),
+        "the option text must say what picking it will do; a neutral label here is the \
+         whole defect"
+    );
+    assert!(
+        !body.contains("p.on_disk == false") && !body.contains("!p.on_disk"),
+        "use a STRICT `=== false`. An older server omits the field entirely, and a \
+         loose test would mark every profile in that listing as missing"
+    );
+}
+
+#[test]
+fn the_delivery_chip_still_handles_a_message_routed_to_the_board() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _msgDeliveryChip(e) {")
+        .expect("_msgDeliveryChip is gone from the bundle");
+    let end = app[start..]
+        .find("\n}\n")
+        .map(|i| start + i + 3)
+        .expect("_msgDeliveryChip has no closing brace");
+    let body = &app[start..end];
+
+    assert!(
+        body.contains("rec === 'board'"),
+        "_msgDeliveryChip no longer handles delivery='board'. Without that arm an \
+         intercepted message renders as `direct?` — \"inferred from its type\" — which \
+         is how a message that was deliberately never delivered reads as sent."
+    );
+    assert!(
+        body.contains("NOT delivered as text"),
+        "the board arm must say the text was not delivered; a neutral label here is the \
+         whole defect"
+    );
+    assert!(
+        body.contains("card_id"),
+        "the board arm must name the card the message became, or the reader has no way \
+         to find where their request went"
+    );
+}
+
+/// AMUX-5017. Ethan's own message rendered as "Unclassified" in peek, and his
+/// constraint is that classification is the ONLY thing peek may change about
+/// the terminal's content — so it has to be right.
+///
+/// amux stamps every message a human sends through it with `[H:MM AM]`. That
+/// is a POSITIVE signal, where the previous fallback reasoned from an absence
+/// ("not in the loaded history window") and therefore labelled every human
+/// message outside the fetched page as unclassifiable.
+///
+/// THE ORDER IS THE CORRECTNESS ARGUMENT. An amux notice carries the same
+/// stamp, so `[05:27 PM] [amux] Idle with...` must match the marker table
+/// FIRST and classify as harness. This pins both the test and its position.
+#[test]
+fn a_stamped_prompt_is_human_and_the_marker_table_still_wins() {
+    let app = asset("app.js");
+    let start = app
+        .find("function _classifyPromptKind(promptText) {")
+        .expect("_classifyPromptKind is gone from the bundle");
+    let end = app[start..]
+        .find("\n}\n")
+        .map(|i| start + i + 3)
+        .expect("_classifyPromptKind has no closing brace");
+    let body = &app[start..end];
+
+    let marker_at = body.find("_NON_HUMAN_PROMPT_MARKS").expect(
+        "the marker table is no longer consulted — every harness notice would read as human",
+    );
+    let stamp_at = body.find("return 'human';").expect(
+        "a timestamp-stamped prompt no longer classifies as human; Ethan's own messages \
+                 would read as Unclassified again",
+    );
+    assert!(
+        marker_at < stamp_at,
+        "the timestamp test runs BEFORE the marker table, so an amux notice — which carries the \
+         same [H:MM AM] stamp — would be attributed to a human"
+    );
+    assert!(
+        body.contains("return 'unknown';"),
+        "unknown must remain reachable: a prompt with no row, no marker and no stamp genuinely \
+         cannot be told, and saying so is the honest answer"
+    );
+}
+
+/// AMUX-4808: the connection history/error dialog is the one the user opens
+/// when sync is already broken, so it must remain readable on a phone and under
+/// a keyboard. Keep its shell in CSS classes, not inline JavaScript styles, so
+/// the shared modal viewport guard can size it and this test can pin the shape.
+#[test]
+fn connection_history_modal_uses_the_mobile_dialog_shell() {
+    let js = asset("app.js");
+    let css = asset("app.css");
+
+    for needle in [
+        "modal.className = 'conn-hist-overlay'",
+        "class=\"conn-hist-box\" role=\"dialog\" aria-modal=\"true\"",
+        "aria-labelledby=\"conn-modal-title\"",
+        "class=\"btn conn-hist-close\"",
+    ] {
+        assert!(
+            js.contains(needle),
+            "connection modal lost its classed, accessible shell: {needle}"
+        );
+    }
+    assert!(
+        !js.contains("modal.style.cssText = 'position:fixed;inset:0;z-index:2200"),
+        "the connection modal shell must not be hidden in inline styles; CSS owns the mobile layout"
+    );
+    for needle in [
+        "#conn-hist-modal.conn-hist-overlay",
+        "#conn-hist-modal .conn-hist-box",
+        "max-height: calc(var(--dialog-viewport-height, 100dvh) - 16px)",
+        "@media (max-width:600px)",
+        "#conn-hist-modal .conn-hist-close",
+        "min-height: 44px",
+        "position: sticky",
+        "-webkit-overflow-scrolling: touch",
+    ] {
+        assert!(
+            css.contains(needle),
+            "connection modal CSS lost mobile-safe layout detail: {needle}"
+        );
+    }
+}
+
+/// JavaScript has no `\UXXXXXXXX` escape: `'\U0001f535'` is the literal text
+/// "U0001f535". Six notification icons were written in Python's spelling when
+/// the dashboard was extracted (3976de4f, 2026-08-09) and every toast showed
+/// that text instead of its emoji until 2026-09-27. Use `\u{1f535}`.
+#[test]
+fn no_python_style_unicode_escapes_in_client_js() {
+    for name in ["app.js", "sw.js"] {
+        let src = asset(name);
+        let bad: Vec<String> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                l.as_bytes().windows(10).any(|w| {
+                    w[0] == b'\\' && w[1] == b'U' && w[2..].iter().all(|c| c.is_ascii_hexdigit())
+                })
+            })
+            .map(|(i, l)| format!("{name}:{}: {}", i + 1, l.trim()))
+            .collect();
+        assert!(bad.is_empty(), "Python-style \\U escapes render as literal text in JS:\n{}", bad.join("\n"));
+    }
+}
+
+/// Every function an inline handler in index.html calls must be defined by a
+/// script the page loads. On 2026-09-28 a merge (8418e2fc) resolved an app.js
+/// conflict by taking an older file, and the Needs input pill's
+/// `onclick="...openNeedsInput()"` pointed at a function that no longer
+/// existed: Safari showed "Can't find variable: openNeedsInput" and the
+/// triage sheet never opened. spa-lint's no-undef covers app.js, not the
+/// handlers written into index.html, so nothing caught it.
+#[test]
+fn every_inline_handler_in_index_html_calls_a_defined_function() {
+    let html = asset("index.html");
+    let defined_in = [asset("app.js"), asset("state/kernel.js")].join("\n");
+    let attr = regex::Regex::new(r#"\son[a-z]+="([^"]*)""#).unwrap();
+    let call = regex::Regex::new(r"(^|[^.\w$])([A-Za-z_$][\w$]*)\s*\(").unwrap();
+    // Language keywords and browser globals an inline handler may call.
+    let builtin = [
+        "if", "else", "for", "while", "switch", "return", "typeof", "function", "new", "try", "catch", "void",
+        "alert", "confirm", "prompt", "setTimeout", "clearTimeout", "fetch",
+        "encodeURIComponent", "decodeURIComponent", "parseInt", "parseFloat",
+        "Number", "String", "Boolean", "Array", "Object", "Promise", "open",
+    ];
+    let mut missing: Vec<String> = Vec::new();
+    for a in attr.captures_iter(&html) {
+        for c in call.captures_iter(&a[1]) {
+            let name = &c[2];
+            if builtin.contains(&name) {
+                continue;
+            }
+            let defined = defined_in.contains(&format!("function {name}("))
+                || defined_in.contains(&format!("function {name} ("))
+                || defined_in.contains(&format!("{name} = "))
+                || defined_in.contains(&format!("window.{name}="));
+            if !defined && !missing.iter().any(|m| m == name) {
+                missing.push(name.to_string());
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "index.html inline handlers call functions no loaded script defines: {missing:?}"
+    );
+}
+
+/// The schedule dialog's action row must be INSIDE its box. One stray `</div>`
+/// closed the box early and left Cancel/Save as a sibling of it in the
+/// overlay's row-flex, which on a phone split the screen in half: a 187px
+/// dialog and a detached button block (Ethan, 2026-09-30 screenshot). The
+/// markup still parses, so nothing else notices.
+#[test]
+fn the_schedule_dialog_keeps_its_action_row_inside_the_box() {
+    let html = asset("index.html");
+    let start = html.find("<div id=\"sched-overlay\"").expect("schedule overlay");
+    let end = start + html[start..].find("<!-- Board card \"add\" small modal -->").expect("next modal");
+    let seg = &html[start..end];
+    let opens = seg.matches("<div").count();
+    let closes = seg.matches("</div>").count();
+    assert_eq!(opens, closes, "schedule dialog divs do not balance: {opens} opens, {closes} closes");
+    // Walk the nesting: the action row must open at depth 3 (overlay > box > row).
+    let foot = seg.find("class=\"sched-modal-foot\"").expect("action row");
+    let before = &seg[..foot];
+    let depth = before.matches("<div").count() as i64 - before.matches("</div>").count() as i64;
+    assert_eq!(depth, 3, "the action row opens at depth {depth}; it must be a child of the box (3)");
+}
+
+/// OFFLINE: every CDN file index.html loads is CORS-requested and pre-cached by
+/// the service worker. Without `crossorigin` the response is opaque, sw.js
+/// declines to cache it, and an offline start with the browser HTTP cache
+/// evicted lost the editor, charts, terminal, map and calendar (2026-10-01).
+#[test]
+fn every_cdn_asset_is_cors_and_precached_for_offline() {
+    let html = asset("index.html");
+    let sw = asset("sw.js");
+    let mut seen = 0;
+    let mut problems = Vec::new();
+    for tag in html.split('<').filter(|t| t.starts_with("script ") || t.starts_with("link ")) {
+        let tag = tag.split('>').next().unwrap_or("");
+        let Some(url) = ["src=\"", "href=\""].iter().find_map(|k| {
+            tag.find(k).map(|i| &tag[i + k.len()..]).and_then(|r| r.split('"').next())
+        }) else { continue };
+        if !["https://cdn.jsdelivr.net/", "https://unpkg.com/", "https://cdnjs.cloudflare.com/"]
+            .iter().any(|h| url.starts_with(h)) { continue }
+        seen += 1;
+        if !tag.contains("crossorigin") { problems.push(format!("no crossorigin: {url}")); }
+        if !sw.contains(&format!("'{url}'")) { problems.push(format!("not in sw.js CDN_URLS: {url}")); }
+    }
+    // View-only libraries load on first use through app.js's _LAZY_LIBS table
+    // rather than a tag, and an offline open needs them precached just the same.
+    let app = asset("app.js");
+    let start = app.find("const _LAZY_LIBS = {").expect("_LAZY_LIBS table in app.js");
+    let table = &app[start..start + app[start..].find("\n};").expect("end of _LAZY_LIBS")];
+    let mut lazy = 0;
+    for url in table.split('\'').filter(|s| s.starts_with("https://")) {
+        lazy += 1;
+        if !sw.contains(&format!("'{url}'")) { problems.push(format!("lazy lib not in sw.js CDN_URLS: {url}")); }
+    }
+    assert!(lazy >= 8, "found only {lazy} URLs in _LAZY_LIBS; the scan is broken, not the table");
+    seen += lazy;
+    assert!(seen >= 10, "found only {seen} CDN assets; the scan is broken, not the page");
+    assert!(problems.is_empty(), "offline would lose these libraries:\n{}", problems.join("\n"));
+}
+
+/// NOTIFICATIONS OBEY ONE GATE. The header switches (in-app pop-ups, native) are
+/// read only by the gate `amuxNotifyAllowed`, the switches' own toggle/render
+/// functions, the test-send, and the two that keep the switch in step
+/// (`_notifDesktopState`, `_pushReconcile`). Any other reader is an emitter deciding for
+/// itself, which is how a press-layer "...: done" toast appeared with in-app
+/// pop-ups off (2026-10-01). The press layer's success toast must ask the gate.
+#[test]
+fn every_notification_emitter_goes_through_the_shared_gate() {
+    let app = asset("app.js");
+    let allowed = [
+        "amuxNotifyAllowed", "_notifToggleNative", "_notifUpdateNativeBtn",
+        "_notifToggleBanners", "_notifUpdateBannerBtn", "_notifSendTest",
+        // The Mac app's answer that sets the native switch, and the load-time
+        // check that makes this device's push subscription match it. Both keep
+        // the switch itself in step and raise nothing (2eb8f94ce).
+        "_notifDesktopState", "_pushReconcile",
+    ];
+    let mut current = String::from("<top level>");
+    let mut offenders = Vec::new();
+    let mut reads = 0;
+    for (i, line) in app.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if line.starts_with("function ") || line.starts_with("async function ") {
+            let rest = trimmed.trim_start_matches("async ").trim_start_matches("function ");
+            current = rest.split('(').next().unwrap_or("").trim().to_string();
+        }
+        if (line.contains("_notifBanners") || line.contains("_notifsNative"))
+            && !trimmed.starts_with("let _notif")
+            && !trimmed.starts_with("//")
+        {
+            reads += 1;
+            if !allowed.contains(&current.as_str()) {
+                offenders.push(format!("app.js:{} in {}", i + 1, current));
+            }
+        }
+    }
+    assert!(reads >= 5, "found only {reads} reads of the notification switches; the scan is broken");
+    assert!(offenders.is_empty(), "notification switch read outside the gate; call amuxNotifyAllowed(kind):\n{}", offenders.join("\n"));
+    assert!(app.contains("if (!amuxNotifyAllowed('banner')) return;"), "_notifShowBanner must ask the gate");
+    assert!(app.contains("if (!amuxNotifyAllowed('native')) return;"), "_notifFireNative must ask the gate");
+    let feedback = asset("state/feedback.mjs");
+    assert!(feedback.contains("amuxNotifyAllowed?.('toast')"), "the press layer's success toast must ask the gate");
+}
+
+/// A server with no model must lead to "Sign in with Claude", not only to an API
+/// key. On an amux Cloud server the first-run window opened only for the old
+/// shared gateway (`is_cloud`), and the banner pointed at the Vault's API keys,
+/// so a customer could not connect a subscription at all (2026-10-19).
+#[test]
+fn no_model_leads_to_the_window_with_the_subscription_sign_in() {
+    let html = asset("index.html");
+    let app = asset("app.js");
+    let banner_start = html.find("id=\"no-apikey-banner\"").expect("banner");
+    let banner = &html[banner_start..banner_start + html[banner_start..].find("</div>").unwrap()];
+    assert!(
+        banner.contains("getElementById('apikey-setup-modal').style.display='flex'"),
+        "the no-model banner opens the first-run window: {banner}"
+    );
+    let modal_start = html.find("id=\"apikey-setup-modal\"").expect("modal");
+    let modal_end = modal_start + html[modal_start..].find("id=\"apikey-setup-input\"").unwrap();
+    assert!(html[modal_start..modal_end].contains("modelLogin('claude')"), "the window offers Sign in with Claude");
+    assert!(
+        app.contains("if (d.is_cloud || d.account_url) {"),
+        "a Cloud server's owner (account_url) gets the first-run window on load"
+    );
 }

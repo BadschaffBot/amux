@@ -211,7 +211,10 @@ fn count_by_session_status(conn: &rusqlite::Connection) -> Vec<StatusCount> {
 /// lines once it is replaced.
 fn strip_prior_auto_aged_lines(desc: &str) -> String {
     const MARKER: &str = "Auto-aged: this card has been in needsyou for";
-    let kept: Vec<&str> = desc.lines().filter(|line| !line.starts_with(MARKER)).collect();
+    let kept: Vec<&str> = desc
+        .lines()
+        .filter(|line| !line.starts_with(MARKER))
+        .collect();
     let mut out = String::new();
     let mut prev_blank = true; // suppress leading blank lines too
     for line in kept {
@@ -237,7 +240,9 @@ async fn needsyou_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
     LAST_NEEDSYOU_RUN.store(now_secs, std::sync::atomic::Ordering::Relaxed);
 
     let cards = {
-        let Ok(conn) = state.store.read() else { return (0, 0) };
+        let Ok(conn) = state.store.read() else {
+            return (0, 0);
+        };
         find_needsyou_cards(&conn, now_secs)
     };
 
@@ -291,7 +296,10 @@ async fn needsyou_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
                         "UPDATE issues SET \"desc\" = ?1, log = ?2, updated = ?3 WHERE id = ?4",
                         rusqlite::params![new_desc, new_log, now_secs, &id],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .await;
             tracing::info!(
@@ -305,39 +313,16 @@ async fn needsyou_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
         } else if card.age_days >= NEEDSYOU_DISCARD_DAYS {
             let id = card.id.clone();
             let age = card.age_days;
-            let note = format!(
-                "Auto-discarded: {age} days in needsyou with no resolution"
-            );
-            let hhmm = chrono::Utc::now().format("%H:%M").to_string();
+            let note = format!("Auto-discarded: {age} days in needsyou with no resolution");
             let _ = state
                 .store
                 .write_async(move |conn| {
-                    let old_desc: String = conn
-                        .query_row(
-                            "SELECT COALESCE(\"desc\", '') FROM issues WHERE id = ?1",
-                            rusqlite::params![&id],
-                            |r| r.get(0),
-                        )
-                        .unwrap_or_default();
-                    let new_desc = if old_desc.trim().is_empty() {
-                        note.clone()
-                    } else {
-                        format!("{}\n{note}", old_desc.trim_end())
-                    };
-                    let old_log: Option<String> = conn
-                        .query_row(
-                            "SELECT log FROM issues WHERE id = ?1",
-                            rusqlite::params![&id],
-                            |r| r.get(0),
-                        )
-                        .ok();
-                    let new_log = bs::append_log(old_log.as_deref(), &hhmm, &note);
-                    conn.execute(
-                        "UPDATE issues SET status = 'discarded', \"desc\" = ?1, log = ?2, \
-                         updated = ?3 WHERE id = ?4",
-                        rusqlite::params![new_desc, new_log, now_secs, &id],
-                    )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    let out = crate::db::advance::harness_close(conn, &id, "discarded", "harness:board-hygiene",
+                        Some(&format!("\n{note}")), &note)?;
+                    Ok(crate::db::WriteOutcome {
+                        applied: out.is_some(),
+                        events: out.map(|o| o.events).unwrap_or_default(),
+                    })
                 })
                 .await;
             tracing::info!(
@@ -350,9 +335,7 @@ async fn needsyou_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
         } else {
             let id = card.id.clone();
             let age = card.age_days;
-            let note = format!(
-                "Auto-aged: this card has been in needsyou for {age} days"
-            );
+            let note = format!("Auto-aged: this card has been in needsyou for {age} days");
             let hhmm = chrono::Utc::now().format("%H:%M").to_string();
             let _ = state
                 .store
@@ -387,7 +370,10 @@ async fn needsyou_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
                         "UPDATE issues SET \"desc\" = ?1, log = ?2, updated = ?3 WHERE id = ?4",
                         rusqlite::params![new_desc, new_log, now_secs, &id],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .await;
             tracing::info!(
@@ -406,7 +392,9 @@ async fn needsyou_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
 /// Run the stale card sweep. Returns (autofix_discarded, backlog_flagged).
 async fn stale_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
     let (autofix_cards, backlog_cards, status_counts) = {
-        let Ok(conn) = state.store.read() else { return (0, 0) };
+        let Ok(conn) = state.store.read() else {
+            return (0, 0);
+        };
         (
             find_stale_autofix_cards(&conn, now_secs),
             find_stale_backlog_cards(&conn, now_secs),
@@ -419,23 +407,14 @@ async fn stale_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
         let id = card.id.clone();
         let age = card.age_hours;
         let note = format!("Auto-discarded: autofix todo card stale for {age}h");
-        let hhmm = chrono::Utc::now().format("%H:%M").to_string();
         let _ = state
             .store
             .write_async(move |conn| {
-                let old_log: Option<String> = conn
-                    .query_row(
-                        "SELECT log FROM issues WHERE id = ?1",
-                        rusqlite::params![&id],
-                        |r| r.get(0),
-                    )
-                    .ok();
-                let new_log = bs::append_log(old_log.as_deref(), &hhmm, &note);
-                conn.execute(
-                    "UPDATE issues SET status = 'discarded', log = ?1, updated = ?2 WHERE id = ?3",
-                    rusqlite::params![new_log, now_secs, &id],
-                )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                let out = crate::db::advance::harness_close(conn, &id, "discarded", "harness:board-hygiene", None, &note)?;
+                Ok(crate::db::WriteOutcome {
+                    applied: out.is_some(),
+                    events: out.map(|o| o.events).unwrap_or_default(),
+                })
             })
             .await;
         tracing::info!(
@@ -467,7 +446,10 @@ async fn stale_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
                     .unwrap_or_default();
                 // Only append if we haven't already flagged this card
                 if old_desc.contains("Stale review:") {
-                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                    return Ok(crate::db::WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    });
                 }
                 let new_desc = if old_desc.trim().is_empty() {
                     note.clone()
@@ -486,7 +468,10 @@ async fn stale_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
                     "UPDATE issues SET \"desc\" = ?1, log = ?2, updated = ?3 WHERE id = ?4",
                     rusqlite::params![new_desc, new_log, now_secs, &id],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await;
         tracing::info!(
@@ -528,11 +513,52 @@ async fn stale_sweep(state: &AppState, now_secs: i64) -> (usize, usize) {
     (autofix_discarded, backlog_flagged)
 }
 
+/// Offer every running lane with stale cards one grooming turn
+/// (`api::board_groom`, docs/design/board-cards-stay-current.md step 2): the
+/// worker judges its own cards; this only finds them. At most one turn a lane a
+/// day; isolated, board-off and switched-off lanes are skipped there.
+/// Returns (lanes with stale cards, turns delivered), or the reason the board
+/// could not be read, so the tick never reports a measurement it did not make.
+async fn groom_sweep(state: &AppState, now_secs: i64) -> Result<(usize, usize), String> {
+    let days = crate::api::board_groom::stale_days();
+    let report = state
+        .store
+        .read_async(move |conn| Ok(crate::api::board_groom::staleness_report(conn, now_secs, days)?))
+        .await
+        .map_err(|e| e.to_string())?;
+    let lanes: Vec<String> = report["lanes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|l| l["stale"].as_i64().unwrap_or(0) > 0)
+        .filter_map(|l| l["lane"].as_str().map(str::to_string))
+        .collect();
+    let mut delivered = 0usize;
+    for lane in &lanes {
+        if !crate::api::session_verbs::is_running(lane).await {
+            continue;
+        }
+        let v = crate::api::board_groom::groom_lane(state, lane, false, false).await;
+        if v["ok"].as_bool() == Some(true) {
+            delivered += 1;
+        }
+    }
+    Ok((lanes.len(), delivered))
+}
+
 pub async fn tick(state: AppState) {
     let now_secs = crate::config::now_f64() as i64;
 
     let (ny_warned, ny_discarded) = needsyou_sweep(&state, now_secs).await;
     let (af_discarded, bl_flagged) = stale_sweep(&state, now_secs).await;
+    // Unconditional, including zero (AF-178): a sweep that only speaks with news
+    // cannot say it ran. A board it could not read says so (land review F1).
+    match groom_sweep(&state, now_secs).await {
+        Ok((groom_lanes, groom_delivered)) => tracing::info!(lanes_with_stale = groom_lanes, groom_delivered,
+            measured = true, n_considered = groom_lanes, verdict = "board_groom_sweep", "board_hygiene: grooming pass"),
+        Err(e) => tracing::warn!(error = %e, measured = false, n_considered = 0,
+            verdict = "board_groom_sweep_unmeasured", "board_hygiene: grooming pass could not read the board"),
+    }
 
     if ny_warned > 0 || ny_discarded > 0 || af_discarded > 0 || bl_flagged > 0 {
         tracing::info!(
@@ -580,7 +606,10 @@ mod tests {
     fn strip_prior_auto_aged_lines_removes_only_the_stamp() {
         let desc = "the real ask: which pricing tier?\n\
                      Auto-aged: this card has been in needsyou for 14 days";
-        assert_eq!(strip_prior_auto_aged_lines(desc), "the real ask: which pricing tier?");
+        assert_eq!(
+            strip_prior_auto_aged_lines(desc),
+            "the real ask: which pricing tier?"
+        );
     }
 
     #[test]
@@ -588,11 +617,17 @@ mod tests {
         let mut desc = "the real ask: which pricing tier?".to_string();
         for n in [14, 15, 16, 17, 20, 21] {
             desc.push('\n');
-            desc.push_str(&format!("Auto-aged: this card has been in needsyou for {n} days"));
+            desc.push_str(&format!(
+                "Auto-aged: this card has been in needsyou for {n} days"
+            ));
         }
         let stripped = strip_prior_auto_aged_lines(&desc);
         assert_eq!(stripped, "the real ask: which pricing tier?");
-        assert_eq!(stripped.matches("Auto-aged").count(), 0, "every historical stamp must be gone");
+        assert_eq!(
+            stripped.matches("Auto-aged").count(),
+            0,
+            "every historical stamp must be gone"
+        );
     }
 
     #[test]
@@ -793,7 +828,10 @@ mod tests {
         let typed = cards.iter().find(|c| c.id == "NY-5").expect("NY-5 found");
         assert_eq!(typed.ask_actor, "ethan");
         let untyped = cards.iter().find(|c| c.id == "NY-6").expect("NY-6 found");
-        assert_eq!(untyped.ask_actor, "", "a NULL ask_actor must read as empty, not error");
+        assert_eq!(
+            untyped.ask_actor, "",
+            "a NULL ask_actor must read as empty, not error"
+        );
     }
 
     fn hygiene_state() -> (AppState, tempfile::TempDir) {
@@ -832,7 +870,9 @@ mod tests {
             .store
             .read()
             .unwrap()
-            .query_row("SELECT status FROM issues WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT status FROM issues WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap()
     }
 
@@ -841,7 +881,11 @@ mod tests {
             .store
             .read()
             .unwrap()
-            .query_row("SELECT COALESCE(\"desc\",'') FROM issues WHERE id = ?1", [id], |r| r.get(0))
+            .query_row(
+                "SELECT COALESCE(\"desc\",'') FROM issues WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
             .unwrap()
     }
 
@@ -881,13 +925,23 @@ mod tests {
         seed_needsyou(&state, "GE-408", 46, Some("ethan"), now);
 
         let (warned, discarded) = needsyou_sweep(&state, now).await;
-        assert_eq!(discarded, 0, "a typed ask must never be counted as discarded");
+        assert_eq!(
+            discarded, 0,
+            "a typed ask must never be counted as discarded"
+        );
         assert_eq!(warned, 1);
-        assert_eq!(card_status(&state, "GE-408"), "needsyou", "must stay open, not discarded");
+        assert_eq!(
+            card_status(&state, "GE-408"),
+            "needsyou",
+            "must stay open, not discarded"
+        );
         let desc = card_desc(&state, "GE-408");
         assert!(desc.contains("waiting on ethan"), "{desc}");
         assert!(desc.contains("AF-702"), "{desc}");
-        assert!(!desc.contains("no resolution"), "must not blame the lane: {desc}");
+        assert!(
+            !desc.contains("no resolution"),
+            "must not blame the lane: {desc}"
+        );
     }
 
     /// CONTROL: an untyped legacy ask (predates the needsyou_requires_typed_ask
@@ -922,6 +976,9 @@ mod tests {
         assert_eq!(warned, 1);
         assert_eq!(card_status(&state, "NY-7"), "needsyou");
         let desc = card_desc(&state, "NY-7");
-        assert!(desc.contains("Auto-aged: this card has been in needsyou for 20 days"), "{desc}");
+        assert!(
+            desc.contains("Auto-aged: this card has been in needsyou for 20 days"),
+            "{desc}"
+        );
     }
 }

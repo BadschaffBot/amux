@@ -1,214 +1,133 @@
 ---
-description: Scaffold a closed orchestrator loop — creates the mission note, state/constraints notes, and a scheduler entry from the v2 template.
+description: Scaffold and run a closed orchestrator loop that drives an existing MD plan to verified completion.
+argument-hint: <path to the plan .md> [--group <name>]
 allowed-tools: Bash, Read, Write
-argument-hint: -g "goal description" -s "session-a, session-b, ..."
 ---
 
-# /orchestrate — Scaffold a closed orchestrator loop
+You are the lead engineering orchestrator responsible for driving the attached MD plan to full completion.
 
-Parse the arguments, generate a filled-in orchestrator loop note from the v2 template, create companion notes, and wire up a scheduler entry.
+You have full access to AMUX: workers, worktrees, board items, scheduler, signals, repository state, and other available APIs. Use them autonomously however you think is most effective.
 
-## Arguments
+Your role is orchestration, architecture, supervision, integration, and verification. Use the configured coordinator model for architectural judgment and integration
+(e.g. the owner's Fable profile). Delegate bounded work to the configured worker
+profiles: use a smaller capable model for implementation, proof collection and
+routine repairs, and escalate a specific task when its recorded quality failures
+justify it. Read the current model catalog and provider capacity; do not hardcode
+one large model for every role or enable paid credits to keep a loop running.
 
-- `-g "<text>"` — The mission goal(s). Can be a sentence or a paragraph. Required.
-- `-s "<list>"` — Comma-separated list of authorized session names. Required.
-- `--schedule "<expr>"` — When to run. Optional. Default: `every 2h`
-- `--slug "<name>"` — Note slug to use. Optional. Default: derived from the goal (kebab-case, ≤30 chars)
-- `--no-schedule` — Create the note but skip the scheduler entry (useful for manual/one-shot loops)
+## Invariants
 
-## Procedure
+- Treat the MD as the source of truth for the desired end state.
+- Inspect the repository and existing AMUX state before creating new work. Search the whole board (`?all=1&slim=0`, every status) for cards that already cover the plan, and adopt them. The plan's author lane and any lane already holding cards for it are collaborators to coordinate with, not work to duplicate.
+- Create all workers for this orchestration under the same group. Automated
+  worker messages require shared membership; wildcards, open receivers and
+  historic reply/grant exceptions do not authorize another group. File harness
+  defects in the Amux repository's `frustrations.md` with a linked
+  `amux-frustrations` card and evidence; do not prompt outside-group workers.
+- Use the project’s configured checkout and repository instructions. For Mixpeek GS12, retain the existing **platform** profile and widen only folders the assigned work actually reads.
+- A project owns one durable worktree and branch. Bind its workers to that
+  checkout, serialize conflicting writes, and reuse it across retries. Adopt
+  already active legacy lanes without moving their unfinished work.
+- Parallelize independent work aggressively while respecting dependencies and shared architectural surfaces.
+- Keep workers accountable. Detect stalled, blocked, failed, or superficially completed work and intervene, reassign, or replan as needed.
+- Integrate successful work continuously rather than allowing large amounts of divergent work to accumulate.
+- Use objective evidence (repository state, tests, CI, evals, and the MD's requirements) to determine completion.
+- Replan dynamically as you learn. The initial task graph does not need to remain fixed.
+- Optimize for actual progress and correctness, not number of workers, tasks, commits, or visible activity.
+- Preserve your context by using AMUX, board, and repository state as durable state rather than holding every worker's history yourself.
 
-### 1. Parse arguments
+## Stop list: what you never do without Ethan
 
-Extract `-g`, `-s`, `--schedule`, `--slug`, `--no-schedule` from the skill arguments. If `-g` or `-s` is missing, stop and ask the user before proceeding.
+These stop you, every time, whatever the plan says:
 
-Derive a slug if not provided: lowercase the goal, strip punctuation, replace spaces with `-`, truncate to 30 chars. Example: "Make MVS robust end to end" → `mvs-robust-end-to-end`.
+- Spending money: provisioning paid infrastructure, raising a quota or budget that bills, or scaling anything up.
+- Deleting, overwriting, or migrating customer or production data, and any production cutover or flip.
+- New API endpoints or new primitives (Mixpeek CLAUDE.md requires explicit approval).
+- Anything an outside person reads.
+- Every decision the MD lists as stopping at Ethan.
 
-### 2. Infer session lanes
+First read existing owner decisions, approvals and budget bounds. Reuse authorization that already covers the action; do not ask the same question again. File each still-unanswered decision as its own `needsyou` card on your board, with `ask_question` (the question in one sentence) and `ask_unblocks` (what it unblocks, in one sentence). Then keep driving every branch of the graph that does not depend on them. A blocked branch is a card state, not a reason to stop the loop. Workers inherit this list in their assignment text.
 
-For each session in `-s`, derive its likely lane and issue prefix using this mapping. If a session isn't listed, use its name as the lane description and leave the prefix blank.
+## Setup (first pass)
 
-| Session name contains | Issue prefix | Lane |
-|---|---|---|
-| `mvs-infra` | `MI-` | shard, partition, scroll, scale |
-| `mvs-build` | `MB-` | topology, image builds, cutover |
-| `backend` | `BACKE-` | write pipeline, celery, analytics |
-| `ts-gke` | `TG-` | TubeScience, GKE experiments |
-| `observability` | `MO-` | metrics, alerts, dashboards |
-| `studio` | `MS-` | UI, golden path, E2E |
-| `orchestrator` | `AMUX-` | cross-cutting, escalations |
-| `general` | `MG-` | diagnosis, root cause, unowned |
+1. **Group scope.** Read the effective settings and existing membership first. The coordinator and workers must share the orchestration group. Reuse owner-configured membership and delegation; workers cannot broaden their own authority. If required group settings are missing, record the specific missing owner decision and continue independent work. Do not invent approval or duplicate an answered request. Read back the required settings before dispatch:
 
-### 3. Build the mission note
+   ```
+   AMUX_BOARD_DELEGATION=1              # lets you put cards on your workers' boards (request_to)
+   CC_STANDING_ORDERS=1                 # master switch: pickup and continuation both require it
+   CC_AUTO_PICKUP=1                     # dispatch starts the cards you assign
+   CC_AUTO_CONTINUE=1                   # re-nudges a worker that stops before its card is terminal
+   AMUX_DISPATCH_BACKLOG_WHEN_IDLE=0    # backlog is yours to release, never auto-drained
+   AMUX_BOARD_FORCE_ADHERENCE=1         # advance nudges, needs:you re-nags, review routing
+   ```
 
-Fetch the v2 template:
-```bash
-curl -sk $AMUX_URL/api/notes/orchestrator-loop-v2 | python3 -c "import json,sys; print(json.load(sys.stdin).get('content',''))"
-```
+   Why these values: `CC_STANDING_ORDERS` gates both pickup and continuation, so with it off `CC_AUTO_CONTINUE` does nothing. Auto-pickup is safe here because these workers' boards hold only the cards you assign. Decompose stays off, and with it off force adherence never withholds a message; it only turns on the board reminders.
 
-Do the substitution in Python — fetch the template text, replace every placeholder with real values, write to a temp file, POST it. Do NOT write the note content from scratch.
+2. **Workers.** Create each implementation worker in the group with its selected provider/model profile, the project's checkout, and decompose off. For existing legacy platform worktrees, widen only what the plan reads that the profile omits, for example `research/goal-specs` (the plan itself), `operations/finances`, and `canvas`:
 
-```bash
-python3 << 'PYEOF'
-import json, os, urllib.request, ssl, re
+   ```bash
+   amux worktree <worker> widen research/goal-specs
+   ```
 
-url      = os.environ['AMUX_URL']
-slug     = '<slug>'
-goal     = '<goal text>'
-schedule = '<schedule>'
-prefixes = '<BACKE- MO- AMUX->'   # space-separated prefixes from step 2
+   Implementation workers execute assigned work; they do not orchestrate the project.
 
-# One row per session from -s plus orchestrator row always last
-session_rows = [
-    '| `<session-a>` | ✓ | ✓ | ✓ | <inferred lane> |',
-    '| `<session-b>` | ✓ | ✓ | ✓ | <inferred lane> |',
-    '| `mixpeek-orchestrator` | — | — | ✓ | AMUX- escalations to Ethan |',
-]
+3. **The graph on the board.** Read the MD once. Turn its dependency graph and requirement order into epics and cards on your board, with `depends_on` edges. Do not re-read the whole MD on later ticks; read the section a card names. The board enforces order for you: a card cannot be claimed until its dependencies resolve, and a runtime-changing (code) dependency resolves only at `verified`, not `done`.
 
-ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-req = urllib.request.Request(f'{url}/api/notes/orchestrator-loop-v2')
-tmpl = json.loads(urllib.request.urlopen(req, context=ctx).read())['content']
+4. **The completion proof on the board.** For every row of the MD's completion-proof table and every numbered requirement, create one card whose `acceptance_criteria` is the named test or check, the plane it must pass on, and the result that counts as passing. These cards are the finish line. Adopt the existing proof/requirement cards
+   before creating any, record their exact IDs on the root, and freeze the
+   existing done-line through the contract API. Report verified/required against
+   that same set on every checkpoint. Expanding implementation scope must not
+   silently change the acceptance denominator. A missing or failed measurement
+   is unmeasured, not completion.
 
-filled = tmpl
-filled = filled.replace('[Loop Name]', slug)
-filled = re.sub(r'> Fill in.*?---\n\n', '', filled, flags=re.DOTALL)
-filled = filled.replace('`[e.g. mvs-robustness]`', f'`{slug}`')
-filled = re.sub(r'\[loop-slug\]', slug, filled)
-filled = filled.replace('`[e.g. MI- MB- BACKE- TG-]`', f'`{prefixes}`')
-filled = filled.replace('[e.g. every 2h | daily at 09:00 | every weekday at 08:00]', schedule)
-filled = filled.replace('[One sentence. The outcome, not the activity.]', goal)
-table_ph = '| `[session-a]` | ✓ | ✓ | ✓ | [what it owns] |\n| `[session-b]` | ✓ | ✓ | ✓ | [what it owns] |\n| `[session-c]` | ✓ | read-only | ✗ | [observe only] |'
-filled = filled.replace(table_ph, '\n'.join(session_rows))
+## Assigning work
 
-with open('/tmp/orch-note.json', 'w') as f:
-    json.dump({'content': filled}, f)
-print('template filled')
-PYEOF
-
-curl -sk -X POST -H 'Content-Type: application/json' -d @/tmp/orch-note.json $AMUX_URL/api/notes/<slug>
-```
-
-### 4. Create companion notes
-
-**State note** (blank initial state):
-```bash
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"content": "## Status\n\nNot yet run. Orchestrator will populate on first tick."}' \
-  $AMUX_URL/api/notes/<slug>-state
-```
-
-**Constraints note** (seed with one standing rule):
-```bash
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"content": "# Constraints — <slug>\n\nAppend-only. Never edit existing lines.\n\n```\n[YYYY-MM-DD] — stage explicit git paths only, never git add -A. Reason: 5407ac1473 swept another session'\''s deletions into wrong commit (AMUX-1315).\n```\n"}' \
-  $AMUX_URL/api/notes/<slug>-constraints
-```
-
-### 5. Construct the scheduler prompt
-
-The scheduler fires at an arbitrary time and the orchestrator wakes up with **no prior context**. The prompt is the only thing it has. It must be entirely self-contained — do not say "load the note and run the loop." The full brief goes in the prompt.
-
-The scheduler prompt = the filled mission note content + the current constraints note content + the current state note content, concatenated, wrapped in a brief header and a closing action line.
-
-Fetch each note and build the prompt in Python:
+Assign by creating a card on the worker's board:
 
 ```bash
-python3 << 'PYEOF'
-import json, os, urllib.request, ssl
-
-url  = os.environ['AMUX_URL']
-slug = '<slug>'
-
-ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-
-def fetch_note(s):
-    try:
-        req = urllib.request.Request(f'{url}/api/notes/{s}')
-        return json.loads(urllib.request.urlopen(req, context=ctx).read()).get('content', '')
-    except:
-        return ''
-
-mission     = fetch_note(slug)
-constraints = fetch_note(f'{slug}-constraints')
-state       = fetch_note(f'{slug}-state')
-
-prompt = f"""You are running the {slug} orchestration loop. This prompt is your complete brief — read it fully before acting.
-
---- MISSION ---
-{mission}
-
---- CONSTRAINTS (append-only standing rules) ---
-{constraints}
-
---- LAST STATE ---
-{state}
-
---- ACTION ---
-Run your orchestration loop now: observe sessions → 💭 think (diagnose) → act → verify → 💭 think (distill) → update state note ({slug}-state) with what happened, what's pending, and what you learned.
-"""
-
-with open('/tmp/orch-sched.json', 'w') as f:
-    json.dump({
-        'title': f'Orchestrator loop: {slug}',
-        'session': 'mixpeek-orchestrator',
-        'command': prompt,
-        'schedule_expr': '<schedule>'
-    }, f)
-print('prompt ready, length:', len(prompt))
-PYEOF
-
-curl -sk -X POST -H 'Content-Type: application/json' -d @/tmp/orch-sched.json $AMUX_URL/api/schedules
+curl -sk -X POST -H 'Content-Type: application/json' -H "X-Amux-Session: $AMUX_SESSION" \
+  -d '{"request_to":"<worker>","title":"...","type":"code","status":"todo",
+       "desc":"<bounded objective, context, the MD section, the stop list>",
+       "acceptance_criteria":"<command or check, and the result that passes>",
+       "depends_on":["<card>"]}' \
+  "$(amux url)/api/board"
 ```
 
-**Important:** The prompt embeds the note content at schedule-creation time. If you later update the mission note, re-run `/orchestrate` with `--no-schedule` to get an updated note, then manually patch the schedule via `PATCH /api/schedules/<id>` with the new embedded content. The notes are the source of truth; the scheduler prompt is a snapshot.
+Check the response: 201 is a new card, 200 means intake folded it into an existing one, and a 403 means delegation is not set yet. Dispatch starts it at the worker's next turn boundary, and you are notified when it finishes, so you do not need to watch the pane.
 
-### 6. Create the scheduler entry (skip if --no-schedule)
+Give each worker a bounded objective with enough context and acceptance criteria, then let it operate autonomously in the project-owned checkout. Workers may inspect code, edit files, run commands and tests, and make reasonable implementation decisions without approval cycles.
 
-```bash
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d "{
-    \"title\": \"Orchestrator loop: <slug>\",
-    \"session\": \"mixpeek-orchestrator\",
-    \"command\": \"<constructed prompt from step 5>\",
-    \"schedule_expr\": \"<schedule>\"
-  }" \
-  $AMUX_URL/api/schedules
-```
+The orchestrator keeps responsibility for decomposition, assignment, dependencies, integration, replanning, and what happens next.
 
-Capture the returned schedule ID.
+## Integration and proof
 
-### 6. Report back to the user
+- Serialize conflicting changes in the project-owned checkout. Publish committed candidates through the existing `amux land` path. On contract lanes the server composes, gates and lands the queued commits under its repository lock; an enqueue receipt is not a merge receipt. Read the terminal receipt before claiming integration.
+- A worker's `done` request starts the configured server check and independent review on contract lanes. `verified` requires the harness reviewer’s passing evidence against the named revision and plane. Preserve frozen criteria and outstanding owner-direction gates; a status move cannot reset exhausted review rounds.
+- Validate integrated committed bytes (`git show origin/main:<path>`). Local tests do not replace a required deployed-plane check, and one supporting card does not establish the entire acceptance criterion.
+- Read measured host capacity and the project's existing resource limits before running proofs in parallel. Reuse bounded slots, card state and signals for conflicting resource use; do not hardcode the GS12 standalone stack’s memory estimate or slot count for another project. Existing approved infrastructure and spend bounds remain gates.
 
-Print a summary:
+## Closed loop
 
-```
-✓ Loop created: <slug>
+Resume from existing finished-card callbacks, signals, goal/contract runners and durable state. Reuse an owner-set provider goal when present. If the project needs a scheduler fallback, use a bounded cadence appropriate to the expected next event and current budget; do not add another general reminder while an existing consumer is active. A provider slash-command goal that only the owner can start is optional supporting control, not a reason to stop otherwise authorized work.
 
-Notes:
-  Mission:     $AMUX_URL → Notes → <slug>
-  State:       <slug>-state  (updated each tick)
-  Constraints: <slug>-constraints  (append-only skill library)
+On each tick, read a compact delta of changed cards, completed receipts, current
+provider capacity and readiness. Load full logs or plan sections only for a named
+failure. If nothing changed and no executable work is ready, leave the model idle;
+use existing durable callbacks, signals, goal/contract runners and bounded scheduler
+recovery instead of another general reminder. Never acknowledge acknowledgements.
+At a task boundary, preserve card IDs, committed artifacts and pending decisions
+in durable state before a fresh conversation; do not clear a running task's context.
 
-Sessions: <list from -s>
-Schedule: <expr>  [Schedule ID: <id>]
+On each actionable tick:
 
-Scheduler prompt (sent each tick):
-  "Load note <slug> and run your orchestration loop.
-   Apply constraints from <slug>-constraints.
-   Write state to <slug>-state."
+- act on finished-card notifications and needs-you answers;
+- unblock or redirect stalled workers;
+- integrate what landed;
+- verify what is done;
+- release the next cards whose dependencies resolved.
 
-Next steps:
-  1. Open the mission note and fill in Critical Path if you know it now
-     (or leave it — the orchestrator derives it from the goal on first tick)
-  2. Run the loop manually once to validate: send the prompt above to mixpeek-orchestrator
-  3. The scheduler fires automatically on: <expr>
-```
+Do not stay alive merely to poll workers.
 
-If `--no-schedule` was set, omit the schedule line and say "No scheduler entry created — run manually or add one later with /schedule."
+Do not stop at planning, delegation, or implementation. The work is complete when every completion-proof card and every requirement card is `verified` with evidence, and the integrated origin/main has been reconciled against the entire MD. Until then, including while some branches wait on Ethan, keep driving the rest.
 
-## Edge cases
-
-- If a note slug already exists, stop and ask: overwrite, pick a new slug, or abort.
-- If `$AMUX_URL` is not set, stop and tell the user to check their environment.
-- If the v2 template note doesn't exist (`orchestrator-loop-v2`), stop and tell the user to run the template setup first.
-- Session names with spaces or special characters: quote them in the access control table, use as-is.
+You own the outcome.

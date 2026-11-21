@@ -1,3 +1,4 @@
+require "json"
 default_platform(:ios)
 
 platform :ios do
@@ -18,6 +19,22 @@ platform :ios do
       key_content:   ENV["APP_STORE_CONNECT_API_KEY_CONTENT"],
       is_key_content_base64: true
     )
+
+    # Sign in with Apple (ServerPickerView) needs the capability on the App ID before match can
+    # mint a profile that carries the entitlement. Idempotent: re-dispatching skips it.
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+    siwa = Spaceship::ConnectAPI::BundleIdCapability::Type::APPLE_ID_AUTH
+    app_id = Spaceship::ConnectAPI::BundleId.find("com.EthanSteininger.nextup")
+    if app_id.get_capabilities.none? { |c| c.capability_type == siwa }
+      app_id.create_capability(siwa, settings: [{ key: "APPLE_ID_AUTH_APP_CONSENT", options: [{ key: "PRIMARY_APP_CONSENT" }] }])
+      UI.message("Enabled Sign in with Apple on com.EthanSteininger.nextup")
+    end
+    # Copied file links open in the app (applinks:*.amux.io, project.yml).
+    domains = Spaceship::ConnectAPI::BundleIdCapability::Type::ASSOCIATED_DOMAINS
+    if app_id.get_capabilities.none? { |c| c.capability_type == domains }
+      app_id.create_capability(domains)
+      UI.message("Enabled Associated Domains on com.EthanSteininger.nextup")
+    end
 
     match(
       type: "appstore",
@@ -40,13 +57,40 @@ platform :ios do
 
     match(type: "appstore", api_key: api_key, readonly: true)
 
+    # Catch-up: a build left processing by the previous run goes out first.
+    distribute_internal
     set_build_number
+
+    # NEVER UPLOAD A VERSION APPLE ALREADY APPROVED (2026-09-30). 1.1.0 was
+    # approved on 09-29 and every nightly after it failed at upload with
+    # "CFBundleShortVersionString [1.1.0] must contain a higher version than
+    # that of the previously approved", so no build reached TestFlight. Read the
+    # newest version in App Store Connect and, if project.yml is not above it,
+    # build the next patch and say so. project.yml stays the source of truth
+    # for the release lane; bump it there too when this fires.
+    spec = ["../project.yml", "project.yml"].find { |p| File.exist?(p) }
+    version = File.read(spec, encoding: "UTF-8")[/MARKETING_VERSION:\s*"([^"]+)"/, 1]
+    latest = begin
+      app_store_build_number(api_key: api_key, live: false)
+      lane_context[SharedValues::LATEST_VERSION]
+    rescue => e
+      UI.important("could not read the App Store Connect version (#{e.message}); building #{version} as is")
+      nil
+    end
+    if latest && Gem::Version.new(version) <= Gem::Version.new(latest)
+      parts = latest.split(".").map(&:to_i)
+      parts << 0 while parts.length < 3
+      parts[2] += 1
+      bumped = parts.join(".")
+      UI.important("verdict=ios_version_bumped project=#{version} app_store=#{latest} building=#{bumped}")
+      version = bumped
+    end
 
     build_app(
       scheme: "AmuxApp",
       configuration: "Release",
       export_method: "app-store",
-      xcargs: "-skipPackagePluginValidation -allowProvisioningUpdates"
+      xcargs: "-skipPackagePluginValidation -allowProvisioningUpdates MARKETING_VERSION=#{version}"
     )
 
     changelog = ENV["CHANGELOG"] || "Bug fixes and improvements."
@@ -56,6 +100,53 @@ platform :ios do
       skip_waiting_for_build_processing: true,
       changelog: changelog
     )
+
+    # An upload is not a release to anyone: a build reaches a tester only once
+    # it is in a beta group, and skip_waiting_for_build_processing skips that
+    # step. 1.1.28..1.1.30 sat READY_FOR_BETA_TESTING while the owner's
+    # TestFlight offered 1.1.27 (2026-10-18). Wait for processing, bounded,
+    # then add the build to the internal groups; a build still processing is
+    # picked up by the next run's catch-up below.
+    distribute_internal(wait_minutes: 25)
+  end
+
+  # Add the newest processed build to every INTERNAL beta group, so internal
+  # testers get it in TestFlight. Never touches external groups (those need
+  # Apple's beta review). Prints one verdict line either way.
+  lane :distribute_internal do |options|
+    api_key = app_store_connect_api_key(
+      key_id:        ENV["APP_STORE_CONNECT_API_KEY_ID"],
+      issuer_id:     ENV["APP_STORE_CONNECT_API_ISSUER_ID"],
+      key_content:   ENV["APP_STORE_CONNECT_API_KEY_CONTENT"],
+      is_key_content_base64: true
+    )
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+    bundle_id = CredentialsManager::AppfileConfig.try_fetch_value(:app_identifier)
+    app = Spaceship::ConnectAPI::App.find(bundle_id)
+    UI.user_error!("app #{bundle_id} not found") unless app
+    groups = app.get_beta_groups.select(&:is_internal_group)
+    UI.user_error!("no internal beta group") if groups.empty?
+    deadline = Time.now + (options[:wait_minutes] || 0).to_i * 60
+    loop do
+      builds = Spaceship::ConnectAPI.get_builds(filter: { app: app.id }, sort: "-uploadedDate", limit: 5,
+                                                includes: "preReleaseVersion,buildBetaDetail").to_a
+      newest = builds.first
+      UI.user_error!("no builds") unless newest
+      v = newest.pre_release_version ? newest.pre_release_version.version : "?"
+      state = newest.build_beta_detail && newest.build_beta_detail.internal_build_state
+      if newest.processing_state == "VALID" && state == "READY_FOR_BETA_TESTING"
+        newest.add_beta_groups(beta_groups: groups)
+        UI.message("verdict=ios_build_distributed version=#{v} build=#{newest.version} groups=#{groups.map(&:name).join('|')}")
+        break
+      elsif newest.processing_state == "VALID"
+        UI.message("verdict=ios_build_already_distributed version=#{v} build=#{newest.version} internal=#{state}")
+        break
+      elsif Time.now >= deadline
+        UI.important("verdict=ios_build_not_distributed version=#{v} build=#{newest.version} processing=#{newest.processing_state}: still processing; the next run adds it")
+        break
+      end
+      sleep 60
+    end
   end
 
   # Push metadata + screenshots only (no build required)
@@ -67,18 +158,65 @@ platform :ios do
       is_key_content_base64: true
     )
 
-    version = ENV["APP_VERSION"] || "1.0.1"
+    # Same version the release lane submits (project.yml MARKETING_VERSION);
+    # the old "1.0.1" default edited a stale entry with no build.
+    spec = ["../project.yml", "project.yml"].find { |p| File.exist?(p) }
+    UI.user_error!("project.yml not found from #{Dir.pwd}") unless spec
+    version = ENV["APP_VERSION"] ||
+      File.read(spec, encoding: "UTF-8")[/MARKETING_VERSION:\s*"([^"]+)"/, 1]
 
     deliver(
       api_key: api_key,
       app_version: version,
       skip_binary_upload: true,
       skip_screenshots: false,
+      # Replace the store set with the repo's; adding on top hit the 10-per-
+      # device cap and skipped images ("Too many screenshots found").
+      overwrite_screenshots: true,
       skip_metadata: false,
       force: true,
       submit_for_review: false,
       run_precheck_before_submit: false
     )
+  end
+
+  # Read-only: where the app stands on App Store Connect (versions, review
+  # state, attached build). Changes nothing. Added 2026-09-25 so "is the iOS
+  # update live?" has a measured answer instead of a guess.
+  lane :status do
+    api_key = app_store_connect_api_key(
+      key_id:        ENV["APP_STORE_CONNECT_API_KEY_ID"],
+      issuer_id:     ENV["APP_STORE_CONNECT_API_ISSUER_ID"],
+      key_content:   ENV["APP_STORE_CONNECT_API_KEY_CONTENT"],
+      is_key_content_base64: true
+    )
+    Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+    bundle_id = CredentialsManager::AppfileConfig.try_fetch_value(:app_identifier)
+    app = Spaceship::ConnectAPI::App.find(bundle_id)
+    UI.user_error!("app #{bundle_id} not found") unless app
+    app.get_app_store_versions(limit: 5, includes: "build").each do |v|
+      build = v.build ? "#{v.build.version} (#{v.build.processing_state})" : "none"
+      UI.message("STATUS version=#{v.version_string} state=#{v.app_store_state} release=#{v.release_type} created=#{v.created_date} build=#{build}")
+    end
+    app.get_review_submissions(filter: { platform: "IOS" }).first(5).each do |sub|
+      UI.message("STATUS submission=#{sub.id} state=#{sub.state} submitted=#{sub.submitted_date}")
+    end
+    # TESTFLIGHT, the part a tester actually installs from (2026-10-18: the
+    # nightly uploaded 1.1.28..1.1.30 while the owner's TestFlight offered
+    # only 1.1.27). One line per recent build with the states that decide
+    # whether a tester can see it, then one line per beta group.
+    Spaceship::ConnectAPI.get_builds(filter: { app: app.id }, sort: "-uploadedDate", limit: 12,
+                                     includes: "preReleaseVersion,buildBetaDetail,betaAppReviewSubmission").each do |b|
+      v = b.pre_release_version ? b.pre_release_version.version : "?"
+      d = b.build_beta_detail
+      r = b.beta_app_review_submission
+      UI.message("TESTFLIGHT version=#{v} build=#{b.version} uploaded=#{b.uploaded_date} processing=#{b.processing_state} expired=#{b.expired} " \
+                 "internal=#{d && d.internal_build_state} external=#{d && d.external_build_state} beta_review=#{r ? r.beta_review_state : 'none'}")
+    end
+    app.get_beta_groups.each do |g|
+      testers = (Spaceship::ConnectAPI.get_beta_testers(filter: { betaGroups: g.id }, limit: 50).to_a rescue [])
+      UI.message("TESTFLIGHT group=#{g.name} internal=#{g.is_internal_group} public_link=#{g.public_link_enabled} testers=#{testers.length}")
+    end
   end
 
   # Promote latest TestFlight build to App Store (run manually)
@@ -90,14 +228,167 @@ platform :ios do
       is_key_content_base64: true
     )
 
-    deliver(
-      api_key: api_key,
-      submit_for_review: true,
-      automatic_release: true,
-      force: true,
-      skip_screenshots: false,
-      skip_metadata: false
-    )
+    # NAME THE VERSION AND THE BUILD (first real run, 2026-09-24, run
+    # 36008794593). Without app_version deliver edited the stale "1.0.1"
+    # App Store entry, which has no build, while TestFlight held 1.1.0 (6261).
+    # The version is the one the app is built with (project.yml
+    # MARKETING_VERSION); the build is the newest TestFlight build of it.
+    # Fastfile Ruby runs in ios/fastlane, actions in ios; accept either.
+    spec = ["../project.yml", "project.yml"].find { |p| File.exist?(p) }
+    UI.user_error!("project.yml not found from #{Dir.pwd}") unless spec
+    version = ENV["APP_VERSION"] ||
+      File.read(spec, encoding: "UTF-8")[/MARKETING_VERSION:\s*"([^"]+)"/, 1]
+    UI.user_error!("no MARKETING_VERSION in project.yml") if version.to_s.empty?
+    build = ENV["BUILD_NUMBER"].to_s.empty? ?
+      latest_testflight_build_number(api_key: api_key, version: version) : ENV["BUILD_NUMBER"]
+    UI.message("Submitting #{version} (#{build}) for review")
+
+    # CANCEL_PENDING=1: take a submission that is waiting for review back out
+    # first. App Store Connect locks screenshots and metadata while a version
+    # waits for review ("Failed verification of all screenshots deleted"), so
+    # replacing them means cancel, edit, resubmit. Opt-in only.
+    if ENV["CANCEL_PENDING"] == "1"
+      Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+      bundle_id = CredentialsManager::AppfileConfig.try_fetch_value(:app_identifier)
+      app = Spaceship::ConnectAPI::App.find(bundle_id)
+      UI.user_error!("app #{bundle_id} not found on App Store Connect") unless app
+      # READY_FOR_REVIEW is an unsent draft, which Apple refuses to cancel
+      # ("Resource is not in cancellable state", run 36596392841); deliver
+      # reuses a draft, so leave it.
+      pending = app.get_review_submissions(filter: { state: "WAITING_FOR_REVIEW,UNRESOLVED_ISSUES" })
+      UI.message("#{pending.size} pending review submission(s)")
+      # DRY_RUN=1: say what CANCEL_PENDING would cancel, then stop. Nothing is
+      # cancelled, edited or submitted.
+      if ENV["DRY_RUN"] == "1"
+        all = app.get_review_submissions(filter: { platform: "IOS" }).first(10)
+        all.each do |sub|
+          verb = pending.any? { |x| x.id == sub.id } ? "WOULD CANCEL" : "would leave"
+          UI.message("DRY_RUN #{verb} submission=#{sub.id} state=#{sub.state}")
+        end
+        UI.message("DRY_RUN stop: nothing changed")
+        next
+      end
+      pending.each do |sub|
+        UI.important("Cancelling review submission #{sub.id} (#{sub.state}) so the listing can be edited")
+        sub.cancel_submission
+      end
+      editable = %w[PREPARE_FOR_SUBMISSION DEVELOPER_REJECTED REJECTED METADATA_REJECTED]
+      state = nil
+      18.times do
+        v = app.get_edit_app_store_version(platform: Spaceship::ConnectAPI::Platform::IOS)
+        state = v && v.app_store_state
+        UI.message("version #{v && v.version_string} state: #{state}")
+        break if editable.include?(state)
+        sleep 10
+      end
+      UI.user_error!("version never became editable (state #{state})") unless editable.include?(state)
+    end
+
+    # DRY_RUN never reaches a step that changes anything, with or without
+    # CANCEL_PENDING.
+    if ENV["DRY_RUN"] == "1"
+      UI.message("DRY_RUN stop: nothing changed")
+      next
+    end
+
+    # EXCLUDE_TERRITORIES=CHN (comma list of territory ids): make the app
+    # unavailable in those storefronts before submitting. Added 2026-09-29:
+    # Apple rejected 1.1.0 under Guideline 5 because the listing names OpenAI,
+    # which needs an MIIT permit in China, and offered dropping the China
+    # mainland storefront as the fix. Uses the v2 availability API and reads
+    # every patched territory back, failing the lane if one did not change.
+    unless ENV["EXCLUDE_TERRITORIES"].to_s.strip.empty?
+      require "net/http"
+      require "json"
+      Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+      bundle_id = CredentialsManager::AppfileConfig.try_fetch_value(:app_identifier)
+      app = Spaceship::ConnectAPI::App.find(bundle_id)
+      UI.user_error!("app #{bundle_id} not found on App Store Connect") unless app
+      asc = lambda do |method, path, body = nil|
+        uri = URI("https://api.appstoreconnect.apple.com#{path}")
+        req = (method == :patch ? Net::HTTP::Patch : Net::HTTP::Get).new(uri)
+        req["Authorization"] = "Bearer #{Spaceship::ConnectAPI.token.text}"
+        req["Content-Type"] = "application/json"
+        req.body = body.to_json if body
+        res = Net::HTTP.start(uri.host, uri.port, use_ssl: true) { |h| h.request(req) }
+        UI.user_error!("#{method.upcase} #{path} -> #{res.code}: #{res.body[0, 400]}") unless res.code.to_i.between?(200, 299)
+        JSON.parse(res.body)
+      end
+      avail_id = asc.call(:get, "/v1/apps/#{app.id}/appAvailabilityV2")["data"]["id"]
+      rows = []
+      path = "/v2/appAvailabilities/#{avail_id}/territoryAvailabilities?limit=200&include=territory"
+      while path
+        page = asc.call(:get, path)
+        rows.concat(page["data"])
+        nxt = page.dig("links", "next")
+        path = nxt ? nxt.sub("https://api.appstoreconnect.apple.com", "") : nil
+      end
+      territory_of = lambda { |r| r.dig("relationships", "territory", "data", "id") }
+      ENV["EXCLUDE_TERRITORIES"].split(",").map(&:strip).reject(&:empty?).each do |t|
+        row = rows.find { |r| territory_of.call(r) == t }
+        UI.user_error!("territory #{t} not in this app's availability (#{rows.size} rows; first ids: #{rows.first(5).map { |r| territory_of.call(r) }.inspect})") unless row
+        if row["attributes"]["available"] == false
+          UI.message("AVAILABILITY #{t} already unavailable")
+          next
+        end
+        asc.call(:patch, "/v1/territoryAvailabilities/#{row['id']}",
+          { data: { type: "territoryAvailabilities", id: row["id"], attributes: { available: false } } })
+        # A territoryAvailability allows UPDATE only (GET on one id is 403), so
+        # verify by listing the collection again.
+        again = asc.call(:get, "/v2/appAvailabilities/#{avail_id}/territoryAvailabilities?limit=200&include=territory")["data"]
+        now = again.find { |r| territory_of.call(r) == t }
+        UI.user_error!("#{t} still available after PATCH") unless now && now["attributes"]["available"] == false
+        UI.message("AVAILABILITY #{t} set unavailable (verified)")
+      end
+    end
+
+    # REVIEW_NOTE: appended to the version's existing App Review notes (never
+    # replacing them), for Apple's "update the Review Notes" step. Only the
+    # notes attribute is written, so contact details and the demo account stay.
+    unless ENV["REVIEW_NOTE"].to_s.strip.empty?
+      Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.from(hash: api_key)
+      bundle_id = CredentialsManager::AppfileConfig.try_fetch_value(:app_identifier)
+      app = Spaceship::ConnectAPI::App.find(bundle_id)
+      v = app.get_edit_app_store_version(platform: Spaceship::ConnectAPI::Platform::IOS)
+      UI.user_error!("no editable App Store version to annotate") unless v
+      detail = v.fetch_app_store_review_detail
+      note = ENV["REVIEW_NOTE"].strip
+      if detail.nil?
+        v.create_app_store_review_detail(attributes: { notes: note })
+        UI.message("REVIEW_NOTE created on #{v.version_string}")
+      elsif detail.notes.to_s.include?(note)
+        UI.message("REVIEW_NOTE already present on #{v.version_string}")
+      else
+        detail.update(attributes: { notes: [detail.notes.to_s.strip, note].reject(&:empty?).join("\n\n") })
+        UI.message("REVIEW_NOTE appended on #{v.version_string}")
+      end
+    end
+
+    # Apple refuses a submission with "check associated errors" and Spaceship
+    # prints only that sentence. The list of what is missing is in the error
+    # body (meta.associatedErrors); print it so the run says what to fix.
+    begin
+      deliver(
+        api_key: api_key,
+        app_version: version,
+        build_number: build.to_s,
+        skip_binary_upload: true,
+        submit_for_review: true,
+        automatic_release: true,
+        force: true,
+        skip_screenshots: false,
+        overwrite_screenshots: true,
+        skip_metadata: false,
+        # Precheck cannot inspect in-app purchases with an API key and fails the
+        # whole submit on that alone. The rest of precheck still runs.
+        precheck_include_in_app_purchases: false,
+        submission_information: { add_id_info_uses_idfa: false }
+      )
+    rescue Spaceship::UnexpectedResponse => e
+      info = e.respond_to?(:error_info) ? e.error_info : nil
+      UI.error("SUBMIT_REFUSED #{info ? JSON.pretty_generate(info) : e.message}")
+      raise
+    end
   end
 
 end

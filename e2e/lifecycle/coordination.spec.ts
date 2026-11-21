@@ -1,7 +1,7 @@
 import { test, expect } from '../fixtures';
 import { boot, auth, checkpoint, deleteOwnedWorkers, getSessionsResilient } from './evidence';
 
-test('LC-COORD-POLICY: peer task awareness spans groups; explicit deny and isolation refuse delivery', async ({ page, request }, info) => {
+test('LC-COORD-POLICY: peer task awareness spans groups; stopped targets and isolation refuse delivery without grants', async ({ page, request }, info) => {
   test.setTimeout(90_000);
   await boot(page);
   const headers = await auth(page);
@@ -13,8 +13,10 @@ test('LC-COORD-POLICY: peer task awareness spans groups; explicit deny and isola
     for (const [name, group, isolated] of [[author, 'build', false], [peer, 'build', false],
       [outside, 'review', false], [raw, 'build', true]] as const) {
       const made = await request.post('/api/sessions', { headers,
-        data: { name, dir: '/tmp', tags: [`lc-${group}-${suffix}`], isolated } });
+        data: { name, dir: '/tmp', start: false, tags: [`lc-${group}-${suffix}`], isolated } });
       expect(made.status()).toBe(201);
+      // New workers start with every Board-tab switch off (no board); turn it on.
+      if (!isolated) expect((await request.patch(`/api/sessions/${name}/config`, { headers, data: { board_enabled: true } })).ok()).toBeTruthy();
     }
     const cards: any[] = [];
     for (const name of [peer, outside]) {
@@ -43,10 +45,19 @@ test('LC-COORD-POLICY: peer task awareness spans groups; explicit deny and isola
     for (const target of [outside, raw]) {
       const refused = await request.post(`/api/sessions/${target}/send`, {
         headers: workerHeaders, data: { text: `lc-denied-${suffix}` } });
-      expect(refused.status()).toBe(403);
       const body = await refused.json();
       if (body.grant_id) grants.push(body.grant_id);
-      expect(body.error).toMatch(target === raw ? /isolated/i : /cross.group|allowance/i);
+      // Group refusal precedes any stopped-worker queue. No grant can widen
+      // automated messaging; isolation independently refuses the raw worker.
+      expect(refused.status(), JSON.stringify(body)).toBe(403);
+      if (target === raw) {
+        expect(body.error).toMatch(/isolated/i);
+        expect(body.grant_id).toBeUndefined();
+      } else {
+        expect(body.code).toBe('worker_group_boundary');
+        expect(body.submitted).toBe(false);
+        expect(body.grant_id).toBeUndefined();
+      }
       await info.attach(`refused-${target}`, { body: JSON.stringify(body), contentType: 'application/json' });
     }
     await page.locator('#board-detail-overlay.active > .overlay-header').getByRole('button', { name: /Back/ }).click();

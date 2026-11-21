@@ -153,7 +153,7 @@ pub struct PaneState {
 pub fn parse_windows(out: &str) -> Vec<PaneState> {
     out.lines()
         .filter_map(|l| {
-            let f: Vec<&str> = l.split('\t').collect();
+            let f: Vec<&str> = l.split('|').collect();
             if f.len() < 5 {
                 return None;
             }
@@ -222,7 +222,14 @@ pub async fn sweep(ignore_leases: bool) -> Vec<String> {
         // `#{window_size}` (underscore) is not a format variable and expands
         // to the empty string — which parses fine, reports every window as
         // unpinned, and silently disables half this check. Verified live.
-        "#{session_name}\t#{window_width}\t#{window_height}\t#{session_attached}\t#{window-size}",
+        // `|`, NOT a tab (2026-10-14). The server runs under launchd with no
+        // LANG, and in the C locale tmux prints a tab in -F output as `_`, so
+        // every row read `amux-amux_80_24_0_latest`, parsed to one field and was
+        // dropped: this sweep saw zero windows on every tick since it shipped,
+        // the boot repair logged count=0, and seven panes sat at 80x24 behind a
+        // blank band in the worker view. amux names and these fields never
+        // contain `|`.
+        "#{session_name}|#{window_width}|#{window_height}|#{session_attached}|#{window-size}",
     ])
     .await
     else {
@@ -232,7 +239,16 @@ pub async fn sweep(ignore_leases: bool) -> Vec<String> {
         return Vec::new();
     }
     let mut fixed = Vec::new();
-    for p in parse_windows(&String::from_utf8_lossy(&out.stdout)) {
+    let text = String::from_utf8_lossy(&out.stdout);
+    let windows = parse_windows(&text);
+    let listed = text.lines().filter(|l| !l.trim().is_empty()).count();
+    if listed > 0 && windows.is_empty() {
+        // The instrument saying it cannot see, instead of reading as a healthy
+        // fleet (the 2026-10-14 failure above).
+        tracing::warn!(listed, sample = %text.lines().next().unwrap_or(""), verdict = "pane_size_parse_empty",
+            measured = false, n_considered = listed, "pane-size: tmux listed windows but none parsed; nothing can be restored");
+    }
+    for p in windows {
         let fresh = !ignore_leases && lease_is_fresh(&p.session);
         if !needs_restore(&p, cols, rows, fresh) {
             continue;
@@ -276,18 +292,35 @@ pub fn spawn() -> PeriodicTask {
 
 #[cfg(test)]
 mod tests {
+    /// The live specimen: tmux in the C locale turns a tab into `_`. A `|`
+    /// survives; a tab-split of the old output parses to nothing.
+    #[test]
+    fn rows_parse_with_the_pipe_separator_tmux_leaves_alone() {
+        let v = parse_windows("amux-amux|80|24|0|latest\namux-amux-cloud|220|50|0|latest\n");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], p("amux-amux", 80, 24, false, false));
+        assert!(needs_restore(&v[0], 220, 50, false), "an 80x24 detached worker is restored");
+        assert!(parse_windows("amux-amux_80_24_0_latest\n").is_empty(), "the C-locale tab form is unreadable");
+    }
+
     use super::*;
 
     fn p(session: &str, cols: u32, rows: u32, attached: bool, pinned: bool) -> PaneState {
-        PaneState { session: session.into(), cols, rows, attached, pinned }
+        PaneState {
+            session: session.into(),
+            cols,
+            rows,
+            attached,
+            pinned,
+        }
     }
 
     #[test]
     fn parses_the_real_list_windows_format() {
         // Byte-for-byte the shape our -F string produces.
-        let out = "amux-foo\t50\t50\t0\tmanual\n\
-                   amux-bar\t220\t50\t1\tlatest\n\
-                   66\t153\t21\t0\tlatest\n\
+        let out = "amux-foo|50|50|0|manual\n\
+                   amux-bar|220|50|1|latest\n\
+                   66|153|21|0|latest\n\
                    garbage line\n";
         let v = parse_windows(out);
         assert_eq!(v.len(), 3, "malformed lines are dropped, not panicked on");
@@ -302,13 +335,23 @@ mod tests {
     // that motivated it, not the convenient case).
     #[test]
     fn restores_the_50x50_phone_peek_specimen() {
-        assert!(needs_restore(&p("amux-mixpeek-autopilot", 50, 50, false, true), 220, 50, false));
+        assert!(needs_restore(
+            &p("amux-mixpeek-autopilot", 50, 50, false, true),
+            220,
+            50,
+            false
+        ));
     }
 
     #[test]
     fn never_touches_a_session_with_a_real_terminal_attached() {
         // 181x44 attached — a human's own terminal, and its size wins.
-        assert!(!needs_restore(&p("amux-gtm-videos", 181, 44, true, true), 220, 50, false));
+        assert!(!needs_restore(
+            &p("amux-gtm-videos", 181, 44, true, true),
+            220,
+            50,
+            false
+        ));
     }
 
     #[test]
@@ -321,27 +364,52 @@ mod tests {
 
     #[test]
     fn never_touches_a_session_we_do_not_manage() {
-        assert!(!needs_restore(&p("66", 153, 21, false, true), 220, 50, false));
-        assert!(!needs_restore(&p("some-dev-shell", 80, 24, false, false), 220, 50, false));
+        assert!(!needs_restore(
+            &p("66", 153, 21, false, true),
+            220,
+            50,
+            false
+        ));
+        assert!(!needs_restore(
+            &p("some-dev-shell", 80, 24, false, false),
+            220,
+            50,
+            false
+        ));
     }
 
     // The half-fix guard: right width, still pinned. list-panes would show
     // this as healthy while the window no longer follows default-size.
     #[test]
     fn a_correctly_sized_but_pinned_window_is_still_repaired() {
-        assert!(needs_restore(&p("amux-ethan-dev", 220, 50, false, true), 220, 50, false));
+        assert!(needs_restore(
+            &p("amux-ethan-dev", 220, 50, false, true),
+            220,
+            50,
+            false
+        ));
     }
 
     #[test]
     fn a_healthy_window_is_left_alone() {
-        assert!(!needs_restore(&p("amux-self", 220, 50, false, false), 220, 50, false));
+        assert!(!needs_restore(
+            &p("amux-self", 220, 50, false, false),
+            220,
+            50,
+            false
+        ));
     }
 
     // Sessions created without -x/-y sit at the global default 80x24 and are
     // also below the configured width — the restorer must claim them too.
     #[test]
     fn an_unsized_session_at_the_global_default_is_repaired() {
-        assert!(needs_restore(&p("amux-bdq-empty", 80, 24, false, false), 220, 50, false));
+        assert!(needs_restore(
+            &p("amux-bdq-empty", 80, 24, false, false),
+            220,
+            50,
+            false
+        ));
     }
 
     #[test]

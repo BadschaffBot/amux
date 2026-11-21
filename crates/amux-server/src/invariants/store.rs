@@ -23,6 +23,13 @@ use serde_json::json;
 /// pass-row age. Flap history lives in _amux_invariant_incident either way.
 const RESULT_RETAIN_SECS: f64 = 7.0 * 86400.0;
 const PASS_RETAIN_SECS: f64 = 3600.0;
+// UNKNOWN KEEPS THE PASS WINDOW (AMUX-6496). An unknown opens no incident
+// (unknown_records_but_does_not_page), so nobody greps its history after
+// one; it only says the check ran and could not measure, which is what the
+// pass window keeps. Kept for the week, it filled the log: on 2026-10-29
+// schema.timestamp_units_declared alone held 187,435 unknown rows, the same
+// 45 per-column verdicts every pass, and the log sat at the 500k bound
+// (store.result_log_bounded failed 25,188 times since 08-22).
 /// Trim cap per write cycle: the first cycle after the differential retention
 /// ships faces a ~7M-row backlog, and deleting it in one transaction would
 /// balloon the WAL past the DB's own size. The monitor cycles constantly, so
@@ -49,6 +56,128 @@ const TRIM_BATCH_ROWS: i64 = 20_000;
 /// written.
 const RESULTS_PER_WRITE: usize = 100;
 
+/// An open incident whose entity its invariant stopped reporting is resolved
+/// after this long (AF-1015).
+const ABSENT_RESOLVE_S: f64 = 3600.0;
+
+/// Resolve open incidents for entities their invariant no longer reports.
+///
+/// A deleted lane, a removed route or a retired schedule is never evaluated
+/// again, so no `pass` or `unknown` can ever arrive to resolve its incident.
+/// On 2026-10-29, 165 of 182 open incidents had not been seen for over an
+/// hour, some for 1,915 h (73 of them session.registered_lane_is_running for
+/// deleted workers): the open list read as a fleet on fire while 90% of it
+/// described things that no longer exist. That is AMUX-3575's shape (an
+/// incident nothing could clear) through a different door.
+///
+/// Only invariants that RAN this pass are touched, and only incidents unseen
+/// for [`ABSENT_RESOLVE_S`]: a check that reports a rotating subset must not
+/// flap, since every reopen starts a new episode and files a new card. The
+/// terminal status is `unknown`, which says it ended unobserved, not healed.
+async fn resolve_absent(
+    store: &SharedStore,
+    present: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    ts: f64,
+) {
+    if present.is_empty() {
+        return;
+    }
+    let res = store
+        .write_async(move |conn| {
+            let stale: Vec<(String, String)> = {
+                let mut q = conn.prepare_cached(
+                    "SELECT invariant_id, entity_key FROM _amux_invariant_incident
+                      WHERE resolved_at IS NULL AND last_seen < ?1",
+                )?;
+                let rows = q.query_map([ts - ABSENT_RESOLVE_S], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.flatten()
+                    .filter(|(id, entity): &(String, String)| {
+                        present.get(id).is_some_and(|seen| !seen.contains(entity))
+                    })
+                    .collect()
+            };
+            for (id, entity) in &stale {
+                conn.prepare_cached(
+                    "UPDATE _amux_invariant_incident SET resolved_at = ?3, status = 'unknown'
+                      WHERE invariant_id = ?1 AND entity_key = ?2 AND resolved_at IS NULL",
+                )?
+                .execute(rusqlite::params![id, entity, ts])?;
+            }
+            if !stale.is_empty() {
+                tracing::info!(verdict = "invariant_incidents_resolved_absent", resolved = stale.len(),
+                    measured = true, n_considered = stale.len(),
+                    sample = %stale.iter().take(5).map(|(i, e)| format!("{i}:{e}")).collect::<Vec<_>>().join(","),
+                    "resolved incidents whose entity its invariant no longer reports");
+            }
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+    if let Err(error) = res {
+        tracing::warn!(verdict = "invariant_absent_resolve_failed", %error, measured = false,
+            "could not resolve incidents for entities no longer reported");
+    }
+}
+
+/// An all-pass invariant whose entities have not changed is re-written at most
+/// this often (AF-1005). Under the 300 s after which a reader calls a check
+/// stale, so a quiet check never reads as one that stopped running.
+const PASS_REFRESH_S: f64 = 240.0;
+
+/// Drop the rows of each invariant that is all `pass`, has the same entities as
+/// the last time it was written, and was written under [`PASS_REFRESH_S`] ago.
+///
+/// A pass wrote ~1,090 rows, 95% of them `pass` (route.callers_have_routes 552,
+/// conversation.one_lane_each 212, schema.timestamp_units_declared 142), as 11
+/// writer transactions of ~0.9 s each, roughly 10 s of the single writer every
+/// 46 s while every non-GET request in the fleet queued behind it. Those rows
+/// are deleted an hour later and say nothing the previous ones did not.
+///
+/// WHOLE INVARIANTS, never single entities: `latest_per_invariant` returns the
+/// newest batch per invariant, so a partial batch would hide the entities that
+/// did not change. Any non-pass row writes the invariant every pass, so
+/// incident occurrences still count; any change writes it at once, so a
+/// recovery still resolves its incident on the pass that observed it.
+fn drop_unchanged_passes(db: &std::path::Path, results: Vec<InvariantResult>, now: f64) -> Vec<InvariantResult> {
+    use std::collections::{BTreeMap, HashMap};
+    type Seen = HashMap<(std::path::PathBuf, String), (u64, f64)>;
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<Seen>> = std::sync::OnceLock::new();
+    let mut by_inv: BTreeMap<String, Vec<InvariantResult>> = BTreeMap::new();
+    for r in results {
+        by_inv.entry(r.invariant_id.clone()).or_default().push(r);
+    }
+    let Ok(mut seen) = SEEN.get_or_init(Default::default).lock() else {
+        return by_inv.into_values().flatten().collect();
+    };
+    let mut kept = Vec::new();
+    let mut skipped = 0usize;
+    for (id, rows) in by_inv {
+        let all_pass = rows.iter().all(|r| r.status == Status::Pass);
+        let mut entities: Vec<&str> = rows.iter().map(|r| r.entity_key.as_str()).collect();
+        entities.sort_unstable();
+        let shape = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            all_pass.hash(&mut h);
+            entities.hash(&mut h);
+            h.finish()
+        };
+        let key = (db.to_path_buf(), id);
+        let fresh = seen.get(&key).is_some_and(|(prev, at)| *prev == shape && now - at < PASS_REFRESH_S);
+        if all_pass && fresh {
+            skipped += rows.len();
+            continue;
+        }
+        seen.insert(key, (shape, now));
+        kept.extend(rows);
+    }
+    if skipped > 0 {
+        tracing::debug!(verdict = "invariant_pass_rows_skipped", skipped, kept = kept.len(),
+            measured = true, n_considered = skipped + kept.len(),
+            "unchanged all-pass invariants not re-written this pass");
+    }
+    kept
+}
+
 fn now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -64,6 +193,14 @@ fn now() -> f64 {
 /// before. Returns the number of incidents newly OPENED, which is the signal a
 /// caller acts on.
 pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration_ms: i64) -> usize {
+    // Who this pass evaluated, taken BEFORE unchanged passes are dropped: an
+    // entity skipped as unchanged was still evaluated.
+    let mut present: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for r in &results {
+        present.entry(r.invariant_id.clone()).or_default().insert(r.entity_key.clone());
+    }
+    let results = drop_unchanged_passes(store.db_path(), results, now());
     if results.is_empty() {
         return 0;
     }
@@ -74,11 +211,13 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
     // evidence, the largest single blob 19 KB. Every millisecond of that was
     // added to every non-GET request in the fleet, which awaits `record_receipt`
     // in `policy::enforce` before its handler runs.
-    let results: Vec<(InvariantResult, String)> =
-        results.into_iter().map(|r| {
+    let results: Vec<(InvariantResult, String)> = results
+        .into_iter()
+        .map(|r| {
             let evidence = r.evidence.to_string();
             (r, evidence)
-        }).collect();
+        })
+        .collect();
     // Also hoisted: it is the same value for every row and was a call per row.
     let build = crate::build_hash();
     let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -133,12 +272,17 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                         .prepare_cached(
                         "INSERT INTO _amux_invariant_incident
                            (invariant_id, entity_key, status, first_seen, last_seen,
-                            occurrences, expected, observed, evidence)
-                         VALUES (?1,?2,?3,?4,?4,1,?5,?6,?7)
+                            occurrences, expected, observed, evidence, episode_occurrences)
+                         VALUES (?1,?2,?3,?4,?4,1,?5,?6,?7,1)
                          ON CONFLICT(invariant_id, entity_key) DO UPDATE SET
                            status      = excluded.status,
                            last_seen   = excluded.last_seen,
                            occurrences = _amux_invariant_incident.occurrences + 1,
+                           -- The current failing run only (AF-1126): what the
+                           -- autofix threshold reads. Restarts at 1 on a reopen,
+                           -- judged on the pre-update resolved_at like `episode`.
+                           episode_occurrences = CASE WHEN _amux_invariant_incident.resolved_at IS NULL
+                               THEN _amux_invariant_incident.episode_occurrences + 1 ELSE 1 END,
                            expected    = excluded.expected,
                            observed    = excluded.observed,
                            evidence    = excluded.evidence,
@@ -250,6 +394,7 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
         })
         .await;
     }
+    resolve_absent(store, present, now()).await;
     // The trim is once per pass, in its own short write, not once per chunk.
     let _ = store
         .write_async(move |conn| {
@@ -272,10 +417,12 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                 .prepare_cached(
                     "DELETE FROM _amux_invariant_result WHERE rowid IN (
                         SELECT rowid FROM _amux_invariant_result
-                         WHERE status = 'pass' AND ts < ?1
+                         WHERE status IN ('pass', 'unknown') AND ts < ?1
                          LIMIT ?2)",
                 )
-                .and_then(|mut s| s.execute(rusqlite::params![ts - PASS_RETAIN_SECS, TRIM_BATCH_ROWS]));
+                .and_then(|mut s| {
+                    s.execute(rusqlite::params![ts - PASS_RETAIN_SECS, TRIM_BATCH_ROWS])
+                });
             let _ = conn
                 .prepare_cached(
                     "DELETE FROM _amux_invariant_result WHERE rowid IN (
@@ -283,8 +430,13 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                          WHERE ts < ?1
                          LIMIT ?2)",
                 )
-                .and_then(|mut s| s.execute(rusqlite::params![ts - RESULT_RETAIN_SECS, TRIM_BATCH_ROWS]));
-            Ok(WriteOutcome { applied: true, events: vec![] })
+                .and_then(|mut s| {
+                    s.execute(rusqlite::params![ts - RESULT_RETAIN_SECS, TRIM_BATCH_ROWS])
+                });
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await;
     opened.load(std::sync::atomic::Ordering::Relaxed)
@@ -394,7 +546,8 @@ pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_jso
             if row["status"] != "pass" {
                 let raw: String = r.get(6)?;
                 if !raw.trim().is_empty() && raw.trim() != "{}" {
-                    row["evidence"] = serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
+                    row["evidence"] =
+                        serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw));
                 }
             }
             Ok(row)
@@ -422,26 +575,66 @@ mod tests {
     use super::*;
     use crate::invariants::InvariantResult;
 
+    /// AF-1005: an unchanged all-pass invariant is skipped inside the refresh
+    /// window and written again after it; failures always write; any change
+    /// (a recovery, a new entity) writes at once; stores do not share memory.
+    #[test]
+    fn unchanged_passes_are_skipped_and_every_change_is_written() {
+        let db = std::path::Path::new("/af1005/a.db");
+        let pass = |e: &str| InvariantResult::pass("af1005.p").entity(e);
+        let n = |rows: Vec<InvariantResult>, at: f64| drop_unchanged_passes(db, rows, at).len();
+        assert_eq!(n(vec![pass("x"), pass("y")], 1000.0), 2, "first sight writes");
+        assert_eq!(n(vec![pass("x"), pass("y")], 1030.0), 0, "unchanged inside the window is skipped");
+        assert_eq!(n(vec![pass("x"), pass("y")], 1000.0 + PASS_REFRESH_S + 1.0), 2, "refreshed before it reads stale");
+        assert_eq!(n(vec![pass("x")], 1250.0), 1, "a changed entity set writes at once");
+        assert_eq!(
+            drop_unchanged_passes(std::path::Path::new("/af1005/b.db"), vec![pass("x")], 1251.0).len(),
+            1,
+            "another store keeps its own memory"
+        );
+        let fail = || InvariantResult::fail("af1005.f", "e", "o").entity("z");
+        assert_eq!(n(vec![fail()], 2000.0), 1);
+        assert_eq!(n(vec![fail()], 2001.0), 1, "a failure writes every pass, so occurrences count");
+        let healed = InvariantResult::pass("af1005.f").entity("z");
+        assert_eq!(n(vec![healed], 2002.0), 1, "the pass after a failure writes, so the incident resolves");
+    }
+
     #[tokio::test]
     async fn invariant_record_does_not_rehash_the_binary_inside_the_writer() {
         let (s, _d) = store();
         // Production measures identity at startup before starting jobs too.
         let build = crate::build_hash();
-        let rows = (0..128).map(|n| {
-            let mut r=InvariantResult::pass("test.writer_latency");
-            r.entity_key=n.to_string(); r
-        }).collect();
-        let recording_store=s.clone();
-        let recording=tokio::spawn(async move {record(&recording_store,rows,0).await});
+        let rows = (0..128)
+            .map(|n| {
+                let mut r = InvariantResult::pass("test.writer_latency");
+                r.entity_key = n.to_string();
+                r
+            })
+            .collect();
+        let recording_store = s.clone();
+        let recording = tokio::spawn(async move { record(&recording_store, rows, 0).await });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let started=std::time::Instant::now();
-        s.write_async(|_|Ok(WriteOutcome {applied:false,events:vec![]})).await.unwrap();
-        assert!(started.elapsed()<std::time::Duration::from_secs(1),
-            "interactive write waited {:?} behind invariant recording",started.elapsed());
+        let started = std::time::Instant::now();
+        s.write_async(|_| {
+            Ok(WriteOutcome {
+                applied: false,
+                events: vec![],
+            })
+        })
+        .await
+        .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "interactive write waited {:?} behind invariant recording",
+            started.elapsed()
+        );
         recording.await.unwrap();
-        let c=s.read().unwrap();
+        let c = s.read().unwrap();
         let stamped:i64=c.query_row("SELECT count(*) FROM _amux_invariant_result WHERE invariant_id='test.writer_latency' AND build=?1",[build],|r|r.get(0)).unwrap();
-        assert_eq!(stamped,128,"every result retains the executing image identity");
+        assert_eq!(
+            stamped, 128,
+            "every result retains the executing image identity"
+        );
     }
 
     /// AMUX-4538. A failing check's stored evidence reaches the reader through
@@ -453,19 +646,34 @@ mod tests {
         record(
             &s,
             vec![
-                InvariantResult::fail("test.evidence_fail", "every card complete", "2 of 5 incomplete")
-                    .evidence(json!({"sample": [{"id": "A-1", "gaps": ["priority"]}], "n_considered": 5})),
+                InvariantResult::fail(
+                    "test.evidence_fail",
+                    "every card complete",
+                    "2 of 5 incomplete",
+                )
+                .evidence(
+                    json!({"sample": [{"id": "A-1", "gaps": ["priority"]}], "n_considered": 5}),
+                ),
                 InvariantResult::pass("test.evidence_pass").evidence(json!({"n_considered": 9})),
             ],
             1,
         )
         .await;
         let rows = latest_per_invariant(&s).unwrap();
-        let fail = rows.iter().find(|r| r["invariant_id"] == "test.evidence_fail").expect("fail row");
+        let fail = rows
+            .iter()
+            .find(|r| r["invariant_id"] == "test.evidence_fail")
+            .expect("fail row");
         assert_eq!(fail["evidence"]["sample"][0]["id"], "A-1", "{fail}");
         assert_eq!(fail["evidence"]["n_considered"], 5, "{fail}");
-        let pass = rows.iter().find(|r| r["invariant_id"] == "test.evidence_pass").expect("pass row");
-        assert!(pass.get("evidence").is_none(), "pass rows stay small: {pass}");
+        let pass = rows
+            .iter()
+            .find(|r| r["invariant_id"] == "test.evidence_pass")
+            .expect("pass row");
+        assert!(
+            pass.get("evidence").is_none(),
+            "pass rows stay small: {pass}"
+        );
     }
 
     fn store() -> (SharedStore, tempfile::TempDir) {
@@ -485,7 +693,10 @@ mod tests {
                  VALUES (?1,?2,?3,?4,'','','{}',0)",
                 rusqlite::params![ts, id, status, entity],
             )?;
-            Ok(WriteOutcome { applied: true, events: vec![] })
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await
         .unwrap();
@@ -509,11 +720,14 @@ mod tests {
     async fn an_unknown_resolves_an_incident_without_claiming_it_healed() {
         let (s, _d) = store();
         let res = |st: &str| {
-            let mut r = InvariantResult::new("schema.timestamp_units_declared", match st {
-                "fail" => Status::Fail,
-                "pass" => Status::Pass,
-                _ => Status::Unknown,
-            });
+            let mut r = InvariantResult::new(
+                "schema.timestamp_units_declared",
+                match st {
+                    "fail" => Status::Fail,
+                    "pass" => Status::Pass,
+                    _ => Status::Unknown,
+                },
+            );
             r.entity_key = "waitlist.ts".into();
             r
         };
@@ -529,7 +743,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(status, "fail", "precondition: the incident must actually be open");
+        assert_eq!(
+            status, "fail",
+            "precondition: the incident must actually be open"
+        );
         assert!(resolved.is_none(), "precondition: and unresolved");
 
         record(&s, vec![res("unknown")], 0).await;
@@ -586,18 +803,27 @@ mod tests {
 
         let got = latest_per_invariant(&s).unwrap();
 
-        let a: Vec<_> = got.iter().filter(|r| r["invariant_id"] == "a.check").collect();
-        assert_eq!(a.len(), 3, "every entity of the newest batch must appear: {got:?}");
+        let a: Vec<_> = got
+            .iter()
+            .filter(|r| r["invariant_id"] == "a.check")
+            .collect();
+        assert_eq!(
+            a.len(),
+            3,
+            "every entity of the newest batch must appear: {got:?}"
+        );
         assert!(
             a.iter().all(|r| r["checked_at"].as_f64().unwrap() == 200.0),
             "the older generation must be gone: {got:?}"
         );
-        let mut ents: Vec<&str> =
-            a.iter().map(|r| r["entity"].as_str().unwrap()).collect();
+        let mut ents: Vec<&str> = a.iter().map(|r| r["entity"].as_str().unwrap()).collect();
         ents.sort();
         assert_eq!(ents, vec!["e1", "e2", "e3"]);
 
-        let b: Vec<_> = got.iter().filter(|r| r["invariant_id"] == "b.check").collect();
+        let b: Vec<_> = got
+            .iter()
+            .filter(|r| r["invariant_id"] == "b.check")
+            .collect();
         assert_eq!(b.len(), 1, "b.check has one entity: {got:?}");
         assert_eq!(
             b[0]["checked_at"].as_f64().unwrap(),
@@ -652,22 +878,42 @@ mod tests {
         let (s, _d) = store();
         let fail = || vec![InvariantResult::fail("x.count", "a", "b").entity("w1")];
 
-        assert_eq!(record(&s, fail(), 1).await, 1, "the first failure opens an incident");
+        assert_eq!(
+            record(&s, fail(), 1).await,
+            1,
+            "the first failure opens an incident"
+        );
         // THE LEG THAT CATCHES A DEAD RETURNING: the fallback value is 1.
-        assert_eq!(record(&s, fail(), 1).await, 0, "a repeat failure opens nothing");
+        assert_eq!(
+            record(&s, fail(), 1).await,
+            0,
+            "a repeat failure opens nothing"
+        );
         assert_eq!(record(&s, fail(), 1).await, 0);
 
         // A different entity is a different incident, so it opens.
         assert_eq!(
-            record(&s, vec![InvariantResult::fail("x.count", "a", "b").entity("w2")], 1).await,
+            record(
+                &s,
+                vec![InvariantResult::fail("x.count", "a", "b").entity("w2")],
+                1
+            )
+            .await,
             1
         );
         // A pass opens nothing at all.
-        assert_eq!(record(&s, vec![InvariantResult::pass("x.count").entity("w1")], 1).await, 0);
+        assert_eq!(
+            record(&s, vec![InvariantResult::pass("x.count").entity("w1")], 1).await,
+            0
+        );
         // And a REOPEN is not an open: the row already exists with a count
         // above 1. Preserved behaviour, asserted here because the rewrite could
         // silently have changed it.
-        assert_eq!(record(&s, fail(), 1).await, 0, "a reopened incident is not a new one");
+        assert_eq!(
+            record(&s, fail(), 1).await,
+            0,
+            "a reopened incident is not a new one"
+        );
         assert_eq!(live_incidents(&s).unwrap().len(), 2);
     }
 
@@ -676,26 +922,116 @@ mod tests {
     #[tokio::test]
     async fn distinct_entities_are_distinct_incidents() {
         let (s, _d) = store();
-        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("w1")], 1).await;
-        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("w2")], 1).await;
+        record(
+            &s,
+            vec![InvariantResult::fail("x", "a", "b").entity("w1")],
+            1,
+        )
+        .await;
+        record(
+            &s,
+            vec![InvariantResult::fail("x", "a", "b").entity("w2")],
+            1,
+        )
+        .await;
         assert_eq!(live_incidents(&s).unwrap().len(), 2);
     }
 
     /// A pass closes the incident, and a later failure REOPENS the same row so
     /// the flap is one story rather than two unrelated ones.
+    /// AF-1015: an incident whose entity its invariant stopped reporting is
+    /// resolved as `unknown` once it has been absent an hour; one still
+    /// reported, one absent under an hour, and one whose invariant did not run
+    /// this pass all stay open.
+    #[tokio::test]
+    async fn an_entity_its_invariant_stopped_reporting_is_resolved_after_an_hour() {
+        let (s, _d) = store();
+        record(&s, vec![
+            InvariantResult::fail("af1015.lane", "a", "b").entity("kept"),
+            InvariantResult::fail("af1015.lane", "a", "b").entity("deleted"),
+            InvariantResult::fail("af1015.lane", "a", "b").entity("recent"),
+            InvariantResult::fail("af1015.other", "a", "b").entity("idle"),
+        ], 1).await;
+        let age = |entity: &'static str, secs: f64| {
+            let s = s.clone();
+            async move {
+                s.write_async(move |c| {
+                    c.execute("UPDATE _amux_invariant_incident SET last_seen = last_seen - ?1 WHERE entity_key = ?2",
+                        rusqlite::params![secs, entity])?;
+                    Ok(WriteOutcome { applied: true, events: vec![] })
+                }).await.unwrap();
+            }
+        };
+        age("deleted", 7200.0).await;
+        age("idle", 7200.0).await;
+        age("recent", 600.0).await;
+        record(&s, vec![InvariantResult::fail("af1015.lane", "a", "b").entity("kept")], 1).await;
+        let state = |entity: &str| -> (String, bool) {
+            s.read().unwrap().query_row(
+                "SELECT status, resolved_at IS NOT NULL FROM _amux_invariant_incident WHERE entity_key = ?1",
+                [entity], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        };
+        assert_eq!(state("deleted"), ("unknown".into(), true), "absent for two hours: resolved, not claimed healed");
+        assert_eq!(state("kept"), ("fail".into(), false), "still reported: stays open");
+        assert_eq!(state("recent"), ("fail".into(), false), "absent under an hour: may be a rotating subset");
+        assert_eq!(state("idle"), ("fail".into(), false), "its invariant did not run this pass: untouched");
+    }
+
     #[tokio::test]
     async fn pass_resolves_and_a_later_failure_reopens() {
         let (s, _d) = store();
-        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("w1")], 1).await;
+        record(
+            &s,
+            vec![InvariantResult::fail("x", "a", "b").entity("w1")],
+            1,
+        )
+        .await;
         assert_eq!(live_incidents(&s).unwrap().len(), 1);
 
         record(&s, vec![InvariantResult::pass("x").entity("w1")], 1).await;
         assert_eq!(live_incidents(&s).unwrap().len(), 0, "pass must resolve it");
 
-        record(&s, vec![InvariantResult::fail("x", "a", "b").entity("w1")], 1).await;
+        record(
+            &s,
+            vec![InvariantResult::fail("x", "a", "b").entity("w1")],
+            1,
+        )
+        .await;
         let inc = live_incidents(&s).unwrap();
         assert_eq!(inc.len(), 1, "a re-failure must reopen, not stay closed");
-        assert_eq!(inc[0]["occurrences"], 2, "history is preserved across the flap");
+        assert_eq!(
+            inc[0]["occurrences"], 2,
+            "history is preserved across the flap"
+        );
+    }
+
+    /// AF-1126: the autofix threshold counts the CURRENT failing run. A pair
+    /// with a long history that healed must not file on its first new blip
+    /// (amux-gtm: 117 lifetime failures, one blip, healed 52 s later), and a
+    /// run that does reach the threshold still files.
+    #[tokio::test]
+    async fn a_healed_incident_files_on_its_new_run_not_its_lifetime_count() {
+        let (s, _d) = store();
+        let fail = || vec![InvariantResult::fail("x", "a", "b").entity("w1")];
+        for _ in 0..5 {
+            record(&s, fail(), 1).await;
+        }
+        record(&s, vec![InvariantResult::pass("x").entity("w1")], 1).await;
+        record(&s, fail(), 1).await;
+        let detect = |s: &SharedStore| {
+            let now = crate::runtime_jobs::registry::unix_now();
+            let conn = s.read().unwrap();
+            let (found, suppressed) = crate::runtime_jobs::autofix::detect_invariants(&conn, now);
+            let run: (i64, i64) = conn.query_row(
+                "SELECT occurrences, episode_occurrences FROM _amux_invariant_incident WHERE entity_key = 'w1'",
+                [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            (found.iter().filter(|f| f.signature.contains("|x|")).count(),
+             suppressed.iter().filter(|f| f.signature.contains("|x|")).count(), run)
+        };
+        assert_eq!(detect(&s), (0, 1, (6, 1)), "one failure after a heal: the run is 1, so it is noise");
+        record(&s, fail(), 1).await;
+        record(&s, fail(), 1).await;
+        assert_eq!(detect(&s), (1, 0, (8, 3)), "three in this run: it files");
     }
 
     /// Unknown must NOT open an incident (it is a gap in observation, not a
@@ -703,8 +1039,17 @@ mod tests {
     #[tokio::test]
     async fn unknown_records_but_does_not_page() {
         let (s, _d) = store();
-        record(&s, vec![InvariantResult::unknown("x", "probe down").entity("w1")], 1).await;
-        assert_eq!(live_incidents(&s).unwrap().len(), 0, "unknown must not open an incident");
+        record(
+            &s,
+            vec![InvariantResult::unknown("x", "probe down").entity("w1")],
+            1,
+        )
+        .await;
+        assert_eq!(
+            live_incidents(&s).unwrap().len(),
+            0,
+            "unknown must not open an incident"
+        );
         let latest = latest_per_invariant(&s).unwrap();
         assert_eq!(latest.len(), 1, "...but it must still be recorded");
         assert_eq!(latest[0]["status"], "unknown");
@@ -720,7 +1065,7 @@ mod tests {
         let old = now() - 7200.0;
         let _ = s
             .write_async(move |conn| {
-                for (st, id) in [("pass", "old.pass"), ("fail", "old.fail")] {
+                for (st, id) in [("pass", "old.pass"), ("fail", "old.fail"), ("unknown", "old.unknown")] {
                     conn.execute(
                         "INSERT INTO _amux_invariant_result
                            (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms)
@@ -746,11 +1091,14 @@ mod tests {
         assert_eq!(
             left,
             vec!["fresh.check".to_string(), "old.fail".to_string()],
-            "stale pass gone, stale fail kept, fresh row kept"
+            "stale pass and stale unknown gone, stale fail kept, fresh row kept"
         );
 
         let (rows, oldest) = result_log_stats(&s).unwrap();
         assert_eq!(rows, 2);
-        assert!(oldest >= 7000.0, "oldest_age_s must reflect the surviving fail row, got {oldest}");
+        assert!(
+            oldest >= 7000.0,
+            "oldest_age_s must reflect the surviving fail row, got {oldest}"
+        );
     }
 }

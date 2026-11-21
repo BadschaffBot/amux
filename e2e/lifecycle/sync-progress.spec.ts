@@ -24,7 +24,10 @@ test('LC-SYNC-PROGRESS: reconnect checks off only acknowledged changes and keeps
     expect(await queue()).toHaveLength(3);
     await context.setOffline(false); await page.evaluate(()=>window.dispatchEvent(new Event('online')));
     await expect.poll(()=>Boolean(releases[0])).toBe(true);
+    // A reconnect with a backlog opens the checklist on the home page, and the
+    // pill carries the same progress (Ethan, 2026-09-24).
     await expect(page.locator('#sync-banner')).toHaveClass(/active/);
+    await expect(page.locator('#conn-status')).toHaveText(/Syncing 0\/3/);
     await expect(page.locator('#toast')).not.toHaveClass(/visible/);
     await expect(page.locator('#sync-items .running')).toHaveCount(1);
     await expect(page.locator('#sync-items .done')).toHaveCount(0);
@@ -45,7 +48,10 @@ test('LC-SYNC-PROGRESS: reconnect checks off only acknowledged changes and keeps
       expect(read.title).toBe(i===1?c.title:'Reconnected '+c.id);
     }
     allowConflict=true;
-    await page.locator('[onclick="forceRetry()"]').locator('visible=true').first().click();
+    // Failed changes are retried from the status modal (07b42586): tap the
+    // "N failed" pill, then Retry now.
+    await page.locator('#conn-status').click();
+    await page.locator('#conn-retry-now').click();
     await expect.poll(()=>Boolean(releases[1])).toBe(true);
     await expect(page.locator('#sync-items .done')).toHaveCount(2); // earlier acknowledgements remain visible
     releases[1](); await expect.poll(async()=>(await queue()).length).toBe(0);

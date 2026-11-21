@@ -49,6 +49,7 @@ use std::path::Path;
 /// Caps, all applied BEFORE a row enters the channel. Everything stored is
 /// bounded; nothing about a request can make its row large.
 const USER_AGENT_CHARS: usize = 300;
+const CLIENT_CHARS: usize = 160;
 const QUERY_CHARS: usize = 500;
 const CONTENT_TYPE_CHARS: usize = 120;
 // AMUX-3132: 500 cut the gate-not-acknowledged 409 body mid-object. That body
@@ -94,6 +95,11 @@ pub struct LogRow {
     pub answered_by: String,
     pub error_body: Option<String>,
     pub req_meta: Option<String>,
+    /// The dashboard's `X-Amux-Client` header: stable per-browser id, APP_VER,
+    /// engine and PWA-standalone. The UA alone cannot tell two Safari tabs on
+    /// one Mac from Safari and the installed PWA, which is the question when
+    /// one browser shows "1 pending" and another shows Live. None = not sent.
+    pub client: Option<String>,
 }
 
 /// Resolve the CALLER of a request, in the same order every handler uses.
@@ -109,6 +115,11 @@ pub(crate) fn caller_from_headers(h: &axum::http::HeaderMap) -> String {
     // trivially spoofable.
     if let Some(actor) = super::org::local_member_actor(h) {
         return actor.to_string();
+    }
+    // A published app proved by its own credential (app_identity.rs), which
+    // also dropped any worker header it sent.
+    if let Some(app) = super::app_identity::actor(h) {
+        return app.to_string();
     }
     for k in ["x-amux-worker", "x-amux-session"] {
         if let Some(v) = h.get(k).and_then(|v| v.to_str().ok()) {
@@ -191,8 +202,8 @@ impl RequestLogger {
                                 "INSERT INTO _amux_request_log \
                                  (ts, method, path, family, status, latency_ms, client_ip, \
                                   user_agent, amux_session, worker, req_bytes, resp_bytes, \
-                                  answered_by, error_body, req_meta, boot_at, load1) \
-                                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                                  answered_by, error_body, req_meta, boot_at, load1, client) \
+                                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                             )?;
                             for r in &batch {
                                 stmt.execute(rusqlite::params![
@@ -223,6 +234,7 @@ impl RequestLogger {
                                     // worth apologising for: a batch forms in
                                     // milliseconds and load1 averages a minute.
                                     load1,
+                                    r.client,
 ])?;
                             }
                         }
@@ -232,6 +244,13 @@ impl RequestLogger {
                                 (SELECT id FROM _amux_interactions WHERE updated_at < ?1)", [(cutoff * 1000.0) as i64])?;
                             let receipts = conn.execute("DELETE FROM _amux_interactions WHERE updated_at < ?1", [(cutoff * 1000.0) as i64])?;
                             if receipts > 0 { tracing::info!(verdict="interaction_retention", n_considered=receipts, "Expired interaction receipts removed"); }
+                            // The ledger keeps its own window (AMUX_LEDGER_RETAIN_DAYS,
+                            // default a year): the interaction rows above are working
+                            // state, the ledger rows written from them are the record.
+                            let ledger_cutoff = ((unix_now() - super::ledger::retain_days() * 86400.0) * 1000.0) as i64;
+                            if let Err(e) = super::ledger::prune(conn, ledger_cutoff) {
+                                tracing::warn!(verdict="ledger_retention_failed", error=%e, "ledger retention prune failed; rows kept");
+                            }
                             // CAPPED (AMUX-4750). This was an unbounded DELETE
                             // over a 3.2M-row table, so the size of one writer
                             // hold was however many rows happened to age out at
@@ -256,6 +275,18 @@ impl RequestLogger {
                                 retain_days,
                                 "request-log retention sweep"
                             );
+                            // Worker tool calls (audit.rs) keep the same window
+                            // as the requests they sit beside, capped the same way.
+                            let cutoff_rfc = chrono::DateTime::from_timestamp(cutoff as i64, 0)
+                                .map(|t| t.to_rfc3339()).unwrap_or_default();
+                            let tools = conn.execute(
+                                "DELETE FROM _amux_tool_events WHERE id IN (
+                                    SELECT id FROM _amux_tool_events WHERE created_at < ?1 LIMIT ?2)",
+                                rusqlite::params![cutoff_rfc, RETENTION_BATCH_ROWS],
+                            ).unwrap_or(0);
+                            if tools > 0 {
+                                tracing::info!(deleted = tools, retain_days, verdict = "tool_event_retention", "tool-event retention sweep");
+                            }
                         }
                         // applied:false — deliberately NO revision bump. The
                         // request log is observability substrate, not fleet
@@ -288,7 +319,7 @@ impl RequestLogger {
 
 /// `AMUX_REQLOG_RETAIN_DAYS`: process env wins, then server.env, then 14 —
 /// the same precedence config.rs gives every other knob.
-fn retain_days_config() -> f64 {
+pub(crate) fn retain_days_config() -> f64 {
     if let Some(d) = std::env::var("AMUX_REQLOG_RETAIN_DAYS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
@@ -357,7 +388,7 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     // Scoped block: a closure borrowing `req` may not outlive the borrow
     // into `next.run(req)` — and `&Request` is !Send (Body is !Sync), so the
     // closure must also drop before the await or the whole future loses Send.
-    let (user_agent, amux_session, content_type) = {
+    let (user_agent, amux_session, content_type, client) = {
         let hdr = |name: &str| {
             req.headers()
                 .get(name)
@@ -394,6 +425,7 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
             truncate_chars(&hdr("user-agent"), USER_AGENT_CHARS),
             caller,
             truncate_chars(&hdr("content-type"), CONTENT_TYPE_CHARS),
+            Some(truncate_chars(&hdr("x-amux-client"), CLIENT_CHARS)).filter(|c| !c.is_empty()),
         )
     };
     // Content-Length ONLY — the logger never reads a request body (a
@@ -458,10 +490,18 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     };
 
     let mut meta = serde_json::Map::new();
-    if let Some(id) = res.headers().get("x-amux-interaction-id").and_then(|v| v.to_str().ok()) {
+    if let Some(id) = res
+        .headers()
+        .get("x-amux-interaction-id")
+        .and_then(|v| v.to_str().ok())
+    {
         meta.insert("interaction_id".into(), json!(id));
     }
-    if let Some(kind) = res.headers().get("x-amux-command-kind").and_then(|v| v.to_str().ok()) {
+    if let Some(kind) = res
+        .headers()
+        .get("x-amux-command-kind")
+        .and_then(|v| v.to_str().ok())
+    {
         meta.insert("command_kind".into(), json!(kind));
     }
     if !query.is_empty() {
@@ -474,7 +514,11 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     // polls up to a caller-chosen budget) declares it via this response
     // header, and the latency detectors skip the row — a timed-out wait is
     // the budget the CALLER asked for, not the service getting slower.
-    if let Some(v) = res.headers().get("x-amux-slow-ok").and_then(|v| v.to_str().ok()) {
+    if let Some(v) = res
+        .headers()
+        .get("x-amux-slow-ok")
+        .and_then(|v| v.to_str().ok())
+    {
         meta.insert("slow_ok".into(), json!(truncate_chars(v, 40)));
     }
     // AMUX-4779: which VERB a multi-verb route ran. `POST /api/browser/action`
@@ -484,7 +528,11 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     // quoting a slow `wait` beside a `click`'s baseline points at the wrong
     // verb. Recorded the same way `command_kind` and `slow_ok` already are:
     // the handler sets a header, this lifts it.
-    if let Some(v) = res.headers().get("x-amux-action").and_then(|v| v.to_str().ok()) {
+    if let Some(v) = res
+        .headers()
+        .get("x-amux-action")
+        .and_then(|v| v.to_str().ok())
+    {
         if !v.is_empty() {
             meta.insert("action".into(), json!(truncate_chars(v, 40)));
         }
@@ -511,6 +559,7 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
         answered_by,
         error_body,
         req_meta,
+        client,
     });
     res
 }
@@ -526,7 +575,8 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
 /// client sent to this origin.
 pub fn family_of(path: &str) -> String {
     let mut best: Option<&str> = None;
-    let owns = |fam: &str| path == fam || (path.starts_with(fam) && path[fam.len()..].starts_with('/'));
+    let owns =
+        |fam: &str| path == fam || (path.starts_with(fam) && path[fam.len()..].starts_with('/'));
     for (fam, _) in super::py_proxy::NATIVE_FAMILIES {
         if owns(fam) && best.is_none_or(|b| fam.len() > b.len()) {
             best = Some(fam);
@@ -557,7 +607,10 @@ pub fn worker_of(path: &str, query: &str) -> Option<String> {
             if name == "self" {
                 return query
                     .split('&')
-                    .find_map(|kv| kv.strip_prefix("session=").or_else(|| kv.strip_prefix("worker=")))
+                    .find_map(|kv| {
+                        kv.strip_prefix("session=")
+                            .or_else(|| kv.strip_prefix("worker="))
+                    })
                     .map(percent_decode)
                     .filter(|s| !s.is_empty());
             }
@@ -672,8 +725,10 @@ fn decoded_error_body(bytes: &[u8], content_encoding: &str) -> String {
     // stops being a trap at every size, which is why this is the fix rather than
     // a third number.
     let kept: String = text.chars().take(ERROR_BODY_CHARS).collect();
-    format!("{kept}\u{2026}<truncated by the request log: kept {ERROR_BODY_CHARS} of {n} chars; \
-             this string is deliberately NOT valid JSON>")
+    format!(
+        "{kept}\u{2026}<truncated by the request log: kept {ERROR_BODY_CHARS} of {n} chars; \
+             this string is deliberately NOT valid JSON>"
+    )
 }
 
 /// Cap on DECOMPRESSED error-body bytes. A compressed body is an amplification
@@ -797,7 +852,10 @@ fn ignored_log_params<'a>(keys: impl Iterator<Item = &'a String>) -> Vec<String>
     out
 }
 
-async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn get_logs(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let limit: i64 = q
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
@@ -937,17 +995,36 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         Ok(c) => c,
         Err(e) => return internal(e),
     };
-    let total: i64 = match conn.query_row(
+    // THE COUNT IS BOUNDED IN TIME, NOT IN ROWS (AF-1044). `total_matched` is
+    // the exact pre-LIMIT count the log sweep reads for volume, so a row cap
+    // would change its meaning. But it scans every matching row in the window
+    // (1.58M in 24h on 2026-10-30), and under load one `?session=` read took
+    // 154s on a pooled read connection while /health went 503 with the store
+    // "hung". Past the budget the count is interrupted and says so: `null`
+    // with the reason, never a number that is not the count.
+    let budget = count_budget();
+    let total: Option<i64> = match count_within(
+        &conn,
         &format!("SELECT COUNT(*) FROM _amux_request_log{where_sql}"),
-        rusqlite::params_from_iter(params.iter()),
-        |r| r.get(0),
+        &params,
+        budget,
     ) {
         Ok(n) => n,
         Err(e) => return internal(e),
     };
+    if total.is_none() {
+        tracing::warn!(
+            verdict = "logs_count_budget_exceeded",
+            budget_ms = budget.as_millis() as u64,
+            filter = %where_sql,
+            "[/api/logs AF-1044] total_matched not counted: the count ran past its budget \
+             and was interrupted so it could not hold a read connection. The page below is \
+             still served. Narrow `since`, or read volume from /api/logs/stats."
+        );
+    }
     let sql = format!(
         "SELECT ts, method, path, family, status, latency_ms, client_ip, user_agent, \
-                amux_session, worker, req_bytes, resp_bytes, answered_by, error_body, req_meta \
+                amux_session, worker, req_bytes, resp_bytes, answered_by, error_body, req_meta, client \
          FROM _amux_request_log{where_sql} ORDER BY ts DESC LIMIT {limit}"
     );
     let events: Vec<Value> = match (|| -> rusqlite::Result<Vec<Value>> {
@@ -968,10 +1045,14 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
     // this is the same admission on the endpoint that lacked it, so the next
     // capped read announces itself in the payload the caller already opens
     // instead of being inferred by whoever happens to compare two numbers.
-    let truncated = events.len() as i64 == limit && total > events.len() as i64;
+    // An uncounted window is truncated whenever the page is full: the rows may go on.
+    let truncated = events.len() as i64 == limit && total.is_none_or(|t| t > events.len() as i64);
     let span_h = match (events.first(), events.last()) {
         (Some(a), Some(b)) => {
-            let (hi, lo) = (a["ts"].as_f64().unwrap_or(0.0), b["ts"].as_f64().unwrap_or(0.0));
+            let (hi, lo) = (
+                a["ts"].as_f64().unwrap_or(0.0),
+                b["ts"].as_f64().unwrap_or(0.0),
+            );
             ((hi - lo) / 3600.0 * 100.0).round() / 100.0
         }
         _ => 0.0,
@@ -992,17 +1073,22 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         tracing::warn!(
             ignored = ?ignored_params,
             recognised = ?RECOGNISED_LOG_PARAMS,
-            total_matched = total,
+            total_matched = ?total,
             "[/api/logs AF-521] query param(s) DROPPED — the rows returned are a \
              SUPERSET of what was asked for, not an answer to it. Filter on a \
              recognised key, or read `ignored_params` in the body."
         );
     }
-    Json(crate::api::measured::measured(
-        json!({
+    let body = json!({
         "events": events,
         "count": events.len(),
         "total_matched": total,
+        // Present only when the count was cut off (AF-1044), saying why it is null.
+        "total_matched_unmeasured": total.is_none().then(|| format!(
+            "the count ran past its {}ms budget and was interrupted (AMUX_LOGS_COUNT_BUDGET_MS); \
+             this is not zero. Narrow `since`, or read volume from /api/logs/stats.",
+            budget.as_millis()
+        )),
         "ignored_params": ignored_params,
         // True = you are holding the newest `limit` rows, NOT the window you
         // asked for. Page backward with `until=<oldest ts you got>`.
@@ -1015,10 +1101,58 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
              Page backward with `until=<the oldest ts in this page>`, or read \
              `total_matched` for volume. Do not describe this page as the window."
         } else { "" },
-        }),
-        total.max(0) as usize,
-    ))
+    });
+    // An interrupted count does not know its population, so it says so rather
+    // than offering the page size as n_considered (land review F1, AF-1044).
+    Json(match total {
+        Some(t) => crate::api::measured::measured(body, t.max(0) as usize),
+        None => crate::api::measured::measured_unknown_population(
+            body,
+            "the count ran past its budget and was interrupted (total_matched_unmeasured)",
+        ),
+    })
     .into_response()
+}
+
+/// How long `/api/logs` may spend counting `total_matched` (AF-1044).
+fn count_budget() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("AMUX_LOGS_COUNT_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000),
+    )
+}
+
+/// Run a single-value COUNT, interrupting it past `budget`. `Ok(None)` means it
+/// was interrupted; any other error is returned as is.
+///
+/// The timer is JOINED before this returns, so it can fire only during the
+/// count or while the connection runs nothing (where an interrupt is a no-op).
+/// A detached timer would outlive the count and abort the page query that
+/// follows on the same pooled connection.
+pub(crate) fn count_within(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+    budget: std::time::Duration,
+) -> rusqlite::Result<Option<i64>> {
+    use std::sync::mpsc;
+    let (done, wait) = mpsc::channel::<()>();
+    let handle = conn.get_interrupt_handle();
+    let timer = std::thread::spawn(move || {
+        if let Err(mpsc::RecvTimeoutError::Timeout) = wait.recv_timeout(budget) {
+            handle.interrupt();
+        }
+    });
+    let got = conn.query_row(sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0));
+    let _ = done.send(());
+    let _ = timer.join();
+    match got {
+        Ok(n) => Ok(Some(n)),
+        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::OperationInterrupted => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// One DB row -> one Python-ring-shaped event (+ additive fields).
@@ -1038,7 +1172,11 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
     let answered_by: String = r.get(12)?;
     let error_body: Option<String> = r.get(13)?;
     let req_meta: Option<String> = r.get(14)?;
-    let session = worker.clone().or_else(|| amux_session.clone()).unwrap_or_default();
+    let client: Option<String> = r.get(15)?;
+    let session = worker
+        .clone()
+        .or_else(|| amux_session.clone())
+        .unwrap_or_default();
     let level = if status >= 500 {
         "error"
     } else if status >= 400 {
@@ -1079,6 +1217,7 @@ fn row_to_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
         "req_bytes": req_bytes,
         "resp_bytes": resp_bytes,
         "user_agent": user_agent,
+        "client": client,
         "source": "request_log",
     }))
 }
@@ -1099,7 +1238,9 @@ async fn get_logs_raw(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(200)
         .clamp(1, 5000);
-    let log_path = super::settings::amux_home().join("logs").join("server-rs.log");
+    let log_path = super::settings::amux_home()
+        .join("logs")
+        .join("server-rs.log");
     match raw_payload(&log_path, lines_n, &state) {
         Ok(v) => {
             // n_considered is the whole tailable population (log file lines +
@@ -1130,7 +1271,14 @@ fn raw_payload(log_path: &Path, lines_n: usize, state: &AppState) -> anyhow::Res
     let file_total = text.lines().count();
     let mut merged: Vec<(f64, String, &'static str)> = Vec::new();
     let mut last_ts = 0.0f64;
-    for line in text.lines().rev().take(lines_n).collect::<Vec<_>>().into_iter().rev() {
+    for line in text
+        .lines()
+        .rev()
+        .take(lines_n)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         // tracing fmt lines start with an RFC3339 timestamp; continuation
         // lines (panics, multi-line fields) inherit the previous line's ts.
         if let Some(ts) = line
@@ -1160,7 +1308,17 @@ fn raw_payload(log_path: &Path, lines_n: usize, state: &AppState) -> anyhow::Res
         let session: Option<String> = r.get(6)?;
         let worker: Option<String> = r.get(7)?;
         let answered_by: String = r.get(8)?;
-        Ok((ts, method, path, status, latency_ms, ip, session, worker, answered_by))
+        Ok((
+            ts,
+            method,
+            path,
+            status,
+            latency_ms,
+            ip,
+            session,
+            worker,
+            answered_by,
+        ))
     })?;
     for row in rows {
         let (ts, method, path, status, latency_ms, ip, session, worker, answered_by) = row?;
@@ -1250,311 +1408,1819 @@ const ANY: &[&str] = &["*"];
 /// public and protected alike. Ordering is by mount site for diffability;
 /// matching specificity is computed, not positional.
 pub const ROUTE_TABLE: &[RouteEntry] = &[
-    RouteEntry { path: "/api/brex/status", methods: &["GET"] },
-    RouteEntry { path: "/api/brex/card", methods: &["POST"] },
-    RouteEntry { path: "/api/brex/webhook", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/connection/security",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/connection/session",
+        methods: &["POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/connection/certificate",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/brex/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/brex/card",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/brex/webhook",
+        methods: &["POST"],
+    },
     // -- public (outside require_bearer)
-    RouteEntry { path: "/health", methods: &["GET"] },
-    RouteEntry { path: "/api/health", methods: &["GET"] },
-    RouteEntry { path: "/api/_clear_sw", methods: &["GET"] },
-    RouteEntry { path: "/manifest.json", methods: &["GET"] },
-    RouteEntry { path: "/api/calendar.ics", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/tmux", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/scan", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/sse", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/downtime", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/logs", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/context-health", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/boundary", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/legacy-port", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/routes", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/duplicate-deliveries", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/needsyou-digest", methods: &["GET"] },
-    RouteEntry { path: "/api/system-jobs", methods: &["GET"] },
-    RouteEntry { path: "/api/system-jobs/{id}/run", methods: &["POST"] },
-    RouteEntry { path: "/api/health/invariants", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/invariants", methods: &["GET"] },
+    RouteEntry {
+        path: "/health",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/health",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/pub/{id}",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/pub/{id}/",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/pub/{id}/{*rest}",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/api/_clear_sw",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/manifest.json",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/calendar.ics",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/tmux",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/scan",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/sse",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board-groom/staleness",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board-groom/{lane}",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/debug/send-profile",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/downtime",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/logs",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/context-health",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/boundary",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/legacy-port",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/routes",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/duplicate-deliveries",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/needsyou-digest",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/system-jobs",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/system-jobs/{id}/run",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/health/invariants",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/invariants",
+        methods: &["GET"],
+    },
     // AMUX-4682: deterministic stale/unverifiable dependency-citation scan.
-    RouteEntry { path: "/api/debug/dependency-audit", methods: &["GET"] },
-    RouteEntry { path: "/api/gmail/callback", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/debug/dependency-audit",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/gmail/callback",
+        methods: &["GET"],
+    },
     // AF-540 approval fate. Mounted at email.rs:71 and unlisted until AMUX-4668.
-    RouteEntry { path: "/api/email/approval/{id}", methods: &["GET"] },
-    RouteEntry { path: "/invite/{token}", methods: &["GET", "POST"] },
+    RouteEntry {
+        path: "/api/email/approval/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/invite/{token}",
+        methods: &["GET", "POST"],
+    },
     // -- core state
-    RouteEntry { path: "/api/interactions/recent", methods: &["GET"] },
-    RouteEntry { path: "/api/interactions/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/interactions/{id}/effects", methods: &["GET"] },
-    RouteEntry { path: "/api/interactions/{id}/why", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/interactions", methods: &["GET"] },
-    RouteEntry { path: "/api/state/summary", methods: &["GET"] },
-    RouteEntry { path: "/api/sync", methods: &["GET"] },
-    RouteEntry { path: "/api/events", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/interactions/recent",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/interactions/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/interactions/{id}/effects",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/interactions/{id}/why",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/interactions",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/state/summary",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/sync",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/events",
+        methods: &["GET"],
+    },
     // -- board
-    RouteEntry { path: "/api/board", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/board-lifecycle", methods: &["GET"] },
-    RouteEntry { path: "/api/board/export", methods: &["GET"] },
-    RouteEntry { path: "/api/board/statuses", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/board/statuses/reorder", methods: &["PUT"] },
-    RouteEntry { path: "/api/board/statuses/{sid}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/board/session-gates", methods: &["GET", "PATCH"] },
-    RouteEntry { path: "/api/board/nudges", methods: &["GET", "PATCH"] },
-    RouteEntry { path: "/api/board/changes", methods: &["GET"] },
-    RouteEntry { path: "/api/board/derived", methods: &["GET"] },
-    RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
-    RouteEntry { path: "/api/board/lease-next", methods: &["POST"] },
-    RouteEntry { path: "/api/board/overlap", methods: &["POST"] },
-    RouteEntry { path: "/api/board/overlap/deployment-permit", methods: &["GET"] },
-    RouteEntry { path: "/api/board/overlap/{coordination_id}", methods: &["GET"] },
-    RouteEntry { path: "/api/board/{id}", methods: &["GET", "PATCH", "DELETE"] },
+    RouteEntry {
+        path: "/api/board",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/board-lifecycle",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/export",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/statuses",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/board/statuses/reorder",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/board/statuses/{sid}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/board/session-gates",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/board/nudges",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/board/changes",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/derived",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/clear-done",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/lease-next",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/overlap",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/overlap/deployment-permit",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/overlap/{coordination_id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
     // The workflow-engine landing (board.rs:80-83) mounted these four and did
     // not add them here, which is what reddened `rust`. Methods read off the
     // router, not guessed: capsule/verifications are GET, artifacts is
     // GET+POST, artifacts/{aid} is PATCH+DELETE.
-    RouteEntry { path: "/api/board/{id}/capsule", methods: &["GET"] },
-    RouteEntry { path: "/api/board/{id}/verifications", methods: &["GET"] },
-    RouteEntry { path: "/api/board/{id}/artifacts", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/board/{id}/artifacts/{aid}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/board/{id}/archive", methods: &["POST"] },
-    RouteEntry { path: "/api/board/{id}/restore", methods: &["POST"] },
-    RouteEntry { path: "/api/board/{id}/undelete", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/board/{id}/capsule",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}/verifications",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}/artifacts",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}/artifacts/{aid}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}/archive",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}/restore",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}/undelete",
+        methods: &["POST"],
+    },
     // -- workers (+dead-letters merge)
-    RouteEntry { path: "/api/workers", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/workers/{id}", methods: &["GET", "PATCH", "DELETE"] },
-    RouteEntry { path: "/api/workers/{id}/start", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/stop", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/pause", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/resume", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/peek", methods: &["GET"] },
-    RouteEntry { path: "/api/workers/{id}/send", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/duplicate", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/wake", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/reset", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/clear", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/resize", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/keys", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/report", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/workers",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/pause",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/resume",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/peek",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/send",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/duplicate",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/wake",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/reset",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/clear",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/resize",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/keys",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/report",
+        methods: &["POST"],
+    },
     // `*`, not GET/POST/DELETE: the route is mounted with `any`, so the router
     // advertises no Allow set and the table must say what the ROUTER accepts,
     // not what the verb happens to implement. Mounting the three explicitly
     // would 405 a PATCH the catch-all currently passes through to steer_mutate,
     // which forks the promoted spelling's behaviour from the legacy one.
-    RouteEntry { path: "/api/workers/{id}/steer", methods: &["*"] },
-    RouteEntry { path: "/api/workers/{id}/config", methods: &["PATCH"] },
-    RouteEntry { path: "/api/workers/{id}/share", methods: &["*"] },
-    RouteEntry { path: "/api/workers/{id}/instructions", methods: &["*"] },
-    RouteEntry { path: "/api/workers/{id}/memory", methods: &["*"] },
+    RouteEntry {
+        path: "/api/workers/{id}/steer",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/config",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/share",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/instructions",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/memory",
+        methods: &["*"],
+    },
     // The checkout sub-resource (AF-291). Listed per sub-verb on purpose: a
     // wildcard would make the table unable to say which parts exist, which is
     // the defect AF-204 retires the catch-all for.
-    RouteEntry { path: "/api/workers/{id}/git", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/git/commits", methods: &["GET"] },
-    RouteEntry { path: "/api/workers/{id}/git/commit-detail", methods: &["GET"] },
-    RouteEntry { path: "/api/workers/{id}/git/diff", methods: &["GET"] },
-    RouteEntry { path: "/api/workers/{id}/git/dirty", methods: &["GET"] },
-    RouteEntry { path: "/api/workers/{id}/git/push", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/git/commit-report", methods: &["POST"] },
-    RouteEntry { path: "/api/workers/{id}/git/tracked-files", methods: &["*"] },
-    RouteEntry { path: "/api/workers/{id}/git/commit-guard", methods: &["*"] },
-    RouteEntry { path: "/api/workers/{id}/dead-letters", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/workers/{id}/git",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/git/commits",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/git/commit-detail",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/git/diff",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/git/dirty",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/git/push",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/git/commit-report",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/git/tracked-files",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/git/commit-guard",
+        methods: &["*"],
+    },
+    RouteEntry {
+        path: "/api/workers/{id}/dead-letters",
+        methods: &["GET"],
+    },
     // -- memories / messages / schedules / verify / prefs / criteria
-    RouteEntry { path: "/api/memories", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/memories/{id}", methods: &["GET", "PATCH", "DELETE"] },
-    RouteEntry { path: "/api/messages", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/messages/accountability", methods: &["GET"] },
-    RouteEntry { path: "/api/messages/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/messages/{id}/ack", methods: &["POST"] },
-    RouteEntry { path: "/api/messages/{id}/acted", methods: &["POST"] },
-    RouteEntry { path: "/api/schedules", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/schedules/runs", methods: &["GET"] },
-    RouteEntry { path: "/api/schedules/audit", methods: &["GET"] },
-    RouteEntry { path: "/api/schedules/{id}", methods: &["GET", "PATCH", "DELETE"] },
-    RouteEntry { path: "/api/schedules/{id}/run", methods: &["POST"] },
-    RouteEntry { path: "/api/verify/{id}", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/policy", methods: &["GET"] },
-    RouteEntry { path: "/api/policy/evaluate", methods: &["POST"] },
-    RouteEntry { path: "/api/policy/approvals", methods: &["POST"] },
-    RouteEntry { path: "/api/policy/receipts", methods: &["GET"] },
-    RouteEntry { path: "/api/harness/checkpoints/{id}", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/harness/handoffs/{id}", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/harness/budgets/{id}", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/harness/sensors", methods: &["GET"] },
-    RouteEntry { path: "/api/harness/sensors/{task_type}", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/harness/guides", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/harness/compile", methods: &["POST"] },
-    RouteEntry { path: "/api/harness/ratchet", methods: &["POST"] },
-    RouteEntry { path: "/api/harness/traces/{turn_id}", methods: &["GET"] },
-    RouteEntry { path: "/api/harness/work-metrics", methods: &["POST"] },
-    RouteEntry { path: "/api/harness/adaptive-wip", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/harness/goals", methods: &["POST"] },
-    RouteEntry { path: "/api/harness/goals/{id}", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/harness/goals/{id}/nodes", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/harness/planning-nodes/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/harness/planning-nodes/{id}/plan", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/harness/reconciliations", methods: &["POST"] },
-    RouteEntry { path: "/api/harness/reconciliations/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/harness/reconciliations/{id}/promote", methods: &["POST"] },
-    RouteEntry { path: "/api/harness/health", methods: &["GET"] },
-    RouteEntry { path: "/api/prefs", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/criteria/{id}", methods: &["GET", "PUT"] },
+    RouteEntry {
+        path: "/api/memories",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/memories/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/messages",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/messages/accountability",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/messages/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/messages/{id}/ack",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/messages/{id}/acted",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/schedules",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/schedules/runs",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/schedules/audit",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/schedules/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/schedules/{id}/run",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/schedules/shell",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/schedules/{id}/output",
+        methods: &["GET"],
+    },
+    // AMUX-5237: named clearance signals.
+    RouteEntry {
+        path: "/api/signals",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/signals/{name}",
+        methods: &["GET", "POST"],
+    },
+    // Event subscriptions (api/signals.rs `subscription_routes`, migration 0130).
+    RouteEntry {
+        path: "/api/subscriptions",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/emit",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/fires",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/catalog",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/events",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/subscriptions/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/verify/{id}",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/policy",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/policy/evaluate",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/policy/approvals",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/policy/receipts",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/harness/checkpoints/{id}",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/harness/handoffs/{id}",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/harness/budgets/{id}",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/harness/sensors",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/harness/sensors/{task_type}",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/harness/guides",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/harness/compile",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/harness/ratchet",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/harness/traces/{turn_id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/harness/work-metrics",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/harness/adaptive-wip",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/harness/goals",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/harness/goals/{id}",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/harness/goals/{id}/nodes",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/harness/planning-nodes/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/harness/planning-nodes/{id}/plan",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/harness/reconciliations",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/harness/reconciliations/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/harness/reconciliations/{id}/promote",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/harness/health",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/prefs",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/criteria/{id}",
+        methods: &["GET", "PUT"],
+    },
     // -- metrics / usage / alerts / stats
-    RouteEntry { path: "/api/metrics", methods: &["GET"] },
-    RouteEntry { path: "/api/metrics/host", methods: &["GET"] },
-    RouteEntry { path: "/api/metrics/host/history", methods: &["GET"] },
-    RouteEntry { path: "/api/metrics/fleet", methods: &["GET"] },
-    RouteEntry { path: "/api/metrics/replay", methods: &["GET"] },
-    RouteEntry { path: "/api/reclaim/scan", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/reclaim/scan/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/reclaim/scan/{id}/cancel", methods: &["POST"] },
-    RouteEntry { path: "/api/reclaim/tree/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/reclaim/quarantine", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/reclaim/quarantine/{id}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/reclaim/quarantine/{id}/restore", methods: &["POST"] },
-    RouteEntry { path: "/api/reclaim/snapshots", methods: &["GET"] },
-    RouteEntry { path: "/api/reclaim/skipped", methods: &["GET", "DELETE"] },
-    RouteEntry { path: "/api/usage", methods: &["GET"] },
-    RouteEntry { path: "/api/usage/attribution", methods: &["GET"] },
-    RouteEntry { path: "/api/usage/report.md", methods: &["GET"] },
-    RouteEntry { path: "/api/alert/config", methods: &["GET", "PATCH"] },
-    RouteEntry { path: "/api/alert/owner", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/stats/daily", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/metrics",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/host",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/host/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/host/pressure",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/workers",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/workers/live",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/telemetry",
+        methods: &["GET"],
+    },
+    // Worker boundaries (boundaries.toml) and resource awareness.
+    RouteEntry {
+        path: "/api/boundaries",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/resources",
+        methods: &["GET"],
+    },
+    // Agent trace archive (370787b2), pinned launchers and the credential vault.
+    RouteEntry {
+        path: "/api/traces",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/traces/file",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/palette",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/pinned",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/pinned/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/pinned/{id}/launch",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/vault",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/vault/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/vault/{id}/fill",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/vault/secrets",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/vault/secrets/import",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/vault/secrets/audit",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/vault/secrets/{id}",
+        methods: &["PUT", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/vault/secrets/{id}/reveal",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/vault/secrets/{id}/access",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/chat-delegate",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/chat-delegate/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/chatgpt-app",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/chatgpt-app/requests/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/chatgpt-app/requests/{id}/deny",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/chatgpt-app/grants/{id}/revoke",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/mcp",
+        methods: &["GET", "POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/oauth/register",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/oauth/authorize",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/oauth/authorize/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/oauth/token",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/.well-known/oauth-protected-resource",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/.well-known/oauth-protected-resource/mcp",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/.well-known/oauth-authorization-server",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/.well-known/openid-configuration",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/fleet",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/metrics/replay",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/scan",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/scan/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/scan/{id}/cancel",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/tree/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/quarantine",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/quarantine/{id}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/quarantine/{id}/restore",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/snapshots",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/reclaim/skipped",
+        methods: &["GET", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/tiering",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/tiering/config",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/tiering/folders",
+        methods: &["POST", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/tiering/move",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/tiering/run",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/usage",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/velocity",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/velocity/optimize",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/velocity/{worker}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/velocity/{worker}/projection",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/usage/attribution",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/usage/report.md",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/usage/accounts",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/usage/accounts/readings",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/alert/config",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/alert/owner",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/stats/daily",
+        methods: &["GET"],
+    },
     // -- branding
-    RouteEntry { path: "/api/branding", methods: &["GET", "POST", "DELETE"] },
-    RouteEntry { path: "/api/branding/asset/{fname}", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/branding",
+        methods: &["GET", "POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/branding/asset/{fname}",
+        methods: &["GET"],
+    },
     // -- email / calendar events
-    RouteEntry { path: "/api/email/send", methods: &["POST"] },
-    RouteEntry { path: "/api/email/reply", methods: &["POST"] },
-    RouteEntry { path: "/api/email/inbox", methods: &["GET"] },
-    RouteEntry { path: "/api/email/message/{id}", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/email/send",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/email/reply",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/email/inbox",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/email/message/{id}",
+        methods: &["GET"],
+    },
     RouteEntry {
         path: "/api/email/message/{id}/attachments/{attachment_id}",
         methods: &["GET"],
     },
-    RouteEntry { path: "/api/email/search", methods: &["GET"] },
-    RouteEntry { path: "/api/email/log", methods: &["GET"] },
-    RouteEntry { path: "/api/email/approve/{id}", methods: &["POST"] },
-    RouteEntry { path: "/api/email/reject/{id}", methods: &["POST"] },
-    RouteEntry { path: "/api/email/approvals", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/email/search",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/email/attachment",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/email/log",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/email/approve/{id}",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/email/reject/{id}",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/email/approvals",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/email/approvals/{id}/attachments/{index}",
+        methods: &["GET"],
+    },
     // AMUX-3998: email_intel's routes, merged into email::routes() so they
     // share its EmailCtx -- AMUX-93 found these were mounted and working
     // (a direct POST to /themes/refresh reached the real handler, HTTP 502
     // from a downstream model-call failure, not a 404) but never added
     // here, so route.callers_have_routes filed a false "no route matches"
     // against this static table rather than the live router.
-    RouteEntry { path: "/api/email/themes", methods: &["GET"] },
-    RouteEntry { path: "/api/email/themes/refresh", methods: &["POST"] },
-    RouteEntry { path: "/api/email/ranked", methods: &["GET"] },
-    RouteEntry { path: "/api/email/annotate", methods: &["POST"] },
-    RouteEntry { path: "/api/cal-events", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/cal-events/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry {
+        path: "/api/email/themes",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/email/themes/refresh",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/email/ranked",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/email/annotate",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/cal-events",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/cal-events/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    // Google Calendar (api/gcal.rs): live read-through and create against
+    // the connected Google grants. Distinct from /api/cal-events above.
+    RouteEntry {
+        path: "/api/gcal/accounts",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/gcal/events",
+        methods: &["GET", "POST"],
+    },
     // -- sessions (legacy list + native per-name verbs) / identity / scope
-    RouteEntry { path: "/api/sessions", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/sessions-git", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/sessions",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/sessions-git",
+        methods: &["GET"],
+    },
     // The git hooks' endpoint. Listed here because "is it routed?" was the
     // question nobody could answer for the whole cutover: the hook's
     // `except: return 0` hid the 405, so the only visible symptom was silence.
-    RouteEntry { path: "/api/git/staged-guard", methods: &["POST"] },
-    RouteEntry { path: "/api/git/observed-edits", methods: &["POST"] },
-    RouteEntry { path: "/api/git/guard-outcome", methods: &["POST"] },
-    RouteEntry { path: "/api/debug/guard-outcomes", methods: &["GET"] },
-    RouteEntry { path: "/api/sessions/{name}", methods: ANY },
-    RouteEntry { path: "/api/sessions/{name}/{*verb}", methods: ANY },
-    RouteEntry { path: "/api/identity", methods: &["GET"] },
-    RouteEntry { path: "/api/offline-origin", methods: &["GET"] },
-    RouteEntry { path: "/api/scope", methods: ANY },
+    RouteEntry {
+        path: "/api/git/staged-guard",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/git/observed-edits",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/git/guard-outcome",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/debug/guard-outcomes",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/sessions/{name}",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/sessions/{name}/{*verb}",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/identity",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/offline-origin",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/page-links",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}",
+        methods: &["DELETE", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}/api",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}/app-token",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/page-links/{id}/open",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/page-links/site-view",
+        methods: &["POST"],
+    },
+    // People's pictures (avatars.rs).
+    RouteEntry {
+        path: "/api/avatars",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/avatars/{email}",
+        methods: &["GET", "PUT", "DELETE"],
+    },
+    // What each person has open right now (whereabouts.rs).
+    RouteEntry {
+        path: "/api/presence/where",
+        methods: &["GET", "POST"],
+    },
+    // Copied file and worker links build on this (deep_links.rs).
+    RouteEntry {
+        path: "/api/deep-link",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/scope",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/audit",
+        methods: &["GET"],
+    },
+    // -- compliance (governance PR 21)
+    RouteEntry {
+        path: "/api/compliance/access-review",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/compliance/timeline",
+        methods: &["GET"],
+    },
     // -- browser
-    RouteEntry { path: "/api/browser/start", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/browser/routing/config",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/routing/request",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/start",
+        methods: &["POST"],
+    },
     // The simulator is nested inside browser::routes(), one composition level
     // below api/mod.rs. Keep its real verbs visible to request-log verdicts
     // and route.callers_have_routes, just like the desktop browser verbs.
-    RouteEntry { path: "/api/browser/ios/targets", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/ios/start", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/ios/status", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/ios/stop", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/ios/state", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/ios/screenshot", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/ios/screenshot/file", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/ios/action", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/ios/inspect", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/ios/inspect/clear", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/status", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/stop", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/identify", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/profiles", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/profile/create", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/profile/{name}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/browser/navigate", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/screenshot", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/screenshot/file", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/state", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/action", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/keepalive", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/inspect", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/inspect/clear", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/search", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/sessions", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/history", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/pw-profiles", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/save-profile", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/agent", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/profile/combine", methods: &["POST"] },
-    RouteEntry { path: "/api/browser/import/discover", methods: &["GET"] },
-    RouteEntry { path: "/api/browser/import", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/browser/ios/targets",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/state",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/screenshot",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/screenshot/file",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/action",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/inspect",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/ios/inspect/clear",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/identify",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/profiles",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/profiles/{name}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/browser/profile-for",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/profile/meta",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/sync-logins",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/complete-order",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/profile-access",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/profile/create",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/profile/{name}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/browser/navigate",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/screenshot",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/screenshot/file",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/state",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/action",
+        methods: &["POST"],
+    },
+    // Verb aliases for /action, and the profile list (4b084e95, AMUX-5490).
+    RouteEntry {
+        path: "/api/browser/profile/list",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/eval",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/click",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/type",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/key",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/scroll",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/wait",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/extract",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/back",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/resize",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/keepalive",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/hold",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/inspect",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/inspect/clear",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/search",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/sessions",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/pw-profiles",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/save-profile",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/agent",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/profile/combine",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/import/discover",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/import",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/context",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/screenshot",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/click",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/double_click",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/move",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/type",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/key",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/scroll",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/open",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/stop",
+        methods: &["POST"],
+    },
     // -- file viewer / files / fs
-    RouteEntry { path: "/api/file", methods: ANY },
-    RouteEntry { path: "/api/file/raw", methods: ANY },
-    RouteEntry { path: "/api/file/xlsx", methods: ANY },
-    RouteEntry { path: "/api/file/vtt", methods: ANY },
-    RouteEntry { path: "/api/file/prepare", methods: ANY },
-    RouteEntry { path: "/api/file/transcode", methods: ANY },
-    RouteEntry { path: "/api/library", methods: ANY },
-    RouteEntry { path: "/api/files", methods: &["GET"] },
-    RouteEntry { path: "/api/files/download", methods: &["GET"] },
-    RouteEntry { path: "/api/files/upload", methods: &["POST"] },
-    RouteEntry { path: "/api/files/mdai", methods: &["GET"] },
-    RouteEntry { path: "/api/files/mdai/run", methods: &["POST"] },
-    RouteEntry { path: "/api/files/mdai/history", methods: &["GET"] },
-    RouteEntry { path: "/api/files/mdai/connect", methods: &["POST"] },
-    RouteEntry { path: "/api/fs/mkdir", methods: ANY },
-    RouteEntry { path: "/api/fs/open", methods: ANY },
-    RouteEntry { path: "/api/fs/upload", methods: ANY },
-    RouteEntry { path: "/api/fs/rename", methods: ANY },
-    RouteEntry { path: "/api/fs/read", methods: ANY },
-    RouteEntry { path: "/api/fs/search", methods: ANY },
-    RouteEntry { path: "/api/fs/list", methods: ANY },
-    RouteEntry { path: "/api/fs/delete", methods: ANY },
-    RouteEntry { path: "/api/fs/resolve", methods: ANY },
-    RouteEntry { path: "/api/ls", methods: ANY },
-    RouteEntry { path: "/api/autocomplete/dir", methods: ANY },
+    RouteEntry {
+        path: "/api/file",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/raw",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/raw-path/{*rest}",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/hls",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/xlsx",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/vtt",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/prepare",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/history",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/preview-image",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/archive",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/sqlite",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/file/transcode",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/library",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/files",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/files/download",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/files/upload",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/run",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/graph",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/chat",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/connect",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/active",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/cancel",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/doc",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/files/mdai/chat",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/fs/mkdir",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/open",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/upload",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/rename",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/move",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/read",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/search",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/list",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/delete",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/resolve",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/fs/opened",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/ls",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/autocomplete/dir",
+        methods: ANY,
+    },
     // -- uploads
-    RouteEntry { path: "/api/upload/start", methods: &["POST"] },
-    RouteEntry { path: "/api/upload/{id}/chunk/{n}", methods: &["PUT"] },
-    RouteEntry { path: "/api/upload/{id}/finish", methods: &["POST"] },
-    RouteEntry { path: "/api/uploads/{filename}", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/upload/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/upload/{id}/chunk/{n}",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/upload/{id}/finish",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/uploads/{filename}",
+        methods: &["GET"],
+    },
     // -- groups / tags
-    RouteEntry { path: "/api/groups", methods: ANY },
-    RouteEntry { path: "/api/groups/{*rest}", methods: ANY },
-    RouteEntry { path: "/api/tags", methods: ANY },
+    RouteEntry {
+        path: "/api/groups",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/groups/{*rest}",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/tags",
+        methods: ANY,
+    },
+    // -- tailnet join (api/tailnet_join.rs)
+    RouteEntry {
+        path: "/api/tailnet/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/join",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/leave",
+        methods: &["POST"],
+    },
     // -- journal / layout presets
-    RouteEntry { path: "/api/journal", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/journal/tags", methods: &["GET"] },
-    RouteEntry { path: "/api/journal/config", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/journal/import", methods: &["POST"] },
-    RouteEntry { path: "/api/journal/media/{id}", methods: &["GET", "DELETE"] },
-    RouteEntry { path: "/api/journal/{id}", methods: &["GET", "PATCH", "DELETE"] },
-    RouteEntry { path: "/api/journal/{id}/media", methods: &["POST"] },
-    RouteEntry { path: "/api/layout-presets", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/layout-presets/{name}", methods: &["DELETE"] },
+    RouteEntry {
+        path: "/api/journal",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/journal/tags",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/journal/config",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/journal/import",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/journal/media/{id}",
+        methods: &["GET", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/journal/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/journal/{id}/media",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/layout-presets",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/layout-presets/{name}",
+        methods: &["DELETE"],
+    },
+    // -- Social posting (api/social.rs, AA-42)
+    RouteEntry {
+        path: "/api/social",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/social/posts",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/social/posts/track",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/social/posts/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/social/posts/{id}/metrics",
+        methods: &["GET"],
+    },
+    // The posting queue (api/social_publish.rs).
+    RouteEntry {
+        path: "/api/social/queue",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/social/queue/{id}/cancel",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/social/queue/{id}/reschedule",
+        methods: &["POST"],
+    },
     // -- New Worker / Connect modals (api/worker_create.rs, AMUX-2871)
-    RouteEntry { path: "/api/templates", methods: &["GET"] },
-    RouteEntry { path: "/api/git-check", methods: &["GET"] },
-    RouteEntry { path: "/api/git-branches", methods: &["GET"] },
-    RouteEntry { path: "/api/suggest-branch", methods: &["POST"] },
-    RouteEntry { path: "/api/tmux-sessions", methods: &["GET"] },
-    RouteEntry { path: "/api/iterm2/sessions", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/templates",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/git-check",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/git-branches",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/worktree-profiles",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/suggest-branch",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outcome/plan",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/plan",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/outcomes",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/outcomes/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/outcomes/{id}/change",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/stats",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/home",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/helpers",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/tidy",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/ideas",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/ideas/refresh",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/ideas/{id}/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/ideas/{id}/dismiss",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/goals",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/goals/{id}",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/intent/goals/{id}/check",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/goals/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/intent/reminders",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/intent/todos",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/tmux-sessions",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/iterm2/sessions",
+        methods: &["GET"],
+    },
+    // -- worker types + chat renderer (api/worker_exec.rs, ACW-1)
+    RouteEntry {
+        path: "/api/worker-types",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/sessions/{name}/chat",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/sessions/{name}/chat/stream",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/sessions/{name}/chat/interrupt",
+        methods: &["POST"],
+    },
+    // -- realtime rooms (api/rt.rs): WebSocket + SSE/POST fallback + debug
+    RouteEntry { path: "/api/rt", methods: &["GET"] },
+    RouteEntry { path: "/api/rt/events", methods: &["GET"] },
+    RouteEntry { path: "/api/rt/send", methods: &["POST"] },
+    RouteEntry { path: "/api/debug/rt", methods: &["GET"] },
+    // -- composer typing presence (api/typing.rs, AC-474)
+    RouteEntry {
+        path: "/api/sessions/{name}/typing",
+        methods: &["GET", "POST"],
+    },
+    // -- a worker's task-name changes, newest first (sessions_legacy::task_history)
+    RouteEntry {
+        path: "/api/sessions/{name}/task-history",
+        methods: &["GET"],
+    },
+    // -- retired worker names and the worker each became (session_verbs::session_renames)
+    RouteEntry {
+        path: "/api/session-renames",
+        methods: &["GET"],
+    },
+    // -- a worker's plan window and limit-killed agents (agent_limit_resume::worker_quota)
+    RouteEntry {
+        path: "/api/sessions/{name}/quota",
+        methods: &["GET"],
+    },
+    // -- every worker's tasks, oldest first (sessions_legacy::task_list, the Tasks tab)
+    RouteEntry {
+        path: "/api/task-history",
+        methods: &["GET"],
+    },
+    // -- the task each worker was on at given times (sessions_legacy::task_at_batch)
+    RouteEntry { path: "/api/task-history/at", methods: &["GET"] },
+    // -- one task's commits, closed requests and handoff (sessions_legacy::task_links)
+    RouteEntry { path: "/api/task-history/links", methods: &["GET"] },
+    RouteEntry { path: "/api/task-history/requests", methods: &["GET"] },
+    // -- Converse tab: voice conversations with a worker (api/converse.rs)
+    RouteEntry { path: "/api/converse/config", methods: &["GET"] },
+    RouteEntry { path: "/api/converse/sweep", methods: &["POST"] },
+    RouteEntry { path: "/api/converse/{worker}/realtime-session", methods: &["POST"] },
+    RouteEntry { path: "/api/converse/{worker}/conversations", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/converse/{worker}/conversations/{id}", methods: &["GET", "DELETE"] },
+    RouteEntry { path: "/api/converse/{worker}/conversations/{id}/audio", methods: &["GET", "PUT"] },
+    // -- Messages: channels, direct messages, worker threads (api/conversations.rs)
+    RouteEntry { path: "/api/conversations", methods: &["GET"] },
+    RouteEntry { path: "/api/conversations/search", methods: &["GET"] },
+    RouteEntry { path: "/api/conversations/mentions", methods: &["GET"] },
+    RouteEntry { path: "/api/conversations/{conv}/posts", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/conversations/{conv}/read", methods: &["POST"] },
+    RouteEntry { path: "/api/conversations/{conv}/typing", methods: &["POST"] },
+    RouteEntry { path: "/api/conversations/posts/{id}", methods: &["PATCH", "DELETE"] },
+    RouteEntry { path: "/api/conversations/posts/{id}/reactions", methods: &["POST"] },
+    RouteEntry { path: "/api/conversations/posts/{id}/pin", methods: &["POST"] },
+    RouteEntry { path: "/api/conversations/unfurl", methods: &["GET"] },
+    RouteEntry { path: "/api/conversations/channels", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/conversations/channels/{name}", methods: &["PATCH"] },
+    RouteEntry { path: "/api/conversations/channels/{name}/members", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/conversations/channels/{name}/members/{email}", methods: &["DELETE"] },
+    RouteEntry { path: "/api/profiles", methods: &["GET"] },
+    RouteEntry { path: "/api/profiles/avatar/{name}", methods: &["GET"] },
+    RouteEntry { path: "/api/profiles/{key}/avatar", methods: &["POST"] },
     // -- saved messages / habits / token-baseline reset (AMUX-2871)
-    RouteEntry { path: "/api/saved-messages", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/saved-messages/{id}", methods: &["DELETE", "PATCH"] },
-    RouteEntry { path: "/api/habits", methods: &["GET", "PUT"] },
+    RouteEntry {
+        path: "/api/saved-messages",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/saved-messages/{id}",
+        methods: &["DELETE", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/habits",
+        methods: &["GET", "PUT"],
+    },
     // CRM (AMUX-2929). Mounted via .nest("/api/crm", crm::routes()), which the
     // completeness test could not see until AMUX-2917 taught it to follow
     // nests — so these answered 200 while the census called them unrouted.
@@ -1563,214 +3229,1190 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // HTML — so the census was calling real routes unrouted. Found once the
     // completeness test learned to follow .nest() (AMUX-2917); it previously
     // scanned only api/mod.rs's own .route() calls.
-    RouteEntry { path: "/api/board/contract", methods: &["GET"] },
-    RouteEntry { path: "/api/board/derived", methods: &["GET"] },
-    RouteEntry { path: "/api/board/ready", methods: &["GET"] },
-    RouteEntry { path: "/api/board/drain", methods: &["GET"] },
-    RouteEntry { path: "/api/board/changes", methods: &["GET"] },
-    RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
-    RouteEntry { path: "/api/board/{id}/decompose", methods: &["POST"] },
-    RouteEntry { path: "/api/board/{id}/fan-out", methods: &["POST"] },
-    // b707aefd one-shot launch endpoint, caught unlisted by the completeness
-    // check in tests/route_table_completeness.rs minutes after it landed.
-    RouteEntry { path: "/api/board/launch", methods: &["POST"] },
-    RouteEntry { path: "/api/board/needsyou", methods: &["GET"] },
-    RouteEntry { path: "/api/schedules/{id}/skip", methods: &["POST"] },
-    RouteEntry { path: "/api/search", methods: &["GET"] },
-    RouteEntry { path: "/api/search/status", methods: &["GET"] },
-    RouteEntry { path: "/api/search/reindex", methods: &["POST"] },
-    RouteEntry { path: "/api/why", methods: &["GET"] },
-    RouteEntry { path: "/api/why/contract", methods: &["GET"] },
-    RouteEntry { path: "/api/why/{kind}/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/crm/contacts", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/crm/contacts/{id}", methods: &["GET", "PATCH", "DELETE"] },
-    RouteEntry { path: "/api/crm/contacts/{id}/interactions", methods: &["POST"] },
-    RouteEntry { path: "/api/crm/interactions/{id}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/crm/followups", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/board/contract",
+        methods: &["GET"],
+    },
+    // Per-rule verdict counts (contract rule 14, 52e13648).
+    RouteEntry {
+        path: "/api/contract/counters",
+        methods: &["GET"],
+    },
+    // The land queue (e52a4aef).
+    RouteEntry {
+        path: "/api/land",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/land/policy",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/land/{id}",
+        methods: &["DELETE"],
+    },
+    // The chat bridge (api/bridge.rs).
+    RouteEntry { path: "/api/bridge", methods: &["GET"] },
+    RouteEntry { path: "/api/bridge/links", methods: &["POST"] },
+    RouteEntry { path: "/api/bridge/links/{platform}/{conversation}", methods: &["DELETE"] },
+    RouteEntry { path: "/api/bridge/outbound/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/bridge/outbound/{id}/approve", methods: &["POST"] },
+    RouteEntry { path: "/api/bridge/hook/whatsapp", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/bridge/hook/slack", methods: &["POST"] },
+    // Outbound phone calls (api/calls.rs).
+    RouteEntry { path: "/api/calls", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/calls/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/calls/{id}/approve", methods: &["POST"] },
+    RouteEntry { path: "/api/calls/{id}/decline", methods: &["POST"] },
+    RouteEntry { path: "/api/calls/{id}/events", methods: &["POST"] },
+    RouteEntry { path: "/api/calls/{id}/result", methods: &["POST"] },
+    // The owner's approval of an owner-gated change (scripts/land_gate.py).
+    RouteEntry {
+        path: "/api/land/approvals",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/land/approvals/request",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/contract/done-line/{epic}",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/board/orchestrations",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/derived",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/ready",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/drain",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/changes",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/bulk-migrate",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}/decompose",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/needsyou",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/schedules/{id}/skip",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/search",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/search/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/search/reindex",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/why",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/why/contract",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/why/{kind}/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/contacts",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/contacts/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/contacts/{id}/interactions",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/interactions/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/followups",
+        methods: &["GET"],
+    },
     // Speedtest (AMUX-2890): the Metrics tab's Run-speed-test button, unrouted
     // since the python retirement — clicks errored against the SPA catch-all.
-    RouteEntry { path: "/api/speedtest/download", methods: &["GET"] },
-    RouteEntry { path: "/api/speedtest/upload", methods: &["POST"] },
-    RouteEntry { path: "/api/stats/reset", methods: &["POST"] },
-    RouteEntry { path: "/api/observability", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/speedtest/download",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/speedtest/upload",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/stats/reset",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/observability",
+        methods: &["GET"],
+    },
     // Connectors (integrations): registry + status, credential paste, OAuth
     // begin/callback, live Test, and the DWD token mint (AMUX-3362). `list` is
     // GET; credentials/auth/test/token are POST; callback is the GET landing.
     // POST declares a connector at runtime, DELETE forgets one (AMUX-3993).
     // Owner-approved ad-hoc permission grants (AMUX-3997).
-    RouteEntry { path: "/api/config/cross-group", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/config/board-drain", methods: &["GET", "PUT"] },
-    RouteEntry { path: "/api/grants", methods: &["GET"] },
-    RouteEntry { path: "/api/grants/{id}/approve", methods: &["POST"] },
-    RouteEntry { path: "/api/grants/{id}/reject", methods: &["POST"] },
-    RouteEntry { path: "/api/connectors", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/connectors/{id}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },
-    RouteEntry { path: "/api/connectors/{id}/credentials", methods: &["POST"] },
-    RouteEntry { path: "/api/connectors/{id}/auth", methods: &["POST"] },
-    RouteEntry { path: "/api/connectors/{id}/test", methods: &["POST"] },
-    RouteEntry { path: "/api/connectors/{id}/token", methods: &["POST"] },
-    RouteEntry { path: "/api/connectors/{family}/callback", methods: &["GET"] },
-    RouteEntry { path: "/api/telegram/status", methods: &["GET"] },
-    RouteEntry { path: "/api/telegram/mappings", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/telegram/mappings/{chat_id}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/telegram/send", methods: &["POST"] },
-    RouteEntry { path: "/api/pull", methods: &["POST"] },
-    RouteEntry { path: "/api/proxies", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/proxies/{id}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/proxies/{id}/start", methods: &["POST"] },
-    RouteEntry { path: "/api/proxies/{id}/stop", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/config/cross-group",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/config/board-drain",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/grants",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/grants/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/grants/{id}/reject",
+        methods: &["POST"],
+    },
+    // AMUX-5270 standing approvals.
+    RouteEntry {
+        path: "/api/approvals/standing",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/approvals/standing/uses",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/approvals/standing/check",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/approvals/standing/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    // AMUX-5286 needs-input triage queue.
+    RouteEntry {
+        path: "/api/needs-input",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/needs-input/snooze",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/needs-input/log",
+        methods: &["POST"],
+    },
+    // AMUX-5301 automatic approval of needs-input items.
+    RouteEntry {
+        path: "/api/needs-input/auto",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/needs-input/auto/sweep",
+        methods: &["POST"],
+    },
+    // A named sender's interrupting instruction, which the worker has to answer.
+    RouteEntry {
+        path: "/api/sessions/{name}/directive",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/directives",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/directives/{id}/ack",
+        methods: &["POST"],
+    },
+    // Z15 daily decision digest.
+    RouteEntry {
+        path: "/api/decision-digest",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/decision-digest/veto",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/decision-digest/recommendation",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/connectors",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/connectors/{id}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/connectors/accounts",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/connectors/maintenance",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/photos/mixpeek",
+        methods: &["GET", "POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/connectors/{id}/credentials",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/connectors/{id}/auth",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/connectors/{id}/test",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/connectors/{id}/accounts/{account}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/connectors/{id}/token",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/connectors/{family}/callback",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/telegram/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/telegram/mappings",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/telegram/mappings/{chat_id}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/telegram/send",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/pull",
+        methods: &["GET", "POST"],
+    },
     // AMUX-2888: mounted ahead of the tunnel client port so the SPA panel and
     // `amux tunnel` stop getting a 404 (status) and a 405 (the POSTs, from the
     // GET-only SPA catch-all) — neither of which a caller can tell from "amux
     // is broken".
-    RouteEntry { path: "/api/tunnel/status", methods: &["GET"] },
-    RouteEntry { path: "/api/tunnel/start", methods: &["POST"] },
-    RouteEntry { path: "/api/tunnel/stop", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/tunnel/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/tunnel/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/tunnel/stop",
+        methods: &["POST"],
+    },
     // The D1-exit pair. Reached by the bash CLI's own curl, which the caller
     // census does not enumerate — so these 405'd for the whole cutover while
     // every layer that mentions them kept routing sessions at them.
-    RouteEntry { path: "/api/board/{id}/status-request", methods: &["POST"] },
-    RouteEntry { path: "/api/board/{id}/status-update", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/board/{id}/status-request",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/{id}/status-update",
+        methods: &["POST"],
+    },
     // AMUX-3131: `amux board claim <id>` POSTs here; it was unmounted (405) and
     // the CLI exited 0 with the card untouched. Now routed to claim_card.
-    RouteEntry { path: "/api/board/{id}/claim", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/board/{id}/claim",
+        methods: &["POST"],
+    },
     // -- skills / slash-commands / map / history
-    RouteEntry { path: "/api/mcp", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/mcp/{name}", methods: &["DELETE"] },
+    RouteEntry {
+        path: "/api/mcp",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/mcp/{name}",
+        methods: &["DELETE"],
+    },
     // GET-only ollama model listing (workers::ollama_models) — mounted in
     // api/mod.rs on the AMUX-3145 ollama work but never tabled, so the route
     // census reported it unrouted while it answered fine (AMUX-2871 class).
-    RouteEntry { path: "/api/ollama/models", methods: &["GET"] },
-    RouteEntry { path: "/api/models", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/ollama/models",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/peek/steps",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/models",
+        methods: &["GET"],
+    },
+    // Scratchpad expiry setting (Ethan, 2026-10-09).
+    RouteEntry {
+        path: "/api/scratchpad/config",
+        methods: &["GET", "PUT"],
+    },
     // Mounted-but-untabled, all found by curling the census's "missing" list
     // against the live server (AMUX-2871). Each was reported as unrouted while
     // answering, because the census reads this table.
-    RouteEntry { path: "/api/client-debug", methods: &["GET", "POST"] },
+    RouteEntry {
+        path: "/api/client-debug",
+        methods: &["GET", "POST"],
+    },
     // Both of screen::routes()'s paths. The census reads this TABLE, so a
     // mounted-but-unlisted route answers fine while every count reports it as
     // unrouted (AMUX-4661's route, listed here after proxy_composition and this
     // census both went red on origin/main).
-    RouteEntry { path: "/api/screen/capture", methods: &["GET"] },
-    RouteEntry { path: "/api/screen/capture/file", methods: &["GET"] },
-    RouteEntry { path: "/api/memory/global", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/review/week", methods: &["GET"] },
-    RouteEntry { path: "/api/review/digest", methods: &["GET"] },
-    RouteEntry { path: "/api/channels", methods: &["GET"] },
-    RouteEntry { path: "/api/channels/{a}/{b}/messages", methods: &["GET", "POST", "DELETE"] },
-    RouteEntry { path: "/api/log-search", methods: &["GET"] },
-    RouteEntry { path: "/api/sql", methods: &["POST"] },
-    RouteEntry { path: "/api/sql/schema", methods: &["GET"] },
-    RouteEntry { path: "/api/sql/rows", methods: &["GET"] },
-    RouteEntry { path: "/api/skills", methods: &["GET"] },
-    RouteEntry { path: "/api/skills/{name}", methods: &["GET", "POST", "DELETE"] },
-    RouteEntry { path: "/api/slash-commands", methods: &["GET"] },
-    RouteEntry { path: "/api/slash-commands/{name}", methods: &["GET"] },
-    RouteEntry { path: "/api/map", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/map/pins", methods: &["POST"] },
-    RouteEntry { path: "/api/map/search", methods: &["GET"] },
-    RouteEntry { path: "/api/graph/fleet", methods: &["GET"] },
-    RouteEntry { path: "/api/graph/board", methods: &["GET"] },
-    RouteEntry { path: "/api/graph/board/verify", methods: &["GET"] },
-    RouteEntry { path: "/api/graph/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/graph/{id}/import-vault", methods: &["POST"] },
-    RouteEntry { path: "/api/graph/{id}/nodes/{nid}", methods: &["PATCH"] },
-    RouteEntry { path: "/api/terminal/create", methods: &["POST"] },
-    RouteEntry { path: "/api/terminal/{id}/input", methods: &["POST"] },
-    RouteEntry { path: "/api/terminal/{id}/resize", methods: &["POST"] },
-    RouteEntry { path: "/api/terminal/{id}/output", methods: &["GET"] },
-    RouteEntry { path: "/api/terminal/{id}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/reports/types", methods: &["GET"] },
-    RouteEntry { path: "/api/reports", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/reports/{id}", methods: &["DELETE", "PATCH"] },
-    RouteEntry { path: "/api/reports/{id}/refresh", methods: &["POST"] },
-    RouteEntry { path: "/api/reports/{id}/data", methods: &["GET"] },
-    RouteEntry { path: "/api/env/apply", methods: &["POST"] },
-    RouteEntry { path: "/api/env/schema", methods: &["GET"] },
-    RouteEntry { path: "/api/history", methods: &["GET", "POST", "DELETE"] },
-    RouteEntry { path: "/api/history/import", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/screen/capture",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/screen/capture/file",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/memory/global",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/review/week",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/review/digest",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/channels",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/channels/{a}/{b}/messages",
+        methods: &["GET", "POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/log-search",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/sql",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/sql/ask",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/sql/schema",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/sql/rows",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/pages",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}",
+        methods: &["GET", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/html",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/sql",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/ask",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/version",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/file",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/snapshots",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/pages/{name}/restore",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/pages/{name}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/pages/{name}/",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/skills",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/skills/usage",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/skills/{name}",
+        methods: &["GET", "POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/skills/{name}/examples",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/slash-commands",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/slash-commands/{name}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/map/pins",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/search",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/meta",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/map/pins/bulk",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/pins/merge",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/pins/{id}",
+        methods: &["PUT", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/map/pins/{id}/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/duplicates",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/visits/match",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/places/link",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/places/refresh",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/lists/{id}/share",
+        methods: &["GET", "POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/share/map/{token}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/s/map/{token}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/location/points",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/map/location/points/range",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/map/location/visits",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/location/timeline",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/location/segments/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/location/summary",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/location/motion",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/map/location/stats",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/location/heatmap",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/map/location/export",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/graph/fleet",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/graph/board",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/graph/board/verify",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/graph/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/graph/{id}/import-vault",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/graph/{id}/nodes/{nid}",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/terminal/create",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/terminal/{id}/input",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/terminal/{id}/resize",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/terminal/{id}/output",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/terminal/{id}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/join",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/tailnet/leave",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/reports/types",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/reports",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/reports/{id}",
+        methods: &["DELETE", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/reports/{id}/refresh",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/reports/{id}/data",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/env/apply",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/env/schema",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/history",
+        methods: &["GET", "POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/history/import",
+        methods: &["POST"],
+    },
+    // gs12 review finding 9: dry-run count, owner-only apply.
+    RouteEntry {
+        path: "/api/history/redact-stored",
+        methods: &["POST"],
+    },
+    // Rebuild cmd_history rows from session_events: dry run, owner-only apply.
+    RouteEntry {
+        path: "/api/history/backfill",
+        methods: &["POST"],
+    },
     // AMUX-4664: ask a question of the messages.
-    RouteEntry { path: "/api/history/ask", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/history/ask",
+        methods: &["POST"],
+    },
     // Nested sub-router routes that were missing from the table (AMUX-3083): they
     // answer for real (POST /api/orchestrate/plan -> 400 transcript-required, GET
     // /api/history/{id} -> the row) while /api/debug/routes and the
     // route.callers_have_routes census read the TABLE and reported them unrouted.
     // Caught by tests/route_table.rs's completeness scan (both were named).
-    RouteEntry { path: "/api/history/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/history/{id}/card", methods: &["PUT"] },
-    RouteEntry { path: "/api/orchestrate/plan", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/history/pins",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/history/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/history/{id}/pin",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/history/{id}/reply",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/history/{id}/card",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/orchestrate/plan",
+        methods: &["POST"],
+    },
     // -- logs (this module)
-    RouteEntry { path: "/api/logs", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/logs",
+        methods: &["GET"],
+    },
     // Ported in d177625. Missing from this table meant /api/debug/routes
     // reported it NOT MOUNTED while the handler was answering — the instrument
     // CLAUDE.md tells people to consult instead of grepping, lying about the
     // very route that was just added.
-    RouteEntry { path: "/api/lookup", methods: &["POST"] },
-    RouteEntry { path: "/api/lookup/bulk", methods: &["POST"] },
-    RouteEntry { path: "/api/skin", methods: &["GET"] },
-    RouteEntry { path: "/api/config/export", methods: &["GET"] },
-    RouteEntry { path: "/api/config/apply", methods: &["PUT"] },
-    RouteEntry { path: "/api/board/themes", methods: &["GET"] },
-    RouteEntry { path: "/api/board/commit-mentions", methods: &["GET"] },
-    RouteEntry { path: "/api/board/deleted-substrate", methods: &["GET"] },
-    RouteEntry { path: "/api/logs/raw", methods: &["GET"] },
-    RouteEntry { path: "/api/logs/analyze", methods: &["GET"] },
-    RouteEntry { path: "/api/logs/stats", methods: &["GET"] },
-    RouteEntry { path: "/api/logs/writers", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/lookup",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/lookup/bulk",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/skin",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/config/export",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/config/apply",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/move/export",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/move/import",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/board/themes",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/commit-mentions",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/board/deleted-substrate",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/logs/raw",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/logs/analyze",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/logs/stats",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/logs/writers",
+        methods: &["GET"],
+    },
     // -- settings / push / dictation
-    RouteEntry { path: "/api/settings/default-model", methods: &["GET", "PATCH"] },
-    RouteEntry { path: "/api/settings/commit-guard", methods: &["GET", "PATCH"] },
-    RouteEntry { path: "/api/settings/task-guard", methods: &["GET", "PATCH"] },
-    RouteEntry { path: "/api/settings/env", methods: &["GET", "PATCH"] },
-    RouteEntry { path: "/api/push/public-key", methods: &["GET"] },
-    RouteEntry { path: "/api/push/subscribe", methods: &["POST"] },
-    RouteEntry { path: "/api/push/unsubscribe", methods: &["POST"] },
-    RouteEntry { path: "/api/push/test", methods: &["POST"] },
-    RouteEntry { path: "/api/push/subscriptions", methods: &["GET"] },
-    RouteEntry { path: "/api/dictation/history", methods: &["GET"] },
-    RouteEntry { path: "/api/dictation/history/{id}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/dictation/history/{id}/edit", methods: &["POST"] },
-    RouteEntry { path: "/api/dictation/dict", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/dictation/dict/{id}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/dictation/config", methods: ANY },
-    RouteEntry { path: "/api/dictate", methods: &["POST"] },
-    RouteEntry { path: "/api/recordings", methods: &["GET"] },
-    RouteEntry { path: "/api/recordings/config", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/recordings/upload", methods: &["POST"] },
-    RouteEntry { path: "/api/recordings/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/recordings/{id}/transcribe", methods: &["POST"] },
-    RouteEntry { path: "/api/tts", methods: &["POST"] },
-    RouteEntry { path: "/api/tts/voices", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/settings/default-model",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/settings/commit-guard",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/settings/task-guard",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/settings/env",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/push/public-key",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/push/subscribe",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/push/unsubscribe",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/push/test",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/push/subscriptions",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/dictation/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/dictation/history/{id}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/dictation/history/{id}/edit",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/dictation/dict",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/dictation/dict/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/dictation/config",
+        methods: ANY,
+    },
+    RouteEntry {
+        path: "/api/dictation/settings",
+        methods: &["GET", "PUT"],
+    },
+    RouteEntry {
+        path: "/api/dictate",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/transcription",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/recordings",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/recordings/config",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/recordings/upload",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/recordings/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/recordings/{id}/transcribe",
+        methods: &["POST"],
+    },
+    // Recording sessions (docs/design/recorder.md).
+    RouteEntry {
+        path: "/api/recordings/sessions",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/recordings/sessions/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/recordings/sessions/{id}/chunks/{track}/{seq}",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/recordings/sessions/{id}/finish",
+        methods: &["POST"],
+    },
+    // Live transcripts, meeting notes and filing (api/recording_live.rs).
+    RouteEntry {
+        path: "/api/recordings/options",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/recordings/sessions/{id}/live",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/recordings/sessions/{id}/notes",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/recordings/{id}/notes",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/recordings/sessions/{id}/send-to",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/recordings/{id}/send",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/recordings/{id}/edit",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/tts",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/tts/voices",
+        methods: &["GET"],
+    },
     // -- torrents / org / gmail
-    RouteEntry { path: "/api/torrents", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/torrents/config", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/torrents/{gid}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/torrents/{gid}/file", methods: &["GET"] },
-    RouteEntry { path: "/api/torrents/{gid}/{action}", methods: &["POST"] },
-    RouteEntry { path: "/api/org", methods: &["GET", "PATCH"] },
-    RouteEntry { path: "/api/org/members", methods: &["GET"] },
-    RouteEntry { path: "/api/org/members/{id}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/org/teams", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/org/teams/{id}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/org/invites", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/org/invites/{token}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/gmail/accounts", methods: &["GET"] },
-    RouteEntry { path: "/api/gmail/auth", methods: &["GET"] },
-    RouteEntry { path: "/api/gmail/account", methods: &["DELETE"] },
-    RouteEntry { path: "/api/gmail/connect", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/torrents",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/torrents/config",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/torrents/{gid}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/torrents/{gid}/file",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/torrents/{gid}/{action}",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/org",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/org/members",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/org/members/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/org/teams",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/org/teams/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/org/invites",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/org/invites/{token}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/gmail/accounts",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/gmail/auth",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/gmail/account",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/gmail/connect",
+        methods: &["POST"],
+    },
     // Mailbox half (api/gmail.rs, AMUX-2883).
-    RouteEntry { path: "/api/gmail/labels", methods: &["GET"] },
-    RouteEntry { path: "/api/gmail/inbox", methods: &["GET"] },
-    RouteEntry { path: "/api/gmail/thread/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/gmail/send", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/gmail/labels",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/gmail/inbox",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/gmail/thread/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/gmail/send",
+        methods: &["POST"],
+    },
     // Merged-router routes the census scanner could not see until it learned
     // to follow `.merge()` (AMUX-2883's table pass): four runtime-jobs debug
     // surfaces and the workers-spelling of the session verb dispatcher.
-    RouteEntry { path: "/api/debug/steering", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/board-drive", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/autofix", methods: &["GET"] },
-    RouteEntry { path: "/api/debug/storage", methods: &["GET"] },
-
+    RouteEntry {
+        path: "/api/debug/steering",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/board-drive",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/autofix",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/debug/storage",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/ledger",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/ledger/verify",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/audit/export",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/audit/holds",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/audit/holds/{id}/lift",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/audit/person",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/audit/person/erase",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/audit/kill-switch",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/mfa/enroll",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/enroll/confirm",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/verify",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/step-up",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/recovery-codes",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/mfa/reset",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/sso/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/scim/tokens",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/scim/tokens/{id}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/trace/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/otel/v1/logs",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/otel/v1/metrics",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/ledger/checkpoints",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/ledger/checkpoints/key",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/ledger/at/{seq}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/capabilities",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/approvals/decide",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/approvals/cards",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/land/approvals/reject",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/schedules/{id}/reown",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/sponsor",
+        methods: &["PUT"],
+    },
+    RouteEntry {
+        path: "/api/org/members/{email}/offboard",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/sandbox",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/workers/{name}/isolation",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/security/at-rest",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/security/at-rest/decrypt",
+        methods: &["POST"],
+    },
 ];
 
 /// Match `path` against an axum-style pattern, returning a specificity score
@@ -1785,7 +4427,11 @@ fn pattern_score(pattern: &str, path: &str) -> Option<u32> {
     for (pi, p) in pat.iter().enumerate() {
         if p.starts_with("{*") {
             // Tail wildcard: consumes the (non-empty) remainder.
-            return if segs.len() > i && pi == pat.len() - 1 { Some(score) } else { None };
+            return if segs.len() > i && pi == pat.len() - 1 {
+                Some(score)
+            } else {
+                None
+            };
         }
         let s = segs.get(i)?;
         if p.starts_with('{') {
@@ -1797,7 +4443,11 @@ fn pattern_score(pattern: &str, path: &str) -> Option<u32> {
         }
         i += 1;
     }
-    if i == segs.len() { Some(score) } else { None }
+    if i == segs.len() {
+        Some(score)
+    } else {
+        None
+    }
 }
 
 /// The table entry axum would dispatch `path` to (most specific match).
@@ -1821,7 +4471,13 @@ pub fn normalize_target(path: &str) -> String {
     }
     path.split('/')
         .enumerate()
-        .map(|(i, seg)| if i >= 3 && !seg.is_empty() && id_ish(seg) { "{id}" } else { seg })
+        .map(|(i, seg)| {
+            if i >= 3 && !seg.is_empty() && id_ish(seg) {
+                "{id}"
+            } else {
+                seg
+            }
+        })
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -1903,7 +4559,9 @@ pub fn normalize_target_verb(path: &str) -> String {
 /// share of its group, not by recency, so a fixed collision keeps showing until
 /// it ages out of the window. Read `last` before filing anything from it.
 fn param_literals_of(path: &str) -> Vec<String> {
-    let Some(e) = best_route(path) else { return Vec::new() };
+    let Some(e) = best_route(path) else {
+        return Vec::new();
+    };
     let want = path.split('?').next().unwrap_or(path);
     e.path
         .split('/')
@@ -1920,7 +4578,9 @@ fn param_literals_of(path: &str) -> Vec<String> {
 /// The methods actually mounted where `path` dispatches (`["*"]` = any), or
 /// empty when no route claims the path at all.
 pub(crate) fn routed_methods_at(path: &str) -> Vec<&'static str> {
-    best_route(path).map(|e| e.methods.to_vec()).unwrap_or_default()
+    best_route(path)
+        .map(|e| e.methods.to_vec())
+        .unwrap_or_default()
 }
 
 /// Up to `n` sibling routes by shared prefix — the "did you mean" list for
@@ -1954,7 +4614,14 @@ pub(crate) fn nearest_routes(path: &str, n: usize) -> Vec<&'static str> {
 /// sample choice) must be order-independent, or flipping the scan direction
 /// creates the inverse defect — see the min/max and sample_ts rules in the
 /// group assembly.
+#[cfg(not(test))]
 const ANALYZE_SCAN_CAP: i64 = 200_000;
+// The over-cap test crosses this cap with 2.6k rows instead of 260k: inserting
+// those through a debug SQLite with five indexes took 227 to 280 s, the whole
+// tail of the lib suite (docs/design/cicd-two-minutes.md, Z8). Every behaviour
+// it pins is relative to the cap, so a hundredth of it pins the same edges.
+#[cfg(test)]
+const ANALYZE_SCAN_CAP: i64 = 2_000;
 /// Groups returned by /analyze (sorted by count desc before the cut).
 const ANALYZE_GROUP_CAP: usize = 200;
 /// slow_outliers cap in /stats.
@@ -2045,7 +4712,10 @@ fn rejected_ack_of(session: &str, error_body: Option<&str>) -> Option<RejectedAc
     let sent = b.get("you_sent").cloned().unwrap_or(Value::Null);
     Some((
         session.to_string(),
-        b.get("attempted_status").and_then(Value::as_str).unwrap_or("").to_string(),
+        b.get("attempted_status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         serde_json::to_string(&sent).ok()?,
         serde_json::to_string(gate).ok()?,
     ))
@@ -2106,7 +4776,10 @@ async fn analyze(
                 client_ip.as_deref().unwrap_or(""),
             );
             let has_body = error_body.as_deref().is_some_and(|b| !b.is_empty());
-            let interaction = req_meta.as_deref().and_then(|m| serde_json::from_str::<Value>(m).ok()).unwrap_or(Value::Null);
+            let interaction = req_meta
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<Value>(m).ok())
+                .unwrap_or(Value::Null);
             let sample = json!({
                 "ts": ts, "when": local_when(ts), "method": method, "path": path,
                 "status": status, "latency_ms": latency_ms,
@@ -2173,9 +4846,13 @@ async fn analyze(
     }
 
     let mut sorted: Vec<ErrGroup> = groups.into_values().collect();
-    sorted.sort_by(|a, b| b.count.cmp(&a.count).then(
-        b.last_ts.partial_cmp(&a.last_ts).unwrap_or(std::cmp::Ordering::Equal),
-    ));
+    sorted.sort_by(|a, b| {
+        b.count.cmp(&a.count).then(
+            b.last_ts
+                .partial_cmp(&a.last_ts)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
     let groups_total = sorted.len();
     sorted.truncate(ANALYZE_GROUP_CAP);
 
@@ -2384,7 +5061,11 @@ async fn analyze(
 pub(crate) fn verdict_405(method: &str, target: &str, routed: &[&str], raw_path: &str) -> String {
     if routed.is_empty() {
         let near = nearest_routes(raw_path, 3);
-        let near = if near.is_empty() { String::from("none") } else { near.join(", ") };
+        let near = if near.is_empty() {
+            String::from("none")
+        } else {
+            near.join(", ")
+        };
         format!(
             "{method} {target}: no route exists at this path — the 405 is the GET-only \
              SPA catch-all answering a non-GET; treat as an unknown path (404-class). \
@@ -2398,7 +5079,10 @@ pub(crate) fn verdict_405(method: &str, target: &str, routed: &[&str], raw_path:
             routed.join(", ")
         )
     } else {
-        format!("{method} {target}: not routed; routed there: {}", routed.join(", "))
+        format!(
+            "{method} {target}: not routed; routed there: {}",
+            routed.join(", ")
+        )
     }
 }
 
@@ -2475,7 +5159,11 @@ async fn stats(
     // was ASKED for rather than the slice that fitted, which is what makes the
     // norm a norm again.
     let window_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM _amux_request_log WHERE ts >= ?1", [cutoff], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM _amux_request_log WHERE ts >= ?1",
+            [cutoff],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let stride: i64 = if window_rows > ANALYZE_SCAN_CAP {
         (window_rows + ANALYZE_SCAN_CAP - 1) / ANALYZE_SCAN_CAP
@@ -2581,7 +5269,8 @@ async fn stats(
     let mut all_clients: std::collections::BTreeSet<String> = Default::default();
     let mut all_origins: std::collections::BTreeMap<String, u64> = Default::default();
     for (family, mut acc) in fams {
-        acc.latencies.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        acc.latencies
+            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = acc.latencies.len();
         let p50 = percentile_sorted(&acc.latencies, 0.50);
         let p95 = percentile_sorted(&acc.latencies, 0.95);
@@ -2595,7 +5284,11 @@ async fn stats(
         all_workers.extend(acc.workers.iter().cloned());
         all_clients.extend(acc.clients.iter().cloned());
         #[allow(clippy::cast_precision_loss)]
-        let error_rate = if n == 0 { 0.0 } else { acc.error_count as f64 / n as f64 };
+        let error_rate = if n == 0 {
+            0.0
+        } else {
+            acc.error_count as f64 / n as f64
+        };
         fam_rows.push((
             family.clone(),
             json!({
@@ -2627,8 +5320,12 @@ async fn stats(
                      WHERE family = ?1 AND ts >= ?2 AND latency_ms > ?3 \
                      ORDER BY latency_ms DESC LIMIT ?4",
                 )?;
-                let mut rows =
-                    stmt.query(rusqlite::params![family, cutoff, threshold, OUTLIER_CAP as i64])?;
+                let mut rows = stmt.query(rusqlite::params![
+                    family,
+                    cutoff,
+                    threshold,
+                    OUTLIER_CAP as i64
+                ])?;
                 while let Some(r) = rows.next()? {
                     let ts: f64 = r.get(0)?;
                     let method: String = r.get(1)?;
@@ -2813,7 +5510,10 @@ const WRITERS_CAP: usize = 500;
 /// its own (uncapped `done_limit`, no-cards-here means UNKNOWN, and
 /// `max(created, updated)`), and it belongs to the reader making the
 /// accusation. This endpoint answers the half that was measured wrongly.
-async fn writers(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn writers(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let since_h = since_h_of(&q);
     let cutoff = unix_now() - since_h * 3600.0;
 
@@ -2834,7 +5534,11 @@ async fn writers(State(state): State<AppState>, Query(q): Query<HashMap<String, 
         Err(e) => return internal(e),
     };
 
-    let holes = MUTATING_METHODS.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let holes = MUTATING_METHODS
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT COALESCE(NULLIF(amux_session,''),''), method, COUNT(*), MIN(ts), MAX(ts) \
          FROM _amux_request_log \
@@ -2866,9 +5570,9 @@ async fn writers(State(state): State<AppState>, Query(q): Query<HashMap<String, 
                 unattributed += n;
                 continue;
             }
-            let e = by_session.entry(sess).or_insert_with(|| {
-                (0, serde_json::Map::new(), f64::MAX, f64::MIN)
-            });
+            let e = by_session
+                .entry(sess)
+                .or_insert_with(|| (0, serde_json::Map::new(), f64::MAX, f64::MIN));
             e.0 += n;
             e.1.insert(method, json!(n));
             e.2 = e.2.min(first);
@@ -2895,9 +5599,15 @@ async fn writers(State(state): State<AppState>, Query(q): Query<HashMap<String, 
         })
         .collect();
     list.sort_by(|a, b| {
-        let (ca, cb) = (a["mutations"].as_u64().unwrap_or(0), b["mutations"].as_u64().unwrap_or(0));
+        let (ca, cb) = (
+            a["mutations"].as_u64().unwrap_or(0),
+            b["mutations"].as_u64().unwrap_or(0),
+        );
         cb.cmp(&ca).then_with(|| {
-            a["amux_session"].as_str().unwrap_or("").cmp(b["amux_session"].as_str().unwrap_or(""))
+            a["amux_session"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["amux_session"].as_str().unwrap_or(""))
         })
     });
     let truncated = list.len() > WRITERS_CAP;
@@ -2955,10 +5665,25 @@ fn round4(v: f64) -> f64 {
 /// Every family claimed by a NAMED tab. `http` is the complement of this set,
 /// so the two definitions cannot disagree about what "everything else" means.
 const NAMED_CATEGORY_FAMILIES: &[&str] = &[
-    "/api/board", "/api/board-lifecycle", "/api/schedules", "/api/cal-events", "/api/calendar",
-    "/api/sessions", "/api/workers", "/api/sessions-git", "/api/channels",
-    "/api/memory", "/api/memories", "/api/scope", "/api/notes",
-    "/api/fs", "/api/file", "/api/files", "/api/upload", "/api/uploads", "/api/library",
+    "/api/board",
+    "/api/board-lifecycle",
+    "/api/schedules",
+    "/api/cal-events",
+    "/api/calendar",
+    "/api/sessions",
+    "/api/workers",
+    "/api/sessions-git",
+    "/api/channels",
+    "/api/memory",
+    "/api/memories",
+    "/api/scope",
+    "/api/notes",
+    "/api/fs",
+    "/api/file",
+    "/api/files",
+    "/api/upload",
+    "/api/uploads",
+    "/api/library",
 ];
 
 /// The families a tab selects. Empty for `http`, which is the complement.
@@ -2987,7 +5712,11 @@ fn families_for_category(cat: &str) -> Vec<&'static str> {
 /// category, and the All tab shows it regardless.
 fn category_of(family: &str) -> &'static str {
     match family {
-        "/api/board" | "/api/board-lifecycle" | "/api/schedules" | "/api/cal-events" | "/api/calendar" => "board",
+        "/api/board"
+        | "/api/board-lifecycle"
+        | "/api/schedules"
+        | "/api/cal-events"
+        | "/api/calendar" => "board",
         "/api/sessions" | "/api/workers" | "/api/sessions-git" | "/api/channels" => "session",
         "/api/memory" | "/api/memories" | "/api/scope" | "/api/notes" => "memory",
         "/api/fs" | "/api/file" | "/api/files" | "/api/upload" | "/api/uploads"
@@ -2999,7 +5728,8 @@ fn category_of(family: &str) -> &'static str {
 pub async fn debug_routes() -> axum::Json<Value> {
     let proxied = |path: &str| {
         super::py_proxy::PROXIED_FAMILIES.iter().any(|f| {
-            path == f.family || (path.starts_with(f.family) && path[f.family.len()..].starts_with('/'))
+            path == f.family
+                || (path.starts_with(f.family) && path[f.family.len()..].starts_with('/'))
         })
     };
     // AF-320: the population here is the route table itself, so a truncated or
@@ -3054,7 +5784,11 @@ mod tests {
     fn param_literals_keep_the_value_that_a_normalized_target_throws_away() {
         // The specimen: "gate" is what makes this diagnosable at all.
         let lits = super::param_literals_of("/api/board/gate?item=AMUX-1&status=done");
-        assert_eq!(lits, vec!["gate".to_string()], "the param literal must survive normalization");
+        assert_eq!(
+            lits,
+            vec!["gate".to_string()],
+            "the param literal must survive normalization"
+        );
 
         // ...and it is exactly what normalize_target discards, which is the
         // whole reason this function exists.
@@ -3067,7 +5801,10 @@ mod tests {
 
         // A real card id lands in the same slot — the function does not judge,
         // it reports, and the count across a group is what discriminates.
-        assert_eq!(super::param_literals_of("/api/board/AMUX-9999"), vec!["AMUX-9999".to_string()]);
+        assert_eq!(
+            super::param_literals_of("/api/board/AMUX-9999"),
+            vec!["AMUX-9999".to_string()]
+        );
 
         // CONTROL: a wildcard tail is skipped rather than half-reported.
         for p in ["/api/sessions/amux/peek", "/api/sessions/amux/send"] {
@@ -3093,7 +5830,10 @@ mod tests {
 
         // THE POINT: one wildcard route, distinct targets per verb.
         assert_eq!(nv("/api/sessions/amux/send"), "/api/sessions/{name}/send");
-        assert_eq!(nv("/api/sessions/gtm-ticker/send"), "/api/sessions/{name}/send");
+        assert_eq!(
+            nv("/api/sessions/gtm-ticker/send"),
+            "/api/sessions/{name}/send"
+        );
         assert_eq!(nv("/api/sessions/amux/peek"), "/api/sessions/{name}/peek");
         assert_ne!(nv("/api/sessions/amux/send"), nv("/api/sessions/amux/peek"));
 
@@ -3102,12 +5842,19 @@ mod tests {
         assert_eq!(nv("/api/sessions/a/send"), nv("/api/sessions/b/send"));
 
         // A query string is not a path segment and must not ride along.
-        assert_eq!(nv("/api/sessions/amux/peek?lines=200"), "/api/sessions/{name}/peek");
+        assert_eq!(
+            nv("/api/sessions/amux/peek?lines=200"),
+            "/api/sessions/{name}/peek"
+        );
 
         // NON-WILDCARD ROUTES ARE UNTOUCHED: this is a strictly additive axis,
         // so everything else must agree with `normalize_target` exactly.
         for p in ["/api/board/AMUX-9999", "/api/health", "/api/sessions"] {
-            assert_eq!(nv(p), normalize_target(p), "non-wildcard target changed for {p}");
+            assert_eq!(
+                nv(p),
+                normalize_target(p),
+                "non-wildcard target changed for {p}"
+            );
         }
 
         // THE CARDINALITY GUARD. An id-shaped tail refuses to refine, so a
@@ -3121,7 +5868,10 @@ mod tests {
         // HOW was testing a path the code had not taken.
         let a = nv("/api/sessions/amux/12345");
         let b = nv("/api/sessions/amux/67890");
-        assert_eq!(a, b, "id-shaped wildcard tails must not each become their own target");
+        assert_eq!(
+            a, b,
+            "id-shaped wildcard tails must not each become their own target"
+        );
         assert_eq!(
             a,
             normalize_target("/api/sessions/amux/12345"),
@@ -3210,7 +5960,10 @@ mod tests {
         }
         // The empty-grep trap: an extractor that matched nothing is broken,
         // not vindicated (the invariant's own rule, applied to its guard).
-        assert!(found_any, "no .route(\"/api/...\") literals matched — the probe is broken");
+        assert!(
+            found_any,
+            "no .route(\"/api/...\") literals matched — the probe is broken"
+        );
         missing.sort();
         missing.dedup();
         assert!(
@@ -3221,10 +5974,33 @@ mod tests {
         );
     }
 
-    use axum::http::StatusCode;   // lib no longer needs it; these tests do
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
+    use axum::http::StatusCode; // lib no longer needs it; these tests do
+
+    /// AF-1044: a count past its budget is interrupted and reported as None,
+    /// a quick one is exact, and the interrupt never reaches the next statement
+    /// on the same connection (the page query that follows in /api/logs).
+    #[test]
+    fn a_count_past_its_budget_is_interrupted_and_does_not_leak() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let endless = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+                       SELECT COUNT(*) FROM (SELECT x FROM c LIMIT 1000000000000)";
+        let t0 = std::time::Instant::now();
+        let got = count_within(&conn, endless, &[], std::time::Duration::from_millis(100)).unwrap();
+        assert_eq!(got, None, "an interrupted count is not a number");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the budget bounds it: {:?}", t0.elapsed());
+        let quick = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 1000) SELECT COUNT(*) FROM c";
+        assert_eq!(count_within(&conn, quick, &[], std::time::Duration::from_millis(300)).unwrap(), Some(1000));
+        // The statement after runs longer than that 300ms budget. A timer left
+        // running past the quick count would fire inside it and abort it.
+        let long = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 20000000) SELECT COUNT(*) FROM c";
+        let t1 = std::time::Instant::now();
+        let after: i64 = conn.query_row(long, [], |r| r.get(0)).expect("the next statement is not interrupted");
+        assert_eq!(after, 20_000_000);
+        assert!(t1.elapsed() > std::time::Duration::from_millis(300), "the after-statement must outlast the budget to test anything: {:?}", t1.elapsed());
+    }
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -3268,7 +6044,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -3291,9 +6067,7 @@ mod tests {
             )
             .route(
                 "/api/fail",
-                get(|| async {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "E".repeat(10_000))
-                }),
+                get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "E".repeat(10_000)) }),
             )
             .route("/api/board", get(|| async { "[]" }));
         layer_with(inner, logger)
@@ -3302,7 +6076,9 @@ mod tests {
     async fn hit(app: &Router, req: HttpRequest<Body>) -> (StatusCode, Vec<u8>) {
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, body.to_vec())
     }
 
@@ -3320,19 +6096,35 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         let c = store.read().unwrap();
-        c.query_row("SELECT COUNT(*) FROM _amux_request_log", [], |r| r.get(0)).unwrap()
+        c.query_row("SELECT COUNT(*) FROM _amux_request_log", [], |r| r.get(0))
+            .unwrap()
     }
 
     #[test]
     fn derivations_worker_and_family() {
-        assert_eq!(worker_of("/api/sessions/amux/peek", ""), Some("amux".into()));
-        assert_eq!(worker_of("/api/sessions/my%20w/send", ""), Some("my w".into()));
-        assert_eq!(worker_of("/api/workers/wrk_01ABC/status", ""), Some("wrk_01ABC".into()));
-        assert_eq!(worker_of("/api/workers/wrk_01ABC", ""), Some("wrk_01ABC".into()));
+        assert_eq!(
+            worker_of("/api/sessions/amux/peek", ""),
+            Some("amux".into())
+        );
+        assert_eq!(
+            worker_of("/api/sessions/my%20w/send", ""),
+            Some("my w".into())
+        );
+        assert_eq!(
+            worker_of("/api/workers/wrk_01ABC/status", ""),
+            Some("wrk_01ABC".into())
+        );
+        assert_eq!(
+            worker_of("/api/workers/wrk_01ABC", ""),
+            Some("wrk_01ABC".into())
+        );
         assert_eq!(worker_of("/api/sessions", ""), None);
         assert_eq!(worker_of("/api/board/AMUX-1", ""), None);
         // /api/sessions/self resolves through its query param, never "self".
-        assert_eq!(worker_of("/api/sessions/self", "session=amux"), Some("amux".into()));
+        assert_eq!(
+            worker_of("/api/sessions/self", "session=amux"),
+            Some("amux".into())
+        );
         assert_eq!(worker_of("/api/sessions/self", ""), None);
 
         assert_eq!(family_of("/api/board/AMUX-1"), "/api/board");
@@ -3373,11 +6165,18 @@ mod tests {
             .unwrap();
         assert_eq!(path, "/api/sessions/w1/peek");
         assert_eq!(family, "/api/sessions");
-        assert_eq!(worker.as_deref(), Some("w1"), "worker attribution from path");
+        assert_eq!(
+            worker.as_deref(),
+            Some("w1"),
+            "worker attribution from path"
+        );
         assert_eq!(sess, "caller-lane");
         assert_eq!(status, 200);
         assert!(latency >= 10.0, "handler sleeps 15ms; measured {latency}ms");
-        assert_eq!(answered, "python-proxy", "x-amux-answered-by response header");
+        assert_eq!(
+            answered, "python-proxy",
+            "x-amux-answered-by response header"
+        );
         let meta: Value = serde_json::from_str(&meta.unwrap()).unwrap();
         assert_eq!(meta["query"], "lines=600");
     }
@@ -3399,7 +6198,11 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(body, format!("{}", big.len()).into_bytes(), "handler saw the full body");
+        assert_eq!(
+            body,
+            format!("{}", big.len()).into_bytes(),
+            "handler saw the full body"
+        );
         assert_eq!(wait_rows(&store, 1).await, 1);
         let c = store.read().unwrap();
         let (req_bytes, err_body, meta_len, row_bytes): (i64, Option<String>, i64, i64) = c
@@ -3424,17 +6227,26 @@ mod tests {
         let app = test_app(RequestLogger::spawn_with(store.clone(), 14.0, 1_000_000));
         let (st, body) = hit(
             &app,
-            HttpRequest::builder().uri("/api/fail").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/fail")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body.len(), 10_000, "client still receives the FULL error body");
+        assert_eq!(
+            body.len(),
+            10_000,
+            "client still receives the FULL error body"
+        );
         assert_eq!(wait_rows(&store, 1).await, 1);
         let c = store.read().unwrap();
         let (err_body, resp_bytes): (String, i64) = c
-            .query_row("SELECT error_body, resp_bytes FROM _amux_request_log", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT error_body, resp_bytes FROM _amux_request_log",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         // AF-59 changed this contract deliberately: the KEPT payload is still
         // exactly ERROR_BODY_CHARS, but an over-cap body now carries a marker
@@ -3485,8 +6297,15 @@ mod tests {
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(&plain).unwrap();
         let gz = enc.finish().unwrap();
-        assert_eq!(&gz[..2], b"\x1f\x8b", "fixture really is gzip, not a paraphrase of one");
-        assert!(gz.len() < plain.len(), "fixture must ACTUALLY compress, not store literally");
+        assert_eq!(
+            &gz[..2],
+            b"\x1f\x8b",
+            "fixture really is gzip, not a paraphrase of one"
+        );
+        assert!(
+            gz.len() < plain.len(),
+            "fixture must ACTUALLY compress, not store literally"
+        );
 
         // THE BUG, reproduced: the old code path, verbatim.
         let old = truncate_chars(&String::from_utf8_lossy(&gz), ERROR_BODY_CHARS);
@@ -3499,15 +6318,23 @@ mod tests {
             "pre-fix specimen must NOT contain the error text — that is the whole defect"
         );
         assert!(
-            flate2::read::GzDecoder::new(old.as_bytes()).read_to_end(&mut Vec::new()).is_err(),
+            flate2::read::GzDecoder::new(old.as_bytes())
+                .read_to_end(&mut Vec::new())
+                .is_err(),
             "the lossy conversion must be IRREVERSIBLE — if this could be re-decoded, \
              the incident would have been recoverable and the fix merely cosmetic"
         );
 
         // THE FIX.
         let got = decoded_error_body(&gz, "gzip");
-        assert!(got.contains("captureScreenshot timed out"), "gzip body must decode: {got}");
-        assert!(!got.contains('\u{FFFD}'), "no replacement chars survive: {got}");
+        assert!(
+            got.contains("captureScreenshot timed out"),
+            "gzip body must decode: {got}"
+        );
+        assert!(
+            !got.contains('\u{FFFD}'),
+            "no replacement chars survive: {got}"
+        );
 
         // Uncompressed still works — the guard must not have broken the 90% case.
         assert!(decoded_error_body(plain_short, "").contains("captureScreenshot"));
@@ -3517,9 +6344,15 @@ mod tests {
         // and a corrupt stream, both SAY so instead of storing bytes that read
         // like content.
         let br = decoded_error_body(&gz, "br");
-        assert!(br.contains("br-encoded") && br.contains("cannot decode"), "{br}");
+        assert!(
+            br.contains("br-encoded") && br.contains("cannot decode"),
+            "{br}"
+        );
         let bad = decoded_error_body(b"\x1f\x8b\x08garbage-not-a-stream", "gzip");
-        assert!(bad.starts_with("<gzip error body could not be decoded"), "{bad}");
+        assert!(
+            bad.starts_with("<gzip error body could not be decoded"),
+            "{bad}"
+        );
 
         // Case-insensitive: hyper does not promise a canonical casing.
         assert!(decoded_error_body(&gz, "GZIP").contains("captureScreenshot"));
@@ -3531,15 +6364,25 @@ mod tests {
         // bodies in 24h sat exactly at the cap, all unparseable.
         let over = format!(r#"{{"error":"{}"}}"#, "z".repeat(ERROR_BODY_CHARS + 500));
         let cut = decoded_error_body(over.as_bytes(), "");
-        assert!(cut.contains("<truncated by the request log"), "must announce the cut: {}", &cut[cut.len()-120..]);
-        assert!(cut.contains(&format!("kept {ERROR_BODY_CHARS} of")), "must name both sizes");
+        assert!(
+            cut.contains("<truncated by the request log"),
+            "must announce the cut: {}",
+            &cut[cut.len() - 120..]
+        );
+        assert!(
+            cut.contains(&format!("kept {ERROR_BODY_CHARS} of")),
+            "must name both sizes"
+        );
         assert!(
             serde_json::from_str::<serde_json::Value>(&cut).is_err(),
             "still not valid JSON — the marker is honest about that, it does not repair it"
         );
         // A body UNDER the cap must be untouched: no marker, and still parseable.
         let small = decoded_error_body(br#"{"error":"nope"}"#, "");
-        assert_eq!(small, r#"{"error":"nope"}"#, "under-cap bodies must not gain a marker");
+        assert_eq!(
+            small, r#"{"error":"nope"}"#,
+            "under-cap bodies must not gain a marker"
+        );
         assert!(serde_json::from_str::<serde_json::Value>(&small).is_ok());
     }
 
@@ -3547,17 +6390,38 @@ mod tests {
     async fn excluded_paths_never_log_and_everything_else_does() {
         let (store, _dir) = store();
         let app = test_app(RequestLogger::spawn_with(store.clone(), 14.0, 1_000_000));
-        for path in ["/health", "/api/events", "/api/debug/boundary", "/app.js", "/"] {
-            let _ = hit(&app, HttpRequest::builder().uri(path).body(Body::empty()).unwrap()).await;
+        for path in [
+            "/health",
+            "/api/events",
+            "/api/debug/boundary",
+            "/app.js",
+            "/",
+        ] {
+            let _ = hit(
+                &app,
+                HttpRequest::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
         }
         // A logged request AFTER the excluded ones: the channel is FIFO, so
         // when this row is visible, any (wrongly) sent earlier row would be
         // too — the absence check cannot pass by racing.
-        let _ = hit(&app, HttpRequest::builder().uri("/api/board").body(Body::empty()).unwrap()).await;
+        let _ = hit(
+            &app,
+            HttpRequest::builder()
+                .uri("/api/board")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(wait_rows(&store, 1).await, 1, "exactly the /api/board row");
         let c = store.read().unwrap();
-        let path: String =
-            c.query_row("SELECT path FROM _amux_request_log", [], |r| r.get(0)).unwrap();
+        let path: String = c
+            .query_row("SELECT path FROM _amux_request_log", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(path, "/api/board");
     }
 
@@ -3577,14 +6441,24 @@ mod tests {
                         rusqlite::params![old_ts + f64::from(i), format!("/api/board/old{i}")],
                     )?;
                 }
-                Ok(WriteOutcome { applied: false, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
         // sweep_every=3: the third inserted row triggers the delete.
         let app = test_app(RequestLogger::spawn_with(store.clone(), 14.0, 3));
         for _ in 0..3 {
-            let _ = hit(&app, HttpRequest::builder().uri("/api/board").body(Body::empty()).unwrap()).await;
+            let _ = hit(
+                &app,
+                HttpRequest::builder()
+                    .uri("/api/board")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
         }
         for _ in 0..200 {
             let c = store.read().unwrap();
@@ -3625,7 +6499,14 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        let _ = hit(&logged, HttpRequest::builder().uri("/api/board").body(Body::empty()).unwrap()).await;
+        let _ = hit(
+            &logged,
+            HttpRequest::builder()
+                .uri("/api/board")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         wait_rows(&store, 2).await;
 
         let api: Router = Router::new()
@@ -3633,7 +6514,10 @@ mod tests {
             .with_state(app_state);
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs?limit=500").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs?limit=500")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -3647,7 +6531,10 @@ mod tests {
         let py_event = fixture["events"][0].as_object().unwrap();
         let our_event = ours["events"][0].as_object().unwrap();
         for key in py_event.keys() {
-            assert!(our_event.contains_key(key), "python event key {key:?} missing from ours");
+            assert!(
+                our_event.contains_key(key),
+                "python event key {key:?} missing from ours"
+            );
         }
         assert_eq!(our_event["type"], "http");
         assert_eq!(our_event["action"], "get");
@@ -3655,7 +6542,10 @@ mod tests {
         // Worker subset: same endpoint, ?worker= filter.
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs?worker=w1").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs?worker=w1")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -3673,27 +6563,43 @@ mod tests {
         // Board tab finds it.
         let (_, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs?category=board").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs?category=board")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         let v: Value = serde_json::from_slice(&body).unwrap();
         let evs = v["events"].as_array().expect("events array");
-        assert!(!evs.is_empty(), "the Board tab must find a /api/board request: {v}");
+        assert!(
+            !evs.is_empty(),
+            "the Board tab must find a /api/board request: {v}"
+        );
         assert!(
             evs.iter().all(|e| e["family"] == "/api/board"),
             "the Board tab must show ONLY board-family rows: {v}"
         );
-        assert_eq!(evs[0]["category"], "board", "the row's own stamp must agree with the tab");
+        assert_eq!(
+            evs[0]["category"], "board",
+            "the row's own stamp must agree with the tab"
+        );
 
         // A category with no matching traffic is still honestly empty — the
         // half of the old assertion that was always right.
         let (_, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs?category=memory").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs?category=memory")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["events"], json!([]), "no memory traffic seeded, so no rows");
+        assert_eq!(
+            v["events"],
+            json!([]),
+            "no memory traffic seeded, so no rows"
+        );
 
         // STATUS BAND: max_status must BOUND, not be silently dropped (AF-402).
         //
@@ -3710,7 +6616,10 @@ mod tests {
         // are here rather than only the happy one.
         let (_, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs?max_status=199").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs?max_status=199")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         let v: Value = serde_json::from_slice(&body).unwrap();
@@ -3719,11 +6628,17 @@ mod tests {
             json!([]),
             "max_status=199 must EXCLUDE the seeded 200s; an ignored param returns them: {v}"
         );
-        assert_eq!(v["total_matched"], 0, "total_matched must respect the bound too: {v}");
+        assert_eq!(
+            v["total_matched"], 0,
+            "total_matched must respect the bound too: {v}"
+        );
 
         let (_, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs?max_status=299").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs?max_status=299")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         let v: Value = serde_json::from_slice(&body).unwrap();
@@ -3743,7 +6658,11 @@ mod tests {
         )
         .await;
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["events"], json!([]), "a 3xx band must not match seeded 200s: {v}");
+        assert_eq!(
+            v["events"],
+            json!([]),
+            "a 3xx band must not match seeded 200s: {v}"
+        );
     }
 
     #[tokio::test]
@@ -3771,10 +6690,17 @@ mod tests {
             .await
             .unwrap();
 
-        let payload =
-            raw_payload(&home.path().join("logs/server-rs.log"), 300, &state(store.clone())).unwrap();
+        let payload = raw_payload(
+            &home.path().join("logs/server-rs.log"),
+            300,
+            &state(store.clone()),
+        )
+        .unwrap();
         for key in PYTHON_RAW_KEYS {
-            assert!(payload.get(*key).is_some(), "python raw key {key:?} missing");
+            assert!(
+                payload.get(*key).is_some(),
+                "python raw key {key:?} missing"
+            );
         }
         let lines: Vec<String> = payload["lines"]
             .as_array()
@@ -3795,11 +6721,16 @@ mod tests {
         // The request-log line uses python's slog format and is the NEWEST,
         // so it merges last; proxy attribution rides the line.
         let last = lines.last().unwrap();
-        assert!(last.contains("[127.0.0.1] GET /api/board 200 12ms"), "{last}");
+        assert!(
+            last.contains("[127.0.0.1] GET /api/board 200 12ms"),
+            "{last}"
+        );
         assert!(last.contains("session=caller"), "{last}");
         assert!(last.contains("via=python-proxy"), "{last}");
         assert!(
-            regex::Regex::new(r"^\d{4}-\d{2}-\d{2} ").unwrap().is_match(last),
+            regex::Regex::new(r"^\d{4}-\d{2}-\d{2} ")
+                .unwrap()
+                .is_match(last),
             "python slog date shape so SPA styling applies: {last}"
         );
         // Missing file: python's empty-shape parity, request log still served.
@@ -3814,7 +6745,10 @@ mod tests {
     fn route_table_matching_and_normalization() {
         // Routed paths normalize to their table pattern.
         assert_eq!(normalize_target("/api/board/AMUX-123"), "/api/board/{id}");
-        assert_eq!(normalize_target("/api/board/statuses"), "/api/board/statuses");
+        assert_eq!(
+            normalize_target("/api/board/statuses"),
+            "/api/board/statuses"
+        );
         assert_eq!(
             normalize_target("/api/board/statuses/review"),
             "/api/board/statuses/{sid}"
@@ -3825,18 +6759,30 @@ mod tests {
             "/api/sessions/{name}/{*verb}"
         );
         // matchit semantics: the static segment outranks {action}.
-        assert_eq!(normalize_target("/api/torrents/g1/file"), "/api/torrents/{gid}/file");
+        assert_eq!(
+            normalize_target("/api/torrents/g1/file"),
+            "/api/torrents/{gid}/file"
+        );
         assert_eq!(
             normalize_target("/api/torrents/g1/pause"),
             "/api/torrents/{gid}/{action}"
         );
         // Unrouted paths: conservative collapse — words stay, ids fold.
-        assert_eq!(normalize_target("/api/sessions-graph"), "/api/sessions-graph");
+        assert_eq!(
+            normalize_target("/api/sessions-graph"),
+            "/api/sessions-graph"
+        );
         assert_eq!(normalize_target("/api/stripe/status"), "/api/stripe/status");
-        assert_eq!(normalize_target("/api/sessions-graph"), "/api/sessions-graph");
+        assert_eq!(
+            normalize_target("/api/sessions-graph"),
+            "/api/sessions-graph"
+        );
         assert_eq!(normalize_target("/api/foo/AMUX-9"), "/api/foo/{id}");
 
-        assert_eq!(routed_methods_at("/api/board/statuses/review"), vec!["PATCH", "DELETE"]);
+        assert_eq!(
+            routed_methods_at("/api/board/statuses/review"),
+            vec!["PATCH", "DELETE"]
+        );
         // Re-pointed from /api/lookup, which became ROUTED in d177625. A
         // fixture that names a real unrouted path is worth keeping accurate
         // rather than deleting — this cell is the "no route at all" case, and
@@ -3860,8 +6806,14 @@ mod tests {
         assert_eq!(percentile_sorted(&[42.0], 0.5), 42.0);
         assert_eq!(percentile_sorted(&[], 0.5), 0.0);
         // n=5: p50 = rank ceil(2.5)=3 -> third value.
-        assert_eq!(percentile_sorted(&[10.0, 10.0, 10.0, 10.0, 100.0], 0.5), 10.0);
-        assert_eq!(percentile_sorted(&[10.0, 10.0, 10.0, 10.0, 100.0], 0.95), 100.0);
+        assert_eq!(
+            percentile_sorted(&[10.0, 10.0, 10.0, 10.0, 100.0], 0.5),
+            10.0
+        );
+        assert_eq!(
+            percentile_sorted(&[10.0, 10.0, 10.0, 10.0, 100.0], 0.95),
+            100.0
+        );
     }
 
     /// Seed one request-log row with the columns the analysis endpoints read.
@@ -3903,14 +6855,19 @@ mod tests {
                         error_body
                     ],
                 )?;
-                Ok(WriteOutcome { applied: false, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
     }
 
     fn logs_api(store: Arc<crate::db::Store>) -> Router {
-        Router::new().nest("/api/logs", routes()).with_state(state(store))
+        Router::new()
+            .nest("/api/logs", routes())
+            .with_state(state(store))
     }
 
     /// AF-261 — a window bigger than the cap must be SAMPLED, not truncated.
@@ -3967,7 +6924,10 @@ mod tests {
         let api = logs_api(store.clone());
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/stats?since_h=72").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/stats?since_h=72")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -3984,7 +6944,10 @@ mod tests {
         );
         // `window_rows` is the TRUE pre-sample count, so a sampled `count` can
         // never be mistaken for the volume.
-        assert_eq!(v["window_rows"], N, "window_rows is the pre-sample truth: {v}");
+        assert_eq!(
+            v["window_rows"], N,
+            "window_rows is the pre-sample truth: {v}"
+        );
         // TRUNCATED and SAMPLED are different facts.
         assert_eq!(
             v["scan_truncated"], false,
@@ -3993,7 +6956,10 @@ mod tests {
         if v["sampled"] == true {
             assert!(v["sample_stride"].as_i64().unwrap_or(0) > 1, "{v}");
             assert!(
-                v["sampling_note"].as_str().unwrap_or("").contains("SAMPLED"),
+                v["sampling_note"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("SAMPLED"),
                 "a sampled answer must say so in the payload a caller already reads: {v}"
             );
         }
@@ -4021,18 +6987,54 @@ mod tests {
         let now = unix_now();
         // A fast baseline so p50 is small and the slow rows clear 5x.
         for i in 0..40u32 {
-            seed(&store, now - 300.0 - f64::from(i), "GET", "/api/board", 200, 1.0, "", "native", None).await;
+            seed(
+                &store,
+                now - 300.0 - f64::from(i),
+                "GET",
+                "/api/board",
+                200,
+                1.0,
+                "",
+                "native",
+                None,
+            )
+            .await;
         }
         // Slow, WITH a session. `/api/board` is deliberately a family whose
         // `worker` is always null, which is the case that had no attribution at all.
-        seed(&store, now - 60.0, "GET", "/api/board", 200, 9000.0, "mvs-infra", "native", None).await;
+        seed(
+            &store,
+            now - 60.0,
+            "GET",
+            "/api/board",
+            200,
+            9000.0,
+            "mvs-infra",
+            "native",
+            None,
+        )
+        .await;
         // Slow, with NO session: the honest-absence control.
-        seed(&store, now - 50.0, "GET", "/api/board", 200, 9500.0, "", "native", None).await;
+        seed(
+            &store,
+            now - 50.0,
+            "GET",
+            "/api/board",
+            200,
+            9500.0,
+            "",
+            "native",
+            None,
+        )
+        .await;
 
         let api = logs_api(store.clone());
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/stats?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -4042,8 +7044,10 @@ mod tests {
 
         let attributed = outs
             .iter()
-            .find(|o| o["latency_ms"].as_f64().unwrap_or(0.0) > 8500.0
-                && o["latency_ms"].as_f64().unwrap_or(0.0) < 9200.0)
+            .find(|o| {
+                o["latency_ms"].as_f64().unwrap_or(0.0) > 8500.0
+                    && o["latency_ms"].as_f64().unwrap_or(0.0) < 9200.0
+            })
             .expect("the 9000ms row");
         assert_eq!(
             attributed["amux_session"], "mvs-infra",
@@ -4086,8 +7090,18 @@ mod tests {
         let (store, _dir) = store();
         let now = unix_now();
         for i in 0..3u32 {
-            seed(&store, now - f64::from(i) * 60.0, "GET", "/api/board", 500, 1.0, "lane", "native",
-                 Some("{\"error\":\"x\"}")).await;
+            seed(
+                &store,
+                now - f64::from(i) * 60.0,
+                "GET",
+                "/api/board",
+                500,
+                1.0,
+                "lane",
+                "native",
+                Some("{\"error\":\"x\"}"),
+            )
+            .await;
         }
         let api = logs_api(store.clone());
         // (path, the field that answers "was this the whole window?")
@@ -4098,8 +7112,11 @@ mod tests {
             ("/api/logs/writers?since_h=24", "scan_truncated"),
         ];
         for (uri, completeness) in sweep_endpoints {
-            let (st, body) =
-                hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+            let (st, body) = hit(
+                &api,
+                HttpRequest::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK, "{uri}");
             let v: Value = serde_json::from_slice(&body).unwrap();
             assert!(
@@ -4111,7 +7128,11 @@ mod tests {
             // The SPAN too, where the answer is a window: "complete" is meaningless if
             // the reader cannot see what was actually covered. `/api/logs` reports the
             // page it returned; the two analysis endpoints report the window they read.
-            let span = if uri.starts_with("/api/logs?") { "page_span_h" } else { "actual_window_h" };
+            let span = if uri.starts_with("/api/logs?") {
+                "page_span_h"
+            } else {
+                "actual_window_h"
+            };
             assert!(
                 v[span].as_f64().is_some(),
                 "{uri} must publish `{span}` — `{completeness}: false` still leaves \
@@ -4144,13 +7165,28 @@ mod tests {
         let now = unix_now();
         // Six rows, one per hour, newest first at now-1h.
         for i in 1..=6u32 {
-            seed(&store, now - (i as f64) * 3600.0, "GET", "/api/board", 200, 1.0, "lane", "native", None).await;
+            seed(
+                &store,
+                now - (i as f64) * 3600.0,
+                "GET",
+                "/api/board",
+                200,
+                1.0,
+                "lane",
+                "native",
+                None,
+            )
+            .await;
         }
         let api = logs_api(store.clone());
         let get = |uri: String| {
             let api = api.clone();
             async move {
-                let (st, body) = hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                let (st, body) = hit(
+                    &api,
+                    HttpRequest::builder().uri(uri).body(Body::empty()).unwrap(),
+                )
+                .await;
                 assert_eq!(st, StatusCode::OK);
                 serde_json::from_slice::<Value>(&body).unwrap()
             }
@@ -4160,7 +7196,10 @@ mod tests {
         // seeding failure would make every `until` assertion below pass by
         // returning nothing (ethos rule 7: confirm the fixture is real).
         let all = get(format!("/api/logs?since={}&limit=2000", now - 7.0 * 3600.0)).await;
-        assert_eq!(all["total_matched"], 6, "control: all six rows are in the window: {all}");
+        assert_eq!(
+            all["total_matched"], 6,
+            "control: all six rows are in the window: {all}"
+        );
 
         // `until` excludes the newest rows. THIS is the assertion that fails
         // on the pre-fix code, where an unknown param is silently dropped and
@@ -4171,19 +7210,37 @@ mod tests {
             now - 3.5 * 3600.0
         ))
         .await;
-        assert_eq!(old["total_matched"], 3, "until must exclude rows newer than it: {old}");
+        assert_eq!(
+            old["total_matched"], 3,
+            "until must exclude rows newer than it: {old}"
+        );
         for e in old["events"].as_array().unwrap() {
             let ts = e["ts"].as_f64().unwrap();
-            assert!(ts <= now - 3.5 * 3600.0, "row newer than `until` leaked through: {e}");
+            assert!(
+                ts <= now - 3.5 * 3600.0,
+                "row newer than `until` leaked through: {e}"
+            );
         }
 
         // The truncation disclosure: a page that IS the whole window must not
         // claim otherwise, and one that is a slice must say so in the body.
-        assert_eq!(all["truncated"], false, "6 of 6 rows is not a truncated page: {all}");
-        assert_eq!(all["note"], "", "an untruncated page carries no warning: {all}");
+        assert_eq!(
+            all["truncated"], false,
+            "6 of 6 rows is not a truncated page: {all}"
+        );
+        assert_eq!(
+            all["note"], "",
+            "an untruncated page carries no warning: {all}"
+        );
         let capped = get(format!("/api/logs?since={}&limit=2", now - 7.0 * 3600.0)).await;
-        assert_eq!(capped["truncated"], true, "2 of 6 rows IS truncated: {capped}");
-        assert_eq!(capped["total_matched"], 6, "total_matched stays the pre-LIMIT count");
+        assert_eq!(
+            capped["truncated"], true,
+            "2 of 6 rows IS truncated: {capped}"
+        );
+        assert_eq!(
+            capped["total_matched"], 6,
+            "total_matched stays the pre-LIMIT count"
+        );
         assert!(
             capped["note"].as_str().unwrap().contains("TRUNCATED"),
             "a capped page must say so in the body, not leave it to be inferred: {capped}"
@@ -4191,12 +7248,18 @@ mod tests {
         // page_span_h describes the ROWS RETURNED, which is the number the
         // sweep needed and did not have: 2 rows an hour apart span 1h even
         // though `since` asked for 7.
-        assert_eq!(capped["page_span_h"], 1.0, "span is of the page, not of `since`: {capped}");
+        assert_eq!(
+            capped["page_span_h"], 1.0,
+            "span is of the page, not of `since`: {capped}"
+        );
 
         // The seam: two disjoint pages must reassemble the window exactly —
         // no row counted twice, none lost between them.
         let newer = get(format!("/api/logs?since={}&limit=2000", now - 3.5 * 3600.0)).await;
-        assert_eq!(newer["total_matched"], 3, "the other half of the split: {newer}");
+        assert_eq!(
+            newer["total_matched"], 3,
+            "the other half of the split: {newer}"
+        );
         let mut seen: Vec<String> = old["events"]
             .as_array()
             .unwrap()
@@ -4206,7 +7269,11 @@ mod tests {
             .collect();
         seen.sort();
         seen.dedup();
-        assert_eq!(seen.len(), 6, "the two pages must partition the window, not overlap it");
+        assert_eq!(
+            seen.len(),
+            6,
+            "the two pages must partition the window, not overlap it"
+        );
     }
 
     /// AF-131, rebuilt from the sweep's own numbers: three /api/logs/stats
@@ -4221,9 +7288,9 @@ mod tests {
     async fn over_cap_stats_samples_the_window_while_analyze_truncates_and_both_report_it() {
         let (store, _dir) = store();
         let now = unix_now();
-        // 50k "old-era" rows around 90-80h ago, then 210k "new-era" rows in
-        // the last 70h — 260k total against the 200k cap, so a truthful
-        // truncation contains ZERO old-era rows.
+        // 500 "old-era" rows around 90-83h ago, then 2100 "new-era" rows over
+        // the last 70h — 2.6k total against the 2k test cap (ANALYZE_SCAN_CAP),
+        // so a truthful truncation contains ZERO old-era rows.
         store
             .write(move |conn| {
                 let tx_like = conn; // Store::write is already one transaction
@@ -4233,15 +7300,18 @@ mod tests {
                       amux_session, worker, answered_by, error_body) \
                      VALUES (?1,'GET',?2,?3,500,1.0,'127.0.0.1','lane',NULL,'native',NULL)",
                 )?;
-                for i in 0..50_000 {
-                    let ts = now - 90.0 * 3600.0 + i as f64 * 0.5;
+                for i in 0..500 {
+                    let ts = now - 90.0 * 3600.0 + i as f64 * 50.0;
                     stmt.execute(rusqlite::params![ts, "/api/old-era", "old-era"])?;
                 }
-                for i in 0..210_000 {
-                    let ts = now - 70.0 * 3600.0 + i as f64;
+                for i in 0..2_100 {
+                    let ts = now - 70.0 * 3600.0 + i as f64 * 100.0;
                     stmt.execute(rusqlite::params![ts, "/api/new-era", "new-era"])?;
                 }
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         let api = logs_api(store.clone());
@@ -4250,7 +7320,10 @@ mod tests {
         // window claim shrinks to what was read.
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/stats?since_h=96").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/stats?since_h=96")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -4273,9 +7346,15 @@ mod tests {
         // sampled mix must match the seeded mix. That catches an oldest-first
         // slice (old-era over-represented) AND a newest-only truncation
         // (old-era absent), where the old cell caught only the first.
-        assert_eq!(v["scan_truncated"], false, "a sampled read covers the window: {v}");
-        assert_eq!(v["sampled"], true, "260k rows over a 200k cap must sample: {v}");
-        assert_eq!(v["window_rows"], 260_000, "the true pre-sample count: {v}");
+        assert_eq!(
+            v["scan_truncated"], false,
+            "a sampled read covers the window: {v}"
+        );
+        assert_eq!(
+            v["sampled"], true,
+            "2.6k rows over a 2k test cap must sample: {v}"
+        );
+        assert_eq!(v["window_rows"], 2_600, "the true pre-sample count: {v}");
         let fam_n = |name: &str| -> f64 {
             v["families"]
                 .as_array()
@@ -4286,12 +7365,15 @@ mod tests {
                 .unwrap_or(0.0)
         };
         let (new_n, old_n) = (fam_n("new-era"), fam_n("old-era"));
-        assert!(new_n > 0.0 && old_n > 0.0, "both eras must survive sampling: {v}");
-        // Seeded 210k new : 50k old = 4.2. A uniform sample preserves the ratio.
+        assert!(
+            new_n > 0.0 && old_n > 0.0,
+            "both eras must survive sampling: {v}"
+        );
+        // Seeded 2100 new : 500 old = 4.2. A uniform sample preserves the ratio.
         let ratio = new_n / old_n;
         assert!(
             (ratio - 4.2).abs() < 0.3,
-            "the sample must be UNIFORM across the window — seeded 210k:50k = 4.2, \
+            "the sample must be UNIFORM across the window — seeded 2100:500 = 4.2, \
              got {new_n}:{old_n} = {ratio}. A skew here means the read is biased \
              toward one end of the window, which is AF-131's bug in either direction: {v}"
         );
@@ -4320,12 +7402,15 @@ mod tests {
             groups.iter().all(|g| g["family"] != "old-era"),
             "analyze must also keep the newest under the cap: {v}"
         );
-        let new_era = groups.iter().find(|g| g["family"] == "new-era").expect("new-era group");
+        let new_era = groups
+            .iter()
+            .find(|g| g["family"] == "new-era")
+            .expect("new-era group");
         let last = new_era["last_ts"].as_f64().unwrap();
-        // The fixture's newest new-era row is at now - (70h - 209,999s), i.e.
+        // The fixture's newest new-era row is at now - (70h - 209,900s), i.e.
         // ~11.67h ago; a positional overwrite under the DESC scan would land
         // ~70h ago instead.
-        let expected_newest = now - 70.0 * 3600.0 + 209_999.0;
+        let expected_newest = now - 70.0 * 3600.0 + 209_900.0;
         assert!(
             (last - expected_newest).abs() < 5.0,
             "last_ts must be the group's NEWEST hit — a positional overwrite under the \
@@ -4360,17 +7445,39 @@ mod tests {
             \"you_sent\":[\"CI/CD green\",\"Deployed to prod\",\
             \"Confirmed working in prod\",\"Zero regressions\"]}";
         for i in 0..8 {
-            seed(&store, now - 100.0 - f64::from(i), "PATCH", "/api/board/MI-4975", 409, 1.0,
-                 "mvs-infra", "native", Some(stuck)).await;
+            seed(
+                &store,
+                now - 100.0 - f64::from(i),
+                "PATCH",
+                "/api/board/MI-4975",
+                409,
+                1.0,
+                "mvs-infra",
+                "native",
+                Some(stuck),
+            )
+            .await;
         }
         // Two other lanes hitting the same gate normally — present so the
         // dominant pair is a MAJORITY of a mixed group, not the whole of a
         // pure one. A verdict that only fires on a homogeneous group would
         // miss the real incident, which was 349 of 494.
         for (i, who) in ["tubescience", "backend"].iter().enumerate() {
-            seed(&store, now - 50.0 - i as f64, "PATCH", "/api/board/MI-4975", 409, 1.0, who,
-                 "native", Some("{\"attempted_status\":\"done\",\"gate\":[\"Outcome recorded\"],\
-                 \"you_sent\":null}")).await;
+            seed(
+                &store,
+                now - 50.0 - i as f64,
+                "PATCH",
+                "/api/board/MI-4975",
+                409,
+                1.0,
+                who,
+                "native",
+                Some(
+                    "{\"attempted_status\":\"done\",\"gate\":[\"Outcome recorded\"],\
+                 \"you_sent\":null}",
+                ),
+            )
+            .await;
         }
         // CONTROL: a 409 group where every ack differs. Must NOT produce a
         // verdict. It has to live in a DIFFERENT family, and that is worth
@@ -4380,36 +7487,71 @@ mod tests {
         // this test — it is precisely why the production incident hid, since
         // every card's 409s in the fleet collapse into one line.
         for (i, who) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
-            let body = format!("{{\"attempted_status\":\"done\",\"gate\":[\"g\"],\
-                                \"you_sent\":[\"{who}\"]}}");
-            seed(&store, now - 30.0 - i as f64, "PATCH", "/api/schedules/SCHED-1", 409, 1.0, who,
-                 "native", Some(&body)).await;
+            let body = format!(
+                "{{\"attempted_status\":\"done\",\"gate\":[\"g\"],\
+                                \"you_sent\":[\"{who}\"]}}"
+            );
+            seed(
+                &store,
+                now - 30.0 - i as f64,
+                "PATCH",
+                "/api/schedules/SCHED-1",
+                409,
+                1.0,
+                who,
+                "native",
+                Some(&body),
+            )
+            .await;
         }
 
         let api = logs_api(store.clone());
-        let (st, body) = hit(&api,
-            HttpRequest::builder().uri("/api/logs/analyze?since_h=24").body(Body::empty()).unwrap()).await;
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder()
+                .uri("/api/logs/analyze?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         let v: Value = serde_json::from_slice(&body).unwrap();
-        let verdicts: Vec<&str> =
-            v["verdicts"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+        let verdicts: Vec<&str> = v["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
 
-        let stuck_v = verdicts.iter().find(|s| s.contains("mvs-infra"))
+        let stuck_v = verdicts
+            .iter()
+            .find(|s| s.contains("mvs-infra"))
             .unwrap_or_else(|| panic!("no stuck-caller verdict: {verdicts:?}"));
         // WHO, HOW MANY, and OUT OF WHAT — the three facts the group line hid.
         assert!(stuck_v.contains("8 of 10"), "{stuck_v}");
-        assert!(stuck_v.contains("verified"), "the refused transition: {stuck_v}");
+        assert!(
+            stuck_v.contains("verified"),
+            "the refused transition: {stuck_v}"
+        );
         // The fork the body settles: wrong criteria, not a missing ack.
         assert!(stuck_v.contains("WRONG criteria"), "{stuck_v}");
-        assert!(stuck_v.contains("contract?card="), "must name the resolved-gate lookup: {stuck_v}");
+        assert!(
+            stuck_v.contains("contract?card="),
+            "must name the resolved-gate lookup: {stuck_v}"
+        );
 
         // The control group must be silent — a diverse 409 group is health.
-        assert!(!verdicts.iter().any(|s| s.contains("/api/schedules")),
-                "a 409 group with differing acks is normal gate traffic: {verdicts:?}");
+        assert!(
+            !verdicts.iter().any(|s| s.contains("/api/schedules")),
+            "a 409 group with differing acks is normal gate traffic: {verdicts:?}"
+        );
 
         // The structured field is present on the group either way, so a reader
         // below the verdict floor can still see the distribution.
-        let grp = v["groups"].as_array().unwrap().iter()
+        let grp = v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
             .find(|g| g["target"] == "/api/board/{id}" && g["status"] == 409)
             .expect("the 409 board group");
         assert_eq!(grp["top_rejected_ack"]["session"], "mvs-infra", "{grp}");
@@ -4426,21 +7568,39 @@ mod tests {
         //
         // The two groups in this fixture are the two readings, so one cell
         // pins both and neither can pass by accident.
-        let diffuse = v["groups"].as_array().unwrap().iter()
+        let diffuse = v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
             .find(|g| g["target"] == "/api/schedules/{id}" && g["status"] == 409)
             .expect("the diffuse 409 group");
-        assert_eq!(diffuse["refusal_shape"]["designed"], serde_json::json!(true),
-                   "six callers with six different acks is the gate working: {diffuse}");
-        assert_eq!(diffuse["refusal_shape"]["distinct_callers"], serde_json::json!(6), "{diffuse}");
+        assert_eq!(
+            diffuse["refusal_shape"]["designed"],
+            serde_json::json!(true),
+            "six callers with six different acks is the gate working: {diffuse}"
+        );
+        assert_eq!(
+            diffuse["refusal_shape"]["distinct_callers"],
+            serde_json::json!(6),
+            "{diffuse}"
+        );
 
         // THE CONTROL, and the half the first version of this field got wrong.
         // It set `designed: true` unconditionally, so the wedged group carried
         // the verdict calling it a fault AND a field calling it by design. A
         // payload that contradicts itself is worse than one that says nothing.
-        assert_eq!(grp["refusal_shape"]["designed"], serde_json::json!(false),
-                   "a caller wedged in a loop is NOT the designed shape: {grp}");
-        assert!(grp["refusal_shape"]["what"].as_str().unwrap_or_default().contains("NOT the ordinary shape"),
-                "and it must say so in words, not only in a bool: {grp}");
+        assert_eq!(
+            grp["refusal_shape"]["designed"],
+            serde_json::json!(false),
+            "a caller wedged in a loop is NOT the designed shape: {grp}"
+        );
+        assert!(
+            grp["refusal_shape"]["what"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("NOT the ordinary shape"),
+            "and it must say so in words, not only in a bool: {grp}"
+        );
     }
 
     #[tokio::test]
@@ -4450,25 +7610,127 @@ mod tests {
         // Cell 1 (the incident specimen, AMUX-2610): PATCH
         // /api/board/statuses/review 405'd on an older build; the CURRENT
         // table routes PATCH there — the verdict must say the build moved.
-        seed(&store, now - 100.0, "PATCH", "/api/board/statuses/review", 405, 1.0, "lane-a", "native", None).await;
-        seed(&store, now - 50.0, "PATCH", "/api/board/statuses/review", 405, 1.0, "lane-b", "native", None).await;
+        seed(
+            &store,
+            now - 100.0,
+            "PATCH",
+            "/api/board/statuses/review",
+            405,
+            1.0,
+            "lane-a",
+            "native",
+            None,
+        )
+        .await;
+        seed(
+            &store,
+            now - 50.0,
+            "PATCH",
+            "/api/board/statuses/review",
+            405,
+            1.0,
+            "lane-b",
+            "native",
+            None,
+        )
+        .await;
         // Cell 2 (the classic): PUT on a path that routes GET, POST.
-        seed(&store, now - 40.0, "PUT", "/api/board", 405, 1.0, "lane-a", "native", None).await;
+        seed(
+            &store,
+            now - 40.0,
+            "PUT",
+            "/api/board",
+            405,
+            1.0,
+            "lane-a",
+            "native",
+            None,
+        )
+        .await;
         // Cell 3 (the catch-all trap): POST on a path with NO route.
-        seed(&store, now - 30.0, "POST", "/api/sessions-graph", 405, 1.0, "", "native", None).await;
+        seed(
+            &store,
+            now - 30.0,
+            "POST",
+            "/api/sessions-graph",
+            405,
+            1.0,
+            "",
+            "native",
+            None,
+        )
+        .await;
         // 404s: one unrouted path (gets nearest_routes), one routed path
         // whose HANDLER 404'd (routed_methods shows it is a real route).
-        seed(&store, now - 20.0, "GET", "/api/sessions-graph", 404, 1.0, "", "native", Some("{\"error\": \"not found\"}")).await;
-        seed(&store, now - 19.0, "GET", "/api/sessions-graph", 404, 1.0, "", "native", Some("{\"error\": \"not found\"}")).await;
-        seed(&store, now - 10.0, "GET", "/api/board/AMUX-9999", 404, 1.0, "lane-a", "native", Some("{\"error\":\"item not found\"}")).await;
+        seed(
+            &store,
+            now - 20.0,
+            "GET",
+            "/api/sessions-graph",
+            404,
+            1.0,
+            "",
+            "native",
+            Some("{\"error\": \"not found\"}"),
+        )
+        .await;
+        seed(
+            &store,
+            now - 19.0,
+            "GET",
+            "/api/sessions-graph",
+            404,
+            1.0,
+            "",
+            "native",
+            Some("{\"error\": \"not found\"}"),
+        )
+        .await;
+        seed(
+            &store,
+            now - 10.0,
+            "GET",
+            "/api/board/AMUX-9999",
+            404,
+            1.0,
+            "lane-a",
+            "native",
+            Some("{\"error\":\"item not found\"}"),
+        )
+        .await;
         // Excluded: a success row, and an error outside the window.
-        seed(&store, now - 5.0, "GET", "/api/board", 200, 1.0, "lane-a", "native", None).await;
-        seed(&store, now - 90_000.0, "PATCH", "/api/board/statuses/review", 405, 1.0, "lane-a", "native", None).await;
+        seed(
+            &store,
+            now - 5.0,
+            "GET",
+            "/api/board",
+            200,
+            1.0,
+            "lane-a",
+            "native",
+            None,
+        )
+        .await;
+        seed(
+            &store,
+            now - 90_000.0,
+            "PATCH",
+            "/api/board/statuses/review",
+            405,
+            1.0,
+            "lane-a",
+            "native",
+            None,
+        )
+        .await;
 
         let api = logs_api(store.clone());
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/analyze?since_h=24").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/analyze?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -4495,7 +7757,11 @@ mod tests {
         assert_eq!(g["count"], 2);
         assert_eq!(g["routed_methods"], json!([]));
         assert!(
-            g["nearest_routes"].as_array().unwrap().iter().any(|r| r == "/api/sessions"),
+            g["nearest_routes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "/api/sessions"),
             "{g}"
         );
         assert_eq!(g["sample"]["error_body"], "{\"error\": \"not found\"}");
@@ -4512,8 +7778,12 @@ mod tests {
         );
 
         // The verdicts: one per 405 group, each landing in its honest cell.
-        let verdicts: Vec<&str> =
-            v["verdicts"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+        let verdicts: Vec<&str> = v["verdicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap())
+            .collect();
         assert_eq!(verdicts.len(), 3, "{verdicts:?}");
         let vd = |frag: &str| {
             verdicts
@@ -4522,10 +7792,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("no verdict containing {frag:?}: {verdicts:?}"))
         };
         let cell1 = vd("PATCH /api/board/statuses/{sid}");
-        assert!(cell1.contains("IS routed here in the CURRENT build"), "{cell1}");
+        assert!(
+            cell1.contains("IS routed here in the CURRENT build"),
+            "{cell1}"
+        );
         assert!(cell1.contains("PATCH, DELETE"), "{cell1}");
         let cell2 = vd("PUT /api/board:");
-        assert!(cell2.contains("not routed; routed there: GET, POST"), "{cell2}");
+        assert!(
+            cell2.contains("not routed; routed there: GET, POST"),
+            "{cell2}"
+        );
         // Re-pointed from /api/lookup (routed in d177625) to a path that is
         // still genuinely unrouted, so this cell keeps testing what it names:
         // a 405 where NO route exists is the GET-only SPA catch-all.
@@ -4561,19 +7837,36 @@ mod tests {
         let boot = now - 300.0;
         // A fast baseline so p50 is small and the threshold (5x p50) is low.
         for i in 0..8 {
-            seed_boot(&store, now - 200.0 + i as f64, "/api/board", 5.0, Some(boot)).await;
+            seed_boot(
+                &store,
+                now - 200.0 + i as f64,
+                "/api/board",
+                5.0,
+                Some(boot),
+            )
+            .await;
         }
         // AF-186's own specimen, read correctly: ARRIVED 20s after its process
         // booted and ran 120s. Startup contention is a plausible cause and this
         // endpoint is not the place that decides.
         seed_boot(&store, boot + 20.0, "/api/board", 120_000.0, Some(boot)).await;
         // The far-from-boot twin: equally slow, 120s into its process's life.
-        seed_boot(&store, now - 10.0, "/api/board", 120_000.0, Some(now - 130.0)).await;
+        seed_boot(
+            &store,
+            now - 10.0,
+            "/api/board",
+            120_000.0,
+            Some(now - 130.0),
+        )
+        .await;
 
         let api = logs_api(store.clone());
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/stats?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -4604,7 +7897,11 @@ mod tests {
         // silently and got it wrong; the number makes it the reader's.
         let near = at(boot + 20.0);
         assert!(
-            (near["since_boot_s"].as_f64().expect("since_boot_s must be a number") - 20.0).abs()
+            (near["since_boot_s"]
+                .as_f64()
+                .expect("since_boot_s must be a number")
+                - 20.0)
+                .abs()
                 < 1e-3,
             "the near-boot row must say HOW near, or hiding it and showing it are equally \
              uninformative: {near}"
@@ -4623,7 +7920,10 @@ mod tests {
         seed_boot(&store, boot - 5.0, "/api/board", 120_000.0, Some(boot)).await;
         let (_, body2) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/stats?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         let v2: Value = serde_json::from_slice(&body2).unwrap();
@@ -4639,8 +7939,12 @@ mod tests {
         // This is the assertion that keeps the now-structurally-false predicate
         // from becoming an invisible no-op.
         assert_eq!(v["totals"]["restart_spanning_excluded"], json!(0), "{v}");
-        let board = v["families"].as_array().unwrap().iter()
-            .find(|f| f["family"] == "/api/board").unwrap();
+        let board = v["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["family"] == "/api/board")
+            .unwrap();
         assert_eq!(board["restart_spanning_excluded"], json!(0), "{board}");
         assert_eq!(board["count"], 10, "8 fast + both slow rows: {board}");
         assert_eq!(board["max_ms"], 120_000.0, "{board}");
@@ -4664,7 +7968,10 @@ mod tests {
                      VALUES (?1,'GET',?2,?2,200,?3,'127.0.0.1','curl','lane','','native',?4)",
                     rusqlite::params![ts, path, latency_ms, boot_at],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -4678,23 +7985,73 @@ mod tests {
         // One 500 (error_rate 0.2), one proxied row, worker attribution via
         // path-independent seed (worker column stays NULL; clients differ).
         for (i, lat) in [10.0, 10.0, 10.0, 10.0].iter().enumerate() {
-            seed(&store, now - 60.0 + i as f64, "GET", "/api/board", 200, *lat, "lane-a", "native", None).await;
+            seed(
+                &store,
+                now - 60.0 + i as f64,
+                "GET",
+                "/api/board",
+                200,
+                *lat,
+                "lane-a",
+                "native",
+                None,
+            )
+            .await;
         }
-        seed(&store, now - 50.0, "GET", "/api/board/AMUX-1", 500, 100.0, "lane-b", "python-proxy", Some("boom")).await;
+        seed(
+            &store,
+            now - 50.0,
+            "GET",
+            "/api/board/AMUX-1",
+            500,
+            100.0,
+            "lane-b",
+            "python-proxy",
+            Some("boom"),
+        )
+        .await;
         // /api/logs: single fast row.
-        seed(&store, now - 40.0, "GET", "/api/logs", 200, 5.0, "lane-a", "native", None).await;
+        seed(
+            &store,
+            now - 40.0,
+            "GET",
+            "/api/logs",
+            200,
+            5.0,
+            "lane-a",
+            "native",
+            None,
+        )
+        .await;
         // Outside window: must not skew percentiles.
-        seed(&store, now - 90_000.0, "GET", "/api/board", 200, 9999.0, "lane-a", "native", None).await;
+        seed(
+            &store,
+            now - 90_000.0,
+            "GET",
+            "/api/board",
+            200,
+            9999.0,
+            "lane-a",
+            "native",
+            None,
+        )
+        .await;
 
         let api = logs_api(store.clone());
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/stats?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert!(v["percentile_method"].as_str().unwrap().contains("nearest-rank"));
+        assert!(v["percentile_method"]
+            .as_str()
+            .unwrap()
+            .contains("nearest-rank"));
 
         let fams = v["families"].as_array().unwrap();
         let board = fams.iter().find(|f| f["family"] == "/api/board").unwrap();
@@ -4714,7 +8071,10 @@ mod tests {
         assert_eq!(v["totals"]["count"], 6);
         assert_eq!(v["totals"]["error_count"], 1);
         assert_eq!(v["totals"]["proxy_count"], 1);
-        assert_eq!(v["totals"]["origins"], json!({"native": 5, "python-proxy": 1}));
+        assert_eq!(
+            v["totals"]["origins"],
+            json!({"native": 5, "python-proxy": 1})
+        );
 
         // The 100ms row is > 5x the family p50 (10ms) -> the one outlier.
         let outliers = v["slow_outliers"].as_array().unwrap();
@@ -4764,8 +8124,12 @@ mod tests {
         session: &str,
         worker: &str,
     ) {
-        let (method, path, session, worker) =
-            (method.to_string(), path.to_string(), session.to_string(), worker.to_string());
+        let (method, path, session, worker) = (
+            method.to_string(),
+            path.to_string(),
+            session.to_string(),
+            worker.to_string(),
+        );
         store
             .write_async(move |conn| {
                 conn.execute(
@@ -4775,7 +8139,10 @@ mod tests {
                      VALUES (?1,?2,?3,?4,200,1.0,'127.0.0.1',?5,?6,'native')",
                     rusqlite::params![ts, method, path, family_of(&path), session, worker],
                 )?;
-                Ok(WriteOutcome { applied: false, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -4806,21 +8173,59 @@ mod tests {
         let now = unix_now();
         // Six writers spread across 20 hours, oldest first. A page-shaped
         // handler sees only the last of these.
-        for (i, sess) in ["oldest", "early", "mid", "late", "later", "newest"].iter().enumerate() {
+        for (i, sess) in ["oldest", "early", "mid", "late", "later", "newest"]
+            .iter()
+            .enumerate()
+        {
             let ts = now - (20.0 - i as f64 * 4.0) * 3600.0;
-            seed(&store, ts, "POST", "/api/board", 200, 1.0, sess, "native", None).await;
-            seed(&store, ts + 1.0, "PATCH", "/api/board/X", 200, 1.0, sess, "native", None).await;
+            seed(
+                &store,
+                ts,
+                "POST",
+                "/api/board",
+                200,
+                1.0,
+                sess,
+                "native",
+                None,
+            )
+            .await;
+            seed(
+                &store,
+                ts + 1.0,
+                "PATCH",
+                "/api/board/X",
+                200,
+                1.0,
+                sess,
+                "native",
+                None,
+            )
+            .await;
         }
         // A busy reader across the same span. Reading is not silent work.
         for i in 0..10u32 {
-            seed(&store, now - 19.0 * 3600.0 + f64::from(i) * 60.0, "GET", "/api/board", 200, 1.0,
-                 "reader", "native", None).await;
+            seed(
+                &store,
+                now - 19.0 * 3600.0 + f64::from(i) * 60.0,
+                "GET",
+                "/api/board",
+                200,
+                1.0,
+                "reader",
+                "native",
+                None,
+            )
+            .await;
         }
 
         let api = logs_api(store.clone());
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/writers?since_h=24").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/writers?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -4831,10 +8236,20 @@ mod tests {
             "all 12 mutating rows across the 20h span must be counted; a page-shaped \
              answer returns the newest few and looks identical: {v}"
         );
-        assert_eq!(v["distinct_writers"], 6, "every writer in the window, not the recent ones: {v}");
-        let names: Vec<&str> =
-            v["writers"].as_array().unwrap().iter().map(|w| w["amux_session"].as_str().unwrap()).collect();
-        assert!(names.contains(&"oldest"), "the 20h-old writer must appear: {names:?}");
+        assert_eq!(
+            v["distinct_writers"], 6,
+            "every writer in the window, not the recent ones: {v}"
+        );
+        let names: Vec<&str> = v["writers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["amux_session"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"oldest"),
+            "the 20h-old writer must appear: {names:?}"
+        );
         assert!(
             !names.contains(&"reader"),
             "GET traffic is not mutating work (AF-34: 103 of 105 flagged requests were GETs): {names:?}"
@@ -4844,16 +8259,29 @@ mod tests {
         // population the list is drawn from. An empty list over 0 mutating rows
         // in a busy window means the fleet only read, and only these two
         // together can say that.
-        assert_eq!(v["n_considered"], 22, "n_considered is every row in the window: {v}");
+        assert_eq!(
+            v["n_considered"], 22,
+            "n_considered is every row in the window: {v}"
+        );
         assert_eq!(v["measured"], true, "{v}");
 
         let aw = v["actual_window_h"].as_f64().expect("actual_window_h");
-        assert!(aw >= 19.9, "actual_window_h must cover the seeded span, got {aw}: {v}");
-        assert_eq!(v["scan_truncated"], false, "6 writers is under the cap: {v}");
+        assert!(
+            aw >= 19.9,
+            "actual_window_h must cover the seeded span, got {aw}: {v}"
+        );
+        assert_eq!(
+            v["scan_truncated"], false,
+            "6 writers is under the cap: {v}"
+        );
 
         // Per-method breakdown, so "mutations: 2" can be read as what it was.
-        let oldest = v["writers"].as_array().unwrap().iter()
-            .find(|w| w["amux_session"] == "oldest").unwrap();
+        let oldest = v["writers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["amux_session"] == "oldest")
+            .unwrap();
         assert_eq!(oldest["methods"]["POST"], 1, "{oldest}");
         assert_eq!(oldest["methods"]["PATCH"], 1, "{oldest}");
         assert_eq!(oldest["mutations"], 2, "{oldest}");
@@ -4882,8 +8310,15 @@ mod tests {
         let (store, _dir) = store();
         let now = unix_now();
         for i in 0..3u32 {
-            seed_with_worker(&store, now - f64::from(i) * 60.0, "POST",
-                             "/api/sessions/mixpeek-security/report", "", "mixpeek-security").await;
+            seed_with_worker(
+                &store,
+                now - f64::from(i) * 60.0,
+                "POST",
+                "/api/sessions/mixpeek-security/report",
+                "",
+                "mixpeek-security",
+            )
+            .await;
         }
         // One genuinely attributed write, so an empty list is not the reason.
         seed_with_worker(&store, now - 10.0, "POST", "/api/board", "mvs-infra", "").await;
@@ -4891,7 +8326,10 @@ mod tests {
         let api = logs_api(store.clone());
         let (st, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/writers?since_h=24").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/writers?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -4901,16 +8339,26 @@ mod tests {
             v["unattributed_mutations"], 3,
             "unattributed writes must be published as their own number, not dropped: {v}"
         );
-        assert_eq!(v["mutating_rows"], 4, "the unattributed rows are still mutating rows: {v}");
-        let names: Vec<&str> =
-            v["writers"].as_array().unwrap().iter().map(|w| w["amux_session"].as_str().unwrap()).collect();
         assert_eq!(
-            names, vec!["mvs-infra"],
+            v["mutating_rows"], 4,
+            "the unattributed rows are still mutating rows: {v}"
+        );
+        let names: Vec<&str> = v["writers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["amux_session"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["mvs-infra"],
             "only the row that named its caller may be listed: {v}"
         );
         assert_eq!(v["distinct_writers"], 1, "{v}");
         assert!(
-            !serde_json::to_string(&v).unwrap().contains("mixpeek-security"),
+            !serde_json::to_string(&v)
+                .unwrap()
+                .contains("mixpeek-security"),
             "the path-derived worker must not reach the reader by ANY field, not just \
              `writers` — a name in a summary line accuses just as well: {v}"
         );
@@ -4951,7 +8399,10 @@ mod tests {
         let api = logs_api(store.clone());
         let (_, body) = hit(
             &api,
-            HttpRequest::builder().uri("/api/logs/writers?since_h=24").body(Body::empty()).unwrap(),
+            HttpRequest::builder()
+                .uri("/api/logs/writers?since_h=24")
+                .body(Body::empty())
+                .unwrap(),
         )
         .await;
         let v: Value = serde_json::from_slice(&body).unwrap();
@@ -4965,7 +8416,10 @@ mod tests {
             "the FULL count survives the cap, or a truncated answer cannot say how much \
              it dropped: {v}"
         );
-        assert_eq!(v["mutating_rows"], n as u64, "every write is still counted: {v}");
+        assert_eq!(
+            v["mutating_rows"], n as u64,
+            "every write is still counted: {v}"
+        );
     }
 
     /// Seed a row where the CALLER and the path-derived worker DISAGREE — the
@@ -4978,8 +8432,11 @@ mod tests {
         amux_session: &str,
         worker: Option<&str>,
     ) {
-        let (path, amux_session, worker) =
-            (path.to_string(), amux_session.to_string(), worker.map(str::to_string));
+        let (path, amux_session, worker) = (
+            path.to_string(),
+            amux_session.to_string(),
+            worker.map(str::to_string),
+        );
         store
             .write_async(move |conn| {
                 conn.execute(
@@ -4989,7 +8446,10 @@ mod tests {
                      VALUES (?1,'POST',?2,?3,200,1.0,'127.0.0.1',?4,?5,'native',NULL)",
                     rusqlite::params![ts, path, family_of(&path), amux_session, worker],
                 )?;
-                Ok(WriteOutcome { applied: false, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                })
             })
             .await
             .unwrap();
@@ -5013,8 +8473,22 @@ mod tests {
         let (store, _dir) = store();
         let now = unix_now();
         // Two reports ABOUT nissan, made by nobody (the 7,708/day unattributed class).
-        seed_attributed(&store, now - 30.0, "/api/sessions/nissan/report", "", Some("nissan")).await;
-        seed_attributed(&store, now - 29.0, "/api/sessions/nissan/report", "", Some("nissan")).await;
+        seed_attributed(
+            &store,
+            now - 30.0,
+            "/api/sessions/nissan/report",
+            "",
+            Some("nissan"),
+        )
+        .await;
+        seed_attributed(
+            &store,
+            now - 29.0,
+            "/api/sessions/nissan/report",
+            "",
+            Some("nissan"),
+        )
+        .await;
         // One write BY nissan, against a path that names nobody.
         seed_attributed(&store, now - 28.0, "/api/board", "nissan", None).await;
         // One write by someone else entirely, so "everything" is distinguishable
@@ -5025,8 +8499,11 @@ mod tests {
         let get = |uri: String| {
             let api = api.clone();
             async move {
-                let (st, body) =
-                    hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                let (st, body) = hit(
+                    &api,
+                    HttpRequest::builder().uri(uri).body(Body::empty()).unwrap(),
+                )
+                .await;
                 assert_eq!(st, StatusCode::OK);
                 serde_json::from_slice::<Value>(&body).unwrap()
             }
@@ -5041,27 +8518,47 @@ mod tests {
 
         // THE ASSERTION THAT FAILS PRE-FIX. Without the clause the param is
         // dropped and this is 4 — every row in the log, read as nissan's writes.
-        let mine = get(format!("/api/logs?since={since}&amux_session=nissan&limit=100")).await;
-        assert_eq!(mine["total_matched"], 1, "amux_session must select the CALLER only: {mine}");
+        let mine = get(format!(
+            "/api/logs?since={since}&amux_session=nissan&limit=100"
+        ))
+        .await;
+        assert_eq!(
+            mine["total_matched"], 1,
+            "amux_session must select the CALLER only: {mine}"
+        );
         for e in mine["events"].as_array().unwrap() {
-            assert_eq!(e["amux_session"], "nissan", "a row nissan did not make leaked through: {e}");
+            assert_eq!(
+                e["amux_session"], "nissan",
+                "a row nissan did not make leaked through: {e}"
+            );
         }
 
         // The other two filters are unchanged, and the numbers differ from each
         // other — which is what proves `amux_session` is a third predicate and
         // not an alias that happens to agree on this fixture.
         let by_worker = get(format!("/api/logs?since={since}&worker=nissan&limit=100")).await;
-        assert_eq!(by_worker["total_matched"], 2, "worker= stays path-derived: {by_worker}");
+        assert_eq!(
+            by_worker["total_matched"], 2,
+            "worker= stays path-derived: {by_worker}"
+        );
         let by_session = get(format!("/api/logs?since={since}&session=nissan&limit=100")).await;
-        assert_eq!(by_session["total_matched"], 3, "session= stays the documented OR: {by_session}");
+        assert_eq!(
+            by_session["total_matched"], 3,
+            "session= stays the documented OR: {by_session}"
+        );
 
         // A caller that does not exist must match NOTHING, not everything. This
         // is the direction step 5 must never fail in: a dropped filter hands
         // back the whole log under the name of a lane, and the output of that
         // step is the accusation the contract calls "the expensive kind".
-        let ghost =
-            get(format!("/api/logs?since={since}&amux_session=NO_SUCH_LANE&limit=100")).await;
-        assert_eq!(ghost["total_matched"], 0, "an unknown caller owns no rows: {ghost}");
+        let ghost = get(format!(
+            "/api/logs?since={since}&amux_session=NO_SUCH_LANE&limit=100"
+        ))
+        .await;
+        assert_eq!(
+            ghost["total_matched"], 0,
+            "an unknown caller owns no rows: {ghost}"
+        );
     }
 
     /// AF-521 — a query key this endpoint does not consume must SAY so.
@@ -5081,8 +8578,11 @@ mod tests {
         let get = |uri: String| {
             let api = api.clone();
             async move {
-                let (st, body) =
-                    hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                let (st, body) = hit(
+                    &api,
+                    HttpRequest::builder().uri(uri).body(Body::empty()).unwrap(),
+                )
+                .await;
                 assert_eq!(st, StatusCode::OK);
                 serde_json::from_slice::<Value>(&body).unwrap()
             }
@@ -5093,20 +8593,41 @@ mod tests {
         // the AF-402 decision standing — but the body now says which key did
         // nothing, in the same payload as the rows.
         let typo = get(format!("/api/logs?since={since}&sesion=nissan&limit=100")).await;
-        assert_eq!(typo["total_matched"], 2, "the drop still happens (AF-402 stands): {typo}");
-        assert_eq!(typo["ignored_params"], json!(["sesion"]), "the drop must be NAMED: {typo}");
+        assert_eq!(
+            typo["total_matched"], 2,
+            "the drop still happens (AF-402 stands): {typo}"
+        );
+        assert_eq!(
+            typo["ignored_params"],
+            json!(["sesion"]),
+            "the drop must be NAMED: {typo}"
+        );
 
         // PRESENT AND EMPTY on a clean query, never absent. An absent key reads
         // as None to `.get()` and as "nothing was dropped" to a human, and those
         // are the same three characters as the honest answer (ethos rule 4).
-        let clean = get(format!("/api/logs?since={since}&amux_session=nissan&limit=100")).await;
-        assert_eq!(clean["ignored_params"], json!([]), "a consumed query drops nothing: {clean}");
-        assert_eq!(clean["total_matched"], 1, "and the recognised filter really ran: {clean}");
+        let clean = get(format!(
+            "/api/logs?since={since}&amux_session=nissan&limit=100"
+        ))
+        .await;
+        assert_eq!(
+            clean["ignored_params"],
+            json!([]),
+            "a consumed query drops nothing: {clean}"
+        );
+        assert_eq!(
+            clean["total_matched"], 1,
+            "and the recognised filter really ran: {clean}"
+        );
 
         // Cache-busters are not typos. Surfacing `_=<ts>` would put noise in
         // every polled response and train the reader to ignore the field.
         let busted = get(format!("/api/logs?since={since}&_=12345&cb=x&limit=100")).await;
-        assert_eq!(busted["ignored_params"], json!([]), "cache-busters are benign: {busted}");
+        assert_eq!(
+            busted["ignored_params"],
+            json!([]),
+            "cache-busters are benign: {busted}"
+        );
     }
 
     /// `ip` is a REAL filter, in both directions.
@@ -5173,9 +8694,12 @@ mod tests {
             let _ = n;
         }
         assert!(
-            conn.query_row("SELECT COUNT(*) FROM _amux_request_log WHERE ip IS NOT NULL", [], |r| r
-                .get::<_, i64>(0))
-                .is_err(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM _amux_request_log WHERE ip IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .is_err(),
             "if a bare `ip` column ever exists, this test's whole premise is stale"
         );
     }
@@ -5249,9 +8773,16 @@ mod category_tests {
     fn the_selector_and_the_stamp_cannot_disagree() {
         for cat in ["board", "session", "memory", "files"] {
             let fams = super::families_for_category(cat);
-            assert!(!fams.is_empty(), "tab {cat} selects no families — it would be dead");
+            assert!(
+                !fams.is_empty(),
+                "tab {cat} selects no families — it would be dead"
+            );
             for f in fams {
-                assert_eq!(category_of(f), cat, "{f} is selected by {cat} but stamped differently");
+                assert_eq!(
+                    category_of(f),
+                    cat,
+                    "{f} is selected by {cat} but stamped differently"
+                );
             }
         }
         // http is the COMPLEMENT, so it names no families by design.
@@ -5285,14 +8816,20 @@ mod caller_attribution_tests {
     /// cross-group refusals on 2026-08-25.
     #[test]
     fn a_worker_header_alone_identifies_the_caller() {
-        assert_eq!(caller_from_headers(&h(&[("x-amux-worker", "backend")])), "backend");
+        assert_eq!(
+            caller_from_headers(&h(&[("x-amux-worker", "backend")])),
+            "backend"
+        );
     }
 
     /// CONTROL: the old behaviour must still work. A client sending only
     /// `x-amux-session` is the common case and must not regress.
     #[test]
     fn a_session_header_alone_still_identifies_the_caller() {
-        assert_eq!(caller_from_headers(&h(&[("x-amux-session", "amux")])), "amux");
+        assert_eq!(
+            caller_from_headers(&h(&[("x-amux-session", "amux")])),
+            "amux"
+        );
     }
 
     /// Order matters and matches `hdr_worker`: worker wins when both are present.

@@ -73,12 +73,11 @@ pub fn sa_config() -> Option<(String, String)> {
 /// locally, with neither result saying which environment it was measuring.
 pub fn sa_config_in(home: &std::path::Path) -> Option<(String, String)> {
     let file_env = crate::config::parse_env_file(&home.join("server.env"));
-    let ambient: Option<OwnedAmbientEnv> =
-        if home == crate::config::amux_home() {
-            Some(Box::new(|k: &str| std::env::var(k).ok()))
-        } else {
-            None
-        };
+    let ambient: Option<OwnedAmbientEnv> = if home == crate::config::amux_home() {
+        Some(Box::new(|k: &str| std::env::var(k).ok()))
+    } else {
+        None
+    };
     resolve_sa(&file_env, ambient.as_deref())
 }
 
@@ -101,6 +100,38 @@ fn resolve_sa(
             .or_else(|| ambient.and_then(|f| f(k)).filter(|v| !v.trim().is_empty()))
     };
     Some((get("GOOGLE_SA_KEY_FILE")?, get("GOOGLE_SA_SUBJECT")?))
+}
+
+/// The env var naming a service-account key for one Workspace domain:
+/// `GOOGLE_SA_KEY_FILE_AMUX_IO` for a subject at amux.io. Each Workspace grants
+/// domain-wide delegation to its own service account, so one key cannot
+/// impersonate users in two domains (hello@amux.io is delegated to the
+/// amux-gmail account, the mixpeek.com users to another).
+pub fn domain_key_var(subject: &str) -> Option<String> {
+    let domain = subject.rsplit_once('@')?.1.trim();
+    if domain.is_empty() {
+        return None;
+    }
+    let tail: String = domain
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    Some(format!("GOOGLE_SA_KEY_FILE_{tail}"))
+}
+
+/// The key file for `subject`'s domain when one is configured, else None (the
+/// caller falls back to `GOOGLE_SA_KEY_FILE`). server.env wins over the process env.
+fn domain_key_file(
+    file_env: &std::collections::BTreeMap<String, String>,
+    ambient: AmbientEnv<'_>,
+    subject: &str,
+) -> Option<String> {
+    let var = domain_key_var(subject)?;
+    file_env
+        .get(&var)
+        .cloned()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| ambient(&var).filter(|v| !v.trim().is_empty()))
 }
 
 /// True only when the SA is configured AND its key file actually EXISTS — i.e. a
@@ -146,7 +177,11 @@ pub async fn mint_token(scope: &str) -> Result<String, String> {
 /// Returns the token plus its lifetime; the error string is safe to surface
 /// (carries no secret). NEVER log the returned token.
 pub async fn mint_token_as(scope: &str, subject: &str) -> Result<MintedToken, String> {
-    let (path, _) = sa_config().ok_or("GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT not set")?;
+    let (default_path, _) = sa_config().ok_or("GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT not set")?;
+    let home = crate::config::amux_home();
+    let file_env = crate::config::parse_env_file(&home.join("server.env"));
+    let path = domain_key_file(&file_env, &|k: &str| std::env::var(k).ok(), subject)
+        .unwrap_or(default_path);
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("read SA key file: {e}"))?;
     let key: SaKey = serde_json::from_str(&raw).map_err(|e| format!("parse SA key JSON: {e}"))?;
     let now = chrono::Utc::now().timestamp();
@@ -166,9 +201,8 @@ pub async fn mint_token_as(scope: &str, subject: &str) -> Result<MintedToken, St
     // application/x-www-form-urlencoded body, built by hand so no extra reqwest
     // feature is needed. The JWT (base64url + '.') and the grant-type URN carry
     // no characters that require form-encoding.
-    let form = format!(
-        "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={assertion}"
-    );
+    let form =
+        format!("grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={assertion}");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -186,7 +220,10 @@ pub async fn mint_token_as(scope: &str, subject: &str) -> Result<MintedToken, St
         .await
         .map_err(|e| format!("token exchange body: {e}"))?;
     if !status.is_success() {
-        let err = body.get("error").and_then(|v| v.as_str()).unwrap_or("error");
+        let err = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error");
         let desc = body
             .get("error_description")
             .and_then(|v| v.as_str())
@@ -214,7 +251,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn env_of(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     /// AF-529. The ambient (process-env) lookup is a PARAMETER, so this asserts
@@ -256,7 +296,10 @@ mod tests {
             Some(("/from/file.json".into(), "file@example.com".into()))
         );
         // A blank in the file is not a value; it falls through, same as before.
-        let blank = env_of(&[("GOOGLE_SA_KEY_FILE", "   "), ("GOOGLE_SA_SUBJECT", "s@e.com")]);
+        let blank = env_of(&[
+            ("GOOGLE_SA_KEY_FILE", "   "),
+            ("GOOGLE_SA_SUBJECT", "s@e.com"),
+        ]);
         assert_eq!(
             resolve_sa(&blank, Some(&always)),
             Some(("from-ambient".into(), "s@e.com".into()))
@@ -312,6 +355,19 @@ mod tests {
     /// GOOGLE_SA_KEY_FILE can be gone (it pointed at an ephemeral uploads copy
     /// that got cleaned up), and the connector reading "connected" off it while
     /// every mint 502'd is the dishonest status this guards against.
+    #[test]
+    fn a_subjects_domain_picks_its_own_key_before_the_default() {
+        assert_eq!(domain_key_var("hello@amux.io").as_deref(), Some("GOOGLE_SA_KEY_FILE_AMUX_IO"));
+        assert_eq!(domain_key_var("no-at-sign"), None);
+        let file = env_of(&[("GOOGLE_SA_KEY_FILE_AMUX_IO", "/k/amux.json")]);
+        let none = |_: &str| None;
+        assert_eq!(domain_key_file(&file, &none, "hello@amux.io").as_deref(), Some("/k/amux.json"));
+        assert_eq!(domain_key_file(&file, &none, "ethan@mixpeek.com"), None, "another domain keeps the default key");
+        let ambient = |k: &str| (k == "GOOGLE_SA_KEY_FILE_AMUX_IO").then(|| "/k/env.json".to_string());
+        assert_eq!(domain_key_file(&env_of(&[]), &ambient, "hello@amux.io").as_deref(), Some("/k/env.json"));
+        assert_eq!(domain_key_file(&file, &ambient, "hello@amux.io").as_deref(), Some("/k/amux.json"), "server.env wins");
+    }
+
     #[test]
     fn sa_usable_requires_the_key_file_to_exist_not_just_be_configured() {
         let dir = tempfile::tempdir().expect("tmp");

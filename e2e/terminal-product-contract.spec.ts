@@ -1,6 +1,6 @@
 import { type Route } from '@playwright/test';
 import { test, expect, type Page, allowUnusedRoute } from './fixtures';
-import { readEarlier } from './reader-scroll';
+import { readEarlier, touchDrag } from './reader-scroll';
 
 const worker = 'terminal-contract';
 
@@ -148,12 +148,21 @@ test('terminal controls stay compact and the bottom affordance distinguishes nav
   const state = await boot(page, { transcript, live: 'latest output\n' });
 
   const layout = await page.evaluate(() => {
-    const controls = document.querySelector('.peek-output-controls')!.getBoundingClientRect();
+    const el = document.querySelector('.peek-output-controls')!;
+    const controls = el.getBoundingClientRect();
     const body = document.getElementById('peek-body')!.getBoundingClientRect();
-    return { controlsWidth: controls.width, bodyWidth: body.width, controlsRight: controls.right, bodyRight: body.right };
+    return { shown: getComputedStyle(el).display !== 'none', controlsWidth: controls.width,
+      bodyWidth: body.width, controlsRight: controls.right, bodyRight: body.right };
   });
-  expect(layout.controlsWidth).toBeLessThan(260);
-  expect(Math.abs(layout.controlsRight - layout.bodyRight)).toBeLessThan(12);
+  // The floating controls hold only the subagent navigator (2f238d67 removed
+  // the copy button from them), so with no subagents nothing floats at all.
+  // When they do show, they stay compact and pinned to the body's right edge.
+  if (layout.shown) {
+    expect(layout.controlsWidth).toBeLessThan(260);
+    expect(Math.abs(layout.controlsRight - layout.bodyRight)).toBeLessThan(12);
+  } else {
+    expect(layout.controlsWidth).toBe(0);
+  }
 
   await readEarlier(page, !!testInfo.project.use.hasTouch);
   await page.evaluate(() => {
@@ -202,6 +211,63 @@ test('a downward or sideways wheel at the bottom keeps the terminal following ne
   expect(await page.evaluate('_peekFollowBottom && !_peekScrollLocked')).toBe(true);
 });
 
+test('a tap, an upward swipe and a sideways drag at the bottom keep the terminal following', async ({ page }, testInfo) => {
+  // AMUX-4802, the touch and click half of AMUX-4601. Every touchmove and every
+  // mousedown stopped following: 73 of 96 follow pauses in one day of beacons
+  // fired at gap_px <= 0, a reader already on the newest output. Only a finger
+  // travelling DOWN the screen asks for earlier output.
+  const transcript = Array.from({ length: 220 }, (_, i) => `terminal output row ${i}`).join('\n');
+  const state = await boot(page, { transcript, live: 'latest output\n' });
+  const body = page.locator('#peek-body');
+  await expect.poll(() => page.evaluate('_peekFollowBottom')).toBe(true);
+  const drag = (dx: number, dy: number) => touchDrag(body, dx, dy);
+  if (testInfo.project.use.hasTouch) await body.tap({ position: { x: 5, y: 5 } });
+  else await body.click({ position: { x: 5, y: 5 } });
+  await drag(0, -60);   // finger up: toward NEWER output
+  await drag(80, 0);    // sideways, as over a wide table
+  expect(await page.evaluate('_peekFollowBottom && !_peekScrollLocked')).toBe(true);
+  for (let i = 1; i <= 3; i++) {
+    state.setLive(Array.from({ length: i * 3 }, (_, j) => `grown output ${i}.${j}`).join('\n') + '\n');
+    await page.evaluate(async () => {
+      await (window as any).refreshPeek(true);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    const gap = await body.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight);
+    expect(gap, `frame ${i} stays on the newest output`).toBeLessThanOrEqual(2);
+    await expect(page.locator('.scroll-lock-badge')).toBeHidden();
+  }
+  // The gesture that DOES ask for earlier output still relinquishes, from its
+  // first pixels (e331c213: small upward gestures escape bottom following).
+  await drag(0, 6);
+  // Let WebKit finish handling the synthetic touch (it can land a frame late:
+  // main rust run 39016591884, [ios-safari], read true). A single read after
+  // two frames, not a poll: a poll would pass a flip to false and back.
+  await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+  expect(await page.evaluate('_peekFollowBottom')).toBe(false);
+});
+
+test('clearing a selection made at the bottom resumes following', async ({ page }, testInfo) => {
+  // AMUX-4802. Selecting pauses following so text does not move under the
+  // cursor. It never came back: copy one line and the view stopped tracking.
+  test.skip(!!testInfo.project.use.hasTouch, 'mouse drag-selection is a pointer-device contract');
+  await page.setViewportSize({ width: 1280, height: 800 });
+  const transcript = Array.from({ length: 220 }, (_, i) => `terminal output row ${i}`).join('\n');
+  const state = await boot(page, { transcript, live: 'latest output\n' });
+  const body = page.locator('#peek-body');
+  await expect.poll(() => page.evaluate('_peekFollowBottom')).toBe(true);
+  const box = (await body.boundingBox())!;
+  await page.mouse.move(box.x + 40, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + 400, box.y + box.height / 2, { steps: 4 });
+  await page.mouse.up();
+  await expect.poll(() => page.evaluate('_peekFollowBottom')).toBe(false);
+  await page.evaluate(() => window.getSelection()!.removeAllRanges());
+  await expect.poll(() => page.evaluate('_peekFollowBottom && !_peekScrollLocked')).toBe(true);
+  state.setLive('output that arrived after the copy\n');
+  await page.evaluate(() => (window as any).refreshPeek(true));
+  await expect.poll(() => body.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThanOrEqual(2);
+});
+
 test('terminal chrome cannot inject navigation or slash-picker keys', async ({ page }) => {
   const keyRequests: string[] = [];
   page.on('request', request => {
@@ -209,10 +275,12 @@ test('terminal chrome cannot inject navigation or slash-picker keys', async ({ p
   });
   await boot(page);
 
+  // Nothing floats over the terminal, and there is no copy button at all
+  // (Ethan, 2026-09-30: "we dont use it"). Selecting text is the copy path.
   const controls = page.locator('.peek-output-controls');
-  await expect(controls.locator('button:visible')).toHaveCount(1);
+  await expect(controls.locator('button:visible')).toHaveCount(0);
   await expect(controls.locator('[onclick*="peekQuickKeys"]')).toHaveCount(0);
-  await controls.locator('#peek-copy-btn').click();
+  await expect(page.locator('.peek-copy-btn')).toHaveCount(0);
   await page.waitForTimeout(100);
   expect(keyRequests).toEqual([]);
   await expect(page.locator('#peek-cmd-input')).toHaveValue('');
@@ -311,11 +379,14 @@ test('a delayed live-frame request cannot hold the terminal loading screen open'
   await boot(page, {
     transcript: 'full response paints without waiting for live\n',
     live: 'current terminal frame\n',
-    liveDelayMs: 3000,
+    // The bound must sit clearly below the delay. With a 3000ms delay and a
+    // 2500ms bound, page boot alone used most of the budget on ios-safari CI
+    // (2900ms, 2026-10-01) without the screen ever waiting on the request.
+    liveDelayMs: 8000,
     waitForBothFrames: false,
   });
   await expect(page.locator('#peek-body')).toContainText('current terminal frame', { timeout: 700 });
-  expect(Date.now() - started).toBeLessThan(2500);
+  expect(Date.now() - started).toBeLessThan(6000);
   await expect(page.locator('#peek-body .peek-loading')).toHaveCount(0);
 });
 

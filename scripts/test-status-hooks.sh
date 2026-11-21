@@ -3,6 +3,8 @@
 set -Eeuo pipefail
 trap 'echo "FAIL status-hook fixture line=$LINENO command=$BASH_COMMAND" >&2' ERR
 cd "$(dirname "$0")/.."
+# The lane's own home would win over the fixture HOME.
+unset AMUX_HOME
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 SETTINGS="$TMP/settings.json"
@@ -38,7 +40,8 @@ printf '%s\n' '{
 
 for _ in 1 2; do
   /usr/bin/python3 scripts/hooks/install-claude-status-hooks.py \
-    --settings "$SETTINGS" --hook-path '$HOME/.amux/hook-report.sh' >/dev/null
+    --settings "$SETTINGS" --hook-path '$HOME/.amux/hook-report.sh' \
+    --ask-guard-path '$HOME/.amux/hooks/ask-guard.py' >/dev/null
 done
 
 /usr/bin/python3 - "$SETTINGS" <<'PY'
@@ -61,11 +64,31 @@ assert any(r[0]=="Notification" and " blocked " in r[2] for r in reports), repor
 assert len([r for r in reports if r[0] == "PostToolUse" and r[1] == ".*"]) == 1
 read_guards=[r for r in rows if "large-read-guard.py" in r[2]]
 assert sorted((r[0],r[1]) for r in read_guards)==[("PreToolUse","Bash"),("PreToolUse","Read")],read_guards
+# AMUX-5234: exactly one anchored AskUserQuestion guard after two installs.
+ask_guards=[r for r in rows if "ask-guard.py" in r[2]]
+assert [(r[0],r[1]) for r in ask_guards]==[("PreToolUse","^AskUserQuestion$")],ask_guards
 assert any(r[2] == "echo unrelated" for r in rows)
 assert any(r[2] == "bash check-format.sh" for r in rows)
 assert not any("/api/sessions/" in r[2] and "hook-report.sh" not in r[2] for r in rows)
 print("ok   installer is idempotent and preserves unrelated hooks/settings")
 PY
+
+# The registered ask-guard command must FAIL OPEN when its script is missing
+# (exit 2 from `python3 <missing>` is a block to Claude Code) and must still
+# pass a real deny through. Run the generated command itself, not a paraphrase.
+ASK_CMD="$(/usr/bin/python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+print([h["command"] for g in v["hooks"]["PreToolUse"] for h in g["hooks"] if "ask-guard.py" in h["command"]][0])' "$SETTINGS")"
+mkdir -p "$TMP/askhome/.amux/hooks"
+missing_rc=0
+HOME="$TMP/askhome" bash -c "$ASK_CMD" </dev/null || missing_rc=$?
+printf 'import sys\nsys.stderr.write("denied")\nsys.exit(2)\n' > "$TMP/askhome/.amux/hooks/ask-guard.py"
+deny_rc=0
+HOME="$TMP/askhome" bash -c "$ASK_CMD" </dev/null 2>/dev/null || deny_rc=$?
+[[ "$missing_rc" == 0 ]] || { echo "FAIL ask guard blocks when its script is missing (rc=$missing_rc)"; exit 1; }
+grep -q '"verdict":"script_missing"' "$TMP/askhome/.amux/logs/ask-guard.jsonl" || { echo "FAIL missing ask-guard script left no log line"; exit 1; }
+[[ "$deny_rc" == 2 ]] || { echo "FAIL ask guard swallowed a deliberate deny (rc=$deny_rc)"; exit 1; }
+echo "ok   ask guard fails open on a missing script, logs it, and keeps a real deny"
 
 # Drive the shipped hook against a disposable HTTP endpoint. The endpoint can
 # refuse requests or drop a response after reading the body, which exercises
@@ -116,6 +139,21 @@ trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 for _ in $(seq 1 100); do [ -s "$PORT_FILE" ] && break; sleep .02; done
 URL="http://127.0.0.1:$(cat "$PORT_FILE")"
 
+# An external helper has no owning pane. The old fallback would select an
+# unrelated project worker and emit a false active hook against it.
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/tmux" <<'SH'
+#!/bin/sh
+printf '%s\n' "$*" >> "$HOOK_TMUX_CALLS"
+printf '%s\n' amux-unrelated-project-worker
+SH
+chmod +x "$TMP/bin/tmux"
+HOME="$TMP/home" PATH="$TMP/bin:$PATH" AMUX_URL="$URL" AMUX_SESSION= TMUX_PANE= \
+  HOOK_TMUX_CALLS="$TMP/tmux-calls" bash scripts/hooks/hook-report.sh active prompt-hook <<<'{}'
+test ! -e "$TMP/tmux-calls"
+test ! -e "$CAPTURE"
+echo "ok   external helper hook cannot adopt the selected project worker"
+
 wait_for() {
   local expr="$1"
   for _ in $(seq 1 300); do
@@ -131,6 +169,23 @@ PY
   return 1
 }
 
+# A worker of a private server reports to that server. HOME still names the real
+# install, whose endpoint.json used to win over AMUX_URL for any localhost URL.
+mkdir -p "$TMP/private/logs"
+printf '{"canonical_url":"%s","legacy_port":8822}' "$URL" > "$TMP/private/endpoint.json"
+printf '{"canonical_url":"http://127.0.0.1:9","legacy_port":8822}' > "$TMP/home/.amux/endpoint.json"
+HOME="$TMP/home" AMUX_HOME="$TMP/private" AMUX_URL="$URL" AMUX_SESSION=probe \
+  bash scripts/hooks/hook-report.sh subagent-start subagent-start-hook \
+  <<<'{"session_id":"private-1","agent_id":"private-home"}'
+wait_for 'any(r["body"].get("agent_id")=="private-home" for r in rows)'
+rm -f "$TMP/home/.amux/endpoint.json"
+echo "ok   a private server's worker reports to its own server, with the real endpoint.json present"
+
+# A Chat tab (AMUX_SESSION=<worker>@chat) is not a worker: it reports nothing
+# (AF-1101). The worker's own report below is the twin that still arrives.
+HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe@chat \
+  bash scripts/hooks/hook-report.sh subagent-start subagent-start-hook \
+  <<<'{"session_id":"chat-1","agent_id":"chat-agent"}'
 HOME="$TMP/home" AMUX_URL="$URL" AMUX_SESSION=probe \
   bash scripts/hooks/hook-report.sh subagent-start subagent-start-hook \
   <<<'{"session_id":"abc-123","agent_id":"explore-1"}'
@@ -143,6 +198,12 @@ assert v["source"] == "subagent-start-hook" and v["session_id"] == "abc-123", v
 assert v["event_id"] == "abc-123:explore-1:start", v
 assert v["delivery_attempt"] == 1, v
 print("ok   SubagentStart carries session, agent and stable event identity")
+PY
+/usr/bin/python3 - "$CAPTURE" <<'PY'
+import json,sys
+rows=[json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+assert not any("@chat" in r["path"] or "chat-agent" in json.dumps(r["body"]) for r in rows), rows
+print("ok   a Chat tab reports nothing; the worker's report arrives")
 PY
 /usr/bin/python3 - "$CAPTURE" <<'PY'
 import json,sys
@@ -508,5 +569,39 @@ with tempfile.TemporaryDirectory() as d:
     assert "Notification" in hooks, sorted(hooks)
     print("ok   a supported handler still wires Notification")
 PY2
+
+# MO-3622: on an Apple Silicon Mac whose pane tree is translated, the hook
+# re-execs natively so its ~20 forks stop paying the Rosetta tax (12x CPU each,
+# measured). The probe is a fake tmux that records whether ITS OWN process is
+# translated: tmux is the one child the hook always starts on this path, and the
+# universal `sysctl` it runs inherits the hook's architecture preference. Only
+# meaningful when this test itself runs translated on arm64 hardware; anywhere
+# else there is nothing to prove, and saying so beats a vacuous pass.
+if [ "$(/usr/sbin/sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ] \
+   && [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then
+  mkdir -p "$TMP/probe-bin"
+  cat > "$TMP/probe-bin/tmux" <<'SH'
+#!/bin/sh
+printf '%s\n' "$(/usr/sbin/sysctl -n sysctl.proc_translated)" >> "$HOOK_TMUX_CALLS"
+printf '%s\n' amux-nativearch
+SH
+  chmod +x "$TMP/probe-bin/tmux"
+  for mode in native optout; do
+    rm -f "$TMP/arch-calls"
+    if [ "$mode" = optout ]; then OPT=0; else OPT=1; fi
+    HOME="$TMP/home" PATH="$TMP/probe-bin:$PATH" AMUX_URL="$URL" AMUX_SESSION= TMUX_PANE=%1 \
+      AMUX_NATIVE_ARCH=$OPT HOOK_TMUX_CALLS="$TMP/arch-calls" \
+      bash scripts/hooks/hook-report.sh active prompt-hook <<<'{}'
+    got="$(head -1 "$TMP/arch-calls")"
+    if [ "$mode" = native ]; then
+      [ "$got" = 0 ] || { echo "FAIL hook children still translated (proc_translated=$got); the native re-exec did not take" >&2; exit 1; }
+    else
+      [ "$got" = 1 ] || { echo "FAIL AMUX_NATIVE_ARCH=0 must restore the inherited (translated) arch, got proc_translated=$got" >&2; exit 1; }
+    fi
+  done
+  echo "ok   hook re-execs natively on a translated tree, and AMUX_NATIVE_ARCH=0 opts out"
+else
+  echo "skip hook native re-exec: this run is not a translated shell on arm64 hardware, so there is no Rosetta tax to remove"
+fi
 
 echo "ok   all shipped status-hook durability regressions passed"

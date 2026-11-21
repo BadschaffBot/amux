@@ -26,9 +26,9 @@
 //!    and logs when it is exceeded so the operator knows before the OOM.
 //!
 //! 5. **True process-table zombies** (`state=Z`). The child is already dead, so
-//!    signalling it cannot clean anything. The sweep calls non-blocking
-//!    `waitpid` only for an aged child owned by this amux-server process;
-//!    zombies owned by another application are reported and left alone.
+//!    signalling it cannot clean anything. Parent PID does not establish who
+//!    owns its exit status: a fleet probe or Tokio Child may still be waiting.
+//!    The sweep reports zombies; only the spawning caller reaps its child.
 //!
 //! 6. **SIP-protected indexing daemons pegged hot** (`fseventsd`, `ecosystemd`,
 //!    `ecosystemanalyti`, `mds*`). the earlier resident-memory ranking had already
@@ -56,7 +56,7 @@
 //! - Kill processes the raylet is still using (raylet running = ray is live).
 //! - Kill rustc processes whose parent is NOT pid 1 (they may still be running).
 //! - Take any action on processes it cannot identify by full command line.
-//! - Reap a zombie whose parent is not this exact server process.
+//! - Reap a zombie: its spawning caller owns the exit status, even in this server.
 //!
 //! SAFE: every termination is SIGTERM, not SIGKILL, and every target class has
 //! a predicate that cannot be satisfied by a legitimate process doing real work.
@@ -165,7 +165,7 @@ fn pid_exists(pid: u32) -> bool {
 }
 
 /// Parse ps etime field [[DD-]HH:]MM:SS into total seconds.
-fn parse_etime(s: &str) -> Option<u64> {
+pub(crate) fn parse_etime(s: &str) -> Option<u64> {
     // Split on '-' first (days), then on ':'
     let (days, rest) = if let Some((d, r)) = s.split_once('-') {
         (d.parse::<u64>().ok()?, r)
@@ -174,14 +174,13 @@ fn parse_etime(s: &str) -> Option<u64> {
     };
     let parts: Vec<&str> = rest.split(':').collect();
     match parts.as_slice() {
-        [mm, ss] => {
-            Some(days * 86400 + mm.parse::<u64>().ok()? * 60 + ss.parse::<u64>().ok()?)
-        }
-        [hh, mm, ss] => {
-            Some(days * 86400 + hh.parse::<u64>().ok()? * 3600
+        [mm, ss] => Some(days * 86400 + mm.parse::<u64>().ok()? * 60 + ss.parse::<u64>().ok()?),
+        [hh, mm, ss] => Some(
+            days * 86400
+                + hh.parse::<u64>().ok()? * 3600
                 + mm.parse::<u64>().ok()? * 60
-                + ss.parse::<u64>().ok()?)
-        }
+                + ss.parse::<u64>().ok()?,
+        ),
         _ => None,
     }
 }
@@ -239,7 +238,13 @@ fn health_process_rows(text: &str) -> Vec<HealthProcess> {
             if command.is_empty() {
                 return None;
             }
-            Some(HealthProcess { pid, ppid, state, elapsed_s, command })
+            Some(HealthProcess {
+                pid,
+                ppid,
+                state,
+                elapsed_s,
+                command,
+            })
         })
         .collect()
 }
@@ -275,7 +280,10 @@ fn owned_zombie_children(
 ) -> (Vec<u32>, Vec<HealthProcess>) {
     let mut owned = Vec::new();
     let mut visible = Vec::new();
-    for child in rows.iter().filter(|p| p.state.starts_with('Z') && p.elapsed_s >= grace_s) {
+    for child in rows
+        .iter()
+        .filter(|p| p.state.starts_with('Z') && p.elapsed_s >= grace_s)
+    {
         visible.push(child.clone());
         if child.ppid == server_pid {
             owned.push(child.pid);
@@ -293,19 +301,26 @@ fn zombie_log_sample(zombies: &[HealthProcess]) -> String {
         .join(", ")
 }
 
-fn reap_owned_zombie(pid: u32) -> Result<bool, String> {
-    let mut status: libc::c_int = 0;
-    // SAFETY: waitpid is restricted to one PID observed as an aged zombie
-    // whose parent is this process. WNOHANG guarantees the health tick cannot
-    // block if another waiter wins the race.
-    let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-    if rc == pid as libc::pid_t {
-        Ok(true)
-    } else if rc == 0 {
-        Ok(false)
-    } else {
-        Err(std::io::Error::last_os_error().to_string())
+// `etime` measures process lifetime, not time spent as a zombie. Even an
+// aged child may have just exited with a caller still waiting. A global waitpid
+// steals that status (CI: pool recovery probes failed with ECHILD), so this
+// observer must never reap any child, including one with our own parent PID.
+fn report_zombie_children(rows: &[HealthProcess], grace_s: u64, server_pid: u32) -> (usize, usize) {
+    let (owned, zombies) = owned_zombie_children(rows, grace_s, server_pid);
+    if !zombies.is_empty() {
+        tracing::warn!(
+            job = JOB,
+            measured = true,
+            n_considered = zombies.len(),
+            owned_by_this_server = owned.len(),
+            foreign_parent = zombies.len().saturating_sub(owned.len()),
+            sample = %zombie_log_sample(&zombies),
+            sample_limit = ZOMBIE_LOG_SAMPLE,
+            verdict = "zombie_waiter_status_preserved",
+            "mac-health: zombies are report-only; the spawning caller owns each exit status"
+        );
     }
+    (zombies.len(), owned.len())
 }
 
 /// Minimum age (seconds) before an orphaned Playwright Chrome is eligible for
@@ -355,7 +370,8 @@ fn orphaned_playwright_chromes(grace_s: u64) -> (Vec<(u32, u64)>, usize) {
         let cmd = cmd_owned.as_str();
         // Must be a Chrome process with a Playwright temp-profile user-data-dir.
         let is_chrome = cmd.contains("Google Chrome") || cmd.contains("Chromium");
-        let has_playwright_tmpdir = cmd.contains("/T/.tmp") && cmd.contains("playwright-auth/profile");
+        let has_playwright_tmpdir =
+            cmd.contains("/T/.tmp") && cmd.contains("playwright-auth/profile");
         if !is_chrome || !has_playwright_tmpdir {
             continue;
         }
@@ -380,7 +396,10 @@ fn orphaned_playwright_chromes(grace_s: u64) -> (Vec<(u32, u64)>, usize) {
 /// `claude_count=0 max_claude=60` while the host sat at 95% swap and macOS was
 /// killing workers. A check that cannot fail is not a check (ethos rule 7).
 fn check_claude_count(max: usize) -> Option<usize> {
-    let out = std::process::Command::new("pgrep").args(["-x", "claude"]).output().ok()?;
+    let out = std::process::Command::new("pgrep")
+        .args(["-x", "claude"])
+        .output()
+        .ok()?;
     // pgrep exits 1 with no output when nothing matches, which IS a real zero.
     // Any other failure is an un-measured count and must stay None.
     let code = out.status.code().unwrap_or(-1);
@@ -392,7 +411,10 @@ fn check_claude_count(max: usize) -> Option<usize> {
         );
         return None;
     }
-    let count = String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).count();
+    let count = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
     if count > max {
         tracing::warn!(
             job = JOB,
@@ -423,9 +445,40 @@ fn swap_used_pct() -> Option<f64> {
     // is why only this one broke.
     let out = SYSCTL_PATHS
         .iter()
-        .find_map(|bin| std::process::Command::new(bin).args(["-n", "vm.swapusage"]).output().ok())
+        .find_map(|bin| {
+            std::process::Command::new(bin)
+                .args(["-n", "vm.swapusage"])
+                .output()
+                .ok()
+        })
         .filter(|o| o.status.success())?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    parse_swap_pct(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `sysctl -n vm.swapusage` into a used-percentage.
+///
+/// Split out from `swap_used_pct` so the two causes of None can be told apart
+/// in a test: this one cannot spawn anything, so a None from here is a PARSE
+/// failure and nothing else.
+///
+/// NO SWAP CONFIGURED IS A MEASUREMENT, NOT A FAILURE. macOS allocates swap
+/// lazily, so a host that has never needed it reports
+/// `total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)`. sysctl ran, both
+/// numbers parsed, and the truthful answer is 0% in use. This used to return
+/// None on `total <= 0.0` — correct arithmetic, wrong semantics, because it
+/// collapsed a HEALTHY host into the same value as the launchd-PATH bug above,
+/// where sysctl never spawns at all. The caller logs `swap_measured=false` and
+/// `swap_pct=-1` for both, so blind and idle were indistinguishable in exactly
+/// the field that exists to tell them apart.
+///
+/// Measured 2026-09-23: this host reports total = 0.00M, and
+/// `swap_and_consumers_report_absence_rather_than_a_false_zero` failed on
+/// origin/main for that reason — the prescribed pre-push suite was red for
+/// every lane, on a healthy machine.
+///
+/// None is now reserved for "could not read it", which is what that test
+/// asserts against.
+fn parse_swap_pct(text: &str) -> Option<f64> {
     // "total = 32768.00M  used = 31284.00M  free = 1484.00M  (encrypted)"
     let grab = |key: &str| -> Option<f64> {
         let at = text.find(key)?;
@@ -437,7 +490,9 @@ fn swap_used_pct() -> Option<f64> {
             .ok()
     };
     let (total, used) = (grab("total")?, grab("used")?);
-    if total <= 0.0 { return None; }
+    if total <= 0.0 {
+        return Some(0.0);
+    }
     Some(used / total * 100.0)
 }
 
@@ -452,12 +507,13 @@ fn swap_used_pct() -> Option<f64> {
 /// Scoped to prefixes a harness mints, never to a worker name. A real lane is
 /// somebody's work in progress and is not this job's to end.
 fn stale_test_panes(grace_s: u64) -> Vec<String> {
-    const HARNESS: [&str; 3] = ["e2e-", "board-reviewer-", "callback-b-"];
     let out = std::process::Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
         .output();
     let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() { return Vec::new(); }
+    if !out.status.success() {
+        return Vec::new();
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -466,20 +522,67 @@ fn stale_test_panes(grace_s: u64) -> Vec<String> {
         .lines()
         .filter_map(|line| {
             let (name, created) = line.rsplit_once(' ')?;
-            let bare = name.strip_prefix("amux-")?;
-            if !HARNESS.iter().any(|p| bare.starts_with(p)) { return None; }
-            let age = now.saturating_sub(created.trim().parse::<u64>().ok()?);
-            (age >= grace_s).then(|| name.to_string())
+            let created = created.trim().parse::<u64>().ok()?;
+            harness_pane_is_stale(name, created, now, grace_s, |bare| {
+                crate::api::session_verbs::env_path(bare).exists()
+            })
+            .then(|| name.to_string())
         })
         .collect()
 }
 
+/// Prefixes only a test harness mints for its throwaway panes.
+const HARNESS_PREFIXES: [&str; 3] = ["e2e-", "board-reviewer-", "callback-b-"];
+
+/// The one rule for what the pressure arm may kill: a pane a harness minted,
+/// old enough that no run still owns it, that NO registered worker owns.
+///
+/// The prefix alone is not proof. 2026-11-17: an owner named a real worker
+/// `e2e-audit`, and at 85% swap this job killed it mid-task 30 minutes after
+/// it started ("reaped a stale test pane", pane=amux-e2e-audit). A worker's
+/// `sessions/<name>.env` is what makes it a lane; harness panes have none.
+fn harness_pane_is_stale(
+    session: &str,
+    created: u64,
+    now: u64,
+    grace_s: u64,
+    registered: impl Fn(&str) -> bool,
+) -> bool {
+    let Some(bare) = session.strip_prefix("amux-") else {
+        return false;
+    };
+    if !HARNESS_PREFIXES.iter().any(|p| bare.starts_with(p)) {
+        return false;
+    }
+    if now.saturating_sub(created) < grace_s {
+        return false;
+    }
+    if registered(bare) {
+        tracing::info!(
+            job = JOB,
+            pane = session,
+            verdict = "harness_prefix_worker_spared",
+            measured = true,
+            n_considered = 1,
+            "mac-health: a pane with a test-harness prefix belongs to a registered worker; not reaping it"
+        );
+        return false;
+    }
+    true
+}
+
 fn test_pane_grace_s() -> u64 {
-    std::env::var("AMUX_TEST_PANE_GRACE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(1800)
+    std::env::var("AMUX_TEST_PANE_GRACE_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800)
 }
 
 fn mem_reap_swap_pct() -> f64 {
-    std::env::var("AMUX_MEM_REAP_SWAP_PCT").ok().and_then(|v| v.parse().ok()).unwrap_or(85.0)
+    std::env::var("AMUX_MEM_REAP_SWAP_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(85.0)
 }
 
 /// SIP-protected indexing daemons worth watching — the same list procwarden's
@@ -487,11 +590,20 @@ fn mem_reap_swap_pct() -> f64 {
 /// so these are prefix-matched (`ecosystemanalyti`, not the full
 /// `ecosystemanalyticsd`).
 const INDEXING_DAEMON_NAMES: [&str; 7] = [
-    "fseventsd", "ecosystemd", "ecosystemanalyti", "mds", "mds_stores", "mdworker", "mdworker_shared",
+    "fseventsd",
+    "ecosystemd",
+    "ecosystemanalyti",
+    "mds",
+    "mds_stores",
+    "mdworker",
+    "mdworker_shared",
 ];
 
 fn indexing_daemon_cpu_above() -> f64 {
-    std::env::var("AMUX_MAC_HEALTH_DAEMON_CPU_ABOVE").ok().and_then(|v| v.parse().ok()).unwrap_or(80.0)
+    std::env::var("AMUX_MAC_HEALTH_DAEMON_CPU_ABOVE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80.0)
 }
 
 /// `ps comm` truncates long names, so this is a prefix match against
@@ -522,14 +634,21 @@ fn spotlight_exclusion_can_reach(name: &str) -> bool {
 /// `(name, %cpu)` for every watched indexing daemon currently above the
 /// threshold. CPU discovery is separate from the compressed-memory snapshot.
 fn hot_indexing_daemons(above: f64) -> Vec<(String, f64)> {
-    let Ok(out) = std::process::Command::new("ps").args(["-eo", "%cpu=,comm="]).output() else {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-eo", "%cpu=,comm="])
+        .output()
+    else {
         return Vec::new();
     };
     let mut out_rows = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let line = line.trim();
-        let Some((cpu, comm)) = line.split_once(char::is_whitespace) else { continue };
-        let Ok(cpu) = cpu.trim().parse::<f64>() else { continue };
+        let Some((cpu, comm)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(cpu) = cpu.trim().parse::<f64>() else {
+            continue;
+        };
         let name = comm.trim().rsplit('/').next().unwrap_or(comm.trim());
         if cpu > above && is_indexing_daemon(name) {
             out_rows.push((name.to_string(), cpu));
@@ -563,7 +682,9 @@ fn spotlight_exclude_paths() -> Vec<std::path::PathBuf> {
         std::path::PathBuf::from(format!("{home}/.amux")),
     ];
     if let Some(uid) = uid {
-        v.push(std::path::PathBuf::from(format!("/private/tmp/claude-{uid}")));
+        v.push(std::path::PathBuf::from(format!(
+            "/private/tmp/claude-{uid}"
+        )));
     }
     v
 }
@@ -588,7 +709,169 @@ fn ensure_spotlight_excluded(dir: &std::path::Path) -> Result<bool, String> {
     if sentinel.exists() {
         return Ok(false);
     }
-    std::fs::File::create(&sentinel).map(|_| true).map_err(|e| e.to_string())
+    std::fs::File::create(&sentinel)
+        .map(|_| true)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// 7. A translated process tree on Apple Silicon (MO-3622).
+//
+// Measured 2026-09-26 with the 15-minute load at 167% of 28 cores: 88% of the
+// ~300 process spawns per second on the box ran under Rosetta, and a translated
+// spawn costs about 12x the CPU of a native one (400 spawns: 7.7 CPU-s vs 0.65).
+// Nothing announced it. The tmux server here is an Intel-only build, so every
+// pane it starts prefers x86_64 and every universal binary below it (bash, git,
+// grep, awk, python3) runs translated; `claude` itself is arm64 and made no
+// difference, because the preference is inherited down the tree, not chosen per
+// binary. It looked like "too much work" because the cost hides inside `sys`
+// time and in oahd/trustd/syspolicyd/XProtect waking on every exec.
+//
+// The signal is the census itself, logged every tick, plus one WARN per
+// cooldown naming who is translated. It does not act: switching a tree native
+// means restarting the tmux server or launching lanes under `arch`, which is the
+// owner's call.
+// ---------------------------------------------------------------------------
+
+/// `P_TRANSLATED` in `p_flag` (sys/proc.h), which is what `ps -o flags=` prints
+/// in hex. Verified against `sysctl sysctl.proc_translated` on the same pids.
+const P_TRANSLATED: u32 = 0x0002_0000;
+
+/// A census of one `ps -A -o flags=,comm=` snapshot.
+#[derive(Debug, PartialEq, Eq)]
+struct TranslatedCensus {
+    total: usize,
+    translated: usize,
+    /// Most-common translated command names first, at most eight.
+    top: Vec<(String, usize)>,
+}
+
+impl TranslatedCensus {
+    fn share_pct(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        100.0 * self.translated as f64 / self.total as f64
+    }
+}
+
+fn parse_translated_census(text: &str) -> TranslatedCensus {
+    let mut total = 0usize;
+    let mut translated = 0usize;
+    let mut by_comm: std::collections::BTreeMap<String, usize> = Default::default();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some((flags, comm)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(flags) = u32::from_str_radix(flags, 16) else {
+            continue;
+        };
+        let comm = comm.trim();
+        if comm.is_empty() {
+            continue;
+        }
+        total += 1;
+        if flags & P_TRANSLATED != 0 {
+            translated += 1;
+            let name = comm.rsplit('/').next().unwrap_or(comm);
+            *by_comm.entry(name.to_string()).or_default() += 1;
+        }
+    }
+    let mut top: Vec<(String, usize)> = by_comm.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top.truncate(8);
+    TranslatedCensus {
+        total,
+        translated,
+        top,
+    }
+}
+
+/// `None` = not measured: not an Apple Silicon build (an aarch64 macOS server
+/// proves the host is Apple Silicon; anywhere else there is no Rosetta), or `ps`
+/// failed.
+fn rosetta_census() -> Option<TranslatedCensus> {
+    if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return None;
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-A", "-o", "flags=,comm="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(parse_translated_census(&String::from_utf8_lossy(
+        &out.stdout,
+    )))
+}
+
+fn rosetta_warn_min_procs() -> usize {
+    std::env::var("AMUX_ROSETTA_WARN_MIN_PROCS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(40)
+}
+
+fn rosetta_warn_min_share_pct() -> f64 {
+    std::env::var("AMUX_ROSETTA_WARN_MIN_SHARE_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(10.0)
+}
+
+/// How long between WARNs. The census line is logged every tick regardless; the
+/// WARN is the nudge, and a nudge that fires every 30 minutes forever is noise.
+const ROSETTA_WARN_COOLDOWN_S: u64 = 6 * 3600;
+
+static ROSETTA_LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pure decision: is a WARN due for this census at `now` (unix seconds)?
+fn rosetta_warn_due(
+    census: &TranslatedCensus,
+    min_procs: usize,
+    min_share_pct: f64,
+    last_warn_s: u64,
+    now_s: u64,
+) -> bool {
+    // A census with nothing translated is never "a translated tree", whatever
+    // the operator set the thresholds to.
+    census.translated > 0
+        && census.translated >= min_procs
+        && census.share_pct() >= min_share_pct
+        && now_s.saturating_sub(last_warn_s) >= ROSETTA_WARN_COOLDOWN_S
+}
+
+fn note_rosetta_census(census: &TranslatedCensus) {
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = ROSETTA_LAST_WARN.load(std::sync::atomic::Ordering::Relaxed);
+    if !rosetta_warn_due(
+        census,
+        rosetta_warn_min_procs(),
+        rosetta_warn_min_share_pct(),
+        last,
+        now_s,
+    ) {
+        return;
+    }
+    ROSETTA_LAST_WARN.store(now_s, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        job = JOB,
+        verdict = "rosetta_translated_tree",
+        measured = true,
+        n_considered = census.total,
+        translated = census.translated,
+        share_pct = census.share_pct() as i64,
+        top = ?census.top,
+        "mac-health: an Apple Silicon host is running much of its process tree under Rosetta; \
+         every spawn there costs ~12x the CPU of a native one (MO-3622). Usual cause: an \
+         Intel-only tmux server, whose panes hand x86_64 down to every universal binary. \
+         Check `sysctl -n sysctl.proc_translated` in a lane shell and `file $(which tmux)`"
+    );
 }
 
 fn one_pass() {
@@ -613,19 +896,24 @@ fn one_pass() {
                     job = JOB, pid, age_s, cmd = %cmd,
                     "mac-health: SIGTERM orphaned ray:: worker"
                 );
-                let _ = std::process::Command::new("kill").args([&pid.to_string()]).output();
+                let _ = std::process::Command::new("kill")
+                    .args([&pid.to_string()])
+                    .output();
             }
         } else {
             tracing::debug!(job = JOB, "mac-health: no orphaned ray:: workers");
         }
     } else {
-        tracing::debug!(job = JOB, "mac-health: raylet running, skipping ray orphan sweep");
+        tracing::debug!(
+            job = JOB,
+            "mac-health: raylet running, skipping ray orphan sweep"
+        );
     }
 
     // --- Orphaned rustc + true zombie sweep ---
     let mut rustc_reaped = 0usize;
     let mut zombies_seen = 0usize;
-    let mut zombies_reaped = 0usize;
+    let mut zombies_owned_reported = 0usize;
     match health_process_snapshot() {
         Some(rows) if !rows.is_empty() => {
             let rustc = orphaned_debug_rustc(&rows, rustc_grace);
@@ -642,41 +930,8 @@ fn one_pass() {
             }
             rustc_reaped = rustc.len();
 
-            let (owned, zombies) =
-                owned_zombie_children(&rows, zombie_grace, std::process::id());
-            zombies_seen = zombies.len();
-            if !zombies.is_empty() {
-                let foreign = zombies.len().saturating_sub(owned.len());
-                let sample = zombie_log_sample(&zombies);
-                tracing::warn!(
-                    job = JOB,
-                    count = zombies.len(),
-                    owned_by_this_server = owned.len(),
-                    foreign_parent = foreign,
-                    sample = %sample,
-                    sample_limit = ZOMBIE_LOG_SAMPLE,
-                    "mac-health: true zombies detected; foreign children are report-only"
-                );
-            }
-            for pid in owned {
-                match reap_owned_zombie(pid) {
-                    Ok(true) => {
-                        zombies_reaped += 1;
-                        tracing::info!(job = JOB, pid, "mac-health: reaped owned zombie child");
-                    }
-                    Ok(false) => tracing::info!(
-                        job = JOB,
-                        pid,
-                        "mac-health: zombie disappeared before reap (another waiter won)"
-                    ),
-                    Err(error) => tracing::warn!(
-                        job = JOB,
-                        pid,
-                        %error,
-                        "mac-health: waitpid failed; zombie was NOT reported as reaped"
-                    ),
-                }
-            }
+            (zombies_seen, zombies_owned_reported) =
+                report_zombie_children(&rows, zombie_grace, std::process::id());
         }
         _ => tracing::warn!(
             job = JOB,
@@ -705,10 +960,14 @@ fn one_pass() {
         );
         for (pid, age_s) in &pw_orphans {
             tracing::info!(
-                job = JOB, pid, age_s,
+                job = JOB,
+                pid,
+                age_s,
                 "mac-health: SIGTERM orphaned Playwright Chrome root"
             );
-            let _ = std::process::Command::new("kill").args([&pid.to_string()]).output();
+            let _ = std::process::Command::new("kill")
+                .args([&pid.to_string()])
+                .output();
         }
     } else {
         tracing::debug!(
@@ -809,6 +1068,12 @@ fn one_pass() {
         }
     }
 
+    // --- Rosetta census (MO-3622) ---
+    let rosetta = rosetta_census();
+    if let Some(census) = &rosetta {
+        note_rosetta_census(census);
+    }
+
     // --- Claude process count ---
     let claude_count = check_claude_count(max_claude);
     tracing::info!(
@@ -826,9 +1091,14 @@ fn one_pass() {
         playwright_chromes_reaped = pw_orphans.len(),
         rustc_reaped,
         zombies_seen,
-        zombies_reaped,
+        zombies_reaped = 0usize,
+        zombies_owned_reported,
         indexing_daemons_hot = hot_daemons.len(),
         spotlight_newly_excluded = spotlight_newly_excluded.len(),
+        // -1 is never a count: not an Apple Silicon build, or ps failed.
+        translated_procs = rosetta.as_ref().map(|r| r.translated as i64).unwrap_or(-1),
+        translated_of = rosetta.as_ref().map(|r| r.total as i64).unwrap_or(-1),
+        translated_measured = rosetta.is_some(),
         "mac-health tick"
     );
 }
@@ -849,11 +1119,25 @@ mod tests {
     /// every process whose name happens to contain a substring.
     #[test]
     fn indexing_daemon_matching_is_prefix_not_substring() {
-        for name in ["fseventsd", "ecosystemd", "ecosystemanalyticsd", "mds", "mds_stores", "mdworker", "mdworker_shared"] {
-            assert!(is_indexing_daemon(name), "{name} must match — it's what this arm exists to find");
+        for name in [
+            "fseventsd",
+            "ecosystemd",
+            "ecosystemanalyticsd",
+            "mds",
+            "mds_stores",
+            "mdworker",
+            "mdworker_shared",
+        ] {
+            assert!(
+                is_indexing_daemon(name),
+                "{name} must match — it's what this arm exists to find"
+            );
         }
         for name in ["rustc", "Chrome", "claude", "xecosystemd", "notmds"] {
-            assert!(!is_indexing_daemon(name), "{name} must NOT match — a substring hit would exclude the wrong host state");
+            assert!(
+                !is_indexing_daemon(name),
+                "{name} must NOT match — a substring hit would exclude the wrong host state"
+            );
         }
     }
 
@@ -884,7 +1168,10 @@ mod tests {
     fn shellexpand_home_only_touches_a_leading_tilde_slash() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into());
         assert_eq!(shellexpand_home("~/Dev"), format!("{home}/Dev"));
-        assert_eq!(shellexpand_home("/private/tmp/claude-501"), "/private/tmp/claude-501");
+        assert_eq!(
+            shellexpand_home("/private/tmp/claude-501"),
+            "/private/tmp/claude-501"
+        );
         // A bare `~` with no trailing slash is not the pattern this function
         // promises to handle — must pass through unchanged, not panic.
         assert_eq!(shellexpand_home("~"), "~");
@@ -901,33 +1188,74 @@ mod tests {
     }
 
     #[test]
+    fn a_registered_worker_with_a_harness_prefix_is_never_reaped() {
+        // 2026-11-17: `e2e-audit` was a real worker, killed at 85% swap 30
+        // minutes after it started. Its sessions/<name>.env is what makes it a
+        // lane; the harness panes beside it have none.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/e2e-audit.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let registered = |bare: &str| crate::api::session_verbs::env_path(bare).exists();
+        let (now, grace) = (10_000, 1_800);
+        assert!(
+            !harness_pane_is_stale("amux-e2e-audit", 0, now, grace, registered),
+            "a registered worker is somebody's work in progress"
+        );
+        assert!(
+            harness_pane_is_stale("amux-e2e-life-desktop-1788996104537", 0, now, grace, registered),
+            "an unregistered harness pane is still reaped"
+        );
+    }
+
+    #[test]
     fn the_pressure_arm_reaps_only_harness_panes_and_only_when_stale() {
         // The rule this job must not get wrong: a real lane is somebody's work
         // in progress. Only prefixes a HARNESS mints are eligible, and only
-        // once they are old enough that no run still owns them.
-        const HARNESS: [&str; 3] = ["e2e-", "board-reviewer-", "callback-b-"];
-        let eligible = |bare: &str| HARNESS.iter().any(|p| bare.starts_with(p));
+        // once they are old enough that no run still owns them. This calls the
+        // shipped rule; a copy of its prefix list here stayed green while the
+        // rule killed a registered worker named e2e-audit (2026-11-17).
+        let (now, grace) = (10_000, 1_800);
+        let eligible =
+            |bare: &str| harness_pane_is_stale(&format!("amux-{bare}"), 0, now, grace, |_| false);
 
         // Real workers, including ones whose names merely CONTAIN a harness
         // word — a prefix test and a substring test differ exactly here.
         for lane in [
-            "amux", "backend", "mixpeek-orchestrator", "amux-testing-e2e",
-            "gtm-e2e-runner", "my-callback-b-worker",
+            "amux",
+            "backend",
+            "mixpeek-orchestrator",
+            "amux-testing-e2e",
+            "gtm-e2e-runner",
+            "my-callback-b-worker",
         ] {
-            assert!(!eligible(lane), "{lane} is a real lane and must never be reaped");
+            assert!(
+                !eligible(lane),
+                "{lane} is a real lane and must never be reaped"
+            );
         }
         for harness in [
             "e2e-life-desktop-1788996104537",
             "board-reviewer-ios-safari-1788976843246",
             "callback-b-desktop-1788849272894",
         ] {
-            assert!(eligible(harness), "{harness} is harness scaffolding and should be eligible");
+            assert!(
+                eligible(harness),
+                "{harness} is harness scaffolding and should be eligible"
+            );
         }
 
         // Age gates independently of the name: a pane from a RUNNING test is
         // not stale, and reaping it would kill the run that owns it.
-        let grace = test_pane_grace_s();
-        assert!(grace > 0, "a zero grace would reap panes belonging to a live run");
+        let fresh = now - grace + 1;
+        assert!(!harness_pane_is_stale("amux-e2e-life-desktop-1", fresh, now, grace, |_| false));
+        assert!(harness_pane_is_stale("amux-e2e-life-desktop-1", now - grace, now, grace, |_| false));
+        // Only amux's own panes, never another tmux user's.
+        assert!(!harness_pane_is_stale("e2e-life-desktop-1", 0, now, grace, |_| false));
+        assert!(
+            test_pane_grace_s() > 0,
+            "a zero grace would reap panes belonging to a live run"
+        );
         assert!(mem_reap_swap_pct() > 0.0 && mem_reap_swap_pct() <= 100.0);
     }
 
@@ -948,6 +1276,39 @@ mod tests {
         // The memory snapshot has its own native and malformed-output controls.
     }
 
+    /// The two causes of None, pinned apart. Without these, the fix to
+    /// `total <= 0.0` is invisible and a later "simplification" back to None
+    /// reads as harmless.
+    #[test]
+    fn a_host_with_no_swap_file_reports_zero_percent_not_unmeasurable() {
+        // What this machine actually prints, verbatim.
+        let real = "total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)";
+        assert_eq!(
+            parse_swap_pct(real),
+            Some(0.0),
+            "no swap configured is 0% in use, not blind"
+        );
+    }
+
+    #[test]
+    fn a_host_with_swap_in_use_still_reports_the_percentage() {
+        // The control. A fix that returned Some(0.0) unconditionally would pass
+        // the test above and silently disable the reaping arm on a host at 95%.
+        let hot = "total = 1024.00M  used = 512.00M  free = 512.00M  (encrypted)";
+        assert_eq!(parse_swap_pct(hot), Some(50.0));
+        let full = "total = 32768.00M  used = 31284.00M  free = 1484.00M  (encrypted)";
+        assert!(parse_swap_pct(full).is_some_and(|p| p > 95.0));
+    }
+
+    #[test]
+    fn output_that_cannot_be_parsed_is_still_none() {
+        // None must keep meaning "could not read it" — that is what the
+        // launchd-PATH assertion below relies on.
+        assert_eq!(parse_swap_pct(""), None);
+        assert_eq!(parse_swap_pct("sysctl: unknown oid 'vm.swapusage'"), None);
+        assert_eq!(parse_swap_pct("total = M  used = M"), None);
+    }
+
     #[test]
     fn ray_orphan_grace_filters_young_processes() {
         // parse_etime + grace check: a 60s-old worker with a 120s grace is kept.
@@ -966,11 +1327,14 @@ mod tests {
              104 1 S 00:20 /toolchain/bin/rustc crate.rs --out-dir /repo/target/debug/deps",
         );
         let selected = orphaned_debug_rustc(&rows, 600);
-        assert_eq!(selected.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![101]);
+        assert_eq!(
+            selected.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![101]
+        );
     }
 
     #[test]
-    fn zombie_cleanup_only_selects_children_owned_by_this_server() {
+    fn zombie_report_classifies_parent_relationship_without_cleanup() {
         let rows = health_process_rows(
             " 200 1 S 20:00 /opt/amux/bin/amux-server\n\
              201 200 Z 05:00 [helper] <defunct>\n\
@@ -981,7 +1345,52 @@ mod tests {
         );
         let (owned, zombies) = owned_zombie_children(&rows, 60, 200);
         assert_eq!(owned, vec![201]);
-        assert_eq!(zombies.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![201, 301, 401]);
+        assert_eq!(
+            zombies.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![201, 301, 401]
+        );
+    }
+
+    #[test]
+    fn zombie_report_preserves_real_child_exit_status_for_its_waiter() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            std::process::Command::new("sh")
+                .args(["-c", "exit 37"])
+                .spawn()
+                .expect("spawn real child"),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let rows = loop {
+            let rows = health_process_snapshot()
+                .expect("measure real process state")
+                .into_iter()
+                .filter(|p| p.pid == child.0.id())
+                .collect::<Vec<_>>();
+            if rows.iter().any(|p| p.state.starts_with('Z')) {
+                break rows;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child did not reach observable zombie state"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(report_zombie_children(&rows, 0, std::process::id()), (1, 1));
+        assert_eq!(
+            child
+                .0
+                .wait()
+                .expect("health observer must not steal wait status")
+                .code(),
+            Some(37)
+        );
     }
 
     #[test]
@@ -998,7 +1407,10 @@ mod tests {
         let sample = zombie_log_sample(&rows);
         assert_eq!(sample.split(", ").count(), ZOMBIE_LOG_SAMPLE);
         assert!(sample.contains("pid=100/ppid=200/age=300s"));
-        assert!(!sample.contains("pid=108/"), "the log sample must stay bounded: {sample}");
+        assert!(
+            !sample.contains("pid=108/"),
+            "the log sample must stay bounded: {sample}"
+        );
     }
 
     #[test]
@@ -1050,7 +1462,10 @@ mod ps_row_tests {
         assert_eq!(pid, 5923);
         assert_eq!(ppid, 1);
         assert_eq!(etime, "10:41");
-        assert!(cmd.starts_with("/Applications/Google Chrome.app/"), "cmd was: {cmd}");
+        assert!(
+            cmd.starts_with("/Applications/Google Chrome.app/"),
+            "cmd was: {cmd}"
+        );
         // The command must survive intact through the re-join, or the reaper's
         // `contains` checks silently stop matching.
         assert!(cmd.contains("playwright-auth/profile"), "cmd was: {cmd}");
@@ -1080,7 +1495,13 @@ mod ps_row_tests {
         assert!(!spotlight_exclusion_can_reach("fseventsd_foo"));
         // The mds family IS reachable — that is why the arm still exists, and a
         // change that made this blanket-false would quietly disable a real fix.
-        for reachable in ["mds", "mds_stores", "mdworker", "mdworker_shared", "ecosystemd"] {
+        for reachable in [
+            "mds",
+            "mds_stores",
+            "mdworker",
+            "mdworker_shared",
+            "ecosystemd",
+        ] {
             assert!(
                 spotlight_exclusion_can_reach(reachable),
                 "{reachable} is addressable by a Spotlight exclusion and must stay so"
@@ -1092,6 +1513,71 @@ mod ps_row_tests {
     fn rows_without_a_command_are_rejected_rather_than_half_parsed() {
         assert!(ps_row("  123   1   00:01").is_none(), "no command field");
         assert!(ps_row("").is_none());
-        assert!(ps_row("not a ps row at all").is_none(), "pid must be numeric");
+        assert!(
+            ps_row("not a ps row at all").is_none(),
+            "pid must be numeric"
+        );
+    }
+
+    // ---- MO-3622: the translated-tree census can fail -----------------------
+
+    #[test]
+    fn translated_census_reads_the_p_translated_bit_from_ps_flags() {
+        // Real `ps -A -o flags=,comm=` shapes from the affected host: 0x34004 is
+        // a translated bash, 0x4004 a native launchd, 0x34084 a translated git.
+        let text = "  4004 /sbin/launchd\n\
+                    34004 bash\n\
+                    34004 /bin/bash\n\
+                    34084 /usr/bin/git\n\
+                    4004 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n\
+                    34004 /Applications/Some Tool.app/Contents/MacOS/Some Tool\n\
+                    not-hex bash\n\
+                    4004\n\
+                    \n";
+        let c = parse_translated_census(text);
+        assert_eq!(c.total, 6, "unparseable rows are not counted as processes");
+        assert_eq!(c.translated, 4);
+        assert_eq!(
+            c.top[0],
+            ("bash".to_string(), 2),
+            "basename groups /bin/bash with bash"
+        );
+        assert!(c.top.contains(&("git".to_string(), 1)));
+        // A name with spaces survives whole.
+        assert!(c.top.contains(&("Some Tool".to_string(), 1)));
+        assert!((c.share_pct() - 66.666).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_native_host_is_never_flagged() {
+        let text = "4004 /sbin/launchd\n4004 bash\n4004 git\n";
+        let c = parse_translated_census(text);
+        assert_eq!(c.translated, 0);
+        assert!(!rosetta_warn_due(&c, 0, 0.0, 0, 10_000_000));
+        assert_eq!(parse_translated_census("").share_pct(), 0.0);
+    }
+
+    #[test]
+    fn rosetta_warn_needs_count_share_and_an_expired_cooldown() {
+        let c = TranslatedCensus {
+            total: 1000,
+            translated: 200,
+            top: vec![],
+        };
+        let now = 10_000_000;
+        assert!(rosetta_warn_due(&c, 40, 10.0, 0, now));
+        // Too few translated processes in absolute terms.
+        assert!(!rosetta_warn_due(&c, 300, 10.0, 0, now));
+        // Too small a share of a big table.
+        assert!(!rosetta_warn_due(&c, 40, 25.0, 0, now));
+        // Inside the cooldown: the census line still logs, the nudge does not.
+        assert!(!rosetta_warn_due(&c, 40, 10.0, now - 60, now));
+        assert!(rosetta_warn_due(
+            &c,
+            40,
+            10.0,
+            now - ROSETTA_WARN_COOLDOWN_S,
+            now
+        ));
     }
 }

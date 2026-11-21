@@ -8,6 +8,18 @@
 #   2. if an old process did replace it, a matching local stamp does not make
 #      the elected builder exit early — /api/health forces re-adoption.
 set -euo pipefail
+# The deploy target directory comes from the environment (server.env reaches
+# every process the server starts); a test's fake cargo must never write there.
+unset AMUX_DEPLOY_TARGET_DIR
+# Their fake cargo writes a few-byte stand-in; the builder refuses those by default.
+export AMUX_DEPLOY_MIN_BIN_BYTES=0
+# Never the real amux on this machine: its in-flight shell schedules would defer
+# this fixture's build, and the test fails only while one is running (AF-1129).
+export AMUX_RS_RUNS_URL=http://127.0.0.1:9/none
+# These cases install builds against a health endpoint that does not model
+# the new commit coming up, so rollback (on by default since 2026-10-29) is
+# off here; test-build-activation-rollback.sh covers it.
+export AMUX_ACTIVATION_ROLLBACK=0
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILDER="$ROOT/scripts/rust-auto-build.sh"
@@ -31,6 +43,11 @@ expect() { if "$@"; then ok; else bad "$*"; fi; }
 
 git init -q -b main "$AUTH"
 mkdir -p "$AUTH/crates" "$AUTH/scripts" "$FAKE_HOME/.amux/rust-build-target"
+mkdir -p "$AUTH/scripts/claude-hooks" "$FAKE_HOME/.amux/hooks"
+for half in pre post; do
+  printf '# elected hook\n' > "$AUTH/scripts/claude-hooks/observed-edits-${half}.py"
+  printf '# stale hook\n' > "$FAKE_HOME/.amux/hooks/observed-edits-${half}.py"
+done
 printf '[workspace]\n' > "$AUTH/Cargo.toml"
 printf 'elected source\n' > "$AUTH/crates/input.rs"
 cat > "$AUTH/scripts/safe-cargo.sh" <<'EOF'
@@ -38,9 +55,12 @@ cat > "$AUTH/scripts/safe-cargo.sh" <<'EOF'
 set -eu
 sha=$(git rev-parse HEAD)
 printf 'build %s\n' "$sha" >> "$TRACE"
-mkdir -p "$CARGO_TARGET_DIR/release"
-printf '#!/bin/sh\necho %s\n' "$sha" > "$CARGO_TARGET_DIR/release/amux-server"
-chmod 0755 "$CARGO_TARGET_DIR/release/amux-server"
+# Output dir the way cargo picks it: --profile NAME, else --release.
+out=release; prev=
+for a in "$@"; do [ "$prev" = --profile ] && out="$a"; prev="$a"; done
+mkdir -p "$CARGO_TARGET_DIR/$out"
+printf '#!/bin/sh\necho %s\n' "$sha" > "$CARGO_TARGET_DIR/$out/amux-server"
+chmod 0755 "$CARGO_TARGET_DIR/$out/amux-server"
 EOF
 chmod +x "$AUTH/scripts/safe-cargo.sh"
 (
@@ -63,6 +83,9 @@ git clone -q "$AUTH" "$FOREIGN"
 STALE=$(git -C "$FOREIGN" rev-parse HEAD)
 printf '{"commit":"%s"}\n' "$STALE" > "$HEALTH"
 
+# The adoption cooldown (default 120s) would turn every build after the first
+# into a COOLDOWN skip, since these cases run seconds apart. It is off here so
+# each case reaches the path it names.
 run_builder() {
   HOME="$FAKE_HOME" \
   AMUX_REPO="$1" \
@@ -74,6 +97,7 @@ run_builder() {
   AMUX_RS_HEALTH_URL="file://$HEALTH" \
   AMUX_BUILD_MIN_FREE_GB=0 \
   AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=999999 \
+  AMUX_RS_BUILD_COOLDOWN=0 \
     bash "$BUILDER" >/dev/null
 }
 
@@ -85,12 +109,18 @@ expect test -x "$INSTALL"
 expect grep -q "$ELECTED" "$INSTALL"
 expect test "$(cat "$STAMP")" = "$ELECTED"
 expect test "$(grep -c '^build ' "$TRACE")" = 1
+for half in pre post; do
+  expect cmp -s "$AUTH/scripts/claude-hooks/observed-edits-${half}.py" "$FAKE_HOME/.amux/hooks/observed-edits-${half}.py"
+done
+expect grep -q 'verdict=observed_hook_synced' "$LOG"
 
 # Chaos: a separately-running stale checkout uses the same normal activation
 # path and shared install locations. It must be refused before cargo/install;
 # keeping the return status zero makes the timer quiet but the builder log is
 # the durable sweep signal.
+printf '# foreign hook\n' > "$FOREIGN/scripts/claude-hooks/observed-edits-post.py"
 run_builder "$FOREIGN"
+expect cmp -s "$AUTH/scripts/claude-hooks/observed-edits-post.py" "$FAKE_HOME/.amux/hooks/observed-edits-post.py"
 expect grep -q "$ELECTED" "$INSTALL"
 expect test "$(grep -c '^build ' "$TRACE")" = 1
 expect grep -q "ACTIVATION AUTHORITY REFUSED $STALE" "$LOG"
@@ -133,12 +163,37 @@ expect test "$(grep -c '^build ' "$TRACE")" = 2
 expect test "$(wc -l < "$CURL_TRACE" | tr -d ' ')" = 1
 expect grep -q 'ACTIVATION IDENTITY UNMEASURED.*curl_exit=28.*action=defer' "$LOG"
 rm -f "$FAKE_HOME/.cargo/bin/curl" "$CURL_TRACE"
-# Missing/invalid identities must not become prefix matches or rebuild orders.
+# Missing/invalid identities must not become prefix matches or rebuild orders,
+# and a dirty build of the ELECTED commit is left alone.
 for identity in '' a unknown "${ELECTED:0:12}-dirty"; do
   printf '{"commit":"%s"}\n' "$identity" > "$HEALTH"
   run_builder "$AUTH"
   expect test "$(grep -c '^build ' "$TRACE")" = 2
 done
+expect grep -q "ACTIVATION IDENTITY DIRTY expected=$ELECTED live=${ELECTED:0:12}-dirty same_commit=true" "$LOG"
+# 2026-10-02: a dirty build of a DIFFERENT commit is a measured foreign image.
+# It used to read as unmeasured and pinned live 176 commits behind for an hour.
+# Here the elected bytes are already installed, so the measured answer is
+# "awaiting adoption" with no rebuild. It used to be "unmeasured, defer".
+printf '{"commit":"%s-dirty"}\n' "${STALE:0:12}" > "$HEALTH"
+run_builder "$AUTH"
+expect test "$(grep -c '^build ' "$TRACE")" = 2
+expect grep -q "ACTIVATION AWAITING ADOPTION expected=$ELECTED live=${STALE:0:12}-dirty" "$LOG"
+
+# An elected image may already be running while its hook is stale. Refresh the
+# hook without rebuilding that image or taking an uncommitted edit's bytes.
+printf '# new elected hook\n' > "$AUTH/scripts/claude-hooks/observed-edits-post.py"
+git -C "$AUTH" add scripts/claude-hooks/observed-edits-post.py
+git -C "$AUTH" -c user.name=test -c user.email=test@example.com commit -qm hook-only
+HOOK_SHA=$(git -C "$AUTH" rev-parse HEAD)
+git -C "$AUTH" update-ref refs/remotes/origin/main "$HOOK_SHA"
+printf '{"commit":"%s"}\n' "$HOOK_SHA" > "$HEALTH"
+printf '# uncommitted hook\n' > "$AUTH/scripts/claude-hooks/observed-edits-post.py"
+run_builder "$AUTH"
+expect grep -q '^# new elected hook$' "$FAKE_HOME/.amux/hooks/observed-edits-post.py"
+expect test "$(grep -c '^build ' "$TRACE")" = 2
+expect grep -q "WORKER HELPER SYNCED sha=$HOOK_SHA half=post" "$LOG"
+git -C "$AUTH" restore scripts/claude-hooks/observed-edits-post.py
 
 # Worker-attributed diagnostic runs must remain offline, while a real install
 # of that same commit must still fail closed without a measured overlap permit.
@@ -179,6 +234,38 @@ expect grep -q "OVERLAP GUARD UNMEASURED $WORKER" "$LOG"
 expect test "$(grep -c '^build ' "$TRACE")" = 2
 expect grep -q "$ELECTED" "$INSTALL"
 expect test "$(cat "$STAMP")" = "$ELECTED"
+
+# A retired duplicate may leave endpoint.json naming its dead process. The
+# builder must resolve the configured server without editing that receipt.
+printf '{"canonical_url":"https://localhost:8823","pid":2147483647}\n' > "$FAKE_HOME/.amux/endpoint.json"
+run_builder "$AUTH"
+expect grep -q 'https://localhost:8824/api/board/overlap/deployment-permit' "$CURL_TRACE"
+expect grep -q 'ENDPOINT OWNER EXITED.*action=use_configured_server' "$LOG"
+# A live owner remains authoritative, including a nondefault port.
+printf '{"canonical_url":"https://localhost:18824","pid":%s}\n' "$$" > "$FAKE_HOME/.amux/endpoint.json"
+run_builder "$AUTH"
+expect grep -q 'https://localhost:18824/api/board/overlap/deployment-permit' "$CURL_TRACE"
+
+# AF-1055: the gate file says when its target was first named, and keeps that
+# time while the target is unchanged, so the server can tell a builder that has
+# had a green commit for 30 minutes from one that got it a minute ago.
+GATE_STATE="$TMP/activation-gate.json"
+eval "$(awk '/^gate_state\(\) \{/,/^\}/' "$ROOT/scripts/rust-auto-build-authority.sh")"
+since_of() { sed -n 's/.*"target_since":\([0-9][0-9]*\).*/\1/p' "$GATE_STATE"; }
+printf '{"at":1,"verdict":"ci_gate_held_back","tip":"t0","tip_state":"pending","target":"tgtA","target_since":1000,"held":2}\n' > "$GATE_STATE"
+gate_state ci_gate_held_back t1 pending tgtA 3
+expect test "$(since_of)" = 1000
+gate_state ci_gate_clear t2 green tgtB 0
+expect test "$(since_of)" -gt 1000
+first_b=$(since_of)
+gate_state ci_gate_clear t2 green tgtB 0
+expect test "$(since_of)" = "$first_b"
+gate_state ci_gate_no_green t3 red "" 4
+expect grep -q '"target":""' "$GATE_STATE"
+# A file from before this field has no target_since: the next write starts it.
+printf '{"at":1,"verdict":"ci_gate_held_back","tip":"t0","tip_state":"pending","target":"tgtC","held":2}\n' > "$GATE_STATE"
+gate_state ci_gate_held_back t1 pending tgtC 2
+expect test -n "$(since_of)"
 
 echo "test-build-activation-authority: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

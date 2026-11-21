@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""A stand-in for the `claude` CLI, for delivery chaos tests. No model runs.
+
+It paints the composer frame amux reads (the same shape as `frame_cleared` in
+session_verbs.rs), accepts whatever amux pastes and submits, and appends every
+submitted line to a log. That log is GROUND TRUTH: it records what actually
+reached the agent, independent of what amux believes it sent.
+
+Log path: $FAKE_CLAUDE_LOG (required). One JSON object per line:
+  {"seq": <1-based>, "text": <submitted line>, "t": <epoch seconds>}
+plus one launch record per process, written before anything is painted:
+  {"event": "launch", "cwd": <os.getcwd()>, "pid": <pid>, "argv": [...], "t": ...}
+The launch cwd is the agent's own report of where it runs, which is what a
+worktree test has to prove (not what amux believes it passed to tmux).
+With $FAKE_CLAUDE_PROBE_SH the launch record carries "probe": the output of
+that shell line run in the agent's place.
+With $FAKE_CLAUDE_ENV_KEYS (comma-separated names) the launch record also
+carries "env_sha256": {name: sha256 of its value, or null when unset}, so a
+test can prove a secret arrived without any log holding the secret.
+
+It ignores every argument amux passes (--model, --resume, ...), because the
+point is to exercise amux's paste, Enter and submission-verification path,
+not the model.
+"""
+import hashlib, json, os, select, subprocess, sys, time, termios, tty
+
+LOG = os.environ.get("FAKE_CLAUDE_LOG")
+# Optional: every raw input byte, for diagnosing what the harness actually typed.
+RAW = os.environ.get("FAKE_CLAUDE_RAW_LOG")
+# Optional: after each submission, stay "mid-turn" this many seconds. While busy
+# the footer says "esc to interrupt" (what amux reads as generating) and Enter
+# is IGNORED, the way Claude Code sometimes drops a mid-turn Enter. Typed text
+# stays in the composer. This reproduces the "unsubmitted text" incidents.
+BUSY_S = float(os.environ.get("FAKE_CLAUDE_BUSY_S") or 0)
+busy_until = 0.0
+# Optional: the FIRST Enter on a given message clears the box, records nothing,
+# and puts the text back this many seconds later (Claude Code restoring input it
+# did not accept, seen live 2026-09-24 on trailing @-mention messages). The next
+# Enter on the same text submits normally.
+RESTORE_S = float(os.environ.get("FAKE_CLAUDE_RESTORE_S") or 0)
+restored_once = set()
+pending_restore = None   # (due_time, text)
+if not LOG:
+    sys.stderr.write("FAKE_CLAUDE_LOG is required\n")
+    sys.exit(2)
+
+RULE = "─" * 24
+buf = []          # the composer's current contents
+said = []         # submitted lines, echoed above the composer like a real transcript
+seq = 0           # submissions recorded so far
+
+def draw():
+    # Clear, then paint the idle frame amux recognises: a ruled composer box
+    # and the bypass footer, with no spinner line (no spinner == not generating).
+    out = sys.stdout
+    out.write("\x1b[2J\x1b[H")
+    for line in said[-10:]:
+        out.write("> " + line + "\r\n")
+    extra_frame = os.environ.get("FAKE_CLAUDE_EXTRA_FRAME", "")
+    if extra_frame:
+        out.write(extra_frame.replace("\n", "\r\n") + "\r\n")
+    out.write(RULE + " fake-claude " + RULE + "\r\n")
+    out.write("❯ " + "".join(buf) + "\r\n")
+    out.write(RULE + RULE + "\r\n")
+    footer_file = os.environ.get("FAKE_CLAUDE_COMPOSER_FOOTER_FILE", "")
+    if footer_file and os.path.isfile(footer_file):
+        with open(footer_file, encoding="utf-8") as f:
+            out.write(f.read().replace("\n", "\r\n") + "\r\n")
+    if time.time() < busy_until:
+        out.write("⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt\r\n")
+    else:
+        footer = os.environ.get("FAKE_CLAUDE_BACKGROUND_FOOTER", "")
+        out.write("⏵⏵ bypass permissions on (shift+tab to cycle)" + footer + "\r\n")
+    out.flush()
+
+def submit():
+    global seq, busy_until
+    text = "".join(buf).strip()
+    buf.clear()
+    if text:
+        said.append(text)
+        seq += 1
+        with open(LOG, "a", encoding="utf-8") as f:
+            rec = {"seq": seq, "text": text, "pid": os.getpid(), "t": time.time()}
+            hashes = env_hashes()
+            if hashes is not None:
+                rec["env_sha256"] = hashes
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if BUSY_S:
+            busy_until = time.time() + BUSY_S
+
+def env_hashes():
+    """sha256 of each $FAKE_CLAUDE_ENV_KEYS variable (None when unset), so a
+    test proves a secret arrived without any log holding the secret."""
+    keys = [k for k in (os.environ.get("FAKE_CLAUDE_ENV_KEYS") or "").split(",") if k]
+    if not keys:
+        return None
+    return {k: (hashlib.sha256(os.environ[k].encode()).hexdigest() if k in os.environ else None) for k in keys}
+
+def headless():
+    """`claude -p` with the prompt on stdin (Chat turns, delegates): log one
+    record with the env hashes, print a reply, exit 0."""
+    prompt = sys.stdin.read()
+    rec = {"event": "headless", "bin": os.path.basename(sys.argv[0]), "cwd": os.getcwd(),
+           "pid": os.getpid(), "argv": sys.argv[1:], "t": time.time(),
+           "session": os.environ.get("AMUX_SESSION", ""), "prompt_len": len(prompt)}
+    hashes = env_hashes()
+    if hashes is not None:
+        rec["env_sha256"] = hashes
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass  # a read-only sandbox (delegates): the reply below still carries the hashes
+    reply = "fake reply env_sha256=" + json.dumps(hashes or {}, sort_keys=True)
+    if "stream-json" in " ".join(sys.argv):
+        print(json.dumps({"type": "result", "subtype": "success", "result": reply, "is_error": False}))
+    else:
+        print(reply)
+    sys.exit(0)
+
+def main():
+    if not sys.stdin.isatty():
+        headless()
+    with open(LOG, "a", encoding="utf-8") as f:
+        rec = {"event": "launch", "bin": os.path.basename(sys.argv[0]),
+               "cwd": os.getcwd(), "pid": os.getpid(),
+               "argv": sys.argv[1:], "t": time.time()}
+        if os.environ.get("FAKE_CLAUDE_PROBE_CHILD_ARCH") == "1":
+            rec["child_translated"] = subprocess.check_output(
+                ["/bin/sh", "-c", "/usr/sbin/sysctl -n sysctl.proc_translated"],
+                text=True).strip()
+        hashes = env_hashes()
+        if hashes is not None:
+            rec["env_sha256"] = hashes
+        # $FAKE_CLAUDE_PROBE_SH: a shell line run where the agent runs, its
+        # output kept in the launch record, so a test can see what the agent
+        # sees (a customer boundary's mounts, for one).
+        probe = os.environ.get("FAKE_CLAUDE_PROBE_SH", "")
+        if probe:
+            r = subprocess.run(["/bin/sh", "-c", probe], capture_output=True, text=True, timeout=30)
+            rec["probe"] = {"out": r.stdout, "err": r.stderr[-2000:], "rc": r.returncode}
+        f.write(json.dumps(rec) + "\n")
+        if os.environ.get("FAKE_CLAUDE_SPAWN_BACKGROUND") == "1":
+            child = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            f.write(json.dumps({"event":"background_child", "pid":child.pid,
+                                "parent_pid":os.getpid(), "cwd":os.getcwd(), "t":time.time()}) + "\n")
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    try:
+        draw()
+        # Terminal input parsing: ESC '[' ... final byte (0x40-0x7e) is a CSI
+        # sequence (arrows, bracketed-paste markers), ESC 'O' x is SS3, and an
+        # ESC followed by anything else is the Escape KEY, after which the next
+        # byte is ordinary input. (amux sends ESC, Ctrl-U before a paste; an
+        # earlier version treated that ESC as a sequence and ate the first
+        # letter of every message.)
+        state = None      # None | "esc" | "csi" | "ss3"
+        was_busy = False
+        while True:
+            # Wake periodically so the frame changes when a busy turn ends.
+            if not select.select([fd], [], [], 0.2)[0]:
+                global pending_restore
+                if pending_restore and time.time() >= pending_restore[0]:
+                    buf[:] = list(pending_restore[1])
+                    pending_restore = None
+                    draw()
+                now_busy = time.time() < busy_until
+                if was_busy and not now_busy:
+                    draw()
+                was_busy = now_busy
+                continue
+            ch = os.read(fd, 1)
+            if not ch:
+                break
+            if RAW:
+                with open(RAW, "ab") as rf:
+                    rf.write(ch)
+            b = ch[0]
+            if state == "csi":
+                if 0x40 <= b <= 0x7E:
+                    state = None
+                continue
+            if state == "ss3":
+                state = None
+                continue
+            if state == "esc":
+                state = None
+                if b == ord("["):
+                    state = "csi"
+                    continue
+                if b == ord("O"):
+                    state = "ss3"
+                    continue
+                # A bare Escape key; fall through and handle b normally.
+            if b == 0x1b:
+                state = "esc"
+                continue
+            if b in (0x0d, 0x0a):          # Enter submits the composer
+                if time.time() < busy_until:
+                    continue               # mid-turn: this Enter is dropped
+                text = "".join(buf).strip()
+                if RESTORE_S and text and text not in restored_once:
+                    restored_once.add(text)
+                    pending_restore = (time.time() + RESTORE_S, text)
+                    buf.clear()            # looks accepted ... then comes back
+                    draw()
+                    continue
+                submit()
+            elif b in (0x7f, 0x08):        # Backspace
+                if buf:
+                    buf.pop()
+            elif b in (0x03, 0x15):        # Ctrl-C / Ctrl-U clear, like the real CLI
+                buf.clear()
+            elif b >= 0x20:
+                # Reassemble UTF-8 so a multi-byte character is one glyph.
+                need = 0
+                if b & 0xE0 == 0xC0: need = 1
+                elif b & 0xF0 == 0xE0: need = 2
+                elif b & 0xF8 == 0xF0: need = 3
+                raw = bytes([b]) + (os.read(fd, need) if need else b"")
+                if RAW and need:
+                    with open(RAW, "ab") as rf:
+                        rf.write(raw[1:])
+                buf.append(raw.decode("utf-8", "replace"))
+            draw()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+if __name__ == "__main__":
+    main()

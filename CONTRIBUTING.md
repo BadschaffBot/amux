@@ -10,6 +10,17 @@ Thanks for your interest in amux! The product is a Rust workspace (`crates/`) se
 
 ## Local development
 
+### Harness recovery rule
+
+If completing ordinary worker work requires an operator to override a policy,
+restart a worker, retry a task, change its board status, or move files by hand,
+treat that intervention as a harness defect. Add a bounded, observable discovery
+and recovery path in Amux, then exercise the original failure through the
+worker lifecycle. Preserve failed-attempt evidence and
+never bypass budget, customer-outbound, or human artifact-review gates. An
+operational problem that the host can resolve must not become a `needs you`
+dependency or a permanent wait.
+
 ```bash
 git clone https://github.com/mixpeek/amux && cd amux
 ./install.sh              # one command: build, install, launchd agent, dashboard on :8824
@@ -36,7 +47,7 @@ While iterating, `cargo check --workspace` is the fast syntax/type gate. If seve
 
 The SPA is real static files under `crates/amux-dashboard/static/` — no build step, no framework. Two rules:
 
-- **Bump `APP_VER` (`static/app.js`) and `CACHE` (`static/sw.js`) together.** Miss either and a browser holding the cached script never receives your fix — the change is live on the server and invisible to every existing client.
+- **Do not bump a version.** `APP_VER` (`static/app.js`) and `CACHE` (`static/sw.js`) hold the `__AMUX_ASSET_VER__` placeholder. `crates/amux-dashboard/build.rs` hashes everything under `static/` and the server stamps that hash in when it serves the files, so any client-visible change moves the version and open browsers reload onto it.
 - Syntax-check with `node --check crates/amux-dashboard/static/app.js`. A PostToolUse hook (`.claude/check-and-commit.sh`) does this automatically on agent edits; `node --check` proves the file *parses*, not that every function it calls exists, so still exercise the UI path you touched.
 
 ### Shared checkout: check what you are shipping

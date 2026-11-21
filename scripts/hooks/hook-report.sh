@@ -23,6 +23,31 @@
 # keep order; a newer main state replaces the older row so replayed idle can
 # never overwrite a later active turn. The hook still always exits zero: amux
 # must never block the model.
+# NATIVE ARCH (MO-3622). This script runs on every tool call of every lane
+# (about 8 times a second across the fleet) and forks ~20 processes per run.
+# On an Apple Silicon Mac whose tmux server is an Intel build, the whole pane
+# tree inherits x86_64 and runs under Rosetta, where each of those forks costs
+# about 12x the CPU of a native one (measured 2026-09-26: 400 spawns = 7.7 CPU-s
+# translated, 0.65 native; this script 0.6 s CPU and 0.7 s wall per call
+# translated, 0.14 s and 0.17 s native). Re-exec ONCE under `arch -arm64
+# -x86_64`: native wherever a native slice exists, unchanged where it does not
+# (an Intel Mac, an Intel-only bash). stdin and argv pass through untouched, so
+# the payload the harness pipes in still reaches the `cat` below. `execfail`
+# keeps a failed exec from ending a script whose contract is to never be the
+# reason a hook fails; the guard variable stops a loop. AMUX_NATIVE_ARCH=0 opts
+# out. The bash builtins $OSTYPE/$HOSTTYPE decide, so a native run pays nothing.
+# The launching server's home, so a private test server's workers report to it
+# and never to the real server named by ~/.amux/endpoint.json (2026-11-02).
+AH="${AMUX_HOME:-$HOME/.amux}"
+case "$OSTYPE:$HOSTTYPE" in
+  darwin*:x86_64)
+    if [ "${AMUX_NATIVE_ARCH:-1}" != 0 ] && [ -z "${_AMUX_NATIVE_REEXEC:-}" ] && [ -x /usr/bin/arch ]; then
+      export _AMUX_NATIVE_REEXEC=1
+      shopt -s execfail
+      exec /usr/bin/arch -arm64 -x86_64 "$BASH" "$0" "$@"
+    fi
+    ;;
+esac
 if [ "${1:-}" = "--drain-subagents" ]; then
   /usr/bin/python3 - "${2:-}" "${3:-}" "${4:-}" "${5:-lifecycle_queue}" <<'PY'
 import fcntl,json,os,ssl,sys,tempfile,time,urllib.error,urllib.request
@@ -47,7 +72,7 @@ while True:
         time.sleep(.05)
 
 def corrupt_note(preserved,exc):
-    path=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+    path=os.path.join(os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),"logs/hook-report-failures.log")
     try:
         os.makedirs(os.path.dirname(path),exist_ok=True)
         with open(path,"a") as stream:
@@ -99,7 +124,7 @@ def locked_rows(change=None,release_on_empty=False):
         return rows
 
 def note(kind,row,code,attempt):
-    path=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+    path=os.path.join(os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),"logs/hook-report-failures.log")
     try:
         os.makedirs(os.path.dirname(path),exist_ok=True)
         with open(path,"a") as stream:
@@ -131,7 +156,8 @@ while True:
         # stale row metadata never overrides this invocation's canonical route.
         req=urllib.request.Request(url,
             data=json.dumps(body,separators=(",",":")).encode(),method="POST",
-            headers={"Content-Type":"application/json","X-Amux-Session":session})
+            headers={"Content-Type":"application/json","X-Amux-Session":session,
+                     **({"X-Amux-Worker-Token":os.environ["AMUX_WORKER_TOKEN"]} if os.environ.get("AMUX_WORKER_TOKEN") else {})})
         with urllib.request.urlopen(req,timeout=3,context=ctx) as response:
             code=str(response.status)
             response.read()
@@ -173,14 +199,17 @@ PY
 fi
 MODE="${1:-idle}"; SRC="${2:-stop-hook}"
 DERIVED=0
-if [ -z "$AMUX_SESSION" ]; then
+# Outside a worker, an unqualified tmux display-message names the last selected
+# session, not this process. Never let an intake/helper Claude hook mark an
+# unrelated Codex project executor busy or adopt its conversation identity.
+if [ -z "$AMUX_SESSION" ] && [ -n "${TMUX_PANE:-}" ]; then
   # MR-43: the var can go missing INSIDE a lane that IS running in its
   # amux-launched pane (spawn always injects it — session_verbs.rs — so this
   # is loss in-process, not absence at launch). Recover it from tmux so the
   # lane is not invisible to its own liveness report, and flag the recovery
   # in the body so /api/logs/analyze can count how often this happens instead
   # of a human noticing a lane that silently never reported.
-  TNAME=$(tmux display-message -p '#S' 2>/dev/null)
+  TNAME=$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null)
   case "$TNAME" in
     amux-*) export AMUX_SESSION="${TNAME#amux-}"; DERIVED=1 ;;
   esac
@@ -202,12 +231,12 @@ fi
 # 404, zero 200s). It cannot capture a deliberate cross-session claim, because
 # there the claimed session exists and this leaves it alone.
 CORRECTED=0
-if [ -n "$AMUX_SESSION" ] && [ ! -f "$HOME/.amux/sessions/$AMUX_SESSION.env" ]; then
-  _TN=$(tmux display-message -p '#S' 2>/dev/null)
+if [ -n "$AMUX_SESSION" ] && [ -n "${TMUX_PANE:-}" ] && [ ! -f "$AH/sessions/$AMUX_SESSION.env" ]; then
+  _TN=$(tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null)
   case "$_TN" in
     amux-*)
       _TRUE="${_TN#amux-}"
-      if [ "$_TRUE" != "$AMUX_SESSION" ] && [ -f "$HOME/.amux/sessions/$_TRUE.env" ]; then
+      if [ "$_TRUE" != "$AMUX_SESSION" ] && [ -f "$AH/sessions/$_TRUE.env" ]; then
         STALE_FROM="$AMUX_SESSION"
         export AMUX_SESSION="$_TRUE"
         CORRECTED=1
@@ -216,6 +245,10 @@ if [ -n "$AMUX_SESSION" ] && [ ! -f "$HOME/.amux/sessions/$AMUX_SESSION.env" ]; 
   esac
 fi
 [ -n "$AMUX_SESSION" ] || exit 0
+# A Chat tab runs its own Claude with AMUX_SESSION=<worker>@chat. It is not a
+# worker and has no status the server tracks, so its reports were 404 "is
+# <worker>'s Chat tab, not a worker", about 460 a day from 16 tabs (AF-1101).
+case "$AMUX_SESSION" in *@chat) exit 0 ;; esac
 # ISOLATED WORKERS (AMUX-3232). An isolated worker has AMUX_SESSION stripped at
 # spawn, so DERIVED=1 is the discriminator. But "derived" also covers a real lane
 # that lost its env var mid-run (the original MR-43 case). The two are separated
@@ -223,17 +256,20 @@ fi
 # real lane that lost its var did not. Skip reporting for isolated workers only —
 # a real lane that derived its session still gets a liveness report.
 if [ "$DERIVED" = "1" ]; then
-  _SF="$HOME/.amux/sessions/$AMUX_SESSION.env"
+  _SF="$AH/sessions/$AMUX_SESSION.env"
   if grep -qE '^CC_ISOLATED="?1"?' "$_SF" 2>/dev/null; then
     exit 0
   fi
 fi
 IN=$(cat 2>/dev/null)
-E="$HOME/.amux/endpoint.json"
+E="$AH/endpoint.json"
 C=$(sed -n 's/.*"canonical_url":"\([^"]*\)".*/\1/p' "$E" 2>/dev/null)
 L=$(sed -n 's/.*"legacy_port":\([0-9]*\).*/\1/p' "$E" 2>/dev/null)
 U="${AMUX_URL:-$C}"
 case "$U" in *localhost:$L|*127.0.0.1:$L) U="${C:-$U}";; esac
+# Any other localhost port endpoint.json does not name is stale too (a reboot
+# race left every lane on 8823, 2026-10-05); the CLI heals and logs the same.
+case "$U" in *://localhost:*|*://127.0.0.1:*) [ -n "$C" ] && U="$C";; esac
 U="${U%/}"
 REPORT_URL="$U/api/sessions/$AMUX_SESSION/report"
 # AMUX-4024: THE SUBAGENT LIFECYCLE PRODUCER.
@@ -316,6 +352,7 @@ if norm.startswith("subagent:"):
     out={"subagent":norm.split(":",1)[1],"source":src}
 else:
     out={"state":mode,"source":src}
+out["provider"]="claude"
 h={}; tp=""; nlines=0; err=""
 try:
     h=json.loads(raw) if raw.strip() else {}
@@ -349,6 +386,25 @@ try:
     if not sid and tp and tp.endswith(".jsonl"):
         sid=os.path.basename(tp)[:-6]
     if sid: out["session_id"]=sid
+    # TOOL AUDIT (2026-10-27). A PostToolUse payload names the tool and its
+    # input; the server writes one _amux_tool_events row from it, so every
+    # Bash, Edit or WebFetch call a worker makes can be triaged later. Only
+    # a short summary of the input goes out (the command, the path, the url),
+    # never the tool output. tool_response is present only after the call.
+    tn=h.get("tool_name") or ""
+    if tn and "tool_response" in h and "subagent" not in out:
+        ti=h.get("tool_input") if isinstance(h.get("tool_input"),dict) else {}
+        keys=("command","file_path","path","url","pattern","query","description","notebook_path","skill","subagent_type")
+        summ=" ".join(str(ti.get(k)) for k in keys if ti.get(k) not in (None,""))
+        if not summ: summ="keys:"+",".join(sorted(ti.keys()))[:120]
+        tr=h.get("tool_response")
+        bad=isinstance(tr,dict) and bool(tr.get("is_error") or tr.get("interrupted") or tr.get("error"))
+        code=None
+        if isinstance(tr,dict):
+            for k in ("exit_code","exitCode","returnCode","code"):
+                if isinstance(tr.get(k),int): code=tr.get(k); break
+        if code not in (None,0): bad=True
+        out["tool"]={"name":tn,"input":summ[:400],"ok":not bad,"exit_code":code,"use_id":h.get("tool_use_id") or "","agent_id":h.get("agent_id") or ""}
     if "subagent" in out:
         sub=out.get("subagent") or ""
         aid=h.get("agent_id") or h.get("agentId") or ""
@@ -365,7 +421,7 @@ try:
             # The same conversation may be resumed by a NEW process. Each
             # SessionStart is therefore a distinct reset; response-loss retries
             # keep this generated id in the durable queue row below.
-            event_id=f"{sid or os.environ.get('AMUX_SESSION','')}:reset:{time.time_ns()}"
+            event_id=(sid or os.environ.get("AMUX_SESSION",""))+f":reset:{time.time_ns()}"
         else:
             # No provider identity means no safe equivalence relation. Two
             # empty-payload starts may be two concurrent agents, so each hook
@@ -419,7 +475,7 @@ if "subagent" not in out and (not out.get("model") or not out.get("tokens")):
         d2={"s":os.environ.get("AMUX_SESSION",""),"src":src,"keys":sorted(h.keys())[:12],
             "tp":bool(tp),"tp_exists":bool(tp) and os.path.exists(tp),"lines":nlines,
             "err":err,"got_model":bool(out.get("model")),"got_tokens":bool(out.get("tokens"))}
-        lg=os.path.expanduser("~/.amux/logs/hook-extract.jsonl")
+        lg=os.path.join(os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),"logs/hook-extract.jsonl")
         if os.path.exists(lg) and os.path.getsize(lg)>2000000: os.remove(lg)
         with open(lg,"a") as f: f.write(json.dumps(d2)+"\n")
     except Exception: pass
@@ -442,7 +498,7 @@ print(json.dumps(out))
 # Lifecycle facts are ordered and durable. Main-turn state uses a separate
 # singleton queue below: latest-wins replacement prevents an old queued idle
 # heartbeat from overwriting a newer active turn.
-QD="$HOME/.amux/hook-report-queue"
+QD="$AH/hook-report-queue"
 QF="$QD/$AMUX_SESSION.json"
 case "${MODE/subagent-/subagent:}" in
   subagent:*)
@@ -473,7 +529,7 @@ with open(path+".lock","a+") as guard:
         except FileNotFoundError: preserved="missing-before-preserve"
         except Exception as move_exc:
             preserved=path+f":preserve_failed:{type(move_exc).__name__}"
-        log=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+        log=os.path.join(os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),"logs/hook-report-failures.log")
         try:
             os.makedirs(os.path.dirname(log),exist_ok=True)
             with open(log,"a") as stream:
@@ -504,14 +560,14 @@ print(f"{len(rows)} {dropped} {limit}")
 PY
     )
     if [ -z "$QUEUE_NOTE" ]; then
-      D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
+      D="$AH/logs"; mkdir -p "$D" 2>/dev/null
       printf '%s %s source=%s lifecycle_queue=enqueue_failed fallback=immediate\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" \
         >> "$D/hook-report-failures.log" 2>/dev/null
     else
       set -- $QUEUE_NOTE
     if [ "${2:-0}" -gt 0 ] 2>/dev/null; then
-      D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
+      D="$AH/logs"; mkdir -p "$D" 2>/dev/null
       printf '%s %s source=%s lifecycle_queue=overflow pending=%s dropped=%s limit=%s\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" "${1:-0}" "${2:-0}" "${3:-128}" \
         >> "$D/hook-report-failures.log" 2>/dev/null
@@ -561,7 +617,7 @@ with open(path+".lock","a+") as guard:
         except FileNotFoundError: preserved="missing-before-preserve"
         except Exception as move_exc:
             preserved=path+f":preserve_failed:{type(move_exc).__name__}"
-        log=os.path.expanduser("~/.amux/logs/hook-report-failures.log")
+        log=os.path.join(os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),"logs/hook-report-failures.log")
         try:
             os.makedirs(os.path.dirname(log),exist_ok=True)
             with open(log,"a") as stream:
@@ -572,6 +628,20 @@ with open(path+".lock","a+") as guard:
         except Exception: pass
         previous=[]
     attempts=max(0,int(previous[0].get("attempts",0))) if previous else 0
+    # Latest-wins is right for the state, wrong for the tool audit: a burst
+    # of tool calls before the drain runs would keep only the last one. Carry
+    # every undelivered tool record forward (the server skips a tool_use_id
+    # it already has, so a row sent just before this replacement is not
+    # counted twice). Capped so a long outage cannot grow the row unbounded.
+    carried=[]
+    for prev in previous:
+        pb=prev.get("body") or {}
+        carried+= [t for t in (pb.get("tools_pending") or []) if isinstance(t,dict)]
+        if isinstance(pb.get("tool"),dict): carried.append(pb["tool"])
+    if carried:
+        if len(carried)>200:
+            body["tools_dropped"]=int(pb.get("tools_dropped") or 0)+len(carried)-200
+        body["tools_pending"]=carried[-200:]
     row={"event_id":event_id,"body":body,"attempts":attempts}
     fd,tmp=tempfile.mkstemp(prefix="state.",dir=os.path.dirname(path))
     try:
@@ -592,7 +662,7 @@ if [ -n "$STATE_NOTE" ]; then
     </dev/null >/dev/null 2>&1 &
   exit 0
 fi
-D="$HOME/.amux/logs"; mkdir -p "$D" 2>/dev/null
+D="$AH/logs"; mkdir -p "$D" 2>/dev/null
 printf '%s %s source=%s state_queue=enqueue_failed fallback=immediate\n' \
   "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$AMUX_SESSION" "$SRC" \
   >> "$D/hook-report-failures.log" 2>/dev/null
@@ -609,8 +679,11 @@ printf '%s %s source=%s state_queue=enqueue_failed fallback=immediate\n' \
 # `%{http_code}` prints 000 when the transfer never completed, so one branch now
 # covers both classes: 000 = could not reach the server (the AMUX-3046 stranded-
 # port case this was written for), 4xx/5xx = reached it and was refused.
+# Contract rule 10 (AH-387): the lane's minted identity, when it has one.
+ID_HDR=()
+[ -n "${AMUX_WORKER_TOKEN:-}" ] && ID_HDR=(-H "X-Amux-Worker-Token: $AMUX_WORKER_TOKEN")
 CODE=$(curl -sk -m 3 -o /dev/null -w '%{http_code}' \
-  -X POST -H 'Content-Type: application/json' \
+  -X POST -H 'Content-Type: application/json' ${ID_HDR[@]+"${ID_HDR[@]}"} \
   -H "X-Amux-Session: $AMUX_SESSION" -d "$BODY" \
   "$REPORT_URL" 2>/dev/null) || CODE=000
 case "$CODE" in
@@ -625,7 +698,7 @@ case "$CODE" in
   #
   # Still fails OPEN — this logs and exits 0. A hook that blocks a turn because
   # amux is unreachable would be worse than the silence it replaces.
-  D="$HOME/.amux/logs"; [ -d "$D" ] || mkdir -p "$D" 2>/dev/null
+  D="$AH/logs"; [ -d "$D" ] || mkdir -p "$D" 2>/dev/null
   F="$D/hook-report-failures.log"
   printf '%s %s source=%s url=%s http=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
     "$AMUX_SESSION" "$SRC" "$U" "$CODE" >> "$F" 2>/dev/null

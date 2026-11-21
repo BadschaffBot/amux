@@ -32,6 +32,11 @@ use std::path::Path;
 /// them is deliberately BROKEN, which is the clearest case of the same rule.
 const ALLOWED: &[(&str, &str)] = &[
     (
+        "id TEXT, session TEXT, owner_type TEXT, archived INTEGER, deleted REAL, status TEXT, type TEXT",
+        "board_intake's fold-candidate predicate fixture (e01c973d): seven columns, exactly the ones \
+         CANDIDATE_PREDICATE reads, no schema claim",
+    ),
+    (
         "id TEXT PRIMARY KEY, status TEXT, session TEXT",
         "the REAL-timestamp regression fixture: it needs a specific 7-column shape to \
          reproduce one bad cell, and adding columns would not make it more faithful",
@@ -53,6 +58,11 @@ const ALLOWED: &[(&str, &str)] = &[
         "id TEXT, source_ref TEXT, status TEXT",
         "the autofix one-card-per-fault fixture: names only what it queries",
     ),
+    (
+        "id TEXT, status TEXT, archived INTEGER DEFAULT 0,",
+        "the autofix invariant-regrowth fixture (365081463): five columns, the card fields the \
+         regrowth rule reads beside session_events.idem, no schema claim",
+    ),
 ];
 
 fn sources() -> Vec<(String, String)> {
@@ -60,7 +70,9 @@ fn sources() -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut stack = vec![root];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
@@ -154,7 +166,10 @@ fn the_migrated_test_db_carries_the_newest_columns() {
         "callback_fired_at",
         "callback_error",
     ] {
-        assert!(cols.contains(&newest.to_string()), "{newest} missing from {cols:?}");
+        assert!(
+            cols.contains(&newest.to_string()),
+            "{newest} missing from {cols:?}"
+        );
     }
     // And the constraints the old fixtures relaxed are really there, since that
     // divergence is what let tests pass against a schema that does not exist.
@@ -212,6 +227,9 @@ fn the_indexes_that_carry_a_query_are_in_the_migrated_schema() {
              which is the only reason the cmd_history half was diagnosable.",
         ),
     ] {
-        assert!(have.contains(&idx.to_string()), "{idx} missing. {why}\ngot {have:?}");
+        assert!(
+            have.contains(&idx.to_string()),
+            "{idx} missing. {why}\ngot {have:?}"
+        );
     }
 }

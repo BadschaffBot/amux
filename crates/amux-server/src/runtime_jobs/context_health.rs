@@ -16,7 +16,9 @@
 //! automatic: a conversation is the lane's accumulated work, so deciding it is
 //! spent belongs to its owner (ethos rule 8). This job reports; a human acts.
 
-use crate::api::session_verbs::{generation_census, is_degraded, GENERATIONS_WARN_AT};
+use crate::api::session_verbs::{
+    compact_scan_of, compact_window_shrank, generation_census, is_degraded, GENERATIONS_WARN_AT,
+};
 
 const JOB: &str = super::registry::ids::CONTEXT_HEALTH;
 const TICK_SECS: u64 = 3600;
@@ -40,6 +42,36 @@ pub fn tick() -> (u32, u32, usize) {
         }
     }
     over.sort_by_key(|(_, g)| std::cmp::Reverse(*g));
+
+    // gs12 review finding 12: a lane whose compaction point fell by more than
+    // 30% between its last two compactions now runs a smaller window (a
+    // settings or model change took effect at a restart) and compacts far
+    // more often. Same population as the census above.
+    let mut sized = 0u32;
+    let mut shrank: Vec<String> = Vec::new();
+    for (lane, gens) in generation_census() {
+        if gens.is_none() {
+            continue;
+        }
+        if let Some(scan) = compact_scan_of(&lane) {
+            if scan.pre_tokens_prev.is_some() && scan.pre_tokens_last.is_some() {
+                sized += 1;
+            }
+            if compact_window_shrank(&scan) {
+                shrank.push(format!(
+                    "{lane}={}->{}",
+                    scan.pre_tokens_prev.unwrap_or(0),
+                    scan.pre_tokens_last.unwrap_or(0)
+                ));
+            }
+        }
+    }
+    if !shrank.is_empty() {
+        tracing::warn!(job = JOB, verdict = "compact_window_shrank", count = shrank.len(),
+            lanes = %shrank.join(" "), measured = true, n_considered = sized,
+            "lanes now compact at a much smaller context size than before; check launch_compact_window_source \
+             (verdict=launch_effective_context) and GET /api/debug/context-health");
+    }
 
     // ALWAYS logged, including on a clean pass. A tick that only speaks when
     // something is wrong makes "no lanes are degraded" and "the census found
@@ -92,14 +124,26 @@ mod tests {
     /// set nobody can name.
     #[test]
     fn tick_counts_partition_the_census() {
+        // A fixed fleet (AF-1007): against the live one the census and the tick
+        // each walk 200+ lanes at different moments and need not agree.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        for lane in ["census-a", "census-b"] {
+            std::fs::write(home.path().join(format!("sessions/{lane}.env")), "CC_DIR=/tmp\n").unwrap();
+        }
+        let _home = crate::api::settings::test_env::set_home(home.path());
         let census = generation_census();
+        assert_eq!(census.len(), 2, "the fixture fleet, not this machine's: {census:?}");
         let (measured, unmeasurable, over) = tick();
         assert_eq!(
             (measured + unmeasurable) as usize,
             census.len(),
             "every lane must land in exactly one of measured/unmeasurable"
         );
-        assert!(over <= measured as usize, "an over-threshold lane must have been measured");
+        assert!(
+            over <= measured as usize,
+            "an over-threshold lane must have been measured"
+        );
     }
 
     /// The boundary of the degraded predicate, both sides.
@@ -113,9 +157,15 @@ mod tests {
     #[test]
     fn the_degraded_predicate_includes_its_own_threshold() {
         let at = std::hint::black_box(GENERATIONS_WARN_AT);
-        assert!(is_degraded(at), "a lane exactly at the threshold must count");
+        assert!(
+            is_degraded(at),
+            "a lane exactly at the threshold must count"
+        );
         assert!(is_degraded(at + 1));
         assert!(!is_degraded(at - 1), "one below must not");
-        assert!(!is_degraded(std::hint::black_box(0u32)), "a pristine lane is never degraded");
+        assert!(
+            !is_degraded(std::hint::black_box(0u32)),
+            "a pristine lane is never degraded"
+        );
     }
 }

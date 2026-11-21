@@ -1,4 +1,4 @@
-//! Minimal adapters for gemini, codex, ollama, and muse (RR-0043).
+//! Minimal adapters for gemini, codex, ollama, grok, and muse (RR-0043).
 //!
 //! "Minimal" is a statement about USAGE, not a placeholder: none of the three
 //! exposes a usage/quota API amux can read on this host today
@@ -49,7 +49,9 @@ impl ProviderAdapter for GeminiAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        crate::provider::model_catalog::worker_model_ids("gemini")
+        // Live when GEMINI_API_KEY is configured (live_catalog's periodic
+        // refresh); the same typed, dated static list otherwise.
+        crate::provider::live_catalog::worker_model_ids("gemini")
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
@@ -99,10 +101,12 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        // Codex itself has no subscription model-listing command. The dated
-        // official fallback is therefore the enumerable surface, while the
-        // configured model remains an unrestricted open string.
-        crate::provider::model_catalog::worker_model_ids("codex")
+        // Codex itself has no subscription model-listing command, but the
+        // OpenAI API does (OPENAI_API_KEY, live_catalog's periodic refresh).
+        // The dated static fallback is used when no key is configured or the
+        // last probe failed; the configured model always remains an
+        // unrestricted open string either way.
+        crate::provider::live_catalog::worker_model_ids("codex")
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
@@ -203,19 +207,13 @@ impl ProviderAdapter for OllamaAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        // The one place a live listing exists: the local `ollama list`
-        // subprocess. Binary missing / daemon down / timeout -> empty vec,
-        // the honest answer on a host without ollama.
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            tokio::process::Command::new("ollama").arg("list").output(),
-        )
-        .await;
-        match out {
-            Ok(Ok(o)) if o.status.success() => {
-                parse_ollama_list(&String::from_utf8_lossy(&o.stdout))
-            }
-            _ => Vec::new(),
+        // The daemon's own HTTP API, never the `ollama` CLI (DESKT-68). On macOS
+        // that CLI launches Ollama.app whenever its daemon is not running, so
+        // `ollama list` here started the app every time the dashboard filled a
+        // model picker. Daemon down -> empty vec, the honest answer.
+        match ollama_http(&ollama_base_url(), "/api/tags", None).await {
+            Some(body) => parse_ollama_tags(&body),
+            None => Vec::new(),
         }
     }
 
@@ -274,6 +272,52 @@ impl ProviderAdapter for OllamaAdapter {
                 "ollama".into(),
                 "--model".into(),
                 self.default_model.clone(),
+            ],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grok Build
+// ---------------------------------------------------------------------------
+
+/// Grok Build CLI (`grok`). Interactive TUI; headless structured events via
+/// `--output-format streaming-json`. No usage/quota API today — `usage()`
+/// returns unknown (Invariant 20). Hooks are not advertised until a hook
+/// surface exists on the CLI.
+pub struct GrokAdapter;
+
+#[async_trait]
+impl ProviderAdapter for GrokAdapter {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("grok")
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            hot_model_switch: false,
+            reports_usage: false,
+            // `--output-format streaming-json` emits NDJSON ACP session updates.
+            structured_events: true,
+            hooks: false,
+        }
+    }
+
+    async fn usage(&self) -> ProviderUsage {
+        ProviderUsage::unknown(self.id())
+    }
+
+    async fn models(&self) -> Vec<String> {
+        vec!["grok-4.6".into(), "grok-4.5".into()]
+    }
+
+    fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
+        match prompt_mode {
+            PromptMode::Interactive => vec!["grok".into()],
+            PromptMode::HeadlessStructured => vec![
+                "grok".into(),
+                "--output-format".into(),
+                "streaming-json".into(),
             ],
         }
     }
@@ -348,15 +392,139 @@ impl ProviderAdapter for MuseAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// OpenCode
+// ---------------------------------------------------------------------------
+
+/// OpenCode CLI (`opencode`, measured against v2.0.28 on Linux).
+///
+/// Runs the interactive TUI in tmux (M0) and speaks the structured protocol for
+/// headless runs: `opencode run --format json` emits one JSON object per line
+/// carrying a stable `sessionID` (`ses_…`). The structured path is wired
+/// through [`super::super::opencode::structured::CliProvider::OpenCode`] and
+/// `events::translate_opencode` (M1). See the fork's
+/// `docs/opencode-provider-plan.md`.
+///
+/// No usage/quota API is read on this host, so `usage()` stays Unknown
+/// (Invariant 20) rather than inventing a number.
+pub struct OpenCodeAdapter;
+
+#[async_trait]
+impl ProviderAdapter for OpenCodeAdapter {
+    fn id(&self) -> ProviderId {
+        ProviderId::new("opencode")
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            hot_model_switch: false,
+            // No usage surface read (terminal scrape only, like the others).
+            reports_usage: false,
+            // `opencode run --format json` emits JSONL lifecycle events.
+            structured_events: true,
+            // No hook surface wired for opencode yet.
+            hooks: false,
+        }
+    }
+
+    async fn usage(&self) -> ProviderUsage {
+        // No usage API to read; unknown is the only honest answer.
+        ProviderUsage::unknown(self.id())
+    }
+
+    async fn models(&self) -> Vec<String> {
+        // Models are account-specific (`opencode models`); enumerating them means
+        // spawning the CLI, which is not worth a launch-time probe. Empty is the
+        // honest answer, and the configured model is an open string either way.
+        Vec::new()
+    }
+
+    fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
+        match prompt_mode {
+            // The interactive TUI, exactly as `opencode` launches it.
+            PromptMode::Interactive => vec!["opencode".into()],
+            // The real headless structured shape (consumed once M1 wires the
+            // protocol); the prompt itself is supplied by the protocol, not argv.
+            PromptMode::HeadlessStructured => vec![
+                "opencode".into(),
+                "run".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+        }
+    }
+}
+
 /// Parse `ollama list` output: a header line, then one model per line with
 /// the name as the first whitespace-separated column, e.g.
 /// `llama3:latest    365c0bd3c000    4.7 GB    2 weeks ago`.
-fn parse_ollama_list(stdout: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .skip(1) // "NAME  ID  SIZE  MODIFIED"
-        .filter_map(|line| line.split_whitespace().next())
-        .map(|name| name.to_string())
+/// The local Ollama daemon's base URL: `OLLAMA_HOST` if set (with or without a
+/// scheme, as ollama itself accepts it), else its default.
+pub(crate) fn ollama_base_url() -> String {
+    normalize_ollama_host(std::env::var("OLLAMA_HOST").ok().as_deref())
+}
+
+fn normalize_ollama_host(raw: Option<&str>) -> String {
+    match raw.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => {
+            let h = h.trim_end_matches('/');
+            if h.starts_with("http://") || h.starts_with("https://") {
+                h.to_string()
+            } else {
+                format!("http://{h}")
+            }
+        }
+        None => "http://127.0.0.1:11434".to_string(),
+    }
+}
+
+/// Ask the running Ollama daemon over HTTP. `None` when nothing answers.
+///
+/// THIS IS THE ONLY WAY AMUX TALKS TO OLLAMA (DESKT-68). The `ollama` CLI on
+/// macOS starts Ollama.app when its daemon is down (it runs `open -j -a Ollama
+/// --args --fast-startup`), so every probe that shelled out to it relaunched an
+/// app the owner had quit: measured 2026-10-01, a dashboard model picker did it
+/// at 10:54:19. An HTTP request to a closed port cannot start anything.
+/// `tests/no_ollama_cli.rs` fails the build if a CLI call comes back.
+pub(crate) async fn ollama_http(
+    base: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let url = format!("{base}{path}");
+    let req = match body {
+        Some(b) => client.post(&url).json(&b),
+        None => client.get(&url),
+    };
+    match req.send().await {
+        Ok(r) if r.status().is_success() => r.text().await.ok(),
+        Ok(r) => {
+            tracing::info!(target: "amux::ollama", url, status = r.status().as_u16(),
+                measured = true, n_considered = 1, verdict = "ollama_http_error",
+                "ollama daemon answered with an error");
+            None
+        }
+        Err(e) => {
+            tracing::info!(target: "amux::ollama", url, error = %e, measured = true,
+                n_considered = 1, verdict = "ollama_daemon_not_running",
+                "ollama daemon not reachable; not starting it (DESKT-68)");
+            None
+        }
+    }
+}
+
+/// Model names from `GET /api/tags` (`{"models":[{"name":"llama3:latest",...}]}`).
+fn parse_ollama_tags(body: &str) -> Vec<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("models").and_then(|m| m.as_array()).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(str::to_string))
         .collect()
 }
 
@@ -371,6 +539,7 @@ mod tests {
             &GeminiAdapter as &dyn ProviderAdapter,
             &CodexAdapter,
             &OllamaAdapter::default(),
+            &GrokAdapter,
             &MuseAdapter,
         ] {
             let usage = adapter.usage().await;
@@ -397,6 +566,11 @@ mod tests {
         assert!(ollama.hooks);
         assert!(!ollama.reports_usage);
         assert!(!ollama.hot_model_switch);
+        let grok = GrokAdapter.capabilities();
+        assert!(grok.structured_events);
+        assert!(!grok.hooks);
+        assert!(!grok.reports_usage);
+        assert!(!grok.hot_model_switch);
         // Muse is the ONLY non-Claude adapter claiming hooks. If this assert is
         // ever "fixed" by flipping it to false, docs/provider-parity.md row 11
         // silently regresses from MET to a scrape fallback for muse lanes.
@@ -405,11 +579,37 @@ mod tests {
         assert!(muse.structured_events);
         assert!(!muse.reports_usage);
         assert!(!muse.hot_model_switch);
+        // OpenCode: JSONL lifecycle events (M1), no hook surface wired, no usage
+        // API read on this host, no hot model switch. Pinned so a future flip is
+        // a build failure rather than a silent capability claim.
+        let opencode = OpenCodeAdapter.capabilities();
+        assert!(
+            opencode.structured_events,
+            "opencode run --format json emits JSONL lifecycle events"
+        );
+        assert!(!opencode.hooks, "no hook surface is wired for opencode yet");
+        assert!(!opencode.reports_usage, "no usage API is read on this host");
+        assert!(!opencode.hot_model_switch);
+    }
+
+    #[test]
+    fn grok_builds_grok_command() {
+        assert_eq!(
+            GrokAdapter.build_command(PromptMode::Interactive),
+            vec!["grok"]
+        );
+        assert_eq!(
+            GrokAdapter.build_command(PromptMode::HeadlessStructured),
+            vec!["grok", "--output-format", "streaming-json"]
+        );
     }
 
     #[test]
     fn muse_builds_muse_command() {
-        assert_eq!(MuseAdapter.build_command(PromptMode::Interactive), vec!["muse"]);
+        assert_eq!(
+            MuseAdapter.build_command(PromptMode::Interactive),
+            vec!["muse"]
+        );
         // `exec` AND `--json`: bare `muse --json` is not a valid invocation.
         assert_eq!(
             MuseAdapter.build_command(PromptMode::HeadlessStructured),
@@ -420,7 +620,10 @@ mod tests {
     #[tokio::test]
     async fn muse_models_lead_with_the_catalog_default() {
         let m = MuseAdapter.models().await;
-        assert_eq!(m.first().map(String::as_str), Some("muse-spark-1.3-contributor"));
+        assert_eq!(
+            m.first().map(String::as_str),
+            Some("muse-spark-1.3-contributor")
+        );
         assert!(m.iter().any(|x| x == "muse-spark-1.2"));
     }
 
@@ -431,19 +634,39 @@ mod tests {
         // herdr/bootstrap path (calls this directly) and the tmux path (which
         // guards on !opts.contains) launch with file-editing and no approval prompts.
         let interactive_expected = vec![
-            "codex", "--oss", "--local-provider", "ollama", "--model", "qwen3.8:27b",
-            "-a", "never", "--sandbox", "workspace-write",
+            "codex",
+            "--oss",
+            "--local-provider",
+            "ollama",
+            "--model",
+            "qwen3.8:27b",
+            "-a",
+            "never",
+            "--sandbox",
+            "workspace-write",
             // `none`, not `low` (AMUX-4611): this path is sync and cannot ask
             // `ollama show` whether the model can think, and `low` is a
             // guaranteed per-turn failure for one that cannot.
-            "-c", "model_reasoning_effort=none",
+            "-c",
+            "model_reasoning_effort=none",
         ];
         // HeadlessStructured: no extra flags needed (headless driver handles approvals).
         let headless_expected = vec![
-            "codex", "--oss", "--local-provider", "ollama", "--model", "qwen3.8:27b",
+            "codex",
+            "--oss",
+            "--local-provider",
+            "ollama",
+            "--model",
+            "qwen3.8:27b",
         ];
-        assert_eq!(a.build_command(PromptMode::Interactive), interactive_expected);
-        assert_eq!(a.build_command(PromptMode::HeadlessStructured), headless_expected);
+        assert_eq!(
+            a.build_command(PromptMode::Interactive),
+            interactive_expected
+        );
+        assert_eq!(
+            a.build_command(PromptMode::HeadlessStructured),
+            headless_expected
+        );
     }
 
     #[test]
@@ -455,16 +678,29 @@ mod tests {
     }
 
     #[test]
-    fn parses_ollama_list_output() {
-        let fixture = "NAME               ID              SIZE      MODIFIED\n\
-                       llama3:latest      365c0bd3c000    4.7 GB    2 weeks ago\n\
-                       qwen3.8:27b           500a1f067a9f    5.2 GB    3 days ago\n";
-        assert_eq!(
-            parse_ollama_list(fixture),
-            vec!["llama3:latest", "qwen3.8:27b"]
-        );
-        assert!(parse_ollama_list("").is_empty());
-        assert!(parse_ollama_list("NAME  ID  SIZE  MODIFIED\n").is_empty());
+    fn parses_ollama_tags_response() {
+        let fixture = r#"{"models":[{"name":"llama3:latest","size":4700000000},{"name":"qwen3.8:27b"}]}"#;
+        assert_eq!(parse_ollama_tags(fixture), vec!["llama3:latest", "qwen3.8:27b"]);
+        assert!(parse_ollama_tags(r#"{"models":[]}"#).is_empty());
+        assert!(parse_ollama_tags("").is_empty(), "garbage is no models, not a panic");
+        assert!(parse_ollama_tags(r#"{"models":[{"model":"x"}]}"#).is_empty(), "an entry without a name is skipped");
+    }
+
+    /// DESKT-68: with no daemon the probe returns quickly with nothing, and
+    /// starts nothing. Port 1 is never an ollama daemon.
+    #[tokio::test]
+    async fn a_stopped_daemon_is_no_models_not_a_launch() {
+        let t0 = std::time::Instant::now();
+        assert!(ollama_http("http://127.0.0.1:1", "/api/tags", None).await.is_none());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn ollama_host_is_honoured_with_or_without_a_scheme() {
+        assert_eq!(normalize_ollama_host(None), "http://127.0.0.1:11434");
+        assert_eq!(normalize_ollama_host(Some("  ")), "http://127.0.0.1:11434");
+        assert_eq!(normalize_ollama_host(Some("127.0.0.1:11500")), "http://127.0.0.1:11500");
+        assert_eq!(normalize_ollama_host(Some("http://box:1234/")), "http://box:1234");
     }
 }
 #[cfg(test)]
@@ -528,7 +764,10 @@ mod ollama_default_tests {
     #[test]
     fn the_adapter_and_the_launcher_resolve_the_same_model() {
         with_knob(Some("pinned:test"), || {
-            assert_eq!(OllamaAdapter::default().default_model, ollama_default_model());
+            assert_eq!(
+                OllamaAdapter::default().default_model,
+                ollama_default_model()
+            );
             assert_eq!(OllamaAdapter::default().default_model, "pinned:test");
         });
     }
@@ -537,7 +776,9 @@ mod ollama_default_tests {
     /// make the default movable, not to move it.
     #[test]
     fn unset_keeps_the_compiled_fallback() {
-        with_knob(None, || assert_eq!(ollama_default_model(), OLLAMA_FALLBACK_MODEL));
+        with_knob(None, || {
+            assert_eq!(ollama_default_model(), OLLAMA_FALLBACK_MODEL)
+        });
     }
 
     /// The knob has to actually move it, or it is decoration. This is the
@@ -562,7 +803,11 @@ mod ollama_default_tests {
     fn a_blank_knob_falls_back_rather_than_launching_an_empty_model() {
         for blank in ["", "   "] {
             with_knob(Some(blank), || {
-                assert_eq!(ollama_default_model(), OLLAMA_FALLBACK_MODEL, "blank {blank:?}");
+                assert_eq!(
+                    ollama_default_model(),
+                    OLLAMA_FALLBACK_MODEL,
+                    "blank {blank:?}"
+                );
             });
         }
     }

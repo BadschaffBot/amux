@@ -6,7 +6,9 @@ test.beforeEach(async ({ page }) => {
   await page.waitForFunction(() => typeof (window as any)._peekHtml === 'function');
   await page.evaluate(() => {
     eval("peekSession='scroll-worker'; _peekMsgRowsFor=peekSession; _peekMsgRows=[]; _peekMsgNavKind='all'; _peekMsgIndex=-1; _peekHistoryHTML=''; _peekEarlier={chunks:[],loadedKb:0,done:true,hidden:true,loading:false};");
-    document.getElementById('peek-overlay')!.classList.add('active');
+    { // Open it the way openPeek does: since 90bedca6 the overlay starts hidden, inert and aria-hidden.
+      const ov = document.getElementById('peek-overlay')!; ov.hidden = false; ov.inert = false;
+      ov.setAttribute('aria-hidden', 'false'); ov.classList.add('active'); }
     (window as any)._stopPeekPoll();
   });
 });
@@ -32,7 +34,8 @@ async function readable(page: import('@playwright/test').Page, selector: string)
     if (node) range.selectNodeContents(node);
     const glyph = node ? range.getClientRects()[0] : target;
 
-    const controls = [...document.querySelectorAll('.peek-copy-btn,.peek-agent-nav')]
+    // Only the subagent navigator floats over the output now.
+    const controls = [...document.querySelectorAll('.peek-output-controls .peek-agent-nav')]
       .filter(e => e.getClientRects().length).map(e => e.getBoundingClientRect().bottom);
     return { top: target.top, bottom: bounds.bottom, safe: Math.max(bounds.top, ...controls),
       left: glyph.left, bodyLeft: bounds.left, bodyRight: bounds.right,
@@ -114,6 +117,10 @@ test('Find reveals text inside a wide terminal table', async ({ page }) => {
 
 for (const mode of ['message', 'search']) for (const tail of [50, 0]) {
   test(`a working worker refresh keeps the selected ${mode} and its position with ${tail} trailing lines`, async ({ page }) => {
+    // A stable, empty subagent list: the fixture worker has none, and the
+    // refresh's failing fetch showed the navigator mid-test, which moves the
+    // output on its own (that case has its own test below).
+    await page.route('**/api/sessions/scroll-worker/subagents', route => route.fulfill({ json: { session: 'scroll-worker', subagents: [] } }));
     const raw = 'before\n'.repeat(45) + '› selected original text\nAssistant\n' + 'after\n'.repeat(tail);
     await render(page, raw);
     if (mode === 'search') {
@@ -136,6 +143,39 @@ for (const mode of ['message', 'search']) for (const tail of [50, 0]) {
   });
 }
 
+
+// The subagent navigator appearing adds top padding to the output; a selected
+// hit near the bottom must stay in view (680b0ecd3's CI red on iPhone).
+for (const mode of ['message', 'search']) {
+  test(`the ${mode} stays in view when the subagent navigator appears`, async ({ page }) => {
+    await render(page, 'before\n'.repeat(45) + '› selected original text\nAssistant\n');
+    if (mode === 'search') {
+      await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
+      await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill('selected original text');
+    } else await page.getByRole('button', { name: 'Next message', exact: true }).click();
+    const selector = mode === 'search' ? '.peek-highlight.current' : '.peek-msg-current';
+    await readable(page, selector);
+    await page.evaluate(() => { (window as any).eval("_peekAgents.error = 'unavailable'; _peekAgentsPaint();"); });
+    await expect(page.locator('#peek-agent-nav')).toBeVisible();
+    await readable(page, selector);
+  });
+
+  // A user who scrolled away from the selection is not pulled back when the
+  // navigator appears (8e96231f1's CI red: the list arrived after the scroll).
+  test(`the navigator appearing leaves a user who scrolled away from the ${mode} in place`, async ({ page }) => {
+    await render(page, 'before\n'.repeat(45) + '› selected original text\nAssistant\n');
+    if (mode === 'search') {
+      await page.getByRole('button', { name: 'Find in terminal', exact: true }).click();
+      await page.getByRole('searchbox', { name: 'Find in terminal', exact: true }).fill('selected original text');
+    } else await page.getByRole('button', { name: 'Next message', exact: true }).click();
+    const selector = mode === 'search' ? '.peek-highlight.current' : '.peek-msg-current';
+    await readable(page, selector);
+    await page.locator('#peek-body').evaluate(el => { el.scrollTop = 0; });
+    await page.evaluate(() => { (window as any).eval("_peekAgents.error = 'unavailable'; _peekAgentsPaint();"); });
+    await expect(page.locator('#peek-agent-nav')).toBeVisible();
+    expect(await page.locator('#peek-body').evaluate(el => el.scrollTop)).toBe(0);
+  });
+}
 
 test('saved Codex input hints stay out of navigation while recorded messages remain', async ({ page }) => {
   const raw = '› Ask Codex to do anything\n\n  gpt-6-astra xhigh · ~/project\n'

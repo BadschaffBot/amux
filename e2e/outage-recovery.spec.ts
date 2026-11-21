@@ -1,5 +1,6 @@
 import { test, expect, Page, allowUnusedRoute } from './fixtures';
 import type { Route } from '@playwright/test';
+import { cleanup } from './teardown';
 
 async function setup(page: Page) {
   await page.addInitScript(() => {
@@ -63,6 +64,15 @@ test(`${failure.reason} retains gate and title intent across reload then retries
   await expect.poll(async () => (await queue(page)).length).toBe(1);
   const persisted = (await queue(page))[0];
   expect(JSON.parse(persisted.options.body).gate).toEqual(['Verify the durable write']);
+  if (failure.status === 500) {
+    // Queued WITH the refusal, so the pill counts it before any retry runs.
+    // The refusal is recorded at queue time ("Server did not save the change
+    // (500)"); a background retry may already have replaced it with its own
+    // wording ("500: pool timeout") before this read (mobile CI run 37138559576).
+    // Either way the entry carries the 500 and counts as attempted.
+    expect(persisted.error).toMatch(/Server did not save the change \(500\)|^500: /);
+    expect(persisted.not_attempted).toBe(false);
+  }
   await page.reload();
   expect((await queue(page))[0].id).toBe(persisted.id);
   await openCard(page, card.id);
@@ -167,16 +177,61 @@ test('a peer edit causes a visible revision conflict without clobbering either d
   expect(durable).toBe('Peer committed title');
 });
 
-test('a board read failure overrides a live SSE connection', async ({page}) => {
+for (const latestFails of [true, false]) test(`the latest board read ${latestFails ? 'failure' : 'recovery'} wins over an older response and live SSE`, async ({page}) => {
   await setup(page);
-  await page.route('**/api/board/statuses', route => route.fulfill({status: 500, body: 'timed out waiting for connection'}));
-  await page.evaluate(async () => {
-    (window as any).eval('_liveSSE = true; online = true');
-    await (window as any).fetchBoard();
-    (window as any).eval('_liveSSE = true; online = true');
-    (window as any).updateConnectionStatus();
-  });
-  await expect(page.locator('#conn-status').first()).toHaveText('Sync error');
+  await page.evaluate(() => (window as any).fetchBoard());
+  // Install and start synchronously: the held response belongs to this read,
+  // never to a boot/background poll that happened to reach page.route first.
+  await page.evaluate(latestFails => {
+    const w = window as any, original = window.fetch;
+    let first = true;
+    const response = (fails: boolean) => new Response(fails ? 'board read failed' : '[]',
+      {status:fails ? 500 : 200, headers:{'Content-Type':'application/json'}});
+    w.__restoreBoardFetch = () => { window.fetch = original; };
+    let firstHead = true;
+    window.fetch = (input, init) => {
+      // The older read's change-feed head comes back late, as it did under CI
+      // load: its statuses request must still be the one this read issued first.
+      if (String(input).endsWith('/api/board/changes?since_seq=0&limit=1') && firstHead) {
+        firstHead = false;
+        return new Promise<Response>(resolve => setTimeout(() => resolve(original(input, init)), 400));
+      }
+      if (String(input).endsWith('/api/board/statuses')) {
+        if (first) {
+          first = false;
+          return new Promise<Response>(resolve => { w.__releaseOlderBoardRead = () => resolve(response(!latestFails)); });
+        }
+        return Promise.resolve(response(latestFails));
+      }
+      return original(input, init);
+    };
+    w.__olderBoardRead = w.fetchBoard();
+  }, latestFails);
+  try {
+    const newest = await page.evaluate(async () => {
+      const w = window as any;
+      w.eval('_liveSSE = true; online = true');
+      await w.fetchBoard();
+      w.updateConnectionStatus();
+      return document.querySelector('#conn-status')?.textContent;
+    });
+    expect(newest).toBe(latestFails ? 'Sync error' : 'Live');
+    const afterOlder = await page.evaluate(async () => {
+      const w = window as any;
+      w.__releaseOlderBoardRead();
+      await w.__olderBoardRead;
+      w.eval('_liveSSE = true; online = true');
+      w.updateConnectionStatus();
+      return document.querySelector('#conn-status')?.textContent;
+    });
+    // Snapshot, not a polling assertion: a later poll must not conceal a stale
+    // publication that already changed what the user saw.
+    expect(afterOlder).toBe(latestFails ? 'Sync error' : 'Live');
+  } finally {
+    await cleanup('restore board read transport', () => page.evaluate(() => {
+      const w = window as any; w.__releaseOlderBoardRead?.(); w.__restoreBoardFetch?.();
+    }), test.info());
+  }
 });
 
 

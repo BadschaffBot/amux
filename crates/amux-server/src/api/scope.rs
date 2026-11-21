@@ -221,7 +221,11 @@ fn memory_file(home: &Path, level: &str, name: &str, key: &str) -> PathBuf {
     let suf = if key == "rules" { ".rules.md" } else { ".md" };
     let mem = home.join("memory");
     match level {
-        "global" => mem.join(if key == "rules" { "_rules.md" } else { "_global.md" }),
+        "global" => mem.join(if key == "rules" {
+            "_rules.md"
+        } else {
+            "_global.md"
+        }),
         "group" => mem.join("tags").join(format!("{name}{suf}")),
         _ => mem.join(format!("{name}{suf}")),
     }
@@ -274,7 +278,11 @@ fn scan_fleet(home: &Path) -> Vec<(String, Vec<String>, bool)> {
 /// `_session_tags_of` (py:21724; order is the documented AMUX-2311
 /// tie-break, so no sorting here).
 fn split_tags(raw: &str) -> Vec<String> {
-    raw.split(',').map(str::trim).filter(|t| !t.is_empty()).map(String::from).collect()
+    raw.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// pub(crate) so the skin resolver uses the SAME reader (AMUX-2678). Two
@@ -339,12 +347,17 @@ fn read_cap_value(
             // already the DB-backed key/value the branding prefs use.
             let k = skin_pref_key(level, name);
             let raw: Option<String> = conn.and_then(|c| {
-                c.query_row("SELECT value FROM prefs WHERE key=?1", rusqlite::params![k], |r| {
-                    r.get::<_, String>(0)
-                })
+                c.query_row(
+                    "SELECT value FROM prefs WHERE key=?1",
+                    rusqlite::params![k],
+                    |r| r.get::<_, String>(0),
+                )
                 .ok()
             });
-            let set = raw.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
+            let set = raw
+                .as_deref()
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
             let parsed: Value = raw
                 .as_deref()
                 .and_then(|v| serde_json::from_str(v).ok())
@@ -352,21 +365,27 @@ fn read_cap_value(
             Ok((json!({ "skin": parsed }), set))
         }
         "connectors" => {
+            use rusqlite::OptionalExtension;
             // Same prefs-backed JSON storage as skin (structured config the SPA
             // and the launch-time connector resolver read, keyed by scope).
             let k = connectors_pref_key(level, name);
-            let raw: Option<String> = conn.and_then(|c| {
-                c.query_row("SELECT value FROM prefs WHERE key=?1", rusqlite::params![k], |r| {
-                    r.get::<_, String>(0)
-                })
-                .ok()
-            });
-            let set = raw.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
-            let parsed: Value = raw
-                .as_deref()
-                .and_then(|v| serde_json::from_str(v).ok())
-                .unwrap_or_else(|| json!({}));
-            Ok((json!({ "connectors": parsed }), set))
+            let conn = conn.ok_or("connector scope database unavailable")?;
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM prefs WHERE key=?1",
+                    rusqlite::params![k],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| format!("could not read saved connector scope '{k}'"))?;
+            let Some(raw) = raw else {
+                return Ok((json!({ "connectors": {} }), false));
+            };
+            // Only an absent row is unrestricted. Corruption must not erase
+            // a deny/pin or fall through to a broader parent grant.
+            let parsed: Map<String, Value> = serde_json::from_str(&raw)
+                .map_err(|_| format!("invalid saved connector scope '{k}'"))?;
+            Ok((json!({ "connectors": parsed }), true))
         }
         "memory" | "rules" => {
             let f = memory_file(home, level, name, key);
@@ -460,6 +479,43 @@ fn read_cap_value(
     }
 }
 
+/// The RESOLVED `connectors` scope for a lane: global, then each of the
+/// lane's groups (from its own `CC_TAGS`, the same source `lane_groups`
+/// reads), then the worker layer — merged BY CONNECTOR KEY, worker winning
+/// last. This is the "launch-time connector resolver" `read_cap_value`'s
+/// `connectors` arm already names as a consumer of `connectors_pref_key`,
+/// but nothing actually composed the three layers until now (APM-2): the
+/// Connectors/Scope tab could mark a worker entitled to one connector and
+/// not another, and `POST /api/connectors/{id}/token` never asked, so
+/// EVERY worker could mint EVERY connected account's live bearer token
+/// regardless of what the scope UI showed. `merge-by-key` (not whole-object
+/// replace) mirrors `skin`'s semantics: a worker enabling one connector
+/// must not have to redeclare every other connector a group already turned
+/// on for it.
+pub(crate) fn effective_connectors(
+    conn: Option<&rusqlite::Connection>,
+    home: &Path,
+    lane: &str,
+) -> Result<Map<String, Value>, String> {
+    let conn = conn.ok_or("connector scope database unavailable")?;
+    let mut merged = Map::new();
+    let mut apply = |level: &str, name: &str| -> Result<(), String> {
+        let (v, _) = read_cap_value(Some(conn), home, level, name, "connectors")?;
+        if let Some(obj) = v.get("connectors").and_then(Value::as_object) {
+            for (k, val) in obj {
+                merged.insert(k.clone(), val.clone());
+            }
+        }
+        Ok(())
+    };
+    apply("global", "")?;
+    for g in crate::api::session_verbs::lane_groups(lane) {
+        apply("group", &g)?;
+    }
+    apply("worker", lane)?;
+    Ok(merged)
+}
+
 /// session_gates key convention: `group:<name>` for groups, the bare name
 /// for workers (py:16147 / py:16290).
 /// Where a skin lives in `prefs`. One key shape for all three levels so a
@@ -505,7 +561,10 @@ async fn write_skin(
                     )?;
                 }
             }
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await
         .map_err(|e| (500, format!("skin write failed: {e}")))?;
@@ -533,32 +592,73 @@ async fn write_connectors(
     name: &str,
     value: &Value,
 ) -> Result<(), (u16, String)> {
+    use rusqlite::OptionalExtension;
     let obj = value.get("connectors").unwrap_or(value);
+    let merge = if value.get("connectors").is_some() {
+        match value.get("merge") {
+            None => false,
+            Some(Value::Bool(v)) => *v,
+            _ => return Err((400, "merge must be a boolean".into())),
+        }
+    } else {
+        false
+    };
     if !obj.is_object() && !obj.is_null() {
         return Err((400, "connectors must be a JSON object".into()));
     }
+    if merge
+        && (!obj.is_object()
+            || obj
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|v| !v.is_object() && !v.is_null()))
+    {
+        return Err((
+            400,
+            "connector patches must be objects or null (remove connector)".into(),
+        ));
+    }
     let key = connectors_pref_key(level, name);
-    let empty = obj.is_null() || obj.as_object().map(|m| m.is_empty()).unwrap_or(true);
-    let payload = if empty { None } else { Some(obj.to_string()) };
-    state
-        .store
-        .write_async(move |conn| {
-            match &payload {
-                None => {
-                    conn.execute("DELETE FROM prefs WHERE key=?1", rusqlite::params![key])?;
-                }
-                Some(v) => {
-                    conn.execute(
-                        "INSERT INTO prefs (key, value) VALUES (?1, ?2) \
-                         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        rusqlite::params![key, v],
-                    )?;
-                }
+    let obj = obj.clone();
+    state.store.write_async(move |conn| {
+        let saved = if merge {
+            // Runs inside Store's IMMEDIATE transaction: concurrent UI/worker
+            // patches never race a client-side read/replace of the whole map.
+            let raw: Option<String> = conn.query_row("SELECT value FROM prefs WHERE key=?1",[&key],|r|r.get(0)).optional()?;
+            let mut current: Map<String,Value> = match raw {
+                Some(raw) => serde_json::from_str(&raw).map_err(|e|rusqlite::Error::FromSqlConversionFailure(0,rusqlite::types::Type::Text,Box::new(e)))?,
+                None => Map::new(),
+            };
+            for (id,patch) in obj.as_object().unwrap() {
+                if patch.is_null() { current.remove(id);continue; }
+                let mut cfg = match current.get(id) {
+                    Some(Value::Object(cfg)) => cfg.clone(),
+                    None => Map::new(),
+                    _ => return Err(rusqlite::Error::InvalidParameterName("stored connector configuration is not an object".into())),
+                };
+                cfg.extend(patch.as_object().unwrap().clone());
+                current.insert(id.clone(),Value::Object(cfg));
             }
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-        })
-        .await
-        .map_err(|e| (500, format!("connectors write failed: {e}")))?;
+            Value::Object(current)
+        } else { obj };
+        if saved.is_null() || saved.as_object().is_some_and(|v|v.is_empty()) {
+            conn.execute("DELETE FROM prefs WHERE key=?1",[&key])?;
+        } else {
+            conn.execute("INSERT INTO prefs (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![key,saved.to_string()])?;
+        }
+        Ok(crate::db::WriteOutcome { applied:true,events:vec![] })
+    }).await.map_err(|e| {
+        tracing::warn!(%e,level,name,merge,verdict="connector_scope_commit_failed", "connector scope update refused without replacing unreadable state");
+        (500,format!("connectors write failed: {e}"))
+    })?;
+    tracing::info!(
+        level,
+        name,
+        merge,
+        verdict = "connector_scope_committed",
+        "connector scope committed atomically"
+    );
     Ok(())
 }
 
@@ -598,7 +698,9 @@ fn load_board_statuses(conn: &rusqlite::Connection) -> Vec<StatusRow> {
                         .as_deref()
                         .and_then(|g| serde_json::from_str(g).ok())
                         .unwrap_or_else(|| json!([])),
-                    mode: mode.filter(|m| !m.is_empty()).unwrap_or_else(|| "implicit".into()),
+                    mode: mode
+                        .filter(|m| !m.is_empty())
+                        .unwrap_or_else(|| "implicit".into()),
                 });
             }
         }
@@ -606,8 +708,20 @@ fn load_board_statuses(conn: &rusqlite::Connection) -> Vec<StatusRow> {
     if out.is_empty() {
         // _DEFAULT_STATUSES have no gate/mode keys; `s.get("gate") or []`
         // and `s.get("mode") or "implicit"` produce exactly this.
-        for id in ["backlog", "todo", "doing", "review", "done", "verified", "discarded"] {
-            out.push(StatusRow { id: id.into(), gate: json!([]), mode: "implicit".into() });
+        for id in [
+            "backlog",
+            "todo",
+            "doing",
+            "review",
+            "done",
+            "verified",
+            "discarded",
+        ] {
+            out.push(StatusRow {
+                id: id.into(),
+                gate: json!([]),
+                mode: "implicit".into(),
+            });
         }
     }
     out
@@ -631,7 +745,9 @@ fn load_session_gates(
         .map(|(st, g)| {
             (
                 st,
-                g.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(json!([])),
+                g.as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(json!([])),
             )
         })
         .collect();
@@ -654,13 +770,19 @@ fn scope_write_allowed(level: &str, name: &str, actor: &str) -> (bool, String) {
         .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
         .unwrap_or(false);
     if open {
-        return (true, "AMUX_SCOPE_WRITE_AGENTS=1 (all levels open to sessions)".into());
+        return (
+            true,
+            "AMUX_SCOPE_WRITE_AGENTS=1 (all levels open to sessions)".into(),
+        );
     }
     if actor.is_empty() {
         return (true, "human (no session header — dashboard)".into());
     }
     if level == "worker" && name == actor {
-        return (true, format!("session writing its own worker layer ({actor})"));
+        return (
+            true,
+            format!("session writing its own worker layer ({actor})"),
+        );
     }
     if level == "worker" {
         return (
@@ -687,7 +809,10 @@ fn scope_write_allowed(level: &str, name: &str, actor: &str) -> (bool, String) {
 // ---------------------------------------------------------------------------
 
 fn j(status: u16, v: Value) -> Response {
-    (StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(v))
+    (
+        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        Json(v),
+    )
         .into_response()
 }
 
@@ -732,8 +857,11 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response {
     //
     // The message names the likely intent rather than only the rule, because
     // `worker=` is the natural guess and the correct spelling is two params.
-    let unknown: Vec<&str> =
-        q.keys().map(String::as_str).filter(|k| !matches!(*k, "level" | "name")).collect();
+    let unknown: Vec<&str> = q
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !matches!(*k, "level" | "name"))
+        .collect();
     if !unknown.is_empty() {
         let hint = unknown
             .iter()
@@ -756,10 +884,16 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response {
         );
     }
     if !matches!(level, "global" | "group" | "worker") {
-        return j(400, json!({"error": "level must be global, group or worker"}));
+        return j(
+            400,
+            json!({"error": "level must be global, group or worker"}),
+        );
     }
     if level != "global" && name.is_empty() {
-        return j(400, json!({"error": format!("name required for level={level}")}));
+        return j(
+            400,
+            json!({"error": format!("name required for level={level}")}),
+        );
     }
     let home = super::groups::amux_home();
     let conn = state.store.read().ok();
@@ -783,8 +917,10 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response {
             out.insert("members".into(), json!(members));
         }
         _ => {
-            let groups: BTreeSet<String> =
-                scan_fleet(&home).into_iter().flat_map(|(_, tags, _)| tags).collect();
+            let groups: BTreeSet<String> = scan_fleet(&home)
+                .into_iter()
+                .flat_map(|(_, tags, _)| tags)
+                .collect();
             out.insert("groups".into(), json!(groups));
         }
     }
@@ -793,6 +929,14 @@ pub async fn handler(State(state): State<AppState>, req: Request) -> Response {
 
 async fn put_scope(state: AppState, req: Request) -> Response {
     let actor = super::groups::hdr_worker(req.headers());
+    let headers = req.headers().clone();
+    // A verified invited member is a HUMAN, though the member middleware stamps
+    // x-amux-session = "member:<email>" for attribution, which made this guard
+    // read Ethan on sandbox.amux.io as a worker reconfiguring a peer
+    // ("'member:ethan@mixpeek.com' may not configure another worker",
+    // 2026-10-07). Their grant decides, not the session rule.
+    let member = super::org::local_member_scope(req.headers())
+        .filter(|_| super::org::local_member_actor(req.headers()).is_some());
     let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(b) => b,
         Err(e) => return j(400, json!({"error": e.to_string()})),
@@ -812,8 +956,10 @@ async fn put_scope(state: AppState, req: Request) -> Response {
     // correctly from what the read half told them; the answer should teach.
     // (Python's comment; without this the 409 below would be unreachable —
     // an unfalsifiable guard, which ethos #7 counts as no guard at all.)
-    let known_layers: BTreeSet<&str> =
-        SCOPE_CAPS.iter().flat_map(|c| c.order.iter().copied()).collect();
+    let known_layers: BTreeSet<&str> = SCOPE_CAPS
+        .iter()
+        .flat_map(|c| c.order.iter().copied())
+        .collect();
     if !matches!(level.as_str(), "global" | "group" | "worker")
         && !known_layers.contains(level.as_str())
     {
@@ -826,7 +972,10 @@ async fn put_scope(state: AppState, req: Request) -> Response {
         );
     }
     if matches!(level.as_str(), "group" | "worker") && name.is_empty() {
-        return j(400, json!({"error": format!("name required for level={level}")}));
+        return j(
+            400,
+            json!({"error": format!("name required for level={level}")}),
+        );
     }
     if capability.is_empty() {
         return j(
@@ -837,7 +986,28 @@ async fn put_scope(state: AppState, req: Request) -> Response {
             }),
         );
     }
-    scope_write(&state, &level, &name, &capability, body.get("value"), &actor).await
+    // A capability grant (AMUX_CAP_*) is one of the owner's governance powers:
+    // it asks for a fresh second factor (mfa.rs, AMUX_MFA_STEP_UP).
+    if capability == "env" {
+        if let Some(v) = body.get("value") {
+            let home = super::groups::amux_home();
+            if let Some(k) = key_changed_where(&home, &level, &name, v, |k| k.starts_with("AMUX_CAP_")) {
+                if let Some(r) = super::mfa::step_up_gate(&headers, &format!("changing the capability {k}")) {
+                    return r;
+                }
+            }
+        }
+    }
+    scope_write(
+        &state,
+        &level,
+        &name,
+        &capability,
+        body.get("value"),
+        &actor,
+        member.as_ref(),
+    )
+    .await
 }
 
 /// Python `_scope_write`: validate → authorize → before-read → storage write
@@ -849,6 +1019,7 @@ async fn scope_write(
     key: &str,
     value: Option<&Value>,
     actor: &str,
+    member: Option<&super::org::MemberScope>,
 ) -> Response {
     let Some(cap) = cap_by_key(key) else {
         return j(400, json!({"error": format!("unknown capability '{key}'")}));
@@ -869,7 +1040,26 @@ async fn scope_write(
             )}),
         );
     }
-    let (ok, why) = scope_write_allowed(level, name, actor);
+    let (ok, why) = match member {
+        Some(m) if m.is_global() => (true, format!("verified member {actor} with global access (a human)")),
+        Some(m) if level == "worker" && m.allows_worker(name) => (
+            true,
+            format!("verified member {actor} configuring '{name}', inside their grant"),
+        ),
+        Some(m) => {
+            tracing::warn!(actor, level, name, scope_level = m.level(), scope_name = m.name(),
+                verdict = "scope_write_member_outside_grant", "member scope write refused");
+            (false, format!(
+                "'{actor}' is a member with {} access ({}) and may configure only workers inside it, not the {level} layer for '{name}'.",
+                m.level(), if m.name().is_empty() { "global" } else { m.name() }))
+        }
+        None if super::session_verbs::is_admin_worker(actor) => {
+            tracing::info!(actor, level, name, gate = "scope_write", verdict = "admin_group_owner_gate",
+                measured = true, n_considered = 1, "an admin-group worker passed an owner-only gate");
+            (true, format!("admin-group worker {actor} (owner reach)"))
+        }
+        None => scope_write_allowed(level, name, actor),
+    };
     if !ok {
         return j(403, json!({"error": why}));
     }
@@ -881,6 +1071,27 @@ async fn scope_write(
     };
 
     let value = value.cloned().unwrap_or(Value::Null);
+    if key == "env" && !actor.is_empty() && !super::session_verbs::is_admin_worker(actor) {
+        if let Some(k) = owner_only_key_changed(&home, level, name, &value) {
+            tracing::warn!(actor = %actor, level, name, key = %k, verdict = "scope_owner_only_key_refused",
+                "a session tried to change an owner-only scope key");
+            return j(403, json!({"error": format!(
+                "'{k}' is owner-only: it widens what this worker may do without the owner \
+                 (auto-approval, auto-proceed, browser profiles, approval types, outside email). \
+                 Change it from the dashboard."), "code": "owner_only_key", "key": k}));
+        }
+    }
+    // A board switch written at any scope can turn a worker's board on or off;
+    // note each affected worker's answer first so a flip can refresh its rules
+    // (AF-986).
+    let board_before: Vec<(String, bool)> = if key == "env" {
+        crate::api::session_verbs::workers_in_scope(level, name)
+            .into_iter()
+            .map(|w| { let off = crate::api::board_lifecycle::board_unused(&w); (w, off) })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let write_result: Result<(), (u16, String)> = match key {
         "memory" | "rules" => write_memory(&home, level, name, key, &value),
         "env" => write_env(&home, level, name, &value),
@@ -895,6 +1106,17 @@ async fn scope_write(
     };
     if let Err((status, msg)) = write_result {
         return j(status, json!({"error": msg}));
+    }
+    // Governance PR 11: a grant written here answers any open capability ask,
+    // so the next refusal of that capability may ask again.
+    let granted = super::capabilities::caps_written(key, &value);
+    if !granted.is_empty() {
+        let workers = if level == "worker" {
+            vec![name.to_string()]
+        } else {
+            crate::api::session_verbs::workers_in_scope(level, name)
+        };
+        super::capabilities::clear_asks(&home, &workers, &granted);
     }
 
     let after = {
@@ -920,19 +1142,38 @@ async fn scope_write(
     )
     .await;
 
-    j(
-        200,
-        json!({
-            "ok": true,
-            "level": level,
-            "name": name,
-            "capability": key,
-            "set_here": set_here,
-            "value": after_value,
-            "actor": if actor.is_empty() { "human" } else { actor },
-            "why_allowed": why,
-        }),
-    )
+    let mut body = json!({
+        "ok": true,
+        "level": level,
+        "name": name,
+        "capability": key,
+        "set_here": set_here,
+        "value": after_value,
+        "actor": if actor.is_empty() { "human" } else { actor },
+        "why_allowed": why,
+    });
+    // A saved rule or memory is not yet an applied one (AH-233). Both are
+    // composed into each worker's launch, so a running worker keeps what it
+    // started with unless it is told. Say who this reaches and when, and tell
+    // the running ones (session_verbs::refresh_scoped_context), deletions
+    // included: an emptied layer is a change the worker must hear about too.
+    if key == "env" {
+        let flipped = crate::api::session_verbs::refresh_if_board_flipped(state, board_before, actor).await;
+        if !flipped.is_empty() {
+            body["board_context_refreshed"] = json!(flipped);
+        }
+    }
+    if key == "rules" || key == "memory" {
+        let reached = crate::api::session_verbs::workers_in_scope(level, name);
+        let what = format!("{key} ({level} scope{})", if level == "global" { String::new() } else { format!(" {name}") });
+        let live = crate::api::session_verbs::refresh_scoped_context(state, &reached, &what, actor).await;
+        let isolated: Vec<&String> = reached.iter().filter(|w| crate::api::session_verbs::session_is_isolated(w)).collect();
+        body["takes_effect"] = json!(crate::api::session_verbs::SCOPED_CONTEXT_TAKES_EFFECT);
+        body["affected_workers"] = json!(reached);
+        body["delivered_live"] = json!(live);
+        body["isolated_not_reached"] = json!(isolated);
+    }
+    j(200, body)
 }
 
 // ---------------------------------------------------------------------------
@@ -955,7 +1196,11 @@ fn write_memory(
     // Python: value if str else (value or {}).get("text", "")
     let text = match value {
         Value::String(s) => s.clone(),
-        Value::Object(o) => o.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        Value::Object(o) => o
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string(),
         _ => String::new(),
     };
     std::fs::write(&f, text).map_err(|e| (500, e.to_string()))
@@ -963,6 +1208,80 @@ fn write_memory(
 
 /// env: whole-file replace for a string value; merge-by-key for an object
 /// (null deletes a key). 0600 — env files carry credentials.
+/// Env keys a session may never set for itself, even in its own worker layer:
+/// each widens what the worker may do WITHOUT the owner. Measured 2026-09-27:
+/// the auto-approve policy (AMUX-5301) resolved worker > group > global, and
+/// scope_write_allowed lets a session write its own worker layer, so a lane
+/// could have raised its own spend cap or switched on outbound auto-approval.
+const OWNER_ONLY_ENV_PREFIXES: &[&str] = &[
+    "AMUX_NEEDS_INPUT_AUTO",
+    "AMUX_DECISION_DIGEST",
+    "AMUX_DIRECTIVE_SENDERS",
+    "AMUX_BROWSER_PROFILES_",
+    "AMUX_APPROVAL_TYPES",
+    "AMUX_EMAIL_EXTERNAL_ALLOW",
+    // Governance PR 11: a capability is a grant, so only the owner sets one.
+    "AMUX_CAP_",
+    // Governance PR 20: who signs in, how, and with what second factor.
+    "AMUX_OIDC_",
+    "AMUX_SSO_",
+    "AMUX_MFA_",
+    "AMUX_SCIM_",
+];
+
+fn is_owner_only_env_key(k: &str) -> bool {
+    OWNER_ONLY_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
+}
+
+#[cfg(test)]
+pub(crate) fn is_owner_only_env_key_pub(k: &str) -> bool {
+    is_owner_only_env_key(k)
+}
+
+/// The first owner-only key whose value this write would change, if any.
+/// Handles both write shapes: a full-text replace and a key/value merge.
+pub(crate) fn owner_only_key_changed(home: &Path, level: &str, name: &str, value: &Value) -> Option<String> {
+    key_changed_where(home, level, name, value, is_owner_only_env_key)
+}
+
+/// The first key matching `pick` whose value this write would change.
+pub(crate) fn key_changed_where(home: &Path, level: &str, name: &str, value: &Value, pick: fn(&str) -> bool) -> Option<String> {
+    let parse = |text: &str| -> std::collections::BTreeMap<String, String> {
+        text.lines()
+            .filter_map(|l| {
+                let l = l.trim().trim_start_matches("export ").trim();
+                if l.starts_with('#') { return None; }
+                let (k, v) = l.split_once('=')?;
+                Some((k.trim().to_string(), v.trim().trim_matches('"').trim_matches('\'').to_string()))
+            })
+            .collect()
+    };
+    let current = parse(&std::fs::read_to_string(env_file(home, level, name)).unwrap_or_default());
+    match value {
+        Value::String(text) => {
+            let next = parse(text);
+            let keys: BTreeSet<String> = current.keys().chain(next.keys()).cloned().collect();
+            keys.into_iter()
+                .find(|k| pick(k) && current.get(k) != next.get(k))
+        }
+        Value::Object(obj) => obj
+            .iter()
+            .find(|(k, v)| {
+                pick(k) && {
+                    let nv = match v {
+                        Value::Null => None,
+                        Value::String(s) => Some(s.clone()),
+                        Value::Bool(b) => Some(if *b { "True".into() } else { "False".into() }),
+                        other => Some(other.to_string()),
+                    };
+                    current.get(k.as_str()).cloned() != nv
+                }
+            })
+            .map(|(k, _)| k.clone()),
+        _ => None,
+    }
+}
+
 fn write_env(home: &Path, level: &str, name: &str, value: &Value) -> Result<(), (u16, String)> {
     let f = env_file(home, level, name);
     match value {
@@ -1094,7 +1413,11 @@ async fn write_status_mode(
         let lv = if level == "group" { "tag" } else { "session" };
         let wanted: BTreeSet<String> = value
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let name = name.to_string();
         state
@@ -1178,7 +1501,11 @@ async fn ilog_scope_write(
 ) {
     let kind = "scope".to_string();
     let action = format!("write:{key}");
-    let actor = if actor.is_empty() { "human".to_string() } else { actor.to_string() };
+    let actor = if actor.is_empty() {
+        "human".to_string()
+    } else {
+        actor.to_string()
+    };
     let target = format!("{level}:{}", if name.is_empty() { "global" } else { name });
     let detail = blob(Some(json!({
         "capability": key, "level": level, "name": name, "why_allowed": why,
@@ -1206,7 +1533,10 @@ async fn ilog_scope_write(
             )?;
             // Audit rows ride the transaction but announce nothing: Python's
             // _ilog emits no client-visible event either.
-            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+            Ok(crate::db::WriteOutcome {
+                applied: false,
+                events: vec![],
+            })
         })
         .await;
     if let Err(e) = res {
@@ -1227,18 +1557,20 @@ mod tests {
     fn state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         AppState {
             store,
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
     fn app(state: &AppState) -> Router {
-        Router::new().nest("/api/scope", routes()).with_state(state.clone())
+        Router::new()
+            .nest("/api/scope", routes())
+            .with_state(state.clone())
     }
 
     async fn call(
@@ -1261,8 +1593,13 @@ mod tests {
         };
         let res = app.clone().oneshot(b.body(body).unwrap()).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
     }
 
     /// AF-518 — an unknown query param must be REFUSED, not dropped.
@@ -1280,9 +1617,16 @@ mod tests {
         let app = app(&st);
 
         let (code, body) = call(&app, "GET", "/api/scope?worker=backend", None, None).await;
-        assert_eq!(code, StatusCode::BAD_REQUEST, "?worker= silently answered global: {body}");
+        assert_eq!(
+            code,
+            StatusCode::BAD_REQUEST,
+            "?worker= silently answered global: {body}"
+        );
         let err = body["error"].as_str().unwrap_or_default();
-        assert!(err.contains("worker"), "the refusal does not name the offending param: {err}");
+        assert!(
+            err.contains("worker"),
+            "the refusal does not name the offending param: {err}"
+        );
         assert!(
             err.contains("level=worker&name=backend"),
             "the refusal does not teach the correct spelling, which is the whole point: {err}"
@@ -1303,11 +1647,30 @@ mod tests {
 
         // THE CONTROL, and without it the clause could reject everything: the
         // documented spellings must still work.
-        for uri in ["/api/scope", "/api/scope?level=global",
-                    "/api/scope?level=worker&name=backend"] {
+        for uri in [
+            "/api/scope",
+            "/api/scope?level=global",
+            "/api/scope?level=worker&name=backend",
+        ] {
             let (code, _) = call(&app, "GET", uri, None, None).await;
             assert_eq!(code, StatusCode::OK, "{uri} — a valid request was refused");
         }
+    }
+
+    #[test]
+    fn a_session_cannot_widen_its_own_owner_only_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(env_file(home, "worker", "lane-a"), "CC_MODEL=haiku\nAMUX_NEEDS_INPUT_AUTO_MONEY_CAP=50\n").unwrap();
+        // Raising its own spend cap, by merge or by full-text replace: refused.
+        assert_eq!(owner_only_key_changed(home, "worker", "lane-a", &json!({"AMUX_NEEDS_INPUT_AUTO_MONEY_CAP": "5000"})).as_deref(), Some("AMUX_NEEDS_INPUT_AUTO_MONEY_CAP"));
+        assert_eq!(owner_only_key_changed(home, "worker", "lane-a", &json!("CC_MODEL=haiku\nAMUX_NEEDS_INPUT_AUTO_MONEY_CAP=5000\n")).as_deref(), Some("AMUX_NEEDS_INPUT_AUTO_MONEY_CAP"));
+        assert_eq!(owner_only_key_changed(home, "worker", "lane-a", &json!({"AMUX_NEEDS_INPUT_AUTO_OUTBOUND": "1"})).as_deref(), Some("AMUX_NEEDS_INPUT_AUTO_OUTBOUND"));
+        assert_eq!(owner_only_key_changed(home, "worker", "lane-a", &json!({"AMUX_BROWSER_PROFILES_ALLOW": "*"})).as_deref(), Some("AMUX_BROWSER_PROFILES_ALLOW"));
+        // Its ordinary keys, and a rewrite that leaves the owner key as it was: allowed.
+        assert_eq!(owner_only_key_changed(home, "worker", "lane-a", &json!({"CC_MODEL": "sonnet"})), None);
+        assert_eq!(owner_only_key_changed(home, "worker", "lane-a", &json!("CC_MODEL=sonnet\nAMUX_NEEDS_INPUT_AUTO_MONEY_CAP=50\n")), None);
     }
 
     fn fleet(home: &Path, sessions: &[(&str, &str, bool)]) {
@@ -1316,7 +1679,10 @@ mod tests {
         for (name, tags, archived) in sessions {
             std::fs::write(
                 sd.join(format!("{name}.env")),
-                format!("CC_TAGS=\"{tags}\"\nCC_ARCHIVED={}\n", if *archived { 1 } else { 0 }),
+                format!(
+                    "CC_TAGS=\"{tags}\"\nCC_ARCHIVED={}\n",
+                    if *archived { 1 } else { 0 }
+                ),
             )
             .unwrap();
         }
@@ -1336,7 +1702,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         fleet(
             home.path(),
-            &[("w1", "alpha, beta", false), ("w2", "alpha", true), ("w3", "", false)],
+            &[
+                ("w1", "alpha, beta", false),
+                ("w2", "alpha", true),
+                ("w3", "", false),
+            ],
         );
         // Shared AMUX_HOME guard (settings::test_env): the var is
         // process-global; the RAII guard serializes and restores it.
@@ -1364,9 +1734,15 @@ mod tests {
                 .filter_map(|c| c.get("key").and_then(|k| k.as_str()))
                 .collect();
             for expected in ["memory", "rules", "env", "gates", "status_mode"] {
-                assert!(caps.contains(&expected), "python capability {expected} is missing: {caps:?}");
+                assert!(
+                    caps.contains(&expected),
+                    "python capability {expected} is missing: {caps:?}"
+                );
             }
-            assert!(caps.contains(&"skin"), "the native skin capability should be published: {caps:?}");
+            assert!(
+                caps.contains(&"skin"),
+                "the native skin capability should be published: {caps:?}"
+            );
         }
         // Global groups include ARCHIVED sessions' tags (Python filters
         // archived only for group members).
@@ -1376,12 +1752,22 @@ mod tests {
         assert_eq!(m["value"]["bytes"], 0);
         assert_eq!(m["value"]["text"], "");
         assert_eq!(m["value"]["truncated"], false);
-        assert!(m["value"]["path"].as_str().unwrap().ends_with("memory/_global.md"));
-        assert_eq!(cap(&v, "gates")["value"], json!({}), "seeded statuses carry no gates");
+        assert!(m["value"]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("memory/_global.md"));
+        assert_eq!(
+            cap(&v, "gates")["value"],
+            json!({}),
+            "seeded statuses carry no gates"
+        );
         // Seeded builtin statuses: all implicit.
         assert_eq!(cap(&v, "status_mode")["value"]["verified"], "implicit");
         assert_eq!(cap(&v, "status_mode")["set_here"], false);
-        assert_eq!(cap(&v, "gates")["order"], json!(["global", "group", "worker", "type", "card"]));
+        assert_eq!(
+            cap(&v, "gates")["order"],
+            json!(["global", "group", "worker", "type", "card"])
+        );
 
         // POST answers the read too (Python has no method guard on it).
         let (s, v2) = call(&app, "POST", "/api/scope", None, None).await;
@@ -1409,7 +1795,6 @@ mod tests {
         let (s, v) = call(&app, "GET", "/api/scope?level=group", None, None).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "name required for level=group");
-
     }
 
     #[tokio::test]
@@ -1421,10 +1806,20 @@ mod tests {
         let app = app(&st);
 
         // Unknown level → 400 naming the real precedence layers.
-        let (s, v) = call(&app, "PUT", "/api/scope", Some(json!({"level": "bogus"})), None).await;
+        let (s, v) = call(
+            &app,
+            "PUT",
+            "/api/scope",
+            Some(json!({"level": "bogus"})),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "level must be global, group or worker");
-        assert_eq!(v["precedence_layers"], json!(["card", "global", "group", "type", "worker"]));
+        assert_eq!(
+            v["precedence_layers"],
+            json!(["card", "global", "group", "type", "worker"])
+        );
 
         // A KNOWN precedence layer that is not settable reaches the 409
         // that teaches (not the flat 400) — the guard is falsifiable.
@@ -1444,27 +1839,47 @@ mod tests {
              that list are intrinsic to the item, not to a scope."
         );
 
-        let (s, v) =
-            call(&app, "PUT", "/api/scope", Some(json!({"level": "group"})), None).await;
+        let (s, v) = call(
+            &app,
+            "PUT",
+            "/api/scope",
+            Some(json!({"level": "group"})),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "name required for level=group");
 
-        let (s, v) =
-            call(&app, "PUT", "/api/scope", Some(json!({"level": "global"})), None).await;
+        let (s, v) = call(
+            &app,
+            "PUT",
+            "/api/scope",
+            Some(json!({"level": "global"})),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "capability required");
         {
             // Same rule as above: the python five, in their python ORDER
             // (the refusal lists them and the UI renders them in order), with
             // native additions permitted to follow or interleave.
-            let caps: Vec<&str> =
-                v["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+            let caps: Vec<&str> = v["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_str().unwrap())
+                .collect();
             let py: Vec<&str> = caps
                 .iter()
                 .copied()
                 .filter(|c| ["memory", "rules", "env", "gates", "status_mode"].contains(c))
                 .collect();
-            assert_eq!(py, vec!["memory", "rules", "env", "gates", "status_mode"], "{caps:?}");
+            assert_eq!(
+                py,
+                vec!["memory", "rules", "env", "gates", "status_mode"],
+                "{caps:?}"
+            );
         }
 
         let (s, v) = call(
@@ -1500,8 +1915,10 @@ mod tests {
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "worker", "name": "other", "capability": "memory",
-                        "value": {"text": "x"}})),
+            Some(
+                json!({"level": "worker", "name": "other", "capability": "memory",
+                        "value": {"text": "x"}}),
+            ),
             Some("probe"),
         )
         .await;
@@ -1515,15 +1932,19 @@ mod tests {
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "worker", "name": "probe", "capability": "memory",
-                        "value": {"text": "self-note"}})),
+            Some(
+                json!({"level": "worker", "name": "probe", "capability": "memory",
+                        "value": {"text": "self-note"}}),
+            ),
             Some("probe"),
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
-        assert_eq!(v["why_allowed"], "session writing its own worker layer (probe)");
+        assert_eq!(
+            v["why_allowed"],
+            "session writing its own worker layer (probe)"
+        );
         assert_eq!(v["actor"], "probe");
-
     }
 
     #[tokio::test]
@@ -1539,8 +1960,10 @@ mod tests {
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "group", "name": "alpha", "capability": "memory",
-                        "value": {"text": "# alpha notes\n"}})),
+            Some(
+                json!({"level": "group", "name": "alpha", "capability": "memory",
+                        "value": {"text": "# alpha notes\n"}}),
+            ),
             None,
         )
         .await;
@@ -1562,8 +1985,10 @@ mod tests {
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "group", "name": "alpha", "capability": "env",
-                        "value": {"NEW": "val", "OLD": null}})),
+            Some(
+                json!({"level": "group", "name": "alpha", "capability": "env",
+                        "value": {"NEW": "val", "OLD": null}}),
+            ),
             None,
         )
         .await;
@@ -1587,8 +2012,10 @@ mod tests {
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "group", "name": "alpha", "capability": "gates",
-                        "value": {"verified": ["peer-reviewed"], "done": []}})),
+            Some(
+                json!({"level": "group", "name": "alpha", "capability": "gates",
+                        "value": {"verified": ["peer-reviewed"], "done": []}}),
+            ),
             None,
         )
         .await;
@@ -1607,15 +2034,20 @@ mod tests {
             assert_eq!(gate, "[\"peer-reviewed\"]");
         }
         let (_, v) = call(&app, "GET", "/api/scope?level=group&name=alpha", None, None).await;
-        assert_eq!(cap(&v, "gates")["value"], json!({"verified": ["peer-reviewed"]}));
+        assert_eq!(
+            cap(&v, "gates")["value"],
+            json!({"verified": ["peer-reviewed"]})
+        );
         assert_eq!(cap(&v, "gates")["set_here"], true);
         // Empty list removes the override.
         let (s, _) = call(
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "group", "name": "alpha", "capability": "gates",
-                        "value": {"verified": []}})),
+            Some(
+                json!({"level": "group", "name": "alpha", "capability": "gates",
+                        "value": {"verified": []}}),
+            ),
             None,
         )
         .await;
@@ -1649,7 +2081,10 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        assert_eq!(v["error"], "mode must be implicit or explicit, got 'sometimes'");
+        assert_eq!(
+            v["error"],
+            "mode must be implicit or explicit, got 'sometimes'"
+        );
         let (s, _) = call(
             &app,
             "PUT",
@@ -1669,8 +2104,10 @@ mod tests {
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "group", "name": "alpha", "capability": "status_mode",
-                        "value": ["verified"]})),
+            Some(
+                json!({"level": "group", "name": "alpha", "capability": "status_mode",
+                        "value": ["verified"]}),
+            ),
             None,
         )
         .await;
@@ -1680,8 +2117,10 @@ mod tests {
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "group", "name": "alpha", "capability": "status_mode",
-                        "value": []})),
+            Some(
+                json!({"level": "group", "name": "alpha", "capability": "status_mode",
+                        "value": []}),
+            ),
             None,
         )
         .await;
@@ -1717,7 +2156,6 @@ mod tests {
         // derivation. group:alpha saw memory, env, gates, gates in order,
         // so the second gates write is the 4th row at this target.
         assert_eq!(seq, 4, "4th write at (scope, group:alpha)");
-
     }
 
     /// Connectors step 3 (AMUX-3105 data model): `connectors` is a scopable
@@ -1731,11 +2169,25 @@ mod tests {
         let app = app(&st);
 
         // It is advertised as a capability (the connectors tab reads the list).
-        let (s, v) = call(&app, "PUT", "/api/scope", Some(json!({"level": "global"})), None).await;
+        let (s, v) = call(
+            &app,
+            "PUT",
+            "/api/scope",
+            Some(json!({"level": "global"})),
+            None,
+        )
+        .await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        let caps: Vec<&str> =
-            v["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
-        assert!(caps.contains(&"connectors"), "connectors must be advertised: {caps:?}");
+        let caps: Vec<&str> = v["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert!(
+            caps.contains(&"connectors"),
+            "connectors must be advertised: {caps:?}"
+        );
 
         // A worker-level connector mapping round-trips.
         let (s, v) = call(
@@ -1750,7 +2202,10 @@ mod tests {
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["ok"], true);
         assert_eq!(v["set_here"], true);
-        assert_eq!(v["value"]["connectors"]["gmail"]["account"], "ethan@mixpeek.com");
+        assert_eq!(
+            v["value"]["connectors"]["gmail"]["account"],
+            "ethan@mixpeek.com"
+        );
         assert_eq!(v["value"]["connectors"]["gmail"]["enabled"], true);
 
         // A second write REPLACES the layer; cross-LEVEL merge-by-key is the
@@ -1759,14 +2214,19 @@ mod tests {
             &app,
             "PUT",
             "/api/scope",
-            Some(json!({"level": "worker", "name": "w1", "capability": "connectors",
-                        "value": {"slack": {"enabled": true, "account": "T123"}}})),
+            Some(
+                json!({"level": "worker", "name": "w1", "capability": "connectors",
+                        "value": {"slack": {"enabled": true, "account": "T123"}}}),
+            ),
             None,
         )
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["value"]["connectors"]["slack"]["account"], "T123");
-        assert!(v["value"]["connectors"].get("gmail").is_none(), "same-level write replaces");
+        assert!(
+            v["value"]["connectors"].get("gmail").is_none(),
+            "same-level write replaces"
+        );
 
         // `{}` CLEARS the layer (unset vs empty stays distinguishable).
         let (s, v) = call(
@@ -1779,6 +2239,75 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["set_here"], false, "an empty object clears the layer");
+    }
+
+    /// APM-2: `effective_connectors` composes global -> group -> worker BY
+    /// CONNECTOR KEY, worker winning, exactly mirroring `scope_env_layers`'
+    /// precedence — this is the resolver `connector_entitlement_check`
+    /// (connectors.rs) is built on, so a worker/group/global grant actually
+    /// reaches the token-mint endpoint instead of being UI-only.
+    #[tokio::test]
+    async fn effective_connectors_merges_global_group_worker_by_key() {
+        let home = tempfile::tempdir().unwrap();
+        fleet(home.path(), &[("w1", "alpha", false)]);
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let st = state();
+        let app = app(&st);
+
+        // global: gmail as info@ ; worker never mentions slack, so the
+        // group's grant must still reach it.
+        call(
+            &app, "PUT", "/api/scope",
+            Some(json!({"level": "global", "capability": "connectors",
+                        "value": {"gmail": {"enabled": true, "account": "info@mixpeek.com"}}})),
+            None,
+        ).await;
+        call(
+            &app, "PUT", "/api/scope",
+            Some(json!({"level": "group", "name": "alpha", "capability": "connectors",
+                        "value": {"slack": {"enabled": true, "account": "T1"}}})),
+            None,
+        ).await;
+        // worker overrides the SAME key (gmail) global set — worker must win.
+        call(
+            &app, "PUT", "/api/scope",
+            Some(json!({"level": "worker", "name": "w1", "capability": "connectors",
+                        "value": {"gmail": {"enabled": true, "account": "ethan@mixpeek.com"}}})),
+            None,
+        ).await;
+
+        let conn = st.store.read().unwrap();
+        let merged = effective_connectors(Some(&conn), home.path(), "w1").unwrap();
+        assert_eq!(
+            merged["gmail"]["account"], "ethan@mixpeek.com",
+            "worker layer must win over global for the SAME key: {merged:?}"
+        );
+        assert_eq!(
+            merged["slack"]["account"], "T1",
+            "the group's grant must reach a worker that never mentions slack itself: {merged:?}"
+        );
+
+        // A worker not in group alpha at all sees only the global layer.
+        fleet(home.path(), &[("w2", "beta", false)]);
+        let merged2 = effective_connectors(Some(&conn), home.path(), "w2").unwrap();
+        assert_eq!(merged2["gmail"]["account"], "info@mixpeek.com");
+        assert!(
+            merged2.get("slack").is_none(),
+            "a different worker/group must not see alpha's slack grant: {merged2:?}"
+        );
+    }
+
+    #[test]
+    fn connector_scope_requires_a_readable_database() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(effective_connectors(None, home.path(), "w").is_err());
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        assert!(effective_connectors(Some(&conn), home.path(), "w").is_err());
+        conn.execute("CREATE TABLE prefs (key TEXT PRIMARY KEY, value TEXT)", [])
+            .unwrap();
+        assert!(effective_connectors(Some(&conn), home.path(), "w")
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -13,16 +13,32 @@
 //   this fails SOFT to "unknown": presence/absence of .git drives the
 //   difference, never a build flag (single-codebase rule).
 fn main() {
-    let root = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("server manifest directory")).join("../..");
+    let root = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("server manifest directory"),
+    )
+    .join("../..");
     println!("cargo:rerun-if-changed={}", root.join("crates").display());
-    println!("cargo:rerun-if-changed={}", root.join("Cargo.toml").display());
-    println!("cargo:rerun-if-changed={}", root.join("Cargo.lock").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("Cargo.toml").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        root.join("Cargo.lock").display()
+    );
     let git = |args: &[&str]| -> Option<String> {
         // Pathspecs below are repository-relative. Running from this crate's
         // directory silently inspected nonexistent crates/crates and called
         // a dirty binary clean.
-        let o = std::process::Command::new("git").arg("-C").arg(&root).args(args).output().ok()?;
-        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .ok()?;
+        o.status
+            .success()
+            .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
     };
     // Linked worktrees store .git as a FILE. Resolve metadata through Git;
     // watching root/.git/HEAD there tells Cargo to rebuild forever because that
@@ -49,17 +65,37 @@ fn main() {
     } else {
         println!("cargo:warning=build_git_metadata_unavailable measured=false n_considered=0 identity=unknown");
     }
+    // The image build (cloud/docker/Dockerfile) has no .git; CI passes the commit it checked
+    // out as AMUX_SOURCE_COMMIT so a customer server's /health can name its revision.
+    println!("cargo:rerun-if-env-changed=AMUX_SOURCE_COMMIT");
+    let source_commit = std::env::var("AMUX_SOURCE_COMMIT")
+        .ok()
+        .filter(|c| c.len() >= 12 && c.chars().all(|ch| ch.is_ascii_hexdigit()));
     let mut sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_default();
     if sha.is_empty() {
-        sha = "unknown".into();
-    } else if git(&["status", "--porcelain", "--", "crates", "Cargo.toml", "Cargo.lock"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+        sha = source_commit
+            .as_ref()
+            .map(|c| c[..12].to_string())
+            .unwrap_or_else(|| "unknown".into());
+    } else if git(&[
+        "status",
+        "--porcelain",
+        "--",
+        "crates",
+        "Cargo.toml",
+        "Cargo.lock",
+    ])
+    .map(|s| !s.is_empty())
+    .unwrap_or(false)
     {
         sha.push_str("-dirty");
     }
-    let mut full = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    if sha.ends_with("-dirty") { full.push_str("-dirty"); }
+    let mut full = git(&["rev-parse", "HEAD"])
+        .or(source_commit)
+        .unwrap_or_else(|| "unknown".into());
+    if sha.ends_with("-dirty") {
+        full.push_str("-dirty");
+    }
     println!("cargo:rustc-env=AMUX_BUILD_COMMIT_FULL={full}");
     println!("cargo:rustc-env=AMUX_BUILD_COMMIT={sha}");
 }

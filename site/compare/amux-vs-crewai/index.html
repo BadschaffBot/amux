@@ -1,16 +1,16 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
   <title>amux vs CrewAI (2026) — AI Engineering Fleet Operator vs Multi-Agent Python Framework</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="amux vs CrewAI 2026: amux runs an AI engineering team from a dashboard (Claude Code + Codex + Gemini CLI, iOS app, self-healing). CrewAI is a Python framework for building custom multi-agent workflows. Not competitors — they compose. Here's the full breakdown.">
+  <meta name="description" content="amux vs CrewAI 2026: amux runs an AI engineering team from a dashboard (Claude Code + Codex + Gemini CLI, iOS app, usage-limit and reboot recovery). CrewAI is a Python framework for building custom multi-agent workflows. Not competitors — they compose. Here's the full breakdown.">
   <meta name="keywords" content="amux vs crewai, crewai alternative, multi-agent orchestration comparison, crewai vs claude code orchestration, run coding agents in parallel, crewai framework vs amux dashboard, ai engineering team management 2026">
   <link rel="canonical" href="https://amux.io/compare/amux-vs-crewai/">
   <meta property="og:title" content="amux vs CrewAI (2026) — AI Engineering Fleet Operator vs Multi-Agent Python Framework">
-  <meta property="og:description" content="CrewAI is a Python framework for building custom multi-agent AI workflows. amux is a control plane for running a fleet of AI coding agents (Claude Code, Codex, Gemini CLI) with a dashboard, iOS app, and self-healing. Not competitors — they compose beautifully.">
+  <meta property="og:description" content="CrewAI is a Python framework for building custom multi-agent AI workflows. amux is a control plane for running a fleet of AI coding agents (Claude Code, Codex, Gemini CLI) with a dashboard, iOS app, and usage-limit and reboot recovery. Not competitors — they compose beautifully.">
   <meta property="og:url" content="https://amux.io/compare/amux-vs-crewai/">
   <meta property="og:image" content="https://amux.io/og-image.png">
   <meta property="og:type" content="article">
@@ -20,7 +20,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
 
   <script type="application/ld+json">
   {
@@ -39,7 +38,7 @@
     "@context": "https://schema.org",
     "@type": "Article",
     "headline": "amux vs CrewAI (2026): AI Engineering Fleet Operator vs Multi-Agent Python Framework",
-    "description": "CrewAI is a Python framework for building custom multi-agent AI workflows. amux is a control plane for running a fleet of AI coding agents (Claude Code, Codex, Gemini CLI) with a dashboard, iOS app, and self-healing. Not competitors — they compose beautifully.",
+    "description": "CrewAI is a Python framework for building custom multi-agent AI workflows. amux is a control plane for running a fleet of AI coding agents (Claude Code, Codex, Gemini CLI) with a dashboard, iOS app, and usage-limit and reboot recovery. Not competitors — they compose beautifully.",
     "url": "https://amux.io/compare/amux-vs-crewai/",
     "datePublished": "2026-07-22",
     "dateModified": "2026-07-22",
@@ -63,7 +62,7 @@
         "name": "Can I use CrewAI with amux?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes — they compose well. A CrewAI agent (e.g. a research or coordination agent) can POST tasks to the amux REST API at /api/board to queue work for Claude Code agents running inside amux. In the other direction, Claude Code agents managed by amux can execute CrewAI workflows as part of their task. amux provides the operational layer (fleet management, dashboard, iOS app, self-healing); CrewAI provides the workflow logic and multi-LLM routing."
+          "text": "Yes — they compose well. A CrewAI agent (e.g. a research or coordination agent) can POST tasks to the amux REST API at /api/board to queue work for Claude Code agents running inside amux. In the other direction, Claude Code agents managed by amux can execute CrewAI workflows as part of their task. amux provides the operational layer (fleet management, dashboard, iOS app, usage-limit and reboot recovery); CrewAI provides the workflow logic and multi-LLM routing."
         }
       },
       {
@@ -71,7 +70,7 @@
         "name": "What is the main difference between amux and CrewAI?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "CrewAI is a Python framework: you define agents with roles, backstories, and tools in Python code, wire them into crews and tasks, and run them programmatically against any LLM API. amux is an operational control plane: you point it at existing full-capability AI coding agents (Claude Code, Codex CLI, Gemini CLI), and it runs, monitors, self-heals, and coordinates them from a web dashboard and iOS app — no Python code required. CrewAI is about building workflows; amux is about operating a fleet."
+          "text": "CrewAI is a Python framework: you define agents with roles, backstories, and tools in Python code, wire them into crews and tasks, and run them programmatically against any LLM API. amux is an operational control plane: you point it at existing full-capability AI coding agents (Claude Code, Codex CLI, Gemini CLI), and it runs, monitors, and coordinates them from a web dashboard and iOS app — no Python code required. CrewAI is about building workflows; amux is about operating a fleet."
         }
       },
       {
@@ -79,7 +78,7 @@
         "name": "Does amux replace CrewAI?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "No. amux does not replace CrewAI and CrewAI does not replace amux — they solve different problems at different layers. If you need to build a custom multi-agent pipeline (research agent + writer agent + reviewer agent) with full control over each agent's role, tools, and task dependencies, CrewAI is the right tool. If you need to run a fleet of full-capability AI coding agents in parallel with a dashboard, iOS monitoring, and self-healing, amux is the right tool. Many teams use both."
+          "text": "No. amux does not replace CrewAI and CrewAI does not replace amux — they solve different problems at different layers. If you need to build a custom multi-agent pipeline (research agent + writer agent + reviewer agent) with full control over each agent's role, tools, and task dependencies, CrewAI is the right tool. If you need to run a fleet of full-capability AI coding agents in parallel with a dashboard, iOS monitoring, and usage-limit and reboot recovery, amux is the right tool. Many teams use both."
         }
       },
       {
@@ -95,24 +94,45 @@
         "name": "Which is better for managing coding agents?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "amux. If your goal is to run 10–50 Claude Code, Codex CLI, or Gemini CLI sessions in parallel — with a web dashboard showing live terminal output from every session, an iOS app for mobile monitoring, a shared kanban board for task coordination, and a self-healing watchdog that auto-compacts context and restarts crashed sessions — amux is built exactly for this. CrewAI can orchestrate LLM calls but does not provide operational infrastructure for managing long-running terminal-based coding agents."
+          "text": "amux. If your goal is to run 10–50 Claude Code, Codex CLI, or Gemini CLI sessions in parallel — with a web dashboard showing live terminal output from every session, an iOS app for mobile monitoring, a shared kanban board for task coordination, and recovery that resumes agents after usage limits and alerts you to stalls — amux is built exactly for this. CrewAI can orchestrate LLM calls but does not provide operational infrastructure for managing long-running terminal-based coding agents."
         }
       }
     ]
   }
   </script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
 
@@ -134,24 +154,11 @@
     <p style="color:var(--muted);font-size:0.85rem">Last updated: July 22, 2026</p>
 
     <!-- EXP-007: compare pages GitHub CTA -->
-    <div style="display:flex;align-items:center;gap:1rem;background:var(--bg-2,#1a1f2e);border:1px solid var(--line,#2a3040);border-radius:8px;padding:0.875rem 1.125rem;margin:1.5rem 0;flex-wrap:wrap">
-      <span style="font-size:13px;color:var(--fg-mute,#8892a4);flex:1;min-width:180px">Considering amux? See it in action before deciding →</span>
-      <a href="https://github.com/mixpeek/amux"
-         target="_blank"
-         rel="noopener"
-         onclick="if(window.posthog) posthog.capture('exp007_compare_github_cta_click', {page: window.location.pathname})"
-         style="display:inline-flex;align-items:center;gap:0.5rem;background:#24292e;color:#fff;text-decoration:none;padding:0.5rem 1rem;border-radius:6px;font-size:13px;font-weight:600;white-space:nowrap">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/>
-        </svg>
-        ⭐ Star amux on GitHub
-      </a>
-    </div>
 
     <!-- Answer-first block -->
-    <div style="background:var(--surface-2,#1a1f2e);border-left:3px solid var(--accent,#6ee7b7);padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0">
+    <div style="background:var(--surface-2,var(--panel));border-left:3px solid var(--accent,var(--c-green));padding:1rem 1.25rem;border-radius:0 8px 8px 0;margin:1.5rem 0">
       <strong>Quick answer:</strong> CrewAI is a Python framework for <em>building</em> custom multi-agent workflows — you define agents with roles, tools, and tasks in code and run them against any LLM API.
-      amux is a control plane for <em>operating</em> a fleet of full-capability AI coding agents (Claude Code, Codex CLI, Gemini CLI) — you get a web dashboard, iOS app, self-healing watchdog, and built-in kanban board without writing any orchestration code.
+      amux is a control plane for <em>operating</em> a fleet of full-capability AI coding agents (Claude Code, Codex CLI, Gemini CLI) — you get a web dashboard, iOS app, usage-limit and reboot recovery, and built-in kanban board without writing any orchestration code.
       These tools solve different jobs at different layers of the AI stack. A CrewAI crew can queue work for amux agents via REST; amux agents can run CrewAI workflows as tasks. Most advanced AI engineering teams end up using both.
     </div>
 
@@ -171,17 +178,17 @@
       </p>
 
       <p>
-        <strong>amux</strong> (~311 GitHub stars, much newer) is the open-source control plane for
-        running an AI engineering team from a single dashboard or your phone. It launches, monitors,
-        and self-heals dozens of parallel
+        <strong>amux</strong> (~311 GitHub stars, much newer) is the self-hosted control plane for
+        running an AI engineering team from a single dashboard or your phone. It launches and monitors
+        dozens of parallel
         <a href="https://docs.anthropic.com/en/docs/claude-code" target="_blank" rel="noopener">Claude Code</a>,
         OpenAI Codex CLI, or Gemini CLI sessions headlessly in tmux — no IDE, no Python framework,
         no custom agent code required. The web dashboard streams live terminal output from every session
         simultaneously. The native iOS app gives you remote monitoring, session steering, and push alerts
         from anywhere. A built-in kanban board lets agents atomically claim tasks so no two sessions
-        duplicate work. A self-healing watchdog handles context exhaustion, crashes, and stuck prompts
-        automatically. Single Rust binary, MIT + Commons Clause. Install:
-        <code>brew install mixpeek/amux/amux</code> or <code>pipx install amux</code>.
+        duplicate work. Usage limits pause delivery and resume at the provider's reset, and stall alerts tell you
+        when a session stops. Single Rust binary, MIT + Commons Clause. Install:
+        <code>curl -fsSL https://amux.io/install.sh | bash</code>.
         Source at <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">github.com/mixpeek/amux</a>.
       </p>
     </section>
@@ -243,7 +250,7 @@
             </tr>
             <tr>
               <td><strong>Setup</strong></td>
-              <td>3 CLI commands — no code to write:<br><code>brew install mixpeek/amux/amux</code><br><code>amux register myproject --dir ~/Dev/myproject</code><br><code>amux serve</code></td>
+              <td>3 CLI commands — no code to write:<br><code>curl -fsSL https://amux.io/install.sh | bash</code><br><code>amux register myproject --dir ~/Dev/myproject</code><br><code>amux serve</code></td>
               <td>Python code — define agents, tools, tasks, and crew in Python; run with <code>crew.kickoff()</code></td>
             </tr>
             <tr>
@@ -257,8 +264,8 @@
               <td>No built-in dashboard — use CrewAI+ cloud UI or integrate your own observability</td>
             </tr>
             <tr>
-              <td><strong>Self-healing</strong></td>
-              <td>Built-in watchdog: auto-compacts context on overflow, restarts crashed sessions, replays last message</td>
+              <td><strong>Recovery</strong></td>
+              <td>Built in: resumes after usage limits, workers return after a macOS reboot, stall alerts</td>
               <td>Custom error handling in Python code — no built-in crash recovery or context management</td>
             </tr>
             <tr>
@@ -292,8 +299,8 @@
               <td>Parallel task execution within a crew — typically 3–10 agents in a single workflow run</td>
             </tr>
             <tr>
-              <td><strong>Open source</strong></td>
-              <td>Yes — MIT + Commons Clause; single Rust binary, zero external dependencies</td>
+              <td><strong>License</strong></td>
+              <td>Source-available, MIT + Commons Clause; single Rust binary, zero external dependencies</td>
               <td>Yes — Apache 2.0</td>
             </tr>
             <tr>
@@ -353,13 +360,13 @@
         When you run <code>amux register myproject</code>, amux stores a lightweight session config
         (project path, runtime, flags). When you start agents, amux launches tmux windows running
         Claude Code (or Codex/Gemini) in <code>--yolo</code> (auto-approve) mode, so they work
-        without requiring human sign-off on every action. The watchdog polls each session's output
-        every few seconds, detecting context limit warnings and crash signals, and responds automatically:
+        without requiring human sign-off on every action. amux watches each session's output
+        every few seconds and handles these cases:
       </p>
 
       <ul>
-        <li><strong>Context auto-compact</strong> — when a session approaches its token limit, the watchdog sends the appropriate compact command, waits for the model to summarize and compress its context, and lets the session continue working without stopping.</li>
-        <li><strong>Crash recovery</strong> — when a session exits unexpectedly, the watchdog restarts it and replays the last message so the agent picks up where it left off.</li>
+        <li><strong>Context compaction</strong> — Claude Code compacts its own context as it nears the limit, and amux lets you set the compaction threshold.</li>
+        <li><strong>Usage limits and stalls</strong> — when a provider usage limit hits, amux holds delivery and resumes the agent at the reset time; stalled work raises an owner alert. Restarting a crashed agent process is not built into the amux server today; an optional macOS script (<code>scripts/tmux-watchdog.sh</code>, not installed by default) restarts crashed Claude Code workers.</li>
         <li><strong>Task queue</strong> — sessions pull tasks from the shared kanban board via REST using an atomic compare-and-swap. No two agents ever claim the same task — even when 20 sessions are polling simultaneously.</li>
       </ul>
 
@@ -411,7 +418,7 @@
         <li>
           <strong>Operating Claude Code, Codex CLI, or Gemini CLI agents at fleet scale.</strong>
           These are full-capability coding agents: they read the filesystem, run tests, make commits,
-          open PRs. amux is the operational layer that manages them: launch, monitor, self-heal,
+          open PRs. amux is the operational layer that manages them: launch, monitor, resume after usage limits,
           coordinate. No custom Python code required.
         </li>
         <li>
@@ -422,9 +429,9 @@
         </li>
         <li>
           <strong>Unattended overnight batch coding — tests, docs, refactors at scale.</strong>
-          The self-healing watchdog is specifically designed for long-running unattended operation.
-          Context exhaustion, crashes, and stuck prompts are handled automatically without human
-          intervention. Queue 50 tasks and wake up to 50 pull requests.
+          amux is built for long-running unattended operation.
+          Usage limits pause delivery and resume at the provider's reset, and stall alerts tell you
+          when a session needs you. Queue 50 tasks and wake up to 50 pull requests.
         </li>
       </ul>
     </section>
@@ -482,7 +489,7 @@ requests.post(f"{amux_url}/api/sessions/myproject-1/send", json={
 })
 </code></pre>
       <p>
-        The CrewAI agent handles triage reasoning; amux handles the persistent, self-healing
+        The CrewAI agent handles triage reasoning; amux handles the persistent
         agent sessions that execute the fixes.
       </p>
 
@@ -526,7 +533,7 @@ requests.post(f"{amux_url}/api/sessions/myproject-1/send", json={
               <td><strong>CrewAI</strong></td>
             </tr>
             <tr>
-              <td>Self-healing agents that recover from crashes and context limits at 2am</td>
+              <td>Agents that resume after usage limits and alert you to stalls at 2am</td>
               <td><strong>amux</strong></td>
             </tr>
             <tr>
@@ -555,13 +562,6 @@ requests.post(f"{amux_url}/api/sessions/myproject-1/send", json={
     </section>
 
     <!-- EXP-007 GitHub CTA block (required spec) -->
-    <div style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:20px 24px;margin:32px 0;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
-      <div style="flex:1;min-width:200px">
-        <div style="font-weight:600;font-size:1rem;margin-bottom:4px">amux — open-source AI engineering team dashboard (311★ GitHub)</div>
-        <div style="color:var(--muted);font-size:.9rem">Run Claude Code, Codex, and Gemini CLI agents in parallel. Built-in kanban, CRM, email, and self-healing. Single Rust binary, MIT licensed.</div>
-      </div>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="posthog&&posthog.capture('exp007_compare_github_cta_click',{page:window.location.pathname})" style="background:#6366f1;color:#fff;padding:10px 20px;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0">View on GitHub ★</a>
-    </div>
 
     <!-- Get started -->
     <section>
@@ -569,9 +569,9 @@ requests.post(f"{amux_url}/api/sessions/myproject-1/send", json={
         <h3>Get started with amux in 3 commands</h3>
         <p>
           Run an AI engineering team from one dashboard. Open source, single Rust binary,
-          zero external dependencies beyond Python 3 + tmux.
+          zero external dependencies beyond one Rust binary.
         </p>
-        <pre><code>brew install mixpeek/amux/amux
+        <pre><code>curl -fsSL https://amux.io/install.sh | bash
 amux register myproject --dir ~/Dev/myproject --yolo
 amux serve  # → https://localhost:8824</code></pre>
         <a class="btn btn-primary" href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">View on GitHub</a>
@@ -589,7 +589,7 @@ amux serve  # → https://localhost:8824</code></pre>
         kanban board (<code>/api/board</code>) so that Claude Code agents pick them up and execute
         them. Conversely, a Claude Code agent inside amux can run a CrewAI Python script as part
         of its work. amux provides the operational infrastructure (fleet management, dashboard, iOS
-        app, self-healing); CrewAI provides the workflow logic and multi-LLM routing within those
+        app, usage-limit and reboot recovery); CrewAI provides the workflow logic and multi-LLM routing within those
         workflows.
       </p>
 
@@ -599,7 +599,7 @@ amux serve  # → https://localhost:8824</code></pre>
         define agents, their roles, their tools, and their task dependencies in code. amux is an
         operations platform for <em>running</em> a fleet of full-capability AI coding agents
         (Claude Code, Codex CLI, Gemini CLI) without writing any orchestration code — you get a
-        web dashboard, iOS app, self-healing watchdog, and shared kanban board out of the box.
+        web dashboard, iOS app, usage-limit and reboot recovery, and shared kanban board out of the box.
         CrewAI is about what your agents do; amux is about how they are operated.
       </p>
 
@@ -608,7 +608,7 @@ amux serve  # → https://localhost:8824</code></pre>
         No. amux does not replace CrewAI and CrewAI does not replace amux. If you need to build a
         custom multi-agent pipeline with fine-grained control over each agent's behavior and tool
         access, CrewAI is the right tool. If you need to operate a fleet of existing CLI-based
-        coding agents in parallel — with a dashboard, phone monitoring, and self-healing —
+        coding agents in parallel — with a dashboard, phone monitoring, and usage-limit and reboot recovery —
         amux is purpose-built for that. Many teams use both at different layers of their AI
         engineering stack.
       </p>
@@ -626,8 +626,8 @@ amux serve  # → https://localhost:8824</code></pre>
       <p>
         amux. If your goal is to run 10–50 Claude Code, Codex CLI, or Gemini CLI sessions in
         parallel — with a web dashboard showing live terminal output, an iOS app for mobile
-        monitoring, a shared kanban board for task coordination, and a watchdog that auto-compacts
-        context and restarts crashed sessions — amux is built exactly for this. CrewAI can
+        monitoring, a shared kanban board for task coordination, and recovery that resumes agents
+        after usage limits and alerts you to stalls — amux is built exactly for this. CrewAI can
         orchestrate LLM calls but does not provide operational infrastructure for managing
         long-running terminal-based coding agents.
       </p>
@@ -647,51 +647,24 @@ amux serve  # → https://localhost:8824</code></pre>
     </section>
   </main>
 
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>

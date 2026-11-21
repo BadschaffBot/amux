@@ -1,0 +1,141 @@
+name: iOS — build on change
+
+# AMUX-4981. ios.yml is a nightly TestFlight RELEASE job (schedule +
+# workflow_dispatch only), so NOTHING compiled the app in response to a commit.
+# A Swift change that does not build was discovered by that night's release,
+# hours later, and attributed to whoever pushed last rather than to the commit
+# that broke it.
+#
+# SCOPED HARD, ON PURPOSE. macos runners bill at a 10x minute multiplier, so
+# this must not behave like the Rust workflow:
+#   - paths: ios/** only. Nothing else can start it.
+#   - concurrency cancels superseded runs, the same shape rust.yml already uses.
+#   - one job, one destination, no matrix.
+# ios/ changes rarely, so the expected cost is a handful of runs a month.
+#
+# It does NOT sign, upload, or tag. Release stays entirely in ios.yml; this
+# answers one question — does the app still compile — and nothing else.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-build.yml'
+  pull_request:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-build.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ios-build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen || true
+
+      # The .xcodeproj is gitignored and generated from project.yml, so a
+      # checkout alone cannot be built. Generating here is also the only thing
+      # that would catch a project.yml that no longer produces a valid project.
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      # EVERY SCHEME THIS FILE INVOKES MUST EXIST, and the way they stop
+      # existing is invisible: naming any target inside a `schemes:` block in
+      # project.yml turns OFF XcodeGen's auto-generation for that target. Doing
+      # that removed the AmuxApp scheme once and the AmuxAppTests scheme once,
+      # in consecutive edits. The failure downstream is
+      # "scheme is not currently configured for the test action" or "scheme not
+      # found", which reads like a typo in the step rather than a project.yml
+      # regression two steps earlier.
+      - name: Every scheme the later steps use must exist
+        run: |
+          set -o pipefail
+          HAVE=$(xcodebuild -project AmuxApp.xcodeproj -list | sed -n '/Schemes:/,$p')
+          echo "$HAVE"
+          for s in AmuxApp AmuxAppTests AmuxShareUITests; do
+            echo "$HAVE" | grep -qE "^ +$s\b" || {
+              echo "::error::scheme '$s' is missing. A target named inside project.yml's schemes: block no longer gets an auto-generated scheme; declare it explicitly."
+              exit 1
+            }
+          done
+          echo "all 3 schemes present"
+
+      # CODE_SIGNING_ALLOWED=NO: this is a compile check, and signing would
+      # need the match credentials the release job carries. Entitlements are
+      # stripped by that, which is fine here and is NOT fine for a release —
+      # another reason this stays separate from ios.yml.
+      - name: Build app + share extension for the simulator
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project AmuxApp.xcodeproj \
+            -scheme AmuxApp \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tail -40
+
+      # Unit tests (AMUX-4981). Hostless logic tests over the Share
+      # Extension's bootstrap parser, compiled into the test target from the
+      # SHIPPING source rather than copied — see ios/project.yml.
+      - name: Unit tests
+        run: |
+          set -o pipefail
+          # Resolve the simulator instead of hardcoding a name: a runner image
+          # bump changes which iPhone exists, and a stale -destination name
+          # fails with a device-not-found that reads like a code error.
+          UDID=$(xcrun simctl list devices available | grep iPhone | grep -oE '[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}' | head -1)
+          if [ -z "$UDID" ]; then
+            echo "::error::no available iPhone simulator on this runner — the tests did NOT run"
+            exit 1
+          fi
+          echo "simulator: $UDID"
+          OUT=$(mktemp)
+          xcodebuild test -project AmuxApp.xcodeproj -scheme AmuxAppTests -sdk iphonesimulator -destination "platform=iOS Simulator,id=$UDID" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO 2>&1 | tee "$OUT" | grep -E "Test Case|Executed|error:|Skipped|TEST (SUCCEEDED|FAILED)" | tail -30
+          # A bundle that SELECTS NOTHING exits 0 and still prints "TEST
+          # SUCCEEDED", so the line above is a pass either way. If project.yml
+          # ever stops compiling AmuxClient.swift into the test target, or the
+          # scheme loses the target, that is what this run would look like.
+          # Name the number beside the verdict (ethos rule 4).
+          # `|| true` on both: with pipefail a grep that matches nothing kills
+          # the step with no explanation, and the explanation is the point.
+          RAN=$(grep -oE 'Executed [0-9]+ test' "$OUT" | grep -oE '[0-9]+' | sort -rn | head -1 || true)
+          # Parse the SUMMARY clause, not a per-test line: xcodebuild writes
+          # "skipped (0.002 seconds)" per case and "with 4 tests skipped" in the
+          # total. An earlier version of this counted 'was skipped', which
+          # appears nowhere, so it printed 0 beside a run that skipped 4.
+          SKIPPED=$(grep -oE 'with [0-9]+ tests? skipped' "$OUT" | grep -oE '[0-9]+' | sort -rn | head -1 || true)
+          echo "tests executed: ${RAN:-0} (skipped: ${SKIPPED:-0})"
+          if [ "${RAN:-0}" -lt 1 ]; then
+            echo "::error::the test bundle executed 0 tests. TEST SUCCEEDED means nothing here."
+            exit 1
+          fi
+          # AmuxClientLiveTests needs a non-loopback amux server and skips
+          # without one, which is correct on a hosted runner. Said out loud so
+          # nobody reads this step as covering the authentication path.
+          echo "note: the live-server tests (AmuxClientLiveTests) skip here by design. They are run against a real server before release."
+
+      # A build that silently stopped producing the extension would still be
+      # "BUILD SUCCEEDED", and the share feature would ship broken. Name the
+      # artifact rather than trusting the exit code (ethos rule 4).
+      - name: The share extension must actually be embedded
+        run: |
+          APP=$(find ~/Library/Developer/Xcode/DerivedData -name 'AmuxApp.app' -maxdepth 6 | head -1)
+          [ -n "$APP" ] || { echo "::error::no AmuxApp.app was produced"; exit 1; }
+          echo "app: $APP"
+          if [ ! -d "$APP/PlugIns/AmuxShare.appex" ]; then
+            echo "::error::AmuxShare.appex is missing from the built app — the share extension did not build or stopped being embedded"
+            exit 1
+          fi
+          echo "AmuxShare.appex present"

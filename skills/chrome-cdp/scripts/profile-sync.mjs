@@ -1,0 +1,327 @@
+// profile-sync - carry a site's logins from the real Chrome into an amux
+// saved profile, so the next worker reaches the site on the first rung of the
+// access ladder (amux browser) instead of borrowing the real Chrome again.
+//
+// Ethan, 2026-09-28: "if im giving credentials, or overriding with context to
+// CDP ... it should save the profile and or append to existing amux profiles
+// so we have a more native approach next time."
+//
+// Capture goes through the CDP connection the tab daemon already holds, so it
+// adds no "Allow remote debugging?" prompt, and Storage.getCookies returns the
+// values decrypted, so nothing depends on either browser's keychain key.
+// Import starts the amux profile's own browser (no prompt, amux launches it
+// with a debugging port), writes cookies and the origin's localStorage, reads
+// the cookies back, stops the browser if it started it, and registers the
+// site on the profile. An existing profile that already lists the site is
+// appended to; otherwise a profile named after the site is created.
+//
+// Every run appends one JSON line to ~/.cache/cdp/profile-sync.log.
+
+import { execFileSync } from 'child_process';
+import { appendFileSync, mkdirSync } from 'fs';
+import { homedir } from 'os';
+import { resolve } from 'path';
+
+const LOG_DIR = resolve(homedir(), '.cache', 'cdp');
+const LOG = resolve(LOG_DIR, 'profile-sync.log');
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+export function log(obj) {
+  try { mkdirSync(LOG_DIR, { recursive: true, mode: 0o700 }); } catch {}
+  try { appendFileSync(LOG, JSON.stringify({ at: new Date().toISOString(), ...obj }) + '\n'); } catch {}
+}
+
+// Registrable domain, close enough for cookie scoping: app.netsuite.com ->
+// netsuite.com, portal.example.co.uk -> example.co.uk. Null for IPs,
+// localhost and single-label hosts, which are never synced.
+const SECOND_LEVEL = new Set(['co', 'com', 'org', 'net', 'gov', 'ac', 'edu', 'ne', 'or']);
+export function siteOf(host) {
+  host = String(host || '').toLowerCase().replace(/\.$/, '');
+  if (!host.includes('.') || /^[\d.]+$/.test(host) || host.includes(':')) return null;
+  const p = host.split('.');
+  if (p.length >= 3 && p[p.length - 1].length === 2 && SECOND_LEVEL.has(p[p.length - 2])) return p.slice(-3).join('.');
+  return p.slice(-2).join('.');
+}
+
+// Sites whose login must never be copied into a second browser. Google revokes
+// a session whose cookies show up in another client (Chrome binds Google
+// sessions to the device), so copying the login signs the owner out of every
+// Google account: three times on 2026-10-14/15, each right after a google.com
+// sync into the amux 'ethan' profile (this log: syncs every 1-2 min from
+// 03:02Z, and 11:49Z, two minutes after a 07:47 sign-in). YouTube shares the
+// session. Same list as the server's SESSION_BOUND_SITES (browser_login_sync.rs).
+export const SESSION_BOUND_SITES = ['google.com', 'youtube.com'];
+export const isSessionBound = (site) => {
+  const s = String(site || '').toLowerCase().replace(/^\./, '');
+  return SESSION_BOUND_SITES.some(b => s === b || s.endsWith('.' + b));
+};
+
+// localStorage logins that must never be copied into a second browser. These
+// SDKs keep a REFRESH TOKEN that rotates on every refresh, and reusing a rotated
+// token revokes the whole session (Supabase "refresh token reuse detection",
+// Auth0 rotation, MSAL, Okta). Two browsers holding one copy race to refresh:
+// the loser's reuse signs out BOTH. Measured 2026-10-20: tubescience-parity
+// copied Ethan's flawless-footage.ts.app sign-in (Supabase sb-*-auth-token) from
+// his Chrome into the amux profile 'ethan-tubescience'; hours later his Chrome
+// read signed out and the copy landed on /auth, so he was asked to sign in again.
+// The durable shape is one session per browser: sign in once inside the amux
+// profile (`amux browser start <profile> <url> --headed`), which Supabase and
+// the rest treat as a separate session with its own token family.
+const ROTATING_SESSION_KEYS = [
+  /^sb-[a-z0-9]+-auth-token$/i,          // Supabase (supabase-js v2)
+  /^supabase\.auth\.token$/i,             // Supabase (v1)
+  /^@@auth0spajs@@::/,                   // Auth0 SPA
+  /^msal\..*refreshtoken/i,               // MSAL
+  /refreshtoken|refresh_token|refresh-token/i, // any key named for a refresh token
+  /^okta-token-storage$/i,               // Okta
+];
+// A value that carries a refresh token marks its key too, whatever the key is named.
+const REFRESH_IN_VALUE = /"refresh_?token"\s*:\s*"[^"]{8,}/i;
+export function isRotatingSessionEntry(key, value) {
+  const k = String(key || '');
+  if (ROTATING_SESSION_KEYS.some(re => re.test(k))) return true;
+  return typeof value === 'string' && value.length < 200_000 && REFRESH_IN_VALUE.test(value);
+}
+
+export const onSite = (c, site) => {
+  const d = String(c.domain || '').replace(/^\./, '');
+  return d === site || d.endsWith('.' + site);
+};
+
+// WHO a site is signed in as, where a cookie says so plainly. An automatic
+// sync into a profile that is already signed in as someone else would switch
+// that profile's account: on 2026-11-03 a CDP session in a Chrome profile
+// signed in to X as @amux_dev saved its x.com cookies over profile 'ethan',
+// whose X publisher posts as @ethansteininger (amux-gtm). Sites not listed
+// here have no identity check.
+const IDENTITY_COOKIES = { 'x.com': ['twid'], 'twitter.com': ['twid'], 'github.com': ['dotcom_user'] };
+export function identityOf(cookies, site) {
+  const names = IDENTITY_COOKIES[site];
+  if (!names) return null;
+  const v = cookies.filter(c => onSite(c, site) && names.includes(c.name)).map(c => `${c.name}=${c.value}`).sort().join(';');
+  return v || null;
+}
+// True when saving `incoming` would sign `existing` in as a different account.
+export function switchesIdentity(existing, incoming, site) {
+  const had = identityOf(existing, site);
+  const now = identityOf(incoming, site);
+  return !!(had && now && had !== now);
+}
+
+// The cookies a login changes: httpOnly or secure ones on the site.
+export function fingerprint(cookies, site) {
+  return cookies
+    .filter(c => onSite(c, site) && (c.httpOnly || c.secure))
+    .map(c => `${c.name}|${c.domain}|${c.path}|${c.value}`)
+    .sort()
+    .join('\n');
+}
+
+function amuxBase() {
+  try { return execFileSync('amux', ['url'], { encoding: 'utf8', timeout: 5000 }).trim(); }
+  catch { return (process.env.AMUX_URL || 'https://localhost:8824').trim(); }
+}
+
+function api(method, path, body) {
+  const args = ['-sk', '--max-time', '90', '-X', method, '-H', 'Content-Type: application/json'];
+  if (process.env.AMUX_SESSION) args.push('-H', `X-Amux-Session: ${process.env.AMUX_SESSION}`);
+  if (body) args.push('-d', JSON.stringify(body));
+  args.push(amuxBase() + path);
+  const out = execFileSync('curl', args, { encoding: 'utf8', maxBuffer: 16 << 20 });
+  try { return JSON.parse(out); } catch { return { error: out.slice(0, 200) || 'empty response' }; }
+}
+
+export function profilesIndex() {
+  const d = api('GET', '/api/browser/profiles');
+  return Array.isArray(d.profiles) ? d.profiles : [];
+}
+
+export function coveringProfile(site, list) {
+  return list.find(p => (p.domains || []).some(d => d === site || d.endsWith('.' + site) || site.endsWith('.' + d)));
+}
+
+// What the tab shows right now: its site, origin, the site's cookies (not
+// partitioned ones, whose scope would change on import) and localStorage.
+export async function capture(cdp, sessionId) {
+  const r = await cdp.send('Runtime.evaluate', {
+    expression: 'JSON.stringify({href: location.href, ls: (() => { try { return Object.entries(localStorage) } catch (e) { return [] } })()})',
+    returnByValue: true,
+  }, sessionId);
+  const page = JSON.parse(r.result.value);
+  const url = new URL(page.href);
+  if (!/^https?:$/.test(url.protocol)) return null;
+  const site = siteOf(url.hostname);
+  if (!site) return null;
+  const { cookies } = await cdp.send('Storage.getCookies', {});
+  const rotating = page.ls.filter(([k, v]) => isRotatingSessionEntry(k, v)).map(([k]) => k);
+  return {
+    site, host: url.hostname, origin: url.origin, href: page.href,
+    cookies: cookies.filter(c => onSite(c, site) && !c.partitionKey),
+    allCookies: cookies,
+    // Never copied: see ROTATING_SESSION_KEYS. The rest of localStorage still is.
+    localStorage: page.ls.filter(([k]) => !rotating.includes(k)),
+    rotatingSessionKeys: rotating,
+  };
+}
+
+// A session cookie is given 30 days. Chrome drops session cookies when the
+// profile's browser closes, and importInto stops that browser right after the
+// copy, so they used to vanish: brex reported 9/9 landed and held 0, GitHub
+// kept 3 of 14, Cloudflare 3 of 43 (2026-10-07).
+const SESSION_TTL_S = 30 * 86400;
+
+// Does this cookie look like a signed-in session? Same rule as the server's
+// integrations::browser_logins::is_auth_cookie, so both sides agree.
+const NOT_AUTH = new Set(['__cf_bm', '_cfuvid', 'cf_clearance', '__cflb', '_ga', '_gid', '_gcl_au', '_fbp', '_fbc',
+  '__stripe_mid', '__stripe_sid', 'm', 'ajs_anonymous_id', 'ajs_user_id', 'nid', 'aec', 'ar_debug', 'datadome', 'aws-waf-token']);
+const AUTH_MARKERS = ['sess', 'auth', 'token', 'login', 'logged', 'sid', 'jwt', 'remember', 'li_at', 'access',
+  'refresh', 'user', 'account', 'identity', '_secure-'];
+export function isAuthCookie(name) {
+  const n = String(name || '').toLowerCase();
+  if (NOT_AUTH.has(n) || n.startsWith('_ga_') || n.startsWith('_hj')) return false;
+  return AUTH_MARKERS.some(m => n.includes(m));
+}
+
+// A sign-in page is not a login worth saving.
+export function looksLikeLoginPage(href) {
+  try {
+    const u = new URL(href);
+    return /(^|\/)(log-?in|sign-?in|signin|auth|sso|oauth|session\/new|account\/login)(\/|$|\?)/i.test(u.pathname + '/');
+  } catch { return false; }
+}
+
+function cookieParam(c) {
+  const p = { name: c.name, value: c.value, domain: c.domain, path: c.path, secure: c.secure, httpOnly: c.httpOnly };
+  if (c.sameSite) p.sameSite = c.sameSite;
+  if (!c.session && c.expires > 0) p.expires = c.expires;
+  else p.expires = Math.floor(Date.now() / 1000) + SESSION_TTL_S;
+  if (c.priority) p.priority = c.priority;
+  if (c.sourceScheme) p.sourceScheme = c.sourceScheme;
+  return p;
+}
+
+export async function importInto(CDPClass, profile, cap, { keepIdentity = false } = {}) {
+  // Importing cookies is not something a route verb can do, so this asks for
+  // the (logged, proxied) CDP port with that reason (cdp_proxy.rs).
+  const reason = encodeURIComponent('profile-sync: importing Chrome cookies into an amux profile; no route verb sets cookies');
+  const running = () => (api('GET', `/api/browser/status?cdp_reason=${reason}`).browsers || []).find(b => b.profile === profile && b.cdp_port);
+  let b = running();
+  let started = false;
+  if (!b) {
+    if (!profilesIndex().some(p => p.name === profile)) {
+      const c = api('POST', '/api/browser/profile/create', { name: profile });
+      if (c.error) throw new Error(`create profile ${profile}: ${JSON.stringify(c.error).slice(0, 200)}`);
+    }
+    const s = api('POST', '/api/browser/start', { profile, url: 'about:blank', headless: true });
+    if (s.error) throw new Error(`start profile ${profile}: ${JSON.stringify(s.error).slice(0, 200)}`);
+    started = true;
+    for (let i = 0; i < 75 && !b; i++) { await sleep(200); b = running(); }
+    if (!b) throw new Error(`profile ${profile} did not come up`);
+  }
+  try {
+    const v = JSON.parse(execFileSync('curl', ['-s', '--max-time', '5', `http://127.0.0.1:${b.cdp_port}/json/version`], { encoding: 'utf8' }));
+    const cdp = new CDPClass();
+    await cdp.connect(v.webSocketDebuggerUrl);
+    try {
+      if (keepIdentity && switchesIdentity((await cdp.send('Storage.getCookies', {})).cookies, cap.cookies, cap.site)) {
+        return { cookies_sent: 0, cookies_landed: 0, local_storage_set: 0, identity_mismatch: true };
+      }
+      const params = cap.cookies.map(cookieParam);
+      if (params.length) await cdp.send('Storage.setCookies', { cookies: params });
+      let localStorageSet = 0;
+      if (cap.localStorage?.length) {
+        const { targetId } = await cdp.send('Target.createTarget', { url: cap.origin });
+        const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+        let onOrigin = false;
+        for (let i = 0; i < 60 && !onOrigin; i++) {
+          await sleep(250);
+          try {
+            const r = await cdp.send('Runtime.evaluate', { expression: 'location.origin', returnByValue: true }, sessionId);
+            onOrigin = r.result.value === cap.origin;
+          } catch {}
+        }
+        if (onOrigin) {
+          const r = await cdp.send('Runtime.evaluate', {
+            expression: `(() => { const e = ${JSON.stringify(cap.localStorage)}; for (const [k, v] of e) localStorage.setItem(k, v); return e.length })()`,
+            returnByValue: true,
+          }, sessionId);
+          localStorageSet = r.result.value;
+        }
+        await cdp.send('Target.closeTarget', { targetId }).catch(() => {});
+      }
+      // Read back: a set that the browser silently dropped must not report success.
+      const { cookies } = await cdp.send('Storage.getCookies', {});
+      const have = new Set(cookies.filter(c => onSite(c, cap.site)).map(c => `${c.name}|${c.domain}|${c.path}`));
+      const landed = params.filter(p => have.has(`${p.name}|${p.domain}|${p.path}`)).length;
+      return { cookies_sent: params.length, cookies_landed: landed, local_storage_set: localStorageSet };
+    } finally {
+      cdp.close();
+    }
+  } finally {
+    if (started) api('POST', '/api/browser/stop', { profile });
+  }
+}
+
+// Capture the tab's site and save it. `profile` overrides the choice.
+export async function syncSite(CDPClass, cdp, sessionId, { profile: explicit = '', reason = 'explicit', list = null } = {}) {
+  const cap = await capture(cdp, sessionId);
+  if (!cap) return { skipped: 'not an http(s) page on a registrable domain' };
+  const rotatingNote = (profile) => cap.rotatingSessionKeys.length
+    ? {
+        rotating_session_not_copied: cap.rotatingSessionKeys,
+        verdict: 'cdp_sync_rotating_session_not_copied',
+        sign_in_instead: `${cap.site} keeps its login in a rotating refresh token (${cap.rotatingSessionKeys.join(', ')}); ` +
+          `a copy would sign out both browsers, so it was not copied. Sign in once inside the amux profile instead: ` +
+          `amux browser start ${profile || '<profile>'} ${cap.origin} --headed`,
+      }
+    : {};
+  if (cap.rotatingSessionKeys.length && !cap.cookies.some(c => isAuthCookie(c.name))) {
+    // The login is ONLY the rotating token: copying the rest saves nothing that signs in.
+    const out = { site: cap.site, skipped: 'login is a rotating session token; not copied', reason, ...rotatingNote(explicit) };
+    log(out);
+    return out;
+  }
+  if (!cap.cookies.length) return { skipped: `no cookies for ${cap.site}`, site: cap.site };
+  // An AUTOMATIC save needs a signed-in page: a logged-out Brex page once
+  // registered "brex" from its tracking cookies, and the next lane was sent to
+  // it (mixpeek-finances, 2026-10-07). An explicit save-profile is honoured.
+  if (reason !== 'explicit save-profile') {
+    const href = cap.origin + (cap.path || '');
+    if (looksLikeLoginPage(cap.href || href)) {
+      log({ skipped: 'login page', site: cap.site, reason });
+      return { skipped: `this is a sign-in page for ${cap.site}; nothing to save until you are signed in`, site: cap.site };
+    }
+    if (!cap.cookies.some(c => isAuthCookie(c.name))) {
+      log({ skipped: 'no session cookie', site: cap.site, reason });
+      return { skipped: `no session or auth cookie for ${cap.site}; not signed in, nothing saved`, site: cap.site };
+    }
+  }
+  const profiles = list || profilesIndex();
+  const cover = coveringProfile(cap.site, profiles);
+  let profile = (explicit || cover?.name || cap.site.split('.')[0]).replace(/[^A-Za-z0-9._-]/g, '-');
+  if (profile.toLowerCase() === 'default') profile = `${cap.site.split('.')[0]}-login`;
+  // Only an explicit save may change which account a profile is signed in as.
+  const res = await importInto(CDPClass, profile, cap, { keepIdentity: reason !== 'explicit save-profile' });
+  if (res.identity_mismatch) {
+    const out = {
+      profile, site: cap.site, reason, skipped: 'signed in as a different account', verdict: 'cdp_sync_identity_mismatch_skipped',
+      sign_in_instead: `amux profile '${profile}' is signed in to ${cap.site} as a different account than this Chrome tab, so its login was left alone. ` +
+        `To replace it on purpose: save-profile ${profile}`,
+    };
+    log(out);
+    return out;
+  }
+  const had = profiles.find(p => p.name === profile);
+  const reg = api('POST', '/api/browser/save-profile', {
+    name: profile,
+    host: cap.site,
+    label: had?.label ? '' : `Logins for ${cap.site}, saved from Ethan's Chrome over CDP on ${new Date().toISOString().slice(0, 10)}.`,
+  });
+  const out = {
+    profile, site: cap.site, appended_to_existing: !!had, reason, ...res,
+    registered: !reg.error, register_error: reg.error || undefined,
+    ...rotatingNote(profile),
+  };
+  log(out);
+  return out;
+}

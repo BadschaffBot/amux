@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -20,7 +20,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
 
   <script type="application/ld+json">{
     "@context":"https://schema.org",
@@ -76,7 +75,7 @@
       {"@type":"Question","name":"Which GitHub Copilot alternative has the best code quality?","acceptedAnswer":{"@type":"Answer","text":"Claude Code with Claude Opus 4.7 leads SWE-bench Verified at approximately 82%, making it the highest-scoring AI coding tool on real-world software engineering tasks. Cursor and Windsurf also support Opus 4.7 as a model option. Codex CLI scores around 72-75% with OpenAI's o3 model. Devin uses a proprietary model fine-tuned for autonomous coding. For open-source flexibility, Aider and OpenCode let you choose any model, so you can use the best-scoring model with any tool."}},
       {"@type":"Question","name":"What happened to Codeium / Windsurf?","acceptedAnswer":{"@type":"Answer","text":"Codeium rebranded to Windsurf and shifted from a Copilot-style autocomplete tool to a full AI IDE with agent capabilities. In late 2025, Windsurf was acquired by Cognition (the company behind Devin). Windsurf continues to operate as a standalone AI IDE at windsurf.com, while Cognition integrates its technology into Devin's autonomous coding platform. The acquisition consolidated two of the most ambitious AI coding companies under one roof."}},
       {"@type":"Question","name":"Can I run GitHub Copilot alternatives locally for privacy?","acceptedAnswer":{"@type":"Answer","text":"Yes. Continue is fully open-source and works with local models via Ollama — your code never leaves your machine. OpenCode supports 75+ providers including Ollama and LM Studio for local inference. Aider works with any OpenAI-compatible API endpoint, including local servers. Tabby (by TabbyML) is a self-hosted alternative that runs entirely on your infrastructure. For enterprise privacy requirements, Amazon Q Developer and Tabnine both offer on-premises deployment options."}},
-      {"@type":"Question","name":"How much do GitHub Copilot alternatives cost?","acceptedAnswer":{"@type":"Answer","text":"Pricing varies widely. Free options: Gemini CLI (1,000 req/day), Continue (open-source, BYO keys), Amazon Q Developer free tier. Subscription options: GitHub Copilot ($10-19/mo), Cursor ($20/mo), Claude Code via Max ($100-200/mo), Windsurf ($15/mo). Usage-based: Claude Code via API (~$30-100/mo typical), Codex CLI (OpenAI API pricing). Autonomous agents: Devin ($500/mo per seat). Orchestration: amux is free and open-source (MIT), but you pay for the underlying agents it manages."}}
+      {"@type":"Question","name":"How much do GitHub Copilot alternatives cost?","acceptedAnswer":{"@type":"Answer","text":"Pricing varies widely. Free options: Gemini CLI (1,000 req/day), Continue (open-source, BYO keys), Amazon Q Developer free tier. Subscription options: GitHub Copilot ($10-19/mo), Cursor ($20/mo), Claude Code via Max ($100-200/mo), Windsurf ($15/mo). Usage-based: Claude Code via API (~$30-100/mo typical), Codex CLI (OpenAI API pricing). Autonomous agents: Devin ($500/mo per seat). Orchestration: amux is free to self-host (MIT + Commons Clause), but you pay for the underlying agents it manages."}}
     ]
   }</script>
 
@@ -123,11 +122,11 @@
     .tldr p:last-child{margin:0}
     .winner-badge{display:inline-block;font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;padding:2px 6px;border-radius:3px;background:oklch(0.80 0.18 145 / .15);color:var(--green);margin-left:0.4rem;vertical-align:middle}
     .cat-label{display:inline-block;font-family:var(--font-mono);font-size:0.7rem;font-weight:600;letter-spacing:0.05em;text-transform:uppercase;padding:3px 8px;border-radius:4px;margin-bottom:0.8rem}
-    .cat-cli{background:oklch(0.65 0.15 250 / .15);color:oklch(0.75 0.15 250)}
-    .cat-ide{background:oklch(0.65 0.18 145 / .15);color:oklch(0.75 0.18 145)}
-    .cat-cloud{background:oklch(0.65 0.16 310 / .15);color:oklch(0.75 0.16 310)}
-    .cat-ext{background:oklch(0.65 0.15 55 / .15);color:oklch(0.75 0.15 55)}
-    .cat-orch{background:oklch(0.65 0.17 25 / .15);color:oklch(0.75 0.17 25)}
+    .cat-cli{background:oklch(0.65 0.15 250 / .15);color:light-dark(oklch(0.48 0.150 250.0), oklch(0.75 0.15 250))}
+    .cat-ide{background:oklch(0.65 0.18 145 / .15);color:light-dark(oklch(0.48 0.150 145.0), oklch(0.75 0.18 145))}
+    .cat-cloud{background:oklch(0.65 0.16 310 / .15);color:light-dark(oklch(0.48 0.150 310.0), oklch(0.75 0.16 310))}
+    .cat-ext{background:oklch(0.65 0.15 55 / .15);color:light-dark(oklch(0.48 0.150 55.0), oklch(0.75 0.15 55))}
+    .cat-orch{background:oklch(0.65 0.17 25 / .15);color:light-dark(oklch(0.48 0.150 25.0), oklch(0.75 0.17 25))}
     .evolution-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1.2rem;margin:1.5rem 0}
     .evo-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.3rem;text-align:center}
     .evo-card h4{margin:0 0 0.4rem;font-size:0.9rem}
@@ -139,18 +138,39 @@
       .evo-arrow{transform:rotate(90deg)}
     }
   </style>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
@@ -167,7 +187,7 @@
       <p><strong>Best free:</strong> <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a> &mdash; 1,000 req/day, 1M token context, no credit card</p>
       <p><strong>Best open source:</strong> <a href="https://continue.dev" target="_blank" rel="noopener">Continue</a> &mdash; VS Code + JetBrains, any model, fully open source</p>
       <p><strong>Best for autonomous work:</strong> <a href="https://cognition.ai" target="_blank" rel="noopener">Devin</a> &mdash; full-stack agent with its own browser, editor, and terminal</p>
-      <p><strong>Best for running agent fleets:</strong> <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> &mdash; orchestrate 50+ agents with dashboard, self-healing, mobile access</p>
+      <p><strong>Best for running agent fleets:</strong> <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> &mdash; orchestrate 50+ agents with dashboard, usage-limit resume, stall alerts, mobile access</p>
     </div>
 
     <nav class="toc" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem 1.6rem;margin:2rem 0;">
@@ -420,7 +440,7 @@
             <td class="y">Native</td>
             <td class="n">No</td>
             <td class="y">50+ agents</td>
-            <td class="y">MIT</td>
+            <td class="y">MIT + Commons Clause</td>
             <td class="y">Yes</td>
             <td>Free</td>
           </tr>
@@ -757,18 +777,18 @@
         <div class="tool-meta">
           <span>By <a href="https://mixpeek.com" target="_blank" rel="noopener">Mixpeek</a></span>
           <span>Python</span>
-          <span>MIT License</span>
+          <span>MIT + Commons Clause</span>
         </div>
-        <p>The open-source control plane for AI coding agents. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> manages fleets of <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> sessions (or any terminal agent) in <a href="https://github.com/tmux/tmux" target="_blank" rel="noopener">tmux</a>, with a web dashboard for monitoring, a self-healing watchdog that recovers from crashes and context compaction, and a shared kanban board for task coordination between agents.</p>
+        <p>The self-hosted control plane for AI coding agents. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> manages fleets of <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> sessions (or any terminal agent) in <a href="https://github.com/tmux/tmux" target="_blank" rel="noopener">tmux</a>, with a web dashboard for monitoring, usage-limit resume and stall alerts, and a shared kanban board for task coordination between agents.</p>
         <ul>
           <li><strong>50+ parallel agents</strong> &mdash; register, start, and monitor dozens of independent coding agents</li>
           <li><strong>Web dashboard</strong> &mdash; real-time session monitoring, token tracking, and peek into agent output</li>
-          <li><strong>Self-healing</strong> &mdash; auto-detect crashed, stuck, or compacted agents and restart them</li>
+          <li><strong>Recovery</strong> &mdash; holds delivery through usage limits and resumes at the provider's reset, brings every worker back in its own conversation after a macOS reboot, and flags stalled board work with an owner alert</li>
           <li><strong>Kanban board</strong> &mdash; shared task board with atomic claiming so agents don&rsquo;t duplicate work</li>
           <li><strong>Mobile PWA</strong> &mdash; manage your agent fleet from your phone with the <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a></li>
           <li><strong>REST API</strong> &mdash; programmatic control over sessions, tasks, notes, CRM, and browser automation</li>
         </ul>
-        <div class="tool-verdict"><strong>Best for:</strong> developers running multiple AI agents in parallel who need visibility, crash recovery, and task coordination. The missing control plane for agent-scale development.</div>
+        <div class="tool-verdict"><strong>Best for:</strong> developers running multiple AI agents in parallel who need visibility, recovery from usage limits and reboots, and task coordination. The missing control plane for agent-scale development.</div>
       </div>
 
     </div>
@@ -898,7 +918,7 @@
           </tr>
           <tr>
             <td><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="tl">amux</a></td>
-            <td class="y">Fully free (MIT)</td>
+            <td class="y">Free to self-host (MIT + Commons Clause)</td>
             <td>Free</td>
             <td>Free (self-hosted)</td>
             <td>Free</td>
@@ -932,7 +952,7 @@
       </div>
       <div class="axis-card">
         <h4><a href="#orchestration">I want to run many agents at once</a></h4>
-        <p><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> orchestrates 50+ <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> sessions (or any terminal agent) with a dashboard, self-healing, and a shared kanban board.</p>
+        <p><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> orchestrates 50+ <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> sessions (or any terminal agent) with a dashboard, usage-limit resume, stall alerts, and a shared kanban board.</p>
       </div>
       <div class="axis-card">
         <h4>I want the cheapest option</h4>
@@ -986,13 +1006,13 @@
       </div>
       <div class="tool-card">
         <h3>How much do Copilot alternatives cost?</h3>
-        <p>Free: <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a> (1,000 req/day), <a href="https://continue.dev" target="_blank" rel="noopener">Continue</a> (open source), <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> (MIT). Subscription: <a href="https://cursor.com" target="_blank" rel="noopener">Cursor</a> ($20/mo), <a href="https://windsurf.com" target="_blank" rel="noopener">Windsurf</a> ($15/mo), <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> Max ($100&ndash;200/mo). Usage-based: <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a>, <a href="https://aider.chat/" target="_blank" rel="noopener">Aider</a>, <a href="https://cline.bot" target="_blank" rel="noopener">Cline</a> (BYO API keys). Premium: <a href="https://cognition.ai" target="_blank" rel="noopener">Devin</a> ($500/mo per seat).</p>
+        <p>Free: <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a> (1,000 req/day), <a href="https://continue.dev" target="_blank" rel="noopener">Continue</a> (open source), <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> (MIT + Commons Clause). Subscription: <a href="https://cursor.com" target="_blank" rel="noopener">Cursor</a> ($20/mo), <a href="https://windsurf.com" target="_blank" rel="noopener">Windsurf</a> ($15/mo), <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> Max ($100&ndash;200/mo). Usage-based: <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a>, <a href="https://aider.chat/" target="_blank" rel="noopener">Aider</a>, <a href="https://cline.bot" target="_blank" rel="noopener">Cline</a> (BYO API keys). Premium: <a href="https://cognition.ai" target="_blank" rel="noopener">Devin</a> ($500/mo per seat).</p>
       </div>
     </div>
 
     <div class="cta-box" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.6rem;margin:2rem 0;">
       <h3 style="margin:0 0 0.6rem;">Ready to go beyond autocomplete?</h3>
-      <p style="font-size:0.88rem;color:var(--dim);margin:0 0 1.2rem;line-height:1.7;">Run dozens of <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agents in parallel with a web dashboard, self-healing watchdog, and shared kanban board. Python 3 + <a href="https://github.com/tmux/tmux" target="_blank" rel="noopener">tmux</a>. Open source.</p>
+      <p style="font-size:0.88rem;color:var(--dim);margin:0 0 1.2rem;line-height:1.7;">Run dozens of <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agents in parallel with a web dashboard, usage-limit resume, stall alerts, and a shared kanban board. One Rust binary + <a href="https://github.com/tmux/tmux" target="_blank" rel="noopener">tmux</a>. MIT + Commons Clause.</p>
       <pre style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:1rem;font-size:0.82rem;overflow-x:auto;margin:0 0 1.2rem;"><code>git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
@@ -1001,52 +1021,24 @@ amux serve  # open https://localhost:8824</code></pre>
     </div>
 
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/blog/github-copilot-alternatives-2026/">Copilot Alternatives</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>

@@ -19,6 +19,7 @@
 //! only to the `ProviderUsage` values collected from them.
 
 pub mod claude;
+pub mod live_catalog;
 pub mod model_catalog;
 pub mod routing;
 pub mod static_providers;
@@ -152,7 +153,9 @@ pub fn default_registry() -> ProviderRegistry {
     reg.register(Arc::new(static_providers::GeminiAdapter));
     reg.register(Arc::new(static_providers::CodexAdapter));
     reg.register(Arc::new(static_providers::OllamaAdapter::default()));
+    reg.register(Arc::new(static_providers::GrokAdapter));
     reg.register(Arc::new(static_providers::MuseAdapter));
+    reg.register(Arc::new(static_providers::OpenCodeAdapter));
     reg
 }
 
@@ -261,8 +264,16 @@ mod tests {
     #[test]
     fn default_registry_registers_all_known() {
         let reg = default_registry();
-        assert_eq!(reg.len(), 5);
-        for id in ["claude-code", "gemini", "codex", "ollama", "muse"] {
+        assert_eq!(reg.len(), 7);
+        for id in [
+            "claude-code",
+            "gemini",
+            "codex",
+            "ollama",
+            "grok",
+            "muse",
+            "opencode",
+        ] {
             assert!(
                 reg.get(&ProviderId::new(id)).is_some(),
                 "default registry missing {id}"
@@ -296,7 +307,7 @@ mod tests {
 
         let mut reg = default_registry();
         reg.register(Arc::new(FutureAdapter));
-        assert_eq!(reg.len(), 6);
+        assert_eq!(reg.len(), 8);
         let got = reg.get(&ProviderId::new("a-provider-from-2031")).unwrap();
         assert_eq!(got.id().as_str(), "a-provider-from-2031");
     }
@@ -305,8 +316,12 @@ mod tests {
     fn resolve_accepts_the_worker_row_default_spelling() {
         let reg = default_registry();
         // The exact ids all resolve...
-        assert_eq!(reg.resolve("claude-code").unwrap().id().as_str(), "claude-code");
+        assert_eq!(
+            reg.resolve("claude-code").unwrap().id().as_str(),
+            "claude-code"
+        );
         assert_eq!(reg.resolve("gemini").unwrap().id().as_str(), "gemini");
+        assert_eq!(reg.resolve("grok").unwrap().id().as_str(), "grok");
         assert_eq!(reg.resolve("muse").unwrap().id().as_str(), "muse");
         // ...and the schema-default legacy spelling lands on claude-code.
         assert_eq!(reg.resolve("claude").unwrap().id().as_str(), "claude-code");
@@ -344,8 +359,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conformance_grok() {
+        conformance(&static_providers::GrokAdapter).await;
+    }
+
+    #[tokio::test]
     async fn conformance_muse() {
         conformance(&static_providers::MuseAdapter).await;
+    }
+
+    #[tokio::test]
+    async fn conformance_opencode() {
+        conformance(&static_providers::OpenCodeAdapter).await;
+    }
+
+    /// Launch parity for a provider that is deliberately NOT in
+    /// `SESSION_PROVIDERS` yet (M0 is terminal-hosted via the CLI). The server's
+    /// binary map (`launch_base_binary`) and the adapter's interactive argv must
+    /// still agree, because the health invariant `provider_launch_check`
+    /// enforces exactly this for every provider that IS listed, and the D6 bug
+    /// class is a provider silently launching a DIFFERENT agent (see the `amux`
+    /// bash path's AMUX-3888 / muse comments). This pins the agreement now, so
+    /// adding opencode to SESSION_PROVIDERS later cannot introduce drift.
+    #[test]
+    fn opencode_launch_binary_matches_the_adapter() {
+        use crate::api::session_verbs::launch_base_binary;
+        let reg = default_registry();
+        let adapter = reg.resolve("opencode").expect("opencode must be registered");
+        assert_eq!(launch_base_binary("opencode"), "opencode");
+        assert_eq!(
+            adapter
+                .build_command(PromptMode::Interactive)
+                .first()
+                .map(String::as_str),
+            Some("opencode"),
+            "the server's binary map and the adapter's interactive argv must agree"
+        );
     }
 
     #[test]

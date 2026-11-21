@@ -18,6 +18,11 @@
 //! probe itself is factored out as [`probe_usage_raw`] and returns a
 //! DISCRIMINATING [`UsageProbe`]. Two consumers, one probe:
 //!
+//! The same OAuth token also answers the PUBLIC list-models endpoint
+//! ([`probe_models_raw`]) — a separate fact from the usage endpoint above,
+//! and the reason `provider::live_catalog` needs no `ANTHROPIC_API_KEY` to
+//! keep the Claude model catalog live for an ordinary subscription.
+//!
 //! - [`ProviderAdapter::usage`] maps `Ok(body)` to windows and every other
 //!   variant to `unknown` — Invariant 20 unchanged;
 //! - `api/usage.rs` turns each variant into its own reason string and passes
@@ -41,8 +46,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use amux_core::provider::{
-    ProviderCapabilities, ProviderId, ProviderUsage, UsageConfidence, UsageProvenance,
-    UsageWindow, UsageWindowKind,
+    ProviderCapabilities, ProviderId, ProviderUsage, UsageConfidence, UsageProvenance, UsageWindow,
+    UsageWindowKind,
 };
 use async_trait::async_trait;
 
@@ -106,10 +111,14 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     async fn models(&self) -> Vec<String> {
-        // Subscription OAuth has no listing endpoint. Use the same typed,
-        // dated fallback the dashboard serves; explicit future ids remain
-        // legal because WorkerConfig.model is an open string.
-        crate::provider::model_catalog::worker_model_ids("claude")
+        // The subscription OAuth token DOES list models (probe_models_raw,
+        // corrected 2026-09-23 — this comment used to claim otherwise); a
+        // configured ANTHROPIC_API_KEY is an equally valid fallback credential
+        // when it doesn't. live_catalog::worker_model_ids reads whatever the
+        // periodic refresh last cached and falls back to the same typed,
+        // dated static list this used to call directly when neither
+        // credential is available or the last probe failed.
+        crate::provider::live_catalog::worker_model_ids("claude")
     }
 
     fn build_command(&self, prompt_mode: PromptMode) -> Vec<String> {
@@ -162,15 +171,34 @@ pub enum UsageProbe {
     Transport(&'static str),
     /// 2xx, but the body was not JSON we could read.
     BadShape,
+    /// The only credential is the subscription token the dashboard's "Sign in
+    /// with Claude" saved (`claude setup-token`). Anthropic's usage endpoint
+    /// refuses that token (401, measured live on a Cloud server 2026-10-21),
+    /// so it is not asked: the sign-in works for workers, the plan usage is
+    /// simply not reported for it.
+    SubscriptionTokenOnly,
     /// A dated reading, possibly historical. Routing accepts only failure=None.
-    Snapshot { body: serde_json::Value, observed_at: i64, retry_at: i64, failure: Option<Box<UsageProbe>> },
+    Snapshot {
+        body: serde_json::Value,
+        observed_at: i64,
+        retry_at: i64,
+        failure: Option<Box<UsageProbe>>,
+    },
     /// No reading yet; the shared probe has scheduled its next attempt.
-    Deferred { failure: Box<UsageProbe>, retry_at: i64 },
+    Deferred {
+        failure: Box<UsageProbe>,
+        retry_at: i64,
+    },
 }
 impl UsageProbe {
     pub(crate) fn exact_body(&self) -> Option<&serde_json::Value> {
         match self {
-            Self::Ok(body) | Self::Snapshot { body, failure: None, .. } => Some(body),
+            Self::Ok(body)
+            | Self::Snapshot {
+                body,
+                failure: None,
+                ..
+            } => Some(body),
             _ => None,
         }
     }
@@ -182,18 +210,27 @@ impl UsageProbe {
 /// keychain-then-file credential order, same expiry check.
 pub async fn probe_usage_raw() -> UsageProbe {
     use sha2::{Digest, Sha256};
-    static CACHE: tokio::sync::Mutex<Option<usage_cache::UsageCache>> = tokio::sync::Mutex::const_new(None);
+    static CACHE: tokio::sync::Mutex<Option<usage_cache::UsageCache>> =
+        tokio::sync::Mutex::const_new(None);
     // Hold the lock through the request: dashboard, routing and reserve share
     // the same in-flight result rather than issuing competing account probes.
     let mut guard = CACHE.lock().await;
-    let Some(token) = oauth_token().await else { return UsageProbe::NoToken; };
+    let Some(token) = oauth_token().await else {
+        return UsageProbe::NoToken;
+    };
+    if token.from_env {
+        return UsageProbe::SubscriptionTokenOnly;
+    }
     if token.expires_at_ms > 0 && chrono::Utc::now().timestamp_millis() > token.expires_at_ms {
         return UsageProbe::Expired;
     }
     let credential = format!("{:x}", Sha256::digest(token.access_token.as_bytes()));
     let now = chrono::Utc::now().timestamp();
     let path = usage_cache::cache_path();
-    if guard.as_ref().is_none_or(|c| !c.credential_matches(&credential)) {
+    if guard
+        .as_ref()
+        .is_none_or(|c| !c.credential_matches(&credential))
+    {
         *guard = Some(usage_cache::UsageCache::load(&path, &credential, now));
     }
     let cache = guard.as_mut().expect("initialized usage cache");
@@ -204,10 +241,13 @@ async fn fetch_usage(token: &OauthToken) -> (UsageProbe, Option<u64>) {
     let Ok(client) = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() else {
         return (UsageProbe::Transport("client"), None);
     };
-    let resp = client.get(USAGE_URL)
+    let resp = client
+        .get(USAGE_URL)
         .header("Authorization", format!("Bearer {}", token.access_token))
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header("anthropic-version", "2023-06-01").send().await;
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await;
     let resp = match resp {
         Ok(r) => r,
         Err(e) if e.is_timeout() => return (UsageProbe::Transport("timeout"), None),
@@ -215,14 +255,83 @@ async fn fetch_usage(token: &OauthToken) -> (UsageProbe, Option<u64>) {
         Err(_) => return (UsageProbe::Transport("request"), None),
     };
     let status = resp.status();
-    let retry_after = resp.headers().get("retry-after").and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok().or_else(|| chrono::DateTime::parse_from_rfc2822(v).ok()
-            .map(|at| (at.timestamp() - chrono::Utc::now().timestamp()).max(0) as u64)));
-    if !status.is_success() { return (UsageProbe::Http(status.as_u16()), retry_after); }
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            v.parse::<u64>().ok().or_else(|| {
+                chrono::DateTime::parse_from_rfc2822(v)
+                    .ok()
+                    .map(|at| (at.timestamp() - chrono::Utc::now().timestamp()).max(0) as u64)
+            })
+        });
+    if !status.is_success() {
+        return (UsageProbe::Http(status.as_u16()), retry_after);
+    }
     match resp.json::<serde_json::Value>().await {
         Ok(body) if !map_usage_response(&body).is_empty() => (UsageProbe::Ok(body), None),
         _ => (UsageProbe::BadShape, None),
     }
+}
+
+const MODELS_URL: &str = "https://api.anthropic.com/v1/models?limit=1000";
+
+/// One read-only GET of the PUBLIC list-models endpoint, using the SAME
+/// subscription OAuth token [`probe_usage_raw`] already reads. This is a
+/// separate, undocumented fact from what the module doc above claims
+/// ("Subscription OAuth has no listing endpoint") — that claim was checked
+/// against the OAuth *usage* endpoint only. Verified live 2026-09-23: the
+/// bearer token this crate already holds for every Claude Code subscription
+/// answers HTTP 200 here too, and included `claude-opus-5-5` ("Claude Opus
+/// 5.5") the same day it shipped. `live_catalog` prefers this over a
+/// standalone `ANTHROPIC_API_KEY` for exactly that reason: it needs no setup
+/// beyond the subscription every user already has.
+///
+/// Same SECRET DISCIPLINE as [`fetch_usage`]: the token goes into one header
+/// and is dropped; every error is a fixed word or a status code, never a
+/// body or a `reqwest::Error`'s `Display`.
+pub(crate) async fn probe_models_raw() -> Result<Vec<String>, String> {
+    let Some(token) = oauth_token().await else {
+        return Err("no_token".to_string());
+    };
+    if token.expires_at_ms > 0 && chrono::Utc::now().timestamp_millis() > token.expires_at_ms {
+        return Err("expired".to_string());
+    }
+    let Ok(client) = reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() else {
+        return Err("client".to_string());
+    };
+    let resp = client
+        .get(MODELS_URL)
+        .header("Authorization", format!("Bearer {}", token.access_token))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => return Err("timeout".to_string()),
+        Err(e) if e.is_connect() => return Err("connect".to_string()),
+        Err(_) => return Err("request".to_string()),
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("http_{}", status.as_u16()));
+    }
+    let body: serde_json::Value = resp.json().await.map_err(|_| "bad_shape".to_string())?;
+    let ids: Vec<String> = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        })
+        .ok_or("bad_shape".to_string())?;
+    if ids.is_empty() {
+        return Err("empty".to_string());
+    }
+    Ok(ids)
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +343,9 @@ struct OauthToken {
     access_token: String,
     /// Unix ms; 0 = the credential did not say.
     expires_at_ms: i64,
+    /// Read from CLAUDE_CODE_OAUTH_TOKEN (the dashboard sign-in), not from
+    /// the keychain or ~/.claude.
+    from_env: bool,
 }
 
 /// Both credential stores hold the same JSON shape:
@@ -245,13 +357,11 @@ fn parse_credentials_json(raw: &str) -> Option<OauthToken> {
     if access_token.is_empty() {
         return None;
     }
-    let expires_at_ms = oauth
-        .get("expiresAt")
-        .and_then(|e| e.as_i64())
-        .unwrap_or(0);
+    let expires_at_ms = oauth.get("expiresAt").and_then(|e| e.as_i64()).unwrap_or(0);
     Some(OauthToken {
         access_token,
         expires_at_ms,
+        from_env: false,
     })
 }
 
@@ -276,7 +386,9 @@ async fn keychain_token() -> Option<OauthToken> {
 
 fn file_token() -> Option<OauthToken> {
     let home = std::env::var_os("HOME")?;
-    let path = PathBuf::from(home).join(".claude").join(".credentials.json");
+    let path = PathBuf::from(home)
+        .join(".claude")
+        .join(".credentials.json");
     parse_credentials_json(&std::fs::read_to_string(path).ok()?)
 }
 
@@ -284,7 +396,16 @@ async fn oauth_token() -> Option<OauthToken> {
     if let Some(t) = keychain_token().await {
         return Some(t);
     }
-    file_token()
+    file_token().or_else(|| env_token(crate::api::settings::effective_env(&crate::config::amux_home(), "CLAUDE_CODE_OAUTH_TOKEN")))
+}
+
+/// The subscription token the dashboard's "Sign in with Claude" saves
+/// (`claude setup-token`, CLAUDE_CODE_OAUTH_TOKEN in server.env). Without this
+/// a server signed in that way read "No Claude subscription token on this host"
+/// in Settings forever. Its expiry is not stored, so 0 (the endpoint decides).
+fn env_token(value: Option<String>) -> Option<OauthToken> {
+    let v = value?.trim().to_string();
+    (!v.is_empty()).then_some(OauthToken { access_token: v, expires_at_ms: 0, from_env: true })
 }
 
 // ---------------------------------------------------------------------------
@@ -343,8 +464,7 @@ fn map_usage_response(v: &serde_json::Value) -> Vec<UsageWindow> {
             } else {
                 continue; // unclassifiable: skip, never guess
             };
-            if let Some(w) =
-                window_from_percent(entry.get("percent"), entry.get("resets_at"), kind)
+            if let Some(w) = window_from_percent(entry.get("percent"), entry.get("resets_at"), kind)
             {
                 windows.push(w);
             }
@@ -383,6 +503,14 @@ fn window_from_percent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_subscription_token_is_a_usage_credential() {
+        let t = env_token(Some(" sk-ant-oat01-fake-token \n".into())).expect("token");
+        assert_eq!((t.access_token.as_str(), t.expires_at_ms, t.from_env), ("sk-ant-oat01-fake-token", 0, true));
+        assert!(env_token(Some("  ".into())).is_none());
+        assert!(env_token(None).is_none());
+    }
 
     // -- response mapping (the network-free contract) ----------------------
 
@@ -574,7 +702,13 @@ mod tests {
             UsageProbe::Http(c) => format!("http_{c}"),
             UsageProbe::Transport(w) => format!("transport_{w}"),
             UsageProbe::BadShape => "bad_shape".into(),
-            UsageProbe::Snapshot { failure, .. } => if failure.is_some() { "last_known" } else { "fresh" }.into(),
+            UsageProbe::SubscriptionTokenOnly => "subscription_token_only".into(),
+            UsageProbe::Snapshot { failure, .. } => if failure.is_some() {
+                "last_known"
+            } else {
+                "fresh"
+            }
+            .into(),
             UsageProbe::Deferred { .. } => "retry_scheduled".into(),
         };
         eprintln!("live probe outcome: {tag}");

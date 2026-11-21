@@ -58,7 +58,9 @@ test('worker card and peek share all worker actions, plus both peek-only actions
     card.innerHTML = w._renderWorkerActionMenu(sample, 'card');
     w._renderPeekWorkerActions(sample);
     const peek = document.getElementById('peek-more-dropdown')!;
-    document.getElementById('peek-overlay')!.classList.add('active');
+    { // Open it the way openPeek does: since 90bedca6 the overlay starts hidden, inert and aria-hidden.
+      const ov = document.getElementById('peek-overlay')!; ov.hidden = false; ov.inert = false;
+      ov.setAttribute('aria-hidden', 'false'); ov.classList.add('active'); }
     peek.classList.add('open');
     const keys = (root: ParentNode) => Array.from(root.querySelectorAll('[data-worker-action]'))
       .map((el) => (el as HTMLElement).dataset.workerAction);
@@ -67,11 +69,13 @@ test('worker card and peek share all worker actions, plus both peek-only actions
       copy.querySelectorAll('.mi').forEach((icon) => icon.remove());
       return (copy.textContent || '').trim();
     };
-    // Prove the final action is reachable in the same render snapshot. Holding
-    // a locator across an await races the app's normal session-poll rerender;
-    // iOS WebKit correctly reported that detached-node race in the full suite.
+    // Focus mode is the FIRST item, visible with the menu unscrolled (Ethan,
+    // 2026-10-20: it sat below the whole action list, off-screen on a phone).
+    // Measured in the same render snapshot: holding a locator across an await
+    // races the app's normal session-poll rerender (iOS WebKit, full suite).
     const focus = peek.querySelector<HTMLElement>('#peek-focus-btn')!;
-    focus.scrollIntoView({ block: 'nearest' });
+    peek.scrollTop = 0;
+    const firstItem = peek.querySelector('.peek-more-item');
     const focusRect = focus.getBoundingClientRect();
     const peekRect = peek.getBoundingClientRect();
     const style = getComputedStyle(peek);
@@ -84,6 +88,7 @@ test('worker card and peek share all worker actions, plus both peek-only actions
       maxHeight: style.maxHeight,
       scrollHeight: peek.scrollHeight,
       clientHeight: peek.clientHeight,
+      focusFirst: firstItem === focus,
       focusReachable: focus.isConnected
         && focusRect.top >= peekRect.top - 1
         && focusRect.bottom <= peekRect.bottom + 1,
@@ -93,12 +98,17 @@ test('worker card and peek share all worker actions, plus both peek-only actions
     };
   }, SAMPLE);
 
-  // 28 since 9af1c88b added Pause/Resume to the shared worker menu (AMUX-4632).
-  expect(state.card).toHaveLength(28);
+  // 28 since 9af1c88b added Pause/Resume to the shared worker menu (AMUX-4632);
+  // 29 with Copy worker link (a /w/<worker> deep link, api/deep_links.rs).
+  expect(state.card).toHaveLength(29);
+  expect(state.card).toContain('copy-worker-link');
   expect(state.card).toContain('task-queue');
   expect(state.card).toContain('copy-directory-link');
   expect(state.peek).toEqual(state.card);
-  expect(state.peekOnly).toEqual(['File browser', 'Focus mode']);
+  // 64f864c6 made the peek item toggle the split file browser, and the
+  // Chat tab's on/off moved into this menu (AMUX-5350).
+  expect(state.peekOnly).toEqual(['Focus mode', 'File browser', 'Turn on chat']);
+  expect(state.focusFirst).toBe(true);
   expect(state.overflowY).toBe('auto');
   expect(state.maxHeight).not.toBe('none');
   expect(state.scrollHeight).toBeGreaterThan(state.clientHeight);
@@ -131,7 +141,6 @@ async function enterFiles(page: import('@playwright/test').Page, source: 'peek-f
 }
 
 test('peek file entries produce the exact same canonical Files route state', async ({ page }) => {
-  const fileBrowser = await enterFiles(page, 'peek-file-browser');
   const directoryPath = await enterFiles(page, 'peek-directory');
   const sharedBrowse = await enterFiles(page, 'browse-files');
 
@@ -142,7 +151,20 @@ test('peek file entries produce the exact same canonical Files route state', asy
     filesVisible: true,
     filesTabSelected: true,
   };
-  expect(fileBrowser).toEqual(expected);
-  expect(directoryPath).toEqual(fileBrowser);
-  expect(sharedBrowse).toEqual(fileBrowser);
+  expect(directoryPath).toEqual(expected);
+  expect(sharedBrowse).toEqual(directoryPath);
+});
+
+// The in-page split is retired (owner, 2026-10-29): in a browser the peek
+// menu's File browser opens the worker's folder in Files, and the in-page
+// split never opens. (In the Mac app it opens a new pane: split-pane.spec.ts.)
+test('the peek File browser item opens the folder in Files, never the old split', async ({ page }) => {
+  await boot(page);
+  await page.evaluate((sample) => {
+    const w = window as any;
+    w._renderPeekWorkerActions(sample);
+    document.querySelector<HTMLElement>('[data-peek-action="file-browser"]')!.click();
+  }, SAMPLE);
+  await expect(page).toHaveURL(/#path=\/tmp\/$/);
+  await expect(page.locator('#peek-split-wrap')).not.toHaveClass(/split-active/);
 });

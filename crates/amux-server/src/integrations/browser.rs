@@ -33,6 +33,7 @@
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 /// Chrome removes these on clean exit; their presence after exit means the
 /// profile was never flushed (Python `_CHROME_SINGLETONS`).
@@ -42,7 +43,14 @@ pub use crate::config::amux_home;
 
 /// The user's real Chrome user-data-dir (Python `_chrome_user_data_dir`).
 pub fn chrome_user_data_dir() -> PathBuf {
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
+    // Allows an owner-selected Chrome installation/profile root and isolated
+    // acceptance fixtures without borrowing the human browser's directories.
+    if let Some(root) = std::env::var_os("AMUX_BROWSER_CHROME_USER_DATA_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(root);
+    }
+    let home = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"));
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/Google/Chrome")
     } else if cfg!(windows) {
@@ -110,7 +118,10 @@ pub fn launch_target(home: &Path, chrome_dir: &Path, name: &str) -> LaunchTarget
             profile_directory: d.file_name().map(|s| s.to_string_lossy().into_owned()),
         }
     } else {
-        LaunchTarget { user_data_dir: d, profile_directory: None }
+        LaunchTarget {
+            user_data_dir: d,
+            profile_directory: None,
+        }
     }
 }
 
@@ -208,7 +219,10 @@ pub fn import_chrome_profile(
     if name.is_empty() || name == "default" {
         return Ok(None);
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ' '))
+    {
         anyhow::bail!("Chrome profile name must be [A-Za-z0-9._-]+");
     }
     let destination = home.join("playwright-auth").join("profiles").join(name);
@@ -217,7 +231,10 @@ pub fn import_chrome_profile(
     }
     let source = chrome_dir.join(name);
     if !source.is_dir() {
-        return Err(anyhow::Error::new(ProfileMissing { profile: name.to_string(), source }));
+        return Err(anyhow::Error::new(ProfileMissing {
+            profile: name.to_string(),
+            source,
+        }));
     }
 
     let parent = destination
@@ -263,7 +280,11 @@ pub fn import_chrome_profile(
                 )));
             };
             return Err(anyhow::anyhow!(import_failure_message(
-                "the copy of the source profile", &source, &temp, kind, &raw
+                "the copy of the source profile",
+                &source,
+                &temp,
+                kind,
+                &raw
             )));
         }
     };
@@ -285,7 +306,11 @@ pub fn import_chrome_profile(
                 "browser: Chrome profile import failed (AF-502)"
             );
             return Err(anyhow::anyhow!(import_failure_message(
-                "the final rename into place", &temp, &destination, kind, &raw
+                "the final rename into place",
+                &temp,
+                &destination,
+                kind,
+                &raw
             )));
         }
     }
@@ -297,7 +322,12 @@ pub fn import_chrome_profile(
         let _ = std::fs::remove_dir_all(&destination);
         return Err(e.context("register imported Chrome profile"));
     }
-    Ok(Some(ImportedChromeProfile { source, destination, files, bytes }))
+    Ok(Some(ImportedChromeProfile {
+        source,
+        destination,
+        files,
+        bytes,
+    }))
 }
 
 fn copy_profile_tree(src: &Path, dst: &Path, stats: &mut (u64, u64)) -> anyhow::Result<()> {
@@ -362,7 +392,10 @@ fn copy_import_local_state(chrome_dir: &Path, source_name: &str, dst: &Path) -> 
         return Ok(());
     };
     let mut value: serde_json::Value = serde_json::from_str(&raw)?;
-    if let Some(profile) = value.get_mut("profile").and_then(serde_json::Value::as_object_mut) {
+    if let Some(profile) = value
+        .get_mut("profile")
+        .and_then(serde_json::Value::as_object_mut)
+    {
         let source_info = profile
             .get("info_cache")
             .and_then(serde_json::Value::as_object)
@@ -402,7 +435,28 @@ pub struct BrowserProfile {
     /// Python server): which domains this profile is signed into.
     pub domains: Vec<String>,
     pub label: String,
+    /// Registry `role`: primary | personal | restricted | customer | test |
+    /// deprecated, or "" (see integrations::browser_logins).
+    pub role: String,
+    /// Registry `identity`: who this profile signs in as (an email or a name).
+    pub identity: String,
     pub registered: bool,
+    /// Does the directory this name resolves to actually EXIST?
+    ///
+    /// `registered` and `on_disk` are independent and the interesting case is
+    /// registered-and-absent: the registry keeps the profile's `domains`, so a
+    /// picker shows a profile claiming to be signed into us.posthog.com with
+    /// nothing behind it. Starting it creates an empty dir and the lane acts
+    /// LOGGED OUT while every field in the listing says otherwise.
+    ///
+    /// `last_used` is already None in that case, but None also means "made and
+    /// never opened", so it cannot carry this. Measured 2026-09-23: 11 registry
+    /// entries, 2 of them (`ethan-posthog`, `lob`) with no directory, and
+    /// nothing anywhere said so (AMUX-5020).
+    pub on_disk: bool,
+    /// Who the registry says owns this profile (`owner`, else `created_by`,
+    /// else `saved_by`), or None when nobody recorded one (AMUX-5307).
+    pub owner: Option<String>,
 }
 
 fn dir_mtime_unix(p: &Path) -> Option<i64> {
@@ -421,7 +475,9 @@ pub fn dir_size_bytes(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
@@ -435,7 +491,7 @@ pub fn dir_size_bytes(root: &Path) -> u64 {
 }
 
 /// Registry metadata (Python `_bu_registry_load`): name -> {domains, label}.
-fn registry_load(home: &Path) -> serde_json::Map<String, serde_json::Value> {
+pub fn registry_load(home: &Path) -> serde_json::Map<String, serde_json::Value> {
     let path = home.join("playwright-auth").join("profiles.json");
     std::fs::read_to_string(path)
         .ok()
@@ -449,8 +505,7 @@ fn registry_load(home: &Path) -> serde_json::Map<String, serde_json::Value> {
 /// not the source of truth for existence).
 pub fn list_profiles(home: &Path, with_sizes: bool) -> Vec<BrowserProfile> {
     let registry = registry_load(home);
-    let mut names: std::collections::BTreeSet<String> =
-        registry.keys().cloned().collect();
+    let mut names: std::collections::BTreeSet<String> = registry.keys().cloned().collect();
     let profiles_dir = home.join("playwright-auth").join("profiles");
     if let Ok(entries) = std::fs::read_dir(&profiles_dir) {
         for e in entries.flatten() {
@@ -476,13 +531,16 @@ pub fn list_profiles(home: &Path, with_sizes: bool) -> Vec<BrowserProfile> {
                 // 3-decimal precision: a 2KB profile must not round to 0.0
                 // (a nonzero directory reading as empty is a lie; display
                 // rounding is the UI's call).
-                size_mb: with_sizes
-                    .then(|| (dir_size_bytes(&dir) as f64 / (1024.0 * 1024.0) * 1000.0).round() / 1000.0),
+                size_mb: with_sizes.then(|| {
+                    (dir_size_bytes(&dir) as f64 / (1024.0 * 1024.0) * 1000.0).round() / 1000.0
+                }),
                 domains: meta
                     .and_then(|m| m.get("domains"))
                     .and_then(|d| d.as_array())
                     .map(|a| {
-                        a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
                     })
                     .unwrap_or_default(),
                 label: meta
@@ -490,8 +548,45 @@ pub fn list_profiles(home: &Path, with_sizes: bool) -> Vec<BrowserProfile> {
                     .and_then(|l| l.as_str())
                     .unwrap_or("")
                     .to_string(),
+                role: meta
+                    .and_then(|m| m.get("role"))
+                    .and_then(|l| l.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                identity: meta
+                    .and_then(|m| m.get("identity"))
+                    .and_then(|l| l.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 registered: meta.is_some(),
+                on_disk: dir.is_dir(),
+                owner: meta.and_then(|m| {
+                    ["owner", "created_by", "saved_by"].iter().find_map(|k| {
+                        m.get(*k)
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string)
+                    })
+                }),
                 name,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .inspect(|p| {
+            // Two-fix rule: the next one of these announces itself in a sweep
+            // rather than waiting for somebody to notice a logged-out lane.
+            if p.registered && !p.on_disk {
+                tracing::warn!(
+                    profile = %p.name,
+                    path = %p.path,
+                    domains = p.domains.len(),
+                    measured = true,
+                    verdict = "browser_registered_profile_missing",
+                    "browser: a REGISTERED profile has no directory — starting it \
+                     creates an empty one and the lane acts logged out"
+                );
             }
         })
         .collect()
@@ -627,7 +722,15 @@ pub fn running_snapshot_for(profile: &str) -> Option<(String, String, i64, u32, 
         .lock()
         .expect("browser registry poisoned")
         .get(profile)
-        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid, r.cdp_port))
+        .map(|r| {
+            (
+                r.profile.clone(),
+                r.started_by.clone(),
+                r.started_at,
+                r.pid,
+                r.cdp_port,
+            )
+        })
 }
 
 /// Every running browser, newest first. The status verb renders all of them;
@@ -638,7 +741,16 @@ pub fn running_all() -> Vec<(String, String, i64, u32, u16, i64)> {
         .lock()
         .expect("browser registry poisoned")
         .values()
-        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid, r.cdp_port, r.last_verb_at))
+        .map(|r| {
+            (
+                r.profile.clone(),
+                r.started_by.clone(),
+                r.started_at,
+                r.pid,
+                r.cdp_port,
+                r.last_verb_at,
+            )
+        })
         .collect();
     v.sort_by_key(|r| std::cmp::Reverse(r.2));
     v
@@ -680,6 +792,18 @@ pub fn touch_verb_for_session(session: &str) {
                 b.last_verb_at = now;
                 return;
             }
+            // Then the browser this session JOINED. A joiner drives a tab in a
+            // browser another session started, so `started_by` never matches it,
+            // and with more than one browser running the fallback below does not
+            // fire either: the shared browser read as idle while a joiner drove it
+            // and the activity reaper released it mid-task (NetSuite session,
+            // 2026-10-26, "since_verb_s=327" while the joiner was fetching CSVs).
+            if let Some(profile) = joined_profile(session) {
+                if let Some(b) = g.values_mut().find(|b| b.profile == profile) {
+                    b.last_verb_at = now;
+                    return;
+                }
+            }
         }
         // Single-browser fallback: mirrors port_for_session.
         if g.len() == 1 {
@@ -689,7 +813,6 @@ pub fn touch_verb_for_session(session: &str) {
         }
     }
 }
-
 
 /// Why the last browser is gone (AMUX-3414: a silent Chrome exit left NOTHING
 /// on record — no API call in the window, no exit reason anywhere, and two
@@ -724,7 +847,11 @@ fn spawn_exit_monitor() {
                 // the next corpse (AMUX-3828).
                 let mut dead_key: Option<String> = None;
                 for (k, rb) in g.iter_mut() {
-                    if rb.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(Some(_)))) {
+                    if rb
+                        .child
+                        .as_mut()
+                        .is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))))
+                    {
                         dead_key = Some(k.clone());
                         break;
                     }
@@ -738,7 +865,13 @@ fn spawn_exit_monitor() {
                                 let signal = std::os::unix::process::ExitStatusExt::signal(&status);
                                 #[cfg(not(unix))]
                                 let signal = None;
-                                Some((rb.profile.clone(), rb.pid, rb.started_by.clone(), status.code(), signal))
+                                Some((
+                                    rb.profile.clone(),
+                                    rb.pid,
+                                    rb.started_by.clone(),
+                                    status.code(),
+                                    signal,
+                                ))
                             }
                             _ => None,
                         },
@@ -793,7 +926,10 @@ fn spawn_exit_monitor() {
                     "code": code,
                     "signal": signal,
                 }));
-                RUNNING.lock().expect("browser registry poisoned").remove(&profile);
+                RUNNING
+                    .lock()
+                    .expect("browser registry poisoned")
+                    .remove(&profile);
                 clear_running_for(&amux_home(), &profile);
             }
         }
@@ -812,16 +948,19 @@ pub fn test_seed_running(profile: &str, started_by: &str, pid: u32) {
 /// vacuously against a registry that hands both the same one (AMUX-3828).
 #[cfg(test)]
 pub fn test_seed_running_port(profile: &str, started_by: &str, pid: u32, port: u16) {
-    RUNNING.lock().expect("browser registry poisoned").insert(profile.to_string(), RunningBrowser {
-        profile: profile.into(),
-        user_data_dir: PathBuf::new(),
-        cdp_port: port,
-        started_at: 0,
-        last_verb_at: 0,
-        pid,
-        started_by: started_by.into(),
-        child: None,
-    });
+    RUNNING.lock().expect("browser registry poisoned").insert(
+        profile.to_string(),
+        RunningBrowser {
+            profile: profile.into(),
+            user_data_dir: PathBuf::new(),
+            cdp_port: port,
+            started_at: 0,
+            last_verb_at: 0,
+            pid,
+            started_by: started_by.into(),
+            child: None,
+        },
+    );
 }
 #[cfg(test)]
 pub fn test_clear_running() {
@@ -885,14 +1024,22 @@ pub(crate) fn persisted_last_exit(home: &Path) -> Option<serde_json::Value> {
     Some(v)
 }
 
+/// Does an already-recorded exit explain the death of `pid`? Same pid and
+/// recorded within the last day. A pid is reused eventually, and a day-old
+/// record about a recycled pid must not mask a real unobserved death.
+pub(crate) fn last_exit_explains(prev: &serde_json::Value, pid: u32, now: i64) -> bool {
+    prev["pid"].as_u64() == Some(pid as u64)
+        && now.saturating_sub(prev["ts"].as_i64().unwrap_or(0)) < 86_400
+}
+
 /// The running-file, as a MAP keyed by profile (AMUX-3828).
 ///
 /// One file holding every browser, rather than one file per profile: profile
 /// names are user input and would have to be sanitised into filenames, and a
 /// traversal bug in a path built from a profile name is a worse failure than
-/// anything this file is protecting. Rewritten whole on every change, always
-/// under the RUNNING lock, so two concurrent starts cannot interleave a
-/// read-modify-write.
+/// anything this file is protecting. Rewritten atomically under a dedicated
+/// file-update lock, independently of the live registry lock, so concurrent
+/// starts, exits and startup guards cannot interleave a read-modify-write.
 ///
 /// READS TOLERATE THE LEGACY SHAPE. Before this change the file was a single
 /// bare object; a server that upgrades mid-flight must still adopt the browser
@@ -906,8 +1053,11 @@ fn read_running_file(home: &Path) -> std::collections::HashMap<String, serde_jso
     };
     // Legacy: a bare record with a `pid` at the top level.
     if v.get("pid").is_some() {
-        let profile =
-            v.get("profile").and_then(serde_json::Value::as_str).unwrap_or("default").to_string();
+        let profile = v
+            .get("profile")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("default")
+            .to_string();
         return std::collections::HashMap::from([(profile, v)]);
     }
     v.as_object()
@@ -915,13 +1065,65 @@ fn read_running_file(home: &Path) -> std::collections::HashMap<String, serde_jso
         .unwrap_or_default()
 }
 
+static RUNNING_FILE_UPDATES: Mutex<()> = Mutex::new(());
+
 fn write_running_file(home: &Path, map: &std::collections::HashMap<String, serde_json::Value>) {
     let obj: serde_json::Map<String, serde_json::Value> =
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let _ = std::fs::write(running_state_path(home), serde_json::Value::Object(obj).to_string());
+    let path = running_state_path(home);
+    let temp = home.join(format!("browser-running-{}.tmp", ulid::Ulid::new()));
+    if let Err(error) = std::fs::write(&temp, serde_json::Value::Object(obj).to_string())
+        .and_then(|_| std::fs::rename(&temp, &path))
+    {
+        let _ = std::fs::remove_file(&temp);
+        tracing::warn!(%error, measured=true, n_considered=1,
+            verdict="browser_running_state_write_failed",
+            "browser restart records could not be atomically published");
+    }
 }
 
-fn persist_running(home: &Path, profile: &str, dir: &Path, port: u16, pid: u32, started: i64, started_by: &str) {
+/// How long a just-spawned Chrome is protected from reconciliation (AMUX-4961).
+///
+/// The CDP wait is 30s, so the grace must cover it with margin. After it
+/// expires an unfinished record IS reclaimable, which is what keeps a crashed
+/// launch from protecting a dead pid forever.
+pub(crate) const STARTUP_GRACE_S: i64 = 45;
+
+/// The grace must OUTLAST the CDP wait it exists for, or it protects nothing at
+/// the moment that matters. Checked at compile time rather than by a test: the
+/// relationship between two constants cannot be observed at runtime, and a
+/// `#[test]` asserting it is the "check that cannot fail" shape — clippy says so
+/// directly with `assertions_on_constants`. Shortening the grace below the CDP
+/// deadline now fails the BUILD.
+const _: () = assert!(
+    STARTUP_GRACE_S > 30,
+    "the CDP wait is 30s; the grace must outlast it"
+);
+
+/// Is this persisted record a browser still inside its startup window?
+///
+/// A MISSING `cdp_ready` MEANS READY, deliberately: records written before this
+/// field existed must keep their old meaning, or an upgrade would grant every
+/// stale record a 45s reprieve exactly once.
+pub(crate) fn record_is_starting(record: &serde_json::Value, now: i64, grace_s: i64) -> bool {
+    !record["cdp_ready"].as_bool().unwrap_or(true)
+        && now.saturating_sub(record["started_at"].as_i64().unwrap_or(0)) < grace_s
+}
+
+// A flat record writer: every argument is one column of the persisted row, so
+// grouping them into a struct would only move the same list one line up.
+#[allow(clippy::too_many_arguments)]
+fn persist_running(
+    home: &Path,
+    profile: &str,
+    dir: &Path,
+    port: u16,
+    pid: u32,
+    started: i64,
+    started_by: &str,
+    cdp_ready: bool,
+) {
+    let _guard = RUNNING_FILE_UPDATES.lock().expect("browser running-file lock poisoned");
     let mut map = read_running_file(home);
     map.insert(
         profile.to_string(),
@@ -932,15 +1134,72 @@ fn persist_running(home: &Path, profile: &str, dir: &Path, port: u16, pid: u32, 
             "pid": pid,
             "started_at": started,
             "started_by": started_by,
+            // AMUX-4961: a launching Chrome is neither absent nor dead.
+            "cdp_ready": cdp_ready,
         }),
     );
     write_running_file(home, &map);
+}
+
+/// On a Linux host run by systemd, Chrome starts in its OWN scope unit, so
+/// nothing done to the server's unit reaches it. A process group (below) is
+/// not enough there: systemd stops a unit by its cgroup, and an amux.service
+/// installed before KillMode=process (INIT-1, 2026-08-31) SIGKILLs everything
+/// in it on every restart. That is the "found dead on adopt" a NetSuite worker
+/// hit twice on 2026-10-26, losing its login each time. `systemd-run --scope`
+/// execs Chrome in place, so the pid recorded is still Chrome's. Probed once;
+/// `AMUX_BROWSER_SYSTEMD_SCOPE=0` turns it off. Off a systemd host: None.
+async fn chrome_systemd_scope() -> Option<&'static [&'static str]> {
+    static SCOPE: tokio::sync::OnceCell<Option<&'static [&'static str]>> = tokio::sync::OnceCell::const_new();
+    *SCOPE
+        .get_or_init(|| async {
+            if !cfg!(target_os = "linux") || !Path::new("/run/systemd/system").exists() {
+                return None;
+            }
+            if std::env::var("AMUX_BROWSER_SYSTEMD_SCOPE").is_ok_and(|v| v == "0") {
+                tracing::info!(verdict = "browser_scope_off", reason = "AMUX_BROWSER_SYSTEMD_SCOPE=0", "browser: Chrome starts in the server's own cgroup");
+                return None;
+            }
+            // SAFETY: getuid has no preconditions and cannot fail.
+            let root = unsafe { libc::getuid() } == 0;
+            let prefix: &'static [&'static str] = if root {
+                &["systemd-run", "--scope", "--quiet", "--collect"]
+            } else {
+                &["systemd-run", "--user", "--scope", "--quiet", "--collect"]
+            };
+            let probe = tokio::process::Command::new(prefix[0])
+                .args(&prefix[1..])
+                .arg("true")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output();
+            match tokio::time::timeout(Duration::from_secs(5), probe).await {
+                Ok(Ok(out)) if out.status.success() => {
+                    tracing::info!(verdict = "browser_scope_on", user = !root, "browser: Chrome starts in its own systemd scope, so a server restart cannot take it down");
+                    Some(prefix)
+                }
+                other => {
+                    let why = match other {
+                        Ok(Ok(out)) => String::from_utf8_lossy(&out.stderr).trim().chars().take(200).collect::<String>(),
+                        Ok(Err(e)) => e.to_string(),
+                        Err(_) => "timed out after 5s".to_string(),
+                    };
+                    tracing::warn!(verdict = "browser_scope_unavailable", why = %why, user = !root,
+                        "browser: systemd-run --scope did not work, so Chrome starts in the server's cgroup and a restart of an amux unit without KillMode=process kills it");
+                    None
+                }
+            }
+        })
+        .await
 }
 
 /// Drop ONE profile's record. The others must survive — clearing the whole file
 /// on a single browser's death is how the remaining ones become unadoptable
 /// orphans after a restart.
 fn clear_running_for(home: &Path, profile: &str) {
+    let _guard = RUNNING_FILE_UPDATES.lock().expect("browser running-file lock poisoned");
     let mut map = read_running_file(home);
     map.remove(profile);
     if map.is_empty() {
@@ -948,11 +1207,6 @@ fn clear_running_for(home: &Path, profile: &str) {
     } else {
         write_running_file(home, &map);
     }
-}
-
-#[allow(dead_code)]
-fn clear_running(home: &Path) {
-    let _ = std::fs::remove_file(running_state_path(home));
 }
 
 /// Re-adopt a browser this server did not spawn, if one is still there.
@@ -968,7 +1222,11 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
     // reuse. Each is judged on its own liveness.
     let mut adopted_any = false;
     for (prof_key, v) in read_running_file(home) {
-        if RUNNING.lock().expect("browser registry poisoned").contains_key(&prof_key) {
+        if RUNNING
+            .lock()
+            .expect("browser registry poisoned")
+            .contains_key(&prof_key)
+        {
             continue;
         }
         if adopt_one(home, &v).await {
@@ -980,8 +1238,14 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
 
 /// Adopt ONE persisted record if its browser is genuinely alive.
 async fn adopt_one(home: &Path, v: &serde_json::Value) -> bool {
-    let port = v.get("cdp_port").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
-    let raw_pid = v.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let port = v
+        .get("cdp_port")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as u16;
+    let raw_pid = v
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let pid = persisted_process_id(v);
     let Some(pid) = pid else {
         if raw_pid != 0 {
@@ -1007,48 +1271,104 @@ async fn adopt_one(home: &Path, v: &serde_json::Value) -> bool {
         // record. The restarted server finding a running-file whose browser
         // is dead IS the observation; clearing it silently was why two lanes
         // spent a morning on hypotheses for a death nothing logged.
-        let started_by =
-            v.get("started_by").and_then(serde_json::Value::as_str).unwrap_or("");
-        let profile =
-            v.get("profile").and_then(serde_json::Value::as_str).unwrap_or("default");
+        let started_by = v
+            .get("started_by")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let profile = v
+            .get("profile")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("default");
         tracing::warn!(
-            pid, port, profile, started_by,
+            pid,
+            port,
+            profile,
+            started_by,
             "browser: running-file names a browser that is GONE (CDP dead) — it died while \
              no server was watching, most likely killed alongside a server restart; \
              recording last_exit and clearing the file"
         );
-        record_last_exit(home, serde_json::json!({
-            "ts": chrono::Utc::now().timestamp(),
-            "reason": "found dead on adopt (died while the server was down or restarting)",
-            "profile": profile,
-            "pid": pid,
-            "started_by": started_by,
-            "code": serde_json::Value::Null,
-            "signal": serde_json::Value::Null,
-        }));
+        // A reaper or /stop that killed THIS pid already wrote why. Overwriting
+        // it with "died while the server was down" turned a known activity
+        // reap into a false server-restart story, and two lanes chased the
+        // wrong cause (2026-10-26). Keep the specific record; log that we did.
+        if let Some(prev) = persisted_last_exit(home) {
+            if last_exit_explains(&prev, pid, chrono::Utc::now().timestamp()) {
+                tracing::info!(
+                    pid, port, profile, started_by,
+                    prev_reason = prev["reason"].as_str().unwrap_or(""),
+                    verdict = "adopt_kept_recorded_exit_reason",
+                    "browser: running-file names a dead browser whose exit was already recorded; \
+                     keeping that reason instead of guessing a server restart"
+                );
+                clear_running_for(home, profile);
+                return false;
+            }
+        }
+        record_last_exit(
+            home,
+            serde_json::json!({
+                "ts": chrono::Utc::now().timestamp(),
+                "reason": "found dead on adopt (died while the server was down or restarting)",
+                "profile": profile,
+                "pid": pid,
+                "started_by": started_by,
+                "code": serde_json::Value::Null,
+                "signal": serde_json::Value::Null,
+            }),
+        );
         clear_running_for(home, profile);
         return false;
     }
-    let profile = v.get("profile").and_then(serde_json::Value::as_str).unwrap_or("default").to_string();
+    let profile = v
+        .get("profile")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default")
+        .to_string();
     let dir = v
         .get("user_data_dir")
         .and_then(serde_json::Value::as_str)
         .map(PathBuf::from)
         .unwrap_or_default();
-    let started = v.get("started_at").and_then(serde_json::Value::as_i64).unwrap_or(0);
-    let started_by =
-        v.get("started_by").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-    RUNNING.lock().expect("browser registry poisoned").insert(profile.clone(), RunningBrowser {
-        profile,
-        user_data_dir: dir,
-        cdp_port: port,
-        started_at: started,
-        last_verb_at: started,
+    let started = v
+        .get("started_at")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let started_by = v
+        .get("started_by")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    RUNNING.lock().expect("browser registry poisoned").insert(
+        profile.clone(),
+        RunningBrowser {
+            profile,
+            user_data_dir: dir,
+            cdp_port: port,
+            started_at: started,
+            // The ACTIVITY clock starts at adoption. It used to be `started`, so
+            // a browser launched two hours before a deploy read as idle for two
+            // hours the moment the new server adopted it, and the activity
+            // reaper released it on its next tick unless a keepalive happened
+            // to land first: tubescience-parity's browser was reaped three
+            // times on 2026-10-16 ("since_verb_s=7215" six minutes after a
+            // deploy) while its drivers sent /keepalive every 60s. The previous
+            // process's last verb is unknown, and an unknown is not idleness,
+            // so the adopted browser gets one full window.
+            last_verb_at: now_secs_i64(),
+            pid,
+            started_by,
+            child: None,
+        },
+    );
+    tracing::info!(
         pid,
-        started_by,
-        child: None,
-    });
-    tracing::info!(pid, port, "browser: adopted an orphan left by a previous server process");
+        port,
+        started_at = started,
+        verdict = "browser_adopted_activity_clock_reset",
+        "browser: adopted an orphan left by a previous server process; its activity \
+         window starts now, since the previous process's last verb is unknown"
+    );
     spawn_exit_monitor();
     true
 }
@@ -1075,14 +1395,57 @@ fn live_chromes_on_dir(home: &Path, target_dir: &Path) -> Vec<u32> {
         return Vec::new();
     }
     let flag = format!("--user-data-dir={}", target_dir.display());
-    let out = match std::process::Command::new("ps").args(["-ax", "-o", "pid=,command="]).output() {
+    let out = match std::process::Command::new("ps")
+        .args(["-ax", "-o", "pid=,command="])
+        .output()
+    {
         Ok(o) => o,
         Err(e) => {
-            tracing::warn!(?e, "browser: could not list processes to find profile co-tenants");
+            tracing::warn!(
+                ?e,
+                "browser: could not list processes to find profile co-tenants"
+            );
             return Vec::new();
         }
     };
     pids_on_dir(&String::from_utf8_lossy(&out.stdout), &flag)
+}
+
+/// The directory browser routing launches its CDP fallback Chromes under
+/// (`scripts/browser-route-driver.mjs`, one subdir per selected profile).
+pub fn route_chrome_root(home: &Path) -> PathBuf {
+    home.join("browser-routing").join("chrome")
+}
+
+/// SIGTERM every live Chrome on one browser-routing CDP dir. Returns how many
+/// were signalled.
+///
+/// The routing driver spawns these detached and unref'd, so the native
+/// registry never knows they exist and no reaper arm ever saw them. On macOS
+/// that is worse than a leak: the headless process still checks in with
+/// LaunchServices as `com.google.Chrome`, so while the human's own Chrome is
+/// closed every link clicked in any app opens in it. Measured 2026-10-13: one
+/// left idle for 9 hours took Ethan's link clicks into a blank window.
+///
+/// Scoped like `live_chromes_on_dir`: only a dir under the routing root,
+/// matched by the exact flag, so the user's own Chrome is never a candidate.
+/// TERM, not KILL, so the copied profile flushes its cookies.
+pub async fn stop_route_chrome(home: &Path, dir: &Path) -> usize {
+    if !dir.starts_with(route_chrome_root(home)) {
+        return 0;
+    }
+    let flag = format!("--user-data-dir={}", dir.display());
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-ax", "-o", "pid=,command="])
+        .output()
+    else {
+        return 0;
+    };
+    let pids = pids_on_dir(&String::from_utf8_lossy(&out.stdout), &flag);
+    for pid in &pids {
+        let _ = run_kill(*pid, "-TERM", "browser route chrome reap").await;
+    }
+    pids.len()
 }
 
 /// Pure half of [`live_chromes_on_dir`], so the matching rule is testable
@@ -1139,9 +1502,30 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     // launch on, so we never kill a browser on an unrelated profile.
     if let Some(v) = persisted {
         let pid = persisted_process_id(&v).unwrap_or(0);
-        let dir = v.get("user_data_dir").and_then(serde_json::Value::as_str).unwrap_or_default();
+        let dir = v
+            .get("user_data_dir")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
         if pid != 0 && Path::new(dir) == target_dir {
-            let alive = pid_alive(pid);
+            // A CONCURRENT LAUNCH IS NOT A DEAD ORPHAN (AMUX-4961).
+            //
+            // Registering the pid before the CDP wait (so the stray branch
+            // below sees it as a tenant) moves it into THIS branch's sights
+            // instead: a launching Chrome has a persisted pid and no CDP yet,
+            // which is exactly what this arm reaps. Closing one branch and
+            // opening the other is not a fix, so the record carries whether it
+            // has reached CDP, and a starting one is left alone until its
+            // grace expires.
+            let starting = record_is_starting(&v, crate::config::now_f64() as i64, STARTUP_GRACE_S);
+            if starting {
+                tracing::debug!(
+                    pid,
+                    dir,
+                    verdict = "startup_grace_respected",
+                    "browser: a launch on this profile is still waiting for CDP; not reaping it"
+                );
+            }
+            let alive = !starting && pid_alive(pid);
             if alive {
                 tracing::warn!(
                     pid, dir,
@@ -1149,7 +1533,7 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
                      unreachable — a launch on this dir would delegate to it and exit 0 (AMUX-3207)"
                 );
                 let _ = run_kill(pid, "-KILL", "orphan reconciliation").await;
-                clear_running(home);
+                clear_running_for(home, v.get("profile").and_then(Value::as_str).unwrap_or("default"));
             }
         }
     }
@@ -1168,8 +1552,34 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     // With N browsers, filtering on a single pid would have this loop kill its
     // own siblings — the exact "two Chromes on one dir" harm it exists to stop,
     // caused by the fix for it.
-    let adopted: std::collections::HashSet<u32> =
-        running_all().into_iter().map(|(_, _, _, pid, _, _)| pid).collect();
+    let mut adopted: std::collections::HashSet<u32> = running_all()
+        .into_iter()
+        .map(|(_, _, _, pid, _, _)| pid)
+        .collect();
+    // A LAUNCH IN FLIGHT IS A LEGITIMATE TENANT TOO (AMUX-4961).
+    //
+    // `running_all()` reads the IN-MEMORY registry, and a start does not join
+    // it until CDP has answered — the insert sits beside the final persist at
+    // the end of `start`. So for the whole 30s CDP wait a just-spawned Chrome
+    // is live on the dir and absent from this set, which is exactly the stray
+    // predicate below. Without this line the sweep reaps the very browser
+    // another start is still waiting on, and the caller reads "exited signal: 9
+    // (SIGKILL) before CDP came up" — indistinguishable from the host-level
+    // kill AMUX-4939 turned out to be.
+    //
+    // The persisted file is the cross-invocation channel here; the in-memory
+    // registry cannot be, because the record has to be visible to a DIFFERENT
+    // call to `start` before this one finishes.
+    {
+        let now = crate::config::now_f64() as i64;
+        for record in read_running_file(home).values() {
+            if record_is_starting(record, now, STARTUP_GRACE_S) {
+                if let Some(pid) = persisted_process_id(record) {
+                    adopted.insert(pid);
+                }
+            }
+        }
+    }
     let strays: Vec<u32> = live_chromes_on_dir(home, target_dir)
         .into_iter()
         .filter(|p| !adopted.contains(p))
@@ -1250,7 +1660,12 @@ pub fn chrome_binary() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let names = ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"];
+    let names = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ];
     let path = std::env::var("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path) {
         for n in names {
@@ -1330,6 +1745,12 @@ pub struct StartedBrowser {
     /// signal — the caller must not treat a mismatch as failure, only as a fact
     /// worth showing. `None` when CDP listed no page tab at all.
     pub launch_url: Option<String>,
+    /// Whether the requested page finished loading before start returned.
+    /// `None` when no page was requested. False comes with `note`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The tail of Chrome's launch stderr, formatted for an error message, or "" if
@@ -1357,10 +1778,7 @@ fn chrome_stderr_tail(path: &Path) -> String {
 /// said `DevTools listening on ws://127.0.0.1:<the very port>`. An investigator
 /// reading "never answered" goes looking at Chrome's startup; an investigator
 /// reading "HTTP 403" goes looking at what amux asked for.
-fn describe_cdp_probe(
-    outcome: &Result<reqwest::Response, reqwest::Error>,
-    http: &str,
-) -> String {
+fn describe_cdp_probe(outcome: &Result<reqwest::Response, reqwest::Error>, http: &str) -> String {
     match outcome {
         Ok(r) => format!("HTTP {} from {http}/json/version", r.status()),
         Err(e) if e.is_connect() => "connection refused (nothing listening)".into(),
@@ -1384,7 +1802,9 @@ fn describe_cdp_probe(
 /// because a diagnostic copy failed, so every error here returns "" and the
 /// caller's message is merely shorter.
 fn preserve_failed_stderr(path: &Path) -> String {
-    let Some(dir) = path.parent() else { return String::new() };
+    let Some(dir) = path.parent() else {
+        return String::new();
+    };
     // A WALL CLOCK IS NOT A UNIQUENESS SOURCE, and this function learned it
     // twice from its own test. Draft one stamped SECONDS: two retries inside one
     // second minted the same name, the copy overwrote the previous failure, and
@@ -1441,8 +1861,10 @@ fn preserve_failed_stderr(path: &Path) -> String {
 /// itself a test harness — see `chrome_launch_args`. Kept as data so the test
 /// pinning that invariant cannot drift from the flags actually passed.
 #[cfg(test)]
-const CHROME_BAD_FLAGS: [&str; 2] =
-    ["--ignore-certificate-errors", "--ignore-certificate-errors-spki-list"];
+const CHROME_BAD_FLAGS: [&str; 2] = [
+    "--ignore-certificate-errors",
+    "--ignore-certificate-errors-spki-list",
+];
 
 /// Every flag Chrome is launched with, in order, as ONE list. Pure in its
 /// inputs so the invariants between flags can be tested without spawning a
@@ -1513,6 +1935,86 @@ fn chrome_launch_args(
 /// `session` is the lane this launch belongs to. It exists because of AC-336:
 /// the tab Chrome opens for `url` must be CLAIMED by the caller, or the next
 /// lane to run a driver verb adopts it as an unowned page.
+/// Clears a `starting` record unless the launch completes (AMUX-4961).
+///
+/// A GUARD RATHER THAN A CLEAR AT EACH EXIT. Registering the pid before the CDP
+/// wait deliberately overrides the old ordering, whose comment explained why it
+/// was late: "written AFTER the handle is live so a file never claims a browser
+/// that failed to start." That property is worth keeping, and `start` has three
+/// error exits between spawn and the final persist — a fourth added later would
+/// not know to clear. Drop does not forget.
+// A failed or cancelled launch must release the exact child it spawned. The
+// published child deliberately survives registry drops for server re-adoption.
+struct PendingChrome(Option<tokio::process::Child>);
+impl PendingChrome {
+    fn publish(mut self) -> tokio::process::Child {
+        self.0.take().expect("pending Chrome child")
+    }
+}
+impl std::ops::Deref for PendingChrome {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("pending Chrome child")
+    }
+}
+impl std::ops::DerefMut for PendingChrome {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("pending Chrome child")
+    }
+}
+impl Drop for PendingChrome {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let pid = child.id();
+            let outcome = child.start_kill();
+            tracing::warn!(?pid, measured=true, n_considered=1, error=?outcome.err(),
+                verdict="browser_unpublished_launch_released",
+                "failed or cancelled startup released its own Chrome child");
+        }
+    }
+}
+
+struct StartingRecord<'a> {
+    home: &'a Path,
+    profile: &'a str,
+    armed: bool,
+}
+
+impl StartingRecord<'_> {
+    /// The launch reached CDP; the final persist owns the record now.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartingRecord<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            clear_running_for(self.home, self.profile);
+        }
+    }
+}
+
+/// Why a HEADED Chrome cannot open on this host, or `None` when it can.
+///
+/// A Linux server reached over the network (a dedicated customer host, a
+/// cloud VM) usually has no X or Wayland display. A headed launch there dies
+/// in ~250ms with "Missing X server or $DISPLAY", so `profile/create`, whose
+/// whole purpose is a human signing in, failed outright on the first such
+/// host it met (wexus.amux.io, 2026-10-06). macOS and Windows always have a
+/// window server for a logged-in user, so only Linux is checked.
+pub fn headed_unavailable_reason() -> Option<&'static str> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let set = |k: &str| std::env::var(k).is_ok_and(|v| !v.trim().is_empty());
+    if set("DISPLAY") || set("WAYLAND_DISPLAY") {
+        None
+    } else {
+        Some("no X/Wayland display on this host (DISPLAY and WAYLAND_DISPLAY are unset)")
+    }
+}
+
 pub async fn start(
     home: &Path,
     profile: &str,
@@ -1521,6 +2023,25 @@ pub async fn start(
     started_by: &str,
     headless: bool,
 ) -> anyhow::Result<StartedBrowser> {
+    // A headed request on a display-less host launches headless instead of
+    // failing: the profile dir and cookie jar are identical either way (new
+    // headless shares the format, see launch_args), and a human signs in
+    // through the dashboard Browser tab's live view, which renders a headless
+    // page. Callers that promise a window read headed_unavailable_reason()
+    // and say so in their response; this WARN is the log signal.
+    let headless = match (headless, headed_unavailable_reason()) {
+        (false, Some(why)) => {
+            tracing::warn!(
+                verdict = "headed_browser_no_display",
+                profile,
+                session,
+                why,
+                "headed browser requested on a display-less host; launching headless (sign in via the dashboard Browser live view)"
+            );
+            true
+        }
+        _ => headless,
+    };
     // A Chrome from a PREVIOUS server process may still hold this profile. The
     // RUNNING registry is in-memory and does not survive the builder's constant
     // re-exec, so start() used to be blind to that orphan: it checked only
@@ -1607,7 +2128,11 @@ pub async fn start(
     // singleton. The invariant was never "one Chrome" — it is "one Chrome per
     // user_data_dir", because that is what corrupts. A browser on a DIFFERENT
     // profile is a legitimate neighbour and is left alone.
-    if RUNNING.lock().expect("browser registry poisoned").contains_key(profile) {
+    if RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .contains_key(profile)
+    {
         // NAME THE DISPLACER AND SAY IT WAS A DISPLACEMENT (AF-378 follow-up).
         // `started_by` is the resolved attribution of whoever asked for THIS
         // start; it was already in hand here and was being dropped, so every
@@ -1629,7 +2154,24 @@ pub async fn start(
     }
 
     let port = ephemeral_port()?;
-    let mut cmd = tokio::process::Command::new(&binary);
+    // Chrome on Linux reads its certificate store from ~/.local/share/pki/nssdb
+    // and logs an error on every launch when the folder is missing (NetSuite
+    // worker, 2026-10-26: harmless, but it reads as a failure in the log the
+    // worker is debugging from). An empty folder is what Chrome expects.
+    if cfg!(target_os = "linux") {
+        if let Some(h) = std::env::var_os("HOME") {
+            let _ = std::fs::create_dir_all(PathBuf::from(h).join(".local/share/pki/nssdb"));
+        }
+    }
+    let scope = chrome_systemd_scope().await;
+    let mut cmd = match scope {
+        Some(prefix) => {
+            let mut c = tokio::process::Command::new(prefix[0]);
+            c.args(&prefix[1..]).arg(&binary);
+            c
+        }
+        None => tokio::process::Command::new(&binary),
+    };
     // OWN PROCESS GROUP (AMUX-3414 root cause). Chrome inherited this server's
     // group, and the builder's self-adoption relaunch (`launchctl kickstart -k`)
     // kills the whole group — so every build adoption, several per hour on this
@@ -1642,7 +2184,13 @@ pub async fn start(
     #[cfg(unix)]
     cmd.process_group(0);
     let spki = amux_cert_spki_b64(home);
-    cmd.args(chrome_launch_args(port, &target, headless, spki.as_deref(), url));
+    cmd.args(chrome_launch_args(
+        port,
+        &target,
+        headless,
+        spki.as_deref(),
+        url,
+    ));
     // Capture Chrome's stderr so a launch failure is DIAGNOSABLE. It used to go
     // to /dev/null, so "CDP never answered" could not distinguish a crash (a bad
     // flag, a locked profile, no display) from a slow start — the exact failure
@@ -1658,8 +2206,38 @@ pub async fn start(
             cmd.stderr(std::process::Stdio::null());
         }
     }
-    let mut child = cmd.spawn().map_err(|e| anyhow::anyhow!("spawn {}: {e}", binary.display()))?;
+    let mut child = PendingChrome(Some(cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawn {}: {e}", binary.display()))?));
     let pid = child.id();
+
+    // REGISTER BEFORE THE CDP WAIT (AMUX-4961). Until this, a Chrome was live
+    // on the profile dir and absent from the running-file for up to 30s, which
+    // is precisely the stray predicate a CONCURRENT start reconciles against —
+    // it would SIGKILL this one and the caller would see "exited signal: 9
+    // (SIGKILL) before CDP came up", indistinguishable from the host-level kill
+    // that AMUX-4939 turned out to be.
+    //
+    // `cdp_ready: false` is what keeps this from simply moving the kill into
+    // the dead-CDP-orphan branch, which reaps a persisted pid whose CDP does
+    // not answer — which a launching Chrome's, by definition, does not yet.
+    let starting_guard = pid.map(|p| {
+        persist_running(
+            home,
+            profile,
+            &target.user_data_dir,
+            port,
+            p,
+            chrono::Utc::now().timestamp(),
+            started_by,
+            false,
+        );
+        StartingRecord {
+            home,
+            profile,
+            armed: true,
+        }
+    });
 
     // A port Chrome never bound is not a started browser; wait for CDP HTTP.
     // Two failure modes, told apart because they need opposite responses:
@@ -1709,15 +2287,44 @@ pub async fn start(
             } else {
                 ""
             };
+            let tail = chrome_stderr_tail(&stderr_path);
             if delegated {
                 tracing::warn!(
                     ?pid, port, dir = %target.user_data_dir.display(),
                     "browser: launch delegated to an existing Chrome and exited 0 before CDP bound (AMUX-3207)"
                 );
+            } else {
+                // A CRASH BEFORE CDP REACHED THE CALLER AS A 502 AND LOGGED
+                // NOTHING (AMUX-4939). Both neighbours WARN — the delegation
+                // arm above, and the CDP-timeout arm below which says so in as
+                // many words ("WARN so a log sweep sees the CLASS") — and this
+                // arm, the one that fires when Chrome dies outright, was the
+                // silent one. Measured 2026-09-22: two launches were SIGKILLed
+                // 7s apart, each caller got a 502, and this module logged not
+                // one line all day. The card exists only because the autofix
+                // 5xx path reads the request log; no log sweep could have
+                // found it.
+                //
+                // `signal` is the field to group on, because it splits two
+                // causes needing opposite responses. A SIGNAL is someone else
+                // killing Chrome: the 2026-09-22 specimen was macOS amfid
+                // failing code-signature validation at exec ~370ms in, hours
+                // after a Chrome self-update, which is nothing amux can fix. A
+                // NON-ZERO EXIT is Chrome itself refusing what we asked for.
+                // `stderr_empty` separates them further — a Chrome that never
+                // wrote a byte never reached its own startup, which points
+                // outside Chrome.
+                let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+                tracing::warn!(
+                    ?pid, port, dir = %target.user_data_dir.display(),
+                    ?signal, code = ?status.code(), stderr_empty = tail.is_empty(),
+                    verdict = classify_launch_death(&status),
+                    "browser: Chrome died before CDP bound — launch failed (AMUX-4939)"
+                );
             }
             let msg = format!(
                 "Chrome (pid {pid:?}) exited {status} before CDP on port {port} came up{}{hint}",
-                chrome_stderr_tail(&stderr_path)
+                tail
             );
             // Same string either way; only the TYPE differs, and only when the
             // caller can act (AF-381).
@@ -1758,6 +2365,26 @@ pub async fn start(
         }
     }
 
+    // Imported cookies.json must reach Chrome BEFORE the first authenticated
+    // navigation. Consume once; subsequent logouts must not resurrect old tokens.
+    if target.user_data_dir.join("cookies.json").is_file() {
+        match apply_imported_cookies(&target.user_data_dir, port).await {
+            Ok(count) => tracing::info!(profile, count, verdict="browser_import_applied", "imported cookies applied and read back from Chrome"),
+            Err(e) => {
+                tracing::warn!(profile, error=%e, verdict="browser_import_failed", "imported cookies could not be installed");
+                let _ = child.kill().await;
+                return Err(e);
+            }
+        }
+        // The initial tab may have loaded before cookies were installed.
+        if !url.is_empty() {
+            if let Some(ws) = cdp_list(port).await?.as_array().and_then(|a|a.iter().find(|t|t["type"]=="page")).and_then(|t|t["webSocketDebuggerUrl"].as_str()) {
+                let mut c=CdpClient::connect(ws).await?;
+                navigate_and_settle(&mut c,url).await?;
+            }
+        }
+    }
+
     // AC-336: CLAIM THE TAB WE JUST OPENED, FOR THE LANE THAT ASKED FOR IT.
     //
     // `resolve_page` treats a page tab as available unless it appears in
@@ -1788,13 +2415,30 @@ pub async fn start(
     // std::sync::Mutex, and holding one across an await deadlocks the runtime.
     // The same listing already resolves the page tab; its URL was being thrown
     // away, which is why the response could not say where the browser landed.
+    // WAIT FOR THE PAGE THE CALLER ASKED FOR. Chrome gets `url` on its command
+    // line and CDP answers before the launch tab has committed it, so a start
+    // used to return with the tab still on about:blank and the lane's first
+    // `state` read a blank page (2026-10-17 replay: linkedin.com started and
+    // observed about:blank in the same second). Bounded: a slow site returns
+    // with what it has, and says so.
+    let wants_page = !url.is_empty() && url != "about:blank";
+    let settle = if wants_page { Some(settle_launch_tab(port, session, url).await) } else { None };
     let launch_page = cdp_list(port).await.ok().and_then(|tabs| {
         tabs.as_array()
-            .and_then(|ts| ts.iter().find(|t| t.get("type").and_then(Value::as_str) == Some("page")))
+            .and_then(|ts| {
+                ts.iter()
+                    .find(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+            })
             .map(|t| {
                 (
-                    t.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-                    t.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+                    t.get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    t.get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                 )
             })
     });
@@ -1820,7 +2464,11 @@ pub async fn start(
         // Not fatal: the lane simply has no binding yet and resolve_page will
         // open it a fresh tab. Logged because a silent miss here is what the
         // whole card is about.
-        None => tracing::warn!(session, port, "launch tab not claimed — CDP listed no page tab"),
+        None => tracing::warn!(
+            session,
+            port,
+            "launch tab not claimed — CDP listed no page tab"
+        ),
     }
 
     // MINIMISE BY DEFAULT (AMUX-4357), against this browser's own port so no
@@ -1848,29 +2496,48 @@ pub async fn start(
         user_data_dir: target.user_data_dir.display().to_string(),
         started_at,
         launch_url,
+        page_ready: settle.as_ref().map(|s| s.settled),
+        note: settle.as_ref().and_then(unsettled_start_note),
     };
     // `child.id()` is None only once the child has been reaped; a browser we
     // just spawned always has one. Refusing here beats persisting pid 0, which
     // `kill` would interpret as the whole process group.
     let pid_num = pid.ok_or_else(|| anyhow::anyhow!("chrome spawned without a pid"))?;
     let udd_for_state = target.user_data_dir.clone();
-    RUNNING.lock().expect("browser registry poisoned").insert(profile.to_string(), RunningBrowser {
-        profile: profile.to_string(),
-        user_data_dir: target.user_data_dir,
-        cdp_port: port,
-        started_at,
-        last_verb_at: started_at,
-        pid: pid_num,
-        // Ownership is the EXPLICIT attribution, never the tab-binding
-        // default ("amux") — an anonymous start records "" so the guard can
-        // refuse the next anonymous caller instead of treating them as the
-        // same session (amux-cloud's validation catch on AMUX-3063).
-        started_by: started_by.to_string(),
-        child: Some(child),
-    });
+    RUNNING.lock().expect("browser registry poisoned").insert(
+        profile.to_string(),
+        RunningBrowser {
+            profile: profile.to_string(),
+            user_data_dir: target.user_data_dir,
+            cdp_port: port,
+            started_at,
+            last_verb_at: started_at,
+            pid: pid_num,
+            // Ownership is the EXPLICIT attribution, never the tab-binding
+            // default ("amux") — an anonymous start records "" so the guard can
+            // refuse the next anonymous caller instead of treating them as the
+            // same session (amux-cloud's validation catch on AMUX-3063).
+            started_by: started_by.to_string(),
+            child: Some(child.publish()),
+        },
+    );
     // Survive a server restart (AC-325). Written AFTER the handle is live so a
     // file never claims a browser that failed to start.
-    persist_running(home, profile, &udd_for_state, port, pid_num, started_at, started_by);
+    persist_running(
+        home,
+        profile,
+        &udd_for_state,
+        port,
+        pid_num,
+        started_at,
+        started_by,
+        true,
+    );
+    // CDP answered, so the record is no longer provisional and the guard must
+    // not clear it on the way out.
+    if let Some(guard) = starting_guard {
+        guard.disarm();
+    }
     spawn_exit_monitor();
     Ok(info)
 }
@@ -1907,10 +2574,17 @@ pub async fn stop_as(home: &Path, stopped_by: &str) -> StopReport {
     // always names one; this arm exists for internal callers and tests.
     let oldest = {
         let g = RUNNING.lock().expect("browser registry poisoned");
-        g.values().min_by_key(|r| r.started_at).map(|r| r.profile.clone())
+        g.values()
+            .min_by_key(|r| r.started_at)
+            .map(|r| r.profile.clone())
     };
     let Some(profile) = oldest else {
-        return StopReport { stopped: false, profile: None, clean_exit: None, locks_cleaned: vec![] };
+        return StopReport {
+            stopped: false,
+            profile: None,
+            clean_exit: None,
+            locks_cleaned: vec![],
+        };
     };
     stop_profile_as(home, &profile, stopped_by).await
 }
@@ -1966,9 +2640,17 @@ pub async fn stop_profile_as_reason(
     stopped_by: &str,
     reason: &str,
 ) -> StopReport {
-    let running = RUNNING.lock().expect("browser registry poisoned").remove(profile);
+    let running = RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .remove(profile);
     let Some(mut running) = running else {
-        return StopReport { stopped: false, profile: None, clean_exit: None, locks_cleaned: vec![] };
+        return StopReport {
+            stopped: false,
+            profile: None,
+            clean_exit: None,
+            locks_cleaned: vec![],
+        };
     };
     *LAST_EXIT.lock().expect("last-exit poisoned") = Some(exit_record(
         reason,
@@ -1987,11 +2669,30 @@ pub async fn stop_profile_as_reason(
     let signalable = checked_process_id(running.pid).is_some();
     // std/tokio only offer SIGKILL; /bin/kill sends the TERM Chrome needs to
     // flush Cookies and Local Storage. `run_kill` validates before spawning.
-    let _ = run_kill(running.pid, "-TERM", "browser stop").await;
+    // Browser.close runs Chrome's normal shutdown path, which commits cookies
+    // installed through CDP. TERM alone can exit before that store is flushed.
+    // The login a site keeps in session cookies goes to disk first, so the
+    // next start of this profile is still signed in (keep_session_cookies).
+    match keep_session_cookies(running.cdp_port).await {
+        Ok(n) if n > 0 => tracing::info!(profile = %running.profile, kept = n, verdict = "browser_session_cookies_kept",
+            measured = true, n_considered = n, "browser stop: session cookies kept so the login survives (values not logged)"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(profile = %running.profile, error = %e, verdict = "browser_session_cookies_not_kept",
+            measured = false, n_considered = 0, "browser stop: could not keep session cookies; a session login may be lost"),
+    }
+    if let Ok(tabs)=cdp_list(running.cdp_port).await {
+        if let Some(ws)=tabs.as_array().and_then(|a|a.iter().find(|t|t["type"]=="page")).and_then(|t|t["webSocketDebuggerUrl"].as_str()) {
+            if let Ok(mut c)=CdpClient::connect(ws).await {
+                let _=c.call("Browser.close",serde_json::json!({}),Duration::from_secs(3)).await;
+            }
+        }
+    }
+    let close_deadline=std::time::Instant::now()+Duration::from_secs(8);
+    while pid_alive(running.pid)&&std::time::Instant::now()<close_deadline {tokio::time::sleep(Duration::from_millis(100)).await;}
+    if pid_alive(running.pid){let _ = run_kill(running.pid, "-TERM", "browser stop").await;}
     match running.child.as_mut() {
         Some(ch) => {
-            let graceful =
-                tokio::time::timeout(std::time::Duration::from_secs(8), ch.wait()).await;
+            let graceful = tokio::time::timeout(std::time::Duration::from_secs(8), ch.wait()).await;
             if graceful.is_err() {
                 let _ = ch.kill().await; // last resort; may lose storage flush
                 let _ = ch.wait().await;
@@ -2013,7 +2714,11 @@ pub async fn stop_profile_as_reason(
             }
         }
     }
-    clear_running(home);
+    clear_running_for(home, &running.profile);
+    tracing::info!(profile=%running.profile, measured=true, n_considered=1,
+        remaining_profiles=read_running_file(home).len(),
+        verdict="browser_profile_restart_record_retired",
+        "retired only the stopped profile's restart record");
 
     let clean_exit = locks_present(&running.user_data_dir).is_empty();
     let locks_cleaned = if !clean_exit && is_amux_owned(home, &running.user_data_dir) {
@@ -2030,15 +2735,213 @@ pub async fn stop_profile_as_reason(
     }
 }
 
+/// A running profile's SESSION cookies, made persistent for
+/// `browser_login_sync::SESSION_TTL_DAYS` (2026-10-26, a NetSuite worker:
+/// "browser profiles drop login sessions when the browser stops, so every
+/// closure means a full NetSuite login again"). Chrome writes only persistent
+/// cookies to disk, so a login a site keeps in a session cookie was lost on
+/// every stop, reap or restart: measured on Chrome 151, a session cookie never
+/// survived a relaunch, after Browser.close, SIGTERM or SIGKILL alike. Made
+/// persistent, it survived Browser.close and (once Chrome's ~30s cookie flush
+/// ran) SIGKILL. Same bounded policy as imported and synced logins; the site
+/// can still end the session on its side.
+///
+/// Pure over the Storage.getCookies rows, so it is tested without a browser.
+pub(crate) fn session_cookies_to_keep(rows: &[Value], now: i64) -> Vec<Value> {
+    let until = now + crate::integrations::browser_login_sync::SESSION_TTL_DAYS * 86_400;
+    rows.iter()
+        .filter(|c| c.get("session").and_then(Value::as_bool).unwrap_or(false))
+        .map(|c| {
+            let mut c = c.clone();
+            c["expires"] = serde_json::json!(until);
+            c["session"] = serde_json::json!(false);
+            c
+        })
+        .collect()
+}
+
+/// Apply [`session_cookies_to_keep`] to the browser on `port`. Called by the
+/// reaper on every tick for each running profile, and by a stop before
+/// Browser.close. Counts only; values are never logged.
+pub async fn keep_session_cookies(port: u16) -> anyhow::Result<usize> {
+    let tabs = cdp_list(port).await?;
+    let Some(ws) = tabs
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["type"] == "page"))
+        .and_then(|t| t["webSocketDebuggerUrl"].as_str())
+    else {
+        return Ok(0);
+    };
+    let mut c = CdpClient::connect(ws).await?;
+    let seen = c.call("Storage.getCookies", serde_json::json!({}), Duration::from_secs(10)).await?;
+    let rows = seen["cookies"].as_array().cloned().unwrap_or_default();
+    let keep = session_cookies_to_keep(&rows, chrono::Utc::now().timestamp());
+    if keep.is_empty() {
+        return Ok(0);
+    }
+    let params = crate::integrations::computer::cookie_params(&keep);
+    c.call("Storage.setCookies", serde_json::json!({ "cookies": params }), Duration::from_secs(10)).await?;
+    Ok(keep.len())
+}
+
+/// What a browser's pages are doing, read from Chrome itself, for the reaper.
+///
+/// The activity clock only moved on amux's own verbs, so a worker driving
+/// Chrome over CDP directly, or keeping it alive by polling `route state`,
+/// read as idle and lost its browser mid-report (NetSuite, 2026-10-26). Three
+/// things Chrome does report are evidence someone is using it:
+/// `fingerprint` (each page's id, URL and title: a change since the last look
+/// is work), `attached` (pages a debugger client is attached to, which is a
+/// driver connected right now; `/json/list` cannot show this, Target.getTargets
+/// can), and `loading` (pages whose document has not finished loading, which
+/// must never be closed under someone).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PageActivity {
+    pub pages: usize,
+    pub attached: usize,
+    pub loading: usize,
+    pub fingerprint: String,
+}
+
+pub async fn page_activity(port: u16) -> anyhow::Result<PageActivity> {
+    let version = cdp_json(
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/json/version"))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await?,
+        &format!("CDP /json/version on port {port}"),
+    )
+    .await?;
+    let ws = version["webSocketDebuggerUrl"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("CDP /json/version on port {port} named no browser socket"))?;
+    let mut browser = CdpClient::connect(ws).await?;
+    let targets = browser.call("Target.getTargets", serde_json::json!({}), Duration::from_secs(5)).await?;
+    let mut out = PageActivity::default();
+    let mut keys = vec![];
+    for t in targets["targetInfos"].as_array().into_iter().flatten() {
+        if t["type"] != "page" {
+            continue;
+        }
+        out.pages += 1;
+        if t["attached"].as_bool() == Some(true) {
+            out.attached += 1;
+        }
+        keys.push(format!(
+            "{}|{}|{}",
+            t["targetId"].as_str().unwrap_or(""),
+            t["url"].as_str().unwrap_or(""),
+            t["title"].as_str().unwrap_or("")
+        ));
+    }
+    keys.sort();
+    out.fingerprint = keys.join("\n");
+    drop(browser);
+    // Load state needs the page itself; only real pages, and only a few.
+    let listed = cdp_list(port).await?;
+    for t in listed.as_array().into_iter().flatten().filter(|t| t["type"] == "page").take(8) {
+        let Some(ws) = t["webSocketDebuggerUrl"].as_str() else { continue };
+        let Ok(mut c) = CdpClient::connect(ws).await else { continue };
+        let state = c
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({ "expression": "document.readyState", "returnByValue": true }),
+                Duration::from_secs(3),
+            )
+            .await;
+        if let Ok(v) = state {
+            if v["result"]["value"].as_str().is_some_and(|s| s != "complete") {
+                out.loading += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// CDP over plain HTTP: the tab list. (Command traffic — screenshot, eval,
 /// input — is the WebSocket client below, [`CdpClient`].)
+/// Apply a pending import once and verify each cookie's value in the running
+/// browser. Verification never logs values. The retained receipt has counts only.
+async fn apply_imported_cookies(dir: &Path, port: u16) -> anyhow::Result<usize> {
+    let file=dir.join("cookies.json");
+    let mut cookies:Vec<Value>=serde_json::from_slice(&std::fs::read(&file)?)?;
+    // Retain imported session cookies across normal Chrome shutdown, using the
+    // same bounded policy as login sync; the site can still revoke the session.
+    for cookie in &mut cookies {
+        if cookie.get("expires").and_then(Value::as_f64).is_none_or(|e|e<=0.0) {
+            cookie["expires"]=serde_json::json!(chrono::Utc::now().timestamp()+crate::integrations::browser_login_sync::SESSION_TTL_DAYS*86400);
+            cookie["session"]=serde_json::json!(false);
+        }
+    }
+    let tabs=cdp_list(port).await?;
+    let ws=tabs.as_array().and_then(|a|a.iter().find(|t|t["type"]=="page")).and_then(|t|t["webSocketDebuggerUrl"].as_str()).ok_or_else(||anyhow::anyhow!("no tab available to install imported cookies"))?;
+    let mut c=CdpClient::connect(ws).await?;
+    let cookies=crate::integrations::computer::cookie_params(&cookies);
+    c.call("Storage.setCookies",serde_json::json!({"cookies":cookies}),Duration::from_secs(20)).await?;
+    let seen=c.call("Storage.getCookies",serde_json::json!({}),Duration::from_secs(20)).await?;
+    let rows=seen["cookies"].as_array().ok_or_else(||anyhow::anyhow!("cookie readback missing"))?;
+    let now=chrono::Utc::now().timestamp() as f64;
+    for expected in &cookies {
+        if expected["expires"].as_f64().is_some_and(|e|e>0.0&&e<=now) {continue;}
+        anyhow::ensure!(rows.iter().any(|r|r["name"]==expected["name"]&&r["domain"]==expected["domain"]&&r["path"]==expected["path"]&&r["value"]==expected["value"]),"imported cookie readback mismatch (values withheld)");
+    }
+    let count=cookies.len();
+    std::fs::write(dir.join("import-receipt.json"),serde_json::to_vec(&serde_json::json!({"applied":true,"cookies":count,"verified_at":chrono::Utc::now().timestamp()}))?)?;
+    std::fs::remove_file(file)?;
+    // state.json is a second plaintext copy of the same imported secrets.
+    let _=std::fs::remove_file(dir.join("state.json"));
+    Ok(count)
+}
+
 pub async fn cdp_list(port: u16) -> anyhow::Result<serde_json::Value> {
     let r = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}/json/list"))
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await?;
-    Ok(r.json().await?)
+    cdp_json(r, &format!("CDP /json/list on port {port}")).await
+}
+
+/// WHAT A CDP HTTP HELPER ACTUALLY GOT, WHEN IT WAS NOT JSON (AMUX-4932).
+///
+/// `.json()` on a response nobody status-checked reports serde's "error
+/// decoding response body: expected value at line 1 column 1" and nothing
+/// else — naming neither the endpoint, nor the HTTP status, nor what the body
+/// held. One specimen reached a caller as a bare 502 after 12.1s on 2026-09-21
+/// and carried nothing to investigate: an empty body and a 403 produce the
+/// identical sentence, and they send an investigator to opposite places.
+///
+/// This is the lesson AMUX-3689 already taught the readiness probe a few
+/// hundred lines up ("connection-refused, a timeout, a 403 and a 500 all
+/// produced the identical 'CDP never answered within 30s'"). These two helpers
+/// never got it.
+async fn cdp_json(resp: reqwest::Response, what: &str) -> anyhow::Result<serde_json::Value> {
+    let status = resp.status().as_u16();
+    // `text()` first, unconditionally: the body is the evidence, and consuming
+    // it as JSON destroys it exactly when it was not JSON.
+    let body = resp.text().await.unwrap_or_default();
+    decode_cdp_json(status, &body, what)
+}
+
+/// Pure half of [`cdp_json`], extracted for the reason `describe_cdp_probe` and
+/// `is_delegation_exit` are: pinning what the message says must not require a
+/// live Chrome serving a malformed body on cue.
+pub fn decode_cdp_json(status: u16, body: &str, what: &str) -> anyhow::Result<serde_json::Value> {
+    serde_json::from_str(body).map_err(|e| {
+        // EMPTY AND NON-EMPTY ARE DIFFERENT FAULTS. An empty body is Chrome
+        // closing the connection without answering; a non-empty one that fails
+        // to parse is Chrome answering something else (an HTML error page, a
+        // proxy interception). Quoting the head tells them apart at a glance,
+        // and `<empty>` is a statement rather than a blank nobody can read.
+        let head: String = body.chars().take(200).collect();
+        let shown = if head.trim().is_empty() {
+            "<empty>".to_string()
+        } else {
+            head
+        };
+        anyhow::anyhow!("{what} answered HTTP {status} with a body that is not JSON ({e}): {shown}")
+    })
 }
 
 /// CDP over plain HTTP: open a new tab. Chrome 111+ requires PUT on
@@ -2054,15 +2957,65 @@ pub async fn cdp_new_tab(port: u16, url: &str) -> anyhow::Result<serde_json::Val
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await;
+    // WHY THE FALLBACK RAN, KEPT (AMUX-5039). The `_` arm used to discard the
+    // PUT's outcome, so when GET then failed, GET's error was the only one that
+    // survived. Chrome's is `405 ... Using unsafe HTTP verb GET to invoke
+    // /json/new. This action supports only PUT verb`, which reads as "amux uses
+    // GET, switch to PUT" while this function has led with PUT since Chrome
+    // 111. Measured 2026-09-23: three 502s on GET /api/browser/screenshot whose
+    // body said exactly that, sending the reader to implement a fix already
+    // three lines above the one they were reading.
+    let put_failure = match &put {
+        Ok(r) if r.status().is_success() => None,
+        Ok(r) => Some(format!("PUT answered HTTP {}", r.status())),
+        Err(e) => Some(format!("PUT failed: {e}")),
+    };
+    // AND THE FALLBACK ONLY RUNS FOR THE REASON IT EXISTS. It is here for
+    // pre-111 Chrome, which accepts GET and refuses PUT. On anything newer GET
+    // can NEVER succeed, so falling back on a TIMEOUT buys nothing and costs
+    // the diagnosis: measured 2026-09-23, this endpoint's worst request took
+    // 27.5s against a 5s PUT timeout, so a slow browser blew the PUT, GET was
+    // refused instantly at the HTTP layer, and a timeout arrived wearing a verb
+    // error. Reproduced against Chrome/153.0.8010.54: PUT 200, GET 405.
+    //
+    // 405/501 is Chrome SAYING it does not support the verb, which is the only
+    // signal that the other verb might work. A connect error or a timeout says
+    // nothing about verbs and is surfaced as itself.
+    let put_refused_the_verb = matches!(
+        &put,
+        Ok(r) if matches!(
+            r.status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED | reqwest::StatusCode::NOT_IMPLEMENTED
+        )
+    );
     let resp = match put {
         Ok(r) if r.status().is_success() => r,
-        _ => client
-            .get(&endpoint)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await?,
+        other => {
+            if !put_refused_the_verb {
+                // Report the PUT, not a GET that was never going to work.
+                return match other {
+                    Ok(r) => cdp_json(r, &format!("CDP /json/new on port {port} (PUT)")).await,
+                    Err(e) => Err(anyhow::anyhow!(
+                        "CDP /json/new on port {port}: PUT failed and amux did not fall back \
+                         to GET, because Chrome did not refuse the VERB (a 405/501) — it \
+                         failed to answer at all, and GET cannot fix that: {e}"
+                    )),
+                };
+            }
+            client
+                .get(&endpoint)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await?
+        }
     };
-    Ok(resp.json().await?)
+    // The PUT's failure leads, because it is the one that explains why a
+    // verb Chrome rejects was tried at all.
+    let what = match &put_failure {
+        Some(why) => format!("CDP /json/new on port {port} ({why}, so amux fell back to GET)"),
+        None => format!("CDP /json/new on port {port}"),
+    };
+    cdp_json(resp, &what).await
 }
 
 /// Minimal query-encoding for the one place we build a query string by hand
@@ -2143,46 +3096,46 @@ impl CdpClient {
         Ok(Self { ws, next_id: 0 })
     }
 
-/// Recover a CDP frame's `id` from text that does NOT parse as JSON (AMUX-4824).
-///
-/// A truncated frame still carries its head, and CDP puts `"id":<n>` in the
-/// object's first field, so the id survives exactly the damage that makes the
-/// frame unparseable. That is the whole point: it answers "was this mine?" when
-/// the parser cannot.
-///
-/// DELIBERATELY NOT A JSON PARSER. It scans for the first `"id":` and reads the
-/// digits after it. An EVENT has no `id` at all (it has `method`), so `None`
-/// means "not a response", which is already a reason to skip. A wrong answer
-/// here is bounded: attributing a frame to us that is not ours fails one call
-/// that would otherwise time out; failing to attribute ours turns a fast error
-/// into a deadline. Neither invents a result.
-fn cdp_frame_id_hint(text: &str) -> Option<u64> {
-    // Only look at the head. A frame whose `id` is megabytes in is not a CDP
-    // response, and scanning the whole of a large malformed payload for every
-    // skipped frame is work with no answer at the end of it.
-    let head = &text[..text.len().min(512)];
-    let at = head.find("\"id\":")? + 5;
-    let rest = head[at..].trim_start();
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
-}
-
-/// The shipped decision, as a function so a test can drive it (AMUX-4824).
-///
-/// Inline, this was a `match` arm inside the socket loop, and nothing but a
-/// live CDP connection could reach it. That is the same shape that let a
-/// deadline test pass against a rebuilt expression earlier today: a decision
-/// only exercised through machinery nobody can stand up in a test is a decision
-/// no mutation can reach.
-fn unparseable_frame_verdict(hint: Option<u64>, waiting_for: u64) -> FrameVerdict {
-    match hint {
-        Some(found) if found == waiting_for => FrameVerdict::Ours,
-        // `None` is an EVENT (no id at all) or a frame damaged past
-        // attribution. Both are skipped: claiming them would fail a call over
-        // a message it never asked for, which is the defect this fixes.
-        _ => FrameVerdict::Skip,
+    /// Recover a CDP frame's `id` from text that does NOT parse as JSON (AMUX-4824).
+    ///
+    /// A truncated frame still carries its head, and CDP puts `"id":<n>` in the
+    /// object's first field, so the id survives exactly the damage that makes the
+    /// frame unparseable. That is the whole point: it answers "was this mine?" when
+    /// the parser cannot.
+    ///
+    /// DELIBERATELY NOT A JSON PARSER. It scans for the first `"id":` and reads the
+    /// digits after it. An EVENT has no `id` at all (it has `method`), so `None`
+    /// means "not a response", which is already a reason to skip. A wrong answer
+    /// here is bounded: attributing a frame to us that is not ours fails one call
+    /// that would otherwise time out; failing to attribute ours turns a fast error
+    /// into a deadline. Neither invents a result.
+    fn cdp_frame_id_hint(text: &str) -> Option<u64> {
+        // Only look at the head. A frame whose `id` is megabytes in is not a CDP
+        // response, and scanning the whole of a large malformed payload for every
+        // skipped frame is work with no answer at the end of it.
+        let head = &text[..text.len().min(512)];
+        let at = head.find("\"id\":")? + 5;
+        let rest = head[at..].trim_start();
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
     }
-}
+
+    /// The shipped decision, as a function so a test can drive it (AMUX-4824).
+    ///
+    /// Inline, this was a `match` arm inside the socket loop, and nothing but a
+    /// live CDP connection could reach it. That is the same shape that let a
+    /// deadline test pass against a rebuilt expression earlier today: a decision
+    /// only exercised through machinery nobody can stand up in a test is a decision
+    /// no mutation can reach.
+    fn unparseable_frame_verdict(hint: Option<u64>, waiting_for: u64) -> FrameVerdict {
+        match hint {
+            Some(found) if found == waiting_for => FrameVerdict::Ours,
+            // `None` is an EVENT (no id at all) or a frame damaged past
+            // attribution. Both are skipped: claiming them would fail a call over
+            // a message it never asked for, which is the defect this fixes.
+            _ => FrameVerdict::Skip,
+        }
+    }
 
     /// One CDP command. Chrome interleaves EVENT messages on the same
     /// socket; anything without our id is skipped, and the deadline caps the
@@ -2195,9 +3148,27 @@ fn unparseable_frame_verdict(hint: Option<u64>, waiting_for: u64) -> FrameVerdic
         params: Value,
         timeout: std::time::Duration,
     ) -> anyhow::Result<Value> {
+        self.call_in(None, method, params, timeout, None).await
+    }
+
+    /// `call`, optionally inside a child session (a cross-origin iframe this
+    /// socket attached to, see `attach_frames`), and optionally keeping the
+    /// EVENTS that arrive while waiting instead of dropping them.
+    pub async fn call_in(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+        mut events: Option<&mut Vec<Value>>,
+    ) -> anyhow::Result<Value> {
         self.next_id += 1;
         let id = self.next_id;
-        let payload = json!({ "id": id, "method": method, "params": params }).to_string();
+        let mut msg = json!({ "id": id, "method": method, "params": params });
+        if let Some(sid) = session {
+            msg["sessionId"] = json!(sid);
+        }
+        let payload = msg.to_string();
         let fut = async {
             use tokio_tungstenite::tungstenite::Message;
             self.ws.send(Message::Text(payload)).await?;
@@ -2267,12 +3238,19 @@ fn unparseable_frame_verdict(hint: Option<u64>, waiting_for: u64) -> FrameVerdic
                             if let Some(err) = v.get("error") {
                                 anyhow::bail!(
                                     "CDP {method}: {}",
-                                    err.get("message").and_then(Value::as_str).unwrap_or("error")
+                                    err.get("message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("error")
                                 );
                             }
                             return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                         }
                         // No id match: a protocol event — not ours, keep reading.
+                        if let Some(ev) = events.as_deref_mut() {
+                            if v.get("method").is_some() {
+                                ev.push(v);
+                            }
+                        }
                     }
                     Message::Close(_) => anyhow::bail!(
                         "CDP websocket closed during {method} ({skipped_unparseable} unparseable \
@@ -2296,15 +3274,80 @@ fn unparseable_frame_verdict(hint: Option<u64>, waiting_for: u64) -> FrameVerdic
         }
     }
 
+    /// Attach to the page's cross-origin iframes. Chrome runs each in its own
+    /// process, so `Runtime.evaluate` on the page never reaches into one (a
+    /// Stripe or Braintree card field). `Target.setAutoAttach` with `flatten`
+    /// announces each existing one as `Target.attachedToTarget` on THIS socket;
+    /// commands then go to it with its `sessionId` (`call_in`, `eval_in`).
+    /// Returns (sessionId, url) per iframe. `settle` is how long to keep
+    /// collecting announcements after Chrome acknowledges.
+    pub async fn attach_frames(
+        &mut self,
+        settle: std::time::Duration,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let mut events = Vec::new();
+        self.call_in(
+            None,
+            "Target.setAutoAttach",
+            json!({ "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true }),
+            std::time::Duration::from_secs(10),
+            Some(&mut events),
+        )
+        .await?;
+        let deadline = tokio::time::Instant::now() + settle;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            use tokio_tungstenite::tungstenite::Message;
+            match tokio::time::timeout(left, self.ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                        if v.get("method").is_some() {
+                            events.push(v);
+                        }
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(e))) => return Err(e.into()),
+                Ok(None) => anyhow::bail!("CDP websocket closed while attaching frames"),
+                Err(_) => break,
+            }
+        }
+        Ok(events
+            .iter()
+            .filter(|e| e["method"] == "Target.attachedToTarget")
+            .filter(|e| e.pointer("/params/targetInfo/type").and_then(Value::as_str) == Some("iframe"))
+            .filter_map(|e| {
+                Some((
+                    e.pointer("/params/sessionId")?.as_str()?.to_string(),
+                    e.pointer("/params/targetInfo/url").and_then(Value::as_str).unwrap_or("").to_string(),
+                ))
+            })
+            .collect())
+    }
+
     /// Runtime.evaluate with by-value results. A page exception is an ERROR
     /// carrying the page's own description, never a silent null — an eval
     /// that cannot fail reads as "the page had no answer" (ethos rule 7).
     pub async fn eval(&mut self, expr: &str, timeout_s: u64) -> anyhow::Result<Value> {
+        self.eval_session(None, expr, timeout_s).await
+    }
+
+    /// `eval` inside an attached iframe (`attach_frames`).
+    pub async fn eval_in(&mut self, session: &str, expr: &str, timeout_s: u64) -> anyhow::Result<Value> {
+        self.eval_session(Some(session), expr, timeout_s).await
+    }
+
+    async fn eval_session(&mut self, session: Option<&str>, expr: &str, timeout_s: u64) -> anyhow::Result<Value> {
         let r = self
-            .call(
+            .call_in(
+                session,
                 "Runtime.evaluate",
                 json!({ "expression": expr, "returnByValue": true, "awaitPromise": true }),
                 std::time::Duration::from_secs(timeout_s),
+                None,
             )
             .await?;
         if let Some(ex) = r.get("exceptionDetails") {
@@ -2502,6 +3545,30 @@ pub fn is_delegation_exit(status: &std::process::ExitStatus) -> bool {
     status.success()
 }
 
+/// Which KIND of death a Chrome that never reached CDP suffered (AMUX-4939).
+///
+/// Extracted for the same reason `describe_cdp_probe` and `is_delegation_exit`
+/// are: the distinction is the one an investigator acts on, and pinning it must
+/// not require spawning a Chrome that dies on cue.
+///
+/// The split is between causes that need OPPOSITE responses. `killed_by_signal`
+/// is somebody else killing Chrome, so the thing to go read is the host: the
+/// 2026-09-22 specimen was macOS `amfid` failing code-signature validation at
+/// exec ~370ms in, hours after a Chrome self-update, and no amux change would
+/// have prevented it. `exited_nonzero` is Chrome itself refusing what amux
+/// asked for, which IS amux's to fix. Grouping both under one "launch failed"
+/// counter sends every reader to the wrong half of that.
+///
+/// Exit 0 never reaches here: `is_delegation_exit` consumes it upstream, so
+/// `exited_nonzero` is accurate at the only call site.
+pub fn classify_launch_death(status: &std::process::ExitStatus) -> &'static str {
+    if std::os::unix::process::ExitStatusExt::signal(status).is_some() {
+        "killed_by_signal"
+    } else {
+        "exited_nonzero"
+    }
+}
+
 impl From<anyhow::Error> for DriverError {
     fn from(e: anyhow::Error) -> Self {
         DriverError::Cdp(e)
@@ -2522,7 +3589,10 @@ pub struct DriverPage {
 /// else a fresh tab on `create_url` (default about:blank). The port comes
 /// from [`RUNNING`] only — verbs NEVER attach to a browser this process did
 /// not launch (a human's Chrome is not ours to drive).
-pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<DriverPage, DriverError> {
+pub async fn resolve_page(
+    session: &str,
+    create_url: Option<&str>,
+) -> Result<DriverPage, DriverError> {
     resolve_page_avoiding(session, create_url, None).await
 }
 
@@ -2550,6 +3620,16 @@ fn registry_row_for_port(port: u16) -> Option<(String, String, u32)> {
 
 /// How many times a verb found the registry naming a browser whose PROCESS is
 /// gone (AMUX-3886). Read by `GET /api/browser/status`.
+/// How many times a verb found a browser ALIVE but wedged (its CDP port stopped
+/// answering) and stopped it so the next verb has a clean state (AMUX-5021).
+///
+/// Deliberately NOT folded into `DEAD_BROWSER_RECOVERIES`: that one counts
+/// browsers whose PROCESS was gone, and a wedged browser's process is running.
+/// AMUX-3886 exists to tell those two apart, so one counter for both would
+/// undo it exactly where a reader looks to check.
+pub static WEDGED_BROWSER_RECOVERIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub static DEAD_BROWSER_RECOVERIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2608,7 +3688,12 @@ async fn run_kill(
     let args = checked_kill_args(pid, signal, operation)?;
     #[cfg(test)]
     let _ = TEST_KILL_COMMANDS.try_with(|commands| commands.borrow_mut().push(args.clone()));
-    Some(tokio::process::Command::new("kill").args(args).status().await)
+    Some(
+        tokio::process::Command::new("kill")
+            .args(args)
+            .status()
+            .await,
+    )
 }
 
 #[cfg(test)]
@@ -2616,12 +3701,16 @@ pub async fn test_with_kill_capture<F>(future: F) -> F::Output
 where
     F: std::future::Future,
 {
-    TEST_KILL_COMMANDS.scope(std::cell::RefCell::new(Vec::new()), future).await
+    TEST_KILL_COMMANDS
+        .scope(std::cell::RefCell::new(Vec::new()), future)
+        .await
 }
 
 #[cfg(test)]
 pub fn test_kill_commands() -> Vec<[String; 2]> {
-    TEST_KILL_COMMANDS.try_with(|commands| commands.borrow().clone()).unwrap_or_default()
+    TEST_KILL_COMMANDS
+        .try_with(|commands| commands.borrow().clone())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2666,7 +3755,11 @@ pub(crate) enum CdpListVerdict {
     Wedged { pid: u32, profile: String },
     /// The process is GONE while the registry still named it. The caller's
     /// fixable state, not amux failing.
-    Gone { pid: u32, profile: String, started_by: String },
+    Gone {
+        pid: u32,
+        profile: String,
+        started_by: String,
+    },
 }
 
 /// The rule, separated from its side effects. `entry` is the registry row for
@@ -2678,7 +3771,11 @@ pub(crate) fn classify_cdp_list_failure(
     match entry {
         None => CdpListVerdict::Unregistered,
         Some((profile, _, pid)) if alive => CdpListVerdict::Wedged { pid, profile },
-        Some((profile, started_by, pid)) => CdpListVerdict::Gone { pid, profile, started_by },
+        Some((profile, started_by, pid)) => CdpListVerdict::Gone {
+            pid,
+            profile,
+            started_by,
+        },
     }
 }
 
@@ -2713,18 +3810,77 @@ async fn cdp_list_failure(session: &str, port: u16, e: anyhow::Error) -> DriverE
             DriverError::Cdp(e)
         }
         CdpListVerdict::Wedged { pid, profile } => {
+            // RECOVER IT INSTEAD OF INSTRUCTING A HUMAN TO (AMUX-5021).
+            //
+            // AMUX-3886 got the DIAGNOSIS right and stopped one step short of
+            // the fix. The `Gone` arm below already self-heals: it records the
+            // corpse, clears the registry and answers with the fixable state.
+            // This arm returned a 502 whose body told the operator to run the
+            // two verbs amux itself owns — "POST /api/browser/stop then
+            // /api/browser/start to replace it".
+            //
+            // CLAUDE.md's standing harness rule is explicit about that shape:
+            // "if normal project or worker progress needs a manual override,
+            // restart, retry ... treat that need as an Amux defect. Implement
+            // bounded, logged discovery and recovery."
+            //
+            // Measured: 3 of 872 requests to /api/browser/screenshot (0.34%),
+            // all inside one 90-second window on 2026-09-23. The first waited
+            // 27,491 ms before giving up; the next two failed in 18 ms and
+            // 62 ms. So the caller already tolerates a long wait here, and
+            // `stop_profile_as_reason` is bounded: SIGTERM, then SIGKILL after
+            // an 8s budget.
+            //
+            // SIGTERM FIRST MATTERS and is why this reuses the stop path rather
+            // than killing directly — TERM is the signal Chrome flushes
+            // Cookies and Local Storage on, so a logged-in profile survives the
+            // recovery. SIGKILL is precisely what loses them.
+            //
+            // It does NOT restart. The `Gone` arm does not either, and starting
+            // a browser has side effects (a profile lock, a window) that belong
+            // to whoever asked for one. The caller gets `NotRunning`, which is
+            // the same fixable state a dead browser produces, and `start` is
+            // theirs to call.
             tracing::warn!(
                 session, port, pid, profile, cause = %format!("{e:#}"),
+                verdict = "browser_wedged_recovered",
                 "browser: Chrome is ALIVE but its CDP port did not answer — wedged or refusing, \
-                 not gone; the registry is left intact (AMUX-3886)"
+                 not gone. Stopping it so the next verb has a clean state instead of returning \
+                 a 502 that asks a human to do it (AMUX-5021, was AMUX-3886)"
             );
-            DriverError::Cdp(e.context(format!(
-                "Chrome pid {pid} (profile {profile:?}) is ALIVE but its CDP port {port} did not \
-                 answer /json/list, so the browser is wedged or refusing rather than gone. \
-                 POST /api/browser/stop then /api/browser/start to replace it"
-            )))
+            let report = stop_profile_as_reason(
+                &amux_home(),
+                &profile,
+                "amux:wedged-cdp-recovery",
+                "CDP port stopped answering /json/list while the process was alive",
+            )
+            .await;
+            tracing::info!(
+                session, port, pid, profile,
+                stopped = report.stopped,
+                verdict = "browser_wedged_recovered",
+                measured = true,
+                "browser: wedged Chrome stopped; the caller gets NotRunning and may start a \
+                 replacement"
+            );
+            NATIVE_TARGETS
+                .lock()
+                .expect("native targets poisoned")
+                .remove(session);
+            // A SEPARATE COUNTER, because reusing the existing one would make it
+            // lie. `DEAD_BROWSER_RECOVERIES` is documented as "how many times a
+            // verb found the registry naming a browser whose PROCESS is gone".
+            // A wedged browser's process is emphatically NOT gone — that is the
+            // whole distinction AMUX-3886 drew, and folding the two together
+            // would erase it in the one place someone reads to check.
+            WEDGED_BROWSER_RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DriverError::NotRunning
         }
-        CdpListVerdict::Gone { pid, profile, started_by } => {
+        CdpListVerdict::Gone {
+            pid,
+            profile,
+            started_by,
+        } => {
             tracing::warn!(
                 session, port, pid, profile, started_by = %started_by, cause = %format!("{e:#}"),
                 "browser: the registry named a browser whose PROCESS IS GONE — recording \
@@ -2740,8 +3896,14 @@ async fn cdp_list_failure(session: &str, port: u16, e: anyhow::Error) -> DriverE
                 "code": serde_json::Value::Null,
                 "signal": serde_json::Value::Null,
             }));
-            RUNNING.lock().expect("browser registry poisoned").remove(&profile);
-            NATIVE_TARGETS.lock().expect("native targets poisoned").remove(session);
+            RUNNING
+                .lock()
+                .expect("browser registry poisoned")
+                .remove(&profile);
+            NATIVE_TARGETS
+                .lock()
+                .expect("native targets poisoned")
+                .remove(session);
             clear_running_for(&amux_home(), &profile);
             DEAD_BROWSER_RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             DriverError::NotRunning
@@ -2752,6 +3914,78 @@ async fn cdp_list_failure(session: &str, port: u16, e: anyhow::Error) -> DriverE
 #[cfg(test)]
 mod cdp_list_failure_tests {
     use super::*;
+
+    /// AMUX-5021. A WEDGED browser must be RECOVERED, not reported with
+    /// instructions for a human.
+    ///
+    /// `Gone` already self-heals — records the corpse, clears the registry,
+    /// answers `NotRunning`. `Wedged` returned a 502 whose body said "POST
+    /// /api/browser/stop then /api/browser/start to replace it", two verbs
+    /// amux owns. CLAUDE.md's standing harness rule calls that an amux defect.
+    ///
+    /// A SOURCE GUARD, and the reason is worth stating rather than hiding.
+    /// Driving this end to end needs a registry entry whose pid is ALIVE, and
+    /// the recovery then kills it — so the test would have to spawn a real
+    /// child. That part is fine. What is not: `cdp_list_failure` calls
+    /// `amux_home()` directly, `amux_home` reads process env, and this
+    /// codebase's own config.rs warns that an env-mutating test races every
+    /// other test that reads a home. So the recovery would run against the
+    /// LIVE `~/.amux` and rewrite `browser-running.json` from a unit test.
+    /// The wiring is what regresses here; the decision it depends on
+    /// (`classify_cdp_list_failure`) is pure and tested separately.
+    #[test]
+    fn a_wedged_browser_is_recovered_rather_than_handed_back_as_a_502() {
+        let src = include_str!("browser.rs");
+        let at = src
+            .find("CdpListVerdict::Wedged { pid, profile } =>")
+            .expect("the Wedged arm is gone; this guard has lost its subject");
+        let end = src[at..]
+            .find("CdpListVerdict::Gone {")
+            .map(|i| at + i)
+            .expect("the Gone arm follows Wedged; the match shape changed");
+        let arm = &src[at..end];
+
+        assert!(
+            arm.contains("stop_profile_as_reason("),
+            "the Wedged arm no longer stops the wedged browser, so the caller is \
+             back to being told to do it by hand:\n{arm}"
+        );
+        assert!(
+            arm.contains("DriverError::NotRunning"),
+            "the Wedged arm must answer with the FIXABLE state, the way Gone does, \
+             rather than a 5xx:\n{arm}"
+        );
+        // NEGATIVES SEARCH THE CODE, NOT THE COMMENTS.
+        //
+        // A negative assertion over `include_str!` finds the arm's own prose.
+        // Building the needle with `format!` was my first fix and it is not
+        // enough: the phrase this arm must no longer EMIT is quoted in the
+        // comment explaining why it no longer emits it, so the literal is in
+        // the file whatever the test does. Stripping `//` lines fixes the class
+        // rather than the instance, and every negative below is over `code`.
+        //
+        // Fifth self-matching check in one session. The tell was never care; it
+        // was the result disagreeing with what I expected to have exercised.
+        let code: String = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("libc::kill("),
+            "the Wedged arm kills directly; going through the stop path is what \
+             gives Chrome a TERM to flush cookies on:\n{code}"
+        );
+        assert!(
+            !code.contains("POST /api/browser/stop then"),
+            "the Wedged arm still tells the operator to run the verbs amux just \
+             ran:\n{code}"
+        );
+        // The positives must hold over the CODE too, or stripping comments could
+        // hide a regression where the call survives only in prose.
+        assert!(code.contains("stop_profile_as_reason("), "{code}");
+        assert!(code.contains("DriverError::NotRunning"), "{code}");
+    }
 
     /// THE DEFECT AMUX-3886 IS ABOUT, pinned against a real socket.
     ///
@@ -2811,25 +4045,40 @@ mod cdp_list_failure_tests {
         // browser out from under its owner.
         assert_eq!(
             classify_cdp_list_failure(entry(), true),
-            CdpListVerdict::Wedged { pid: 4242, profile: "default".into() },
+            CdpListVerdict::Wedged {
+                pid: 4242,
+                profile: "default".into()
+            },
             "a live pid must never be swept as a corpse"
         );
         // A stop that raced us leaves no row to judge.
-        assert_eq!(classify_cdp_list_failure(None, false), CdpListVerdict::Unregistered);
-        assert_eq!(classify_cdp_list_failure(None, true), CdpListVerdict::Unregistered);
+        assert_eq!(
+            classify_cdp_list_failure(None, false),
+            CdpListVerdict::Unregistered
+        );
+        assert_eq!(
+            classify_cdp_list_failure(None, true),
+            CdpListVerdict::Unregistered
+        );
     }
 
     /// `pid_alive` must actually discriminate, or the classifier above is fed a
     /// constant and every arm of it is decoration.
     #[test]
     fn pid_alive_separates_this_process_from_a_reaped_one() {
-        assert!(pid_alive(std::process::id()), "this very process must read as alive");
+        assert!(
+            pid_alive(std::process::id()),
+            "this very process must read as alive"
+        );
         // A child we spawn and reap: its pid is genuinely gone, and unlike a
         // made-up number it cannot accidentally belong to something else.
         let mut c = std::process::Command::new("true").spawn().expect("spawn");
         let pid = c.id();
         c.wait().expect("wait");
-        assert!(!pid_alive(pid), "a reaped child (pid {pid}) must read as gone");
+        assert!(
+            !pid_alive(pid),
+            "a reaped child (pid {pid}) must read as gone"
+        );
     }
 
     /// The exact Linux runner-kill boundary from ATE-44. procps accepted
@@ -2839,14 +4088,22 @@ mod cdp_list_failure_tests {
     #[test]
     fn process_id_validation_rejects_group_sentinels_and_unsigned_wrap() {
         for invalid in [0, 1, (i32::MAX as u32) + 1, u32::MAX] {
-            assert_eq!(checked_process_id(invalid), None, "accepted invalid pid {invalid}");
+            assert_eq!(
+                checked_process_id(invalid),
+                None,
+                "accepted invalid pid {invalid}"
+            );
             assert_eq!(
                 checked_kill_args(invalid, "-TERM", "test"),
                 None,
                 "pid {invalid} reached /bin/kill argument construction"
             );
         }
-        assert_eq!(checked_process_id(2), Some(2), "ordinary positive pid must remain valid");
+        assert_eq!(
+            checked_process_id(2),
+            Some(2),
+            "ordinary positive pid must remain valid"
+        );
         assert_eq!(
             checked_kill_args(42, "-TERM", "test"),
             Some(["-TERM".to_string(), "42".to_string()]),
@@ -2871,7 +4128,10 @@ mod cdp_list_failure_tests {
         ] {
             assert_eq!(persisted_process_id(&invalid), None, "accepted {invalid}");
         }
-        assert_eq!(persisted_process_id(&serde_json::json!({"pid": 42})), Some(42));
+        assert_eq!(
+            persisted_process_id(&serde_json::json!({"pid": 42})),
+            Some(42)
+        );
     }
 }
 
@@ -2912,17 +4172,55 @@ pub async fn resolve_page_avoiding(
             cdp_port: port,
             target_id: t.get("id")?.as_str()?.to_string(),
             ws_url: t.get("webSocketDebuggerUrl")?.as_str()?.to_string(),
-            url: t.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
-            title: t.get("title").and_then(Value::as_str).unwrap_or("").to_string(),
+            url: t
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            title: t
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         })
     };
     let tab_id = |t: &Value| t.get("id").and_then(Value::as_str).map(str::to_string);
+
+    // A JOINER DRIVES ONLY ITS OWN TAB. Every other tab in the browser belongs
+    // to the owner whether or not the owner has bound it, so the rebind rules
+    // below (prefer a real page, take an unclaimed one) must never run for a
+    // joiner. If its tab is gone or unreachable it gets a fresh one.
+    if let Some(own) = joined_tab(session) {
+        let alive = tabs
+            .iter()
+            .find(|t| tab_id(t).as_deref() == Some(own.as_str()))
+            .and_then(page_of)
+            .filter(|_| avoid != Some(own.as_str()));
+        let p = match alive {
+            Some(p) => p,
+            None => {
+                let t = cdp_new_tab(port, create_url.unwrap_or("about:blank")).await.map_err(DriverError::Cdp)?;
+                let p = page_of(&t).ok_or_else(|| DriverError::Cdp(anyhow::anyhow!("CDP /json/new returned no webSocketDebuggerUrl: {t}")))?;
+                if let Some(j) = JOINED.lock().expect("joined registry poisoned").get_mut(session) {
+                    j.tab = p.target_id.clone();
+                }
+                tracing::warn!(session, old_tab = %own, new_tab = %p.target_id, measured = true, n_considered = 1,
+                    verdict = "browser_join_tab_replaced", "a joined session's own tab was gone or unreachable; opened a new one rather than using the owner's");
+                p
+            }
+        };
+        NATIVE_TARGETS.lock().expect("native targets poisoned").insert(session.to_string(), p.target_id.clone());
+        return Ok(p);
+    }
 
     let (bound, claimed_by_others): (Option<String>, std::collections::HashSet<String>) = {
         let map = NATIVE_TARGETS.lock().expect("native targets poisoned");
         (
             map.get(session).cloned(),
-            map.iter().filter(|(k, _)| k.as_str() != session).map(|(_, v)| v.clone()).collect(),
+            map.iter()
+                .filter(|(k, _)| k.as_str() != session)
+                .map(|(_, v)| v.clone())
+                .collect(),
         )
     };
     let (choice, binding_was_stale) =
@@ -2932,7 +4230,10 @@ pub async fn resolve_page_avoiding(
         // binding is stale however healthy `/json/list` still claims it is. Drop
         // it here rather than at the call site: leaving it would make the very
         // next request resolve straight back to the tab we are abandoning.
-        NATIVE_TARGETS.lock().expect("native targets poisoned").remove(session);
+        NATIVE_TARGETS
+            .lock()
+            .expect("native targets poisoned")
+            .remove(session);
         STALE_BINDING_RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             "[browser] session {session:?} unbound from wedged target {}: Chrome still lists it \
@@ -2942,7 +4243,10 @@ pub async fn resolve_page_avoiding(
     }
     match choice {
         TargetChoice::KeepBound(tid) | TargetChoice::Rebind(tid) => {
-            if let Some(p) = tabs.iter().find(|t| tab_id(t).as_deref() == Some(tid.as_str())).and_then(page_of)
+            if let Some(p) = tabs
+                .iter()
+                .find(|t| tab_id(t).as_deref() == Some(tid.as_str()))
+                .and_then(page_of)
             {
                 NATIVE_TARGETS
                     .lock()
@@ -2956,9 +4260,13 @@ pub async fn resolve_page_avoiding(
     }
     // Every page tab is claimed by another session (or none exist): open a
     // fresh one rather than hijacking a peer's tab.
-    let t = cdp_new_tab(port, create_url.unwrap_or("about:blank")).await.map_err(DriverError::Cdp)?;
+    let t = cdp_new_tab(port, create_url.unwrap_or("about:blank"))
+        .await
+        .map_err(DriverError::Cdp)?;
     let p = page_of(&t).ok_or_else(|| {
-        DriverError::Cdp(anyhow::anyhow!("CDP /json/new returned no webSocketDebuggerUrl: {t}"))
+        DriverError::Cdp(anyhow::anyhow!(
+            "CDP /json/new returned no webSocketDebuggerUrl: {t}"
+        ))
     })?;
     NATIVE_TARGETS
         .lock()
@@ -2998,9 +4306,8 @@ pub(crate) fn choose_target(
 ) -> (TargetChoice, bool) {
     let id_of = |t: &Value| t.get("id").and_then(Value::as_str).map(str::to_string);
     let listed = |tid: &str| {
-        tabs.iter().any(|t| {
-            id_of(t).as_deref() == Some(tid) && t.get("webSocketDebuggerUrl").is_some()
-        })
+        tabs.iter()
+            .any(|t| id_of(t).as_deref() == Some(tid) && t.get("webSocketDebuggerUrl").is_some())
     };
     let stale = bound.is_some() && bound == avoid;
     let blank_url = |u: &str| u.is_empty() || u == "about:blank" || u.starts_with("chrome://");
@@ -3083,14 +4390,168 @@ pub(crate) fn choose_target(
     }
 }
 
+/// The browser `session` started MOST RECENTLY, for rule 1 below.
+///
+/// A lane can start more than one browser (a Console profile, then a NetSuite
+/// profile). This used to take the FIRST match in HashMap order, which is
+/// arbitrary: on 2026-10-06 a lane started `netsuite` and its very next
+/// `eval` ran on the still-open `claude` profile's Console page. The lane's
+/// latest `start` is the browser it means. Ties on the second-resolution
+/// `started_at` break on pid. Ambiguity is logged so a sweep sees lanes
+/// holding several browsers.
+fn latest_started_by<'a>(
+    g: &'a std::collections::HashMap<String, RunningBrowser>,
+    session: &str,
+) -> Option<&'a RunningBrowser> {
+    if session.is_empty() {
+        return None;
+    }
+    let mine: Vec<&RunningBrowser> = g.values().filter(|r| r.started_by == session).collect();
+    if mine.len() > 1 {
+        tracing::warn!(
+            verdict = "session_owns_multiple_browsers",
+            session,
+            n = mine.len(),
+            profiles = ?mine.iter().map(|r| r.profile.as_str()).collect::<Vec<_>>(),
+            "a session started several browsers; driving the most recently started one"
+        );
+    }
+    mine.into_iter().max_by_key(|r| (r.started_at, r.pid))
+}
+
+// ---- joining a running browser ---------------------------------------------
+//
+// One Chrome runs per profile. A second session wanting the same profile used
+// to be refused with a 409, and the shared browser route then dropped to its
+// CDP rung: a headless COPY of the human's Chrome profile, made once and never
+// refreshed, so its sign-ins went stale (measured 2026-10-17: all 13 CDP
+// routes in two days followed exactly that refusal). Joining gives the second
+// session its own NEW tab in the running browser, which already holds the
+// profile's live sign-ins. It never adopts the owner's tabs, never displaces
+// the owner, and its stop closes only its own tab.
+
+/// A session's join of a browser another session started.
+#[derive(Clone, Debug)]
+pub struct Join {
+    pub profile: String,
+    /// The tab this session opened. It is the ONLY tab a joiner drives and the
+    /// only one its stop closes. The general resolver rebinds a blank binding
+    /// to any unclaimed real page, and in a shared browser that is the
+    /// owner's tab: measured 2026-10-17, a joined session navigated and then
+    /// closed a tab it never opened while its own stayed on about:blank.
+    pub tab: String,
+    /// The pid of the browser joined. A join belongs to THAT browser: after it
+    /// stops (or dies) a later start of the same profile is someone else's
+    /// browser, and the stale join used to route the joiner into it and open a
+    /// tab there (2026-11-06). 0 in old test fixtures matches any pid.
+    pub pid: u32,
+}
+
+/// session -> its join.
+pub static JOINED: LazyLock<Mutex<std::collections::HashMap<String, Join>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn joined_port(g: &std::collections::HashMap<String, RunningBrowser>, session: &str) -> Option<(u16, String)> {
+    let (profile, pid) = JOINED.lock().expect("joined registry poisoned").get(session).map(|j| (j.profile.clone(), j.pid))?;
+    let r = g.values().find(|r| r.profile == profile)?;
+    if pid != 0 && r.pid != pid {
+        JOINED.lock().expect("joined registry poisoned").remove(session);
+        tracing::warn!(session, profile = %profile, joined_pid = pid, running_pid = r.pid, measured = true, n_considered = 1,
+            verdict = "browser_join_stale_dropped", "the browser this session joined stopped; a later start of the profile is not its join");
+        return None;
+    }
+    Some((r.cdp_port, r.profile.clone()))
+}
+
+
+/// Open a fresh tab for `session` in the browser already running `profile`
+/// and bind the session to it. Errors when that profile is not running.
+pub async fn join_running(session: &str, profile: &str, url: &str) -> Result<DriverPage, DriverError> {
+    if session.trim().is_empty() {
+        return Err(DriverError::Cdp(anyhow::anyhow!("joining a running browser needs an explicit session")));
+    }
+    let found = {
+        let g = RUNNING.lock().expect("browser registry poisoned");
+        g.values().find(|r| r.profile == profile).map(|r| (r.cdp_port, r.pid))
+    };
+    let Some((port, browser_pid)) = found else { return Err(DriverError::NotRunning) };
+    let t = cdp_new_tab(port, if url.is_empty() { "about:blank" } else { url })
+        .await
+        .map_err(DriverError::Cdp)?;
+    let target_id = t.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+    let ws_url = t.get("webSocketDebuggerUrl").and_then(Value::as_str).unwrap_or_default().to_string();
+    if target_id.is_empty() || ws_url.is_empty() {
+        return Err(DriverError::Cdp(anyhow::anyhow!("CDP /json/new returned no target: {t}")));
+    }
+    JOINED.lock().expect("joined registry poisoned")
+        .insert(session.to_string(), Join { profile: profile.to_string(), tab: target_id.clone(), pid: browser_pid });
+    // Joining IS a verb. Without this stamp a browser adopted long ago and joined
+    // a moment ago still carried its old activity clock (2026-10-26: reaped 90s
+    // after a join).
+    touch_verb(profile);
+    NATIVE_TARGETS.lock().expect("native targets poisoned").insert(session.to_string(), target_id.clone());
+    tracing::info!(session, profile, cdp_port = port, target = %target_id, measured = true, n_considered = 1,
+        verdict = "browser_joined", "a session joined the browser already running its profile, in its own tab");
+    Ok(DriverPage { cdp_port: port, target_id, ws_url, url: url.to_string(), title: String::new() })
+}
+
+/// Every session currently joined to `profile`'s browser, sorted. The reaper
+/// tells these as well as the owner when it releases the browser: a joiner is
+/// driving a tab in it and is the session most likely to be mid-task.
+pub fn joiners_of(profile: &str) -> Vec<String> {
+    let mut v: Vec<String> = JOINED
+        .lock()
+        .expect("joined registry poisoned")
+        .iter()
+        .filter(|(_, j)| j.profile == profile)
+        .map(|(s, _)| s.clone())
+        .collect();
+    v.sort();
+    v
+}
+
+/// The profile `session` joined, if it is a joiner rather than an owner.
+pub fn joined_profile(session: &str) -> Option<String> {
+    JOINED.lock().expect("joined registry poisoned").get(session).map(|j| j.profile.clone())
+}
+
+/// The tab `session` opened by joining, if it is a joiner.
+pub fn joined_tab(session: &str) -> Option<String> {
+    JOINED.lock().expect("joined registry poisoned").get(session).map(|j| j.tab.clone())
+}
+
+/// Release a joined session: close ONLY its own tab and forget the join. The
+/// browser and its owner's tabs keep running. Returns (profile, closed tab).
+pub async fn leave_joined(session: &str) -> Option<(String, Option<String>)> {
+    let Join { profile, tab, .. } = JOINED.lock().expect("joined registry poisoned").remove(session)?;
+    NATIVE_TARGETS.lock().expect("native targets poisoned").remove(session);
+    let target = Some(tab);
+    let port = {
+        let g = RUNNING.lock().expect("browser registry poisoned");
+        g.values().find(|r| r.profile == profile).map(|r| r.cdp_port)
+    };
+    if let (Some(port), Some(t)) = (port, target.as_deref()) {
+        let _ = reqwest::Client::new()
+            .put(format!("http://127.0.0.1:{port}/json/close/{t}"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+    }
+    tracing::info!(session, profile = %profile, target = target.as_deref().unwrap_or(""), measured = true, n_considered = 1,
+        verdict = "browser_join_released", "a joined session closed its own tab; the shared browser keeps running");
+    Some((profile, target))
+}
+
 /// WHICH BROWSER A SESSION MEANS (AMUX-3828).
 ///
 /// 1. The one it STARTED. That is what a lane means by "my browser", and it is
 ///    what makes two workers on two profiles independent without either naming
 ///    a profile on every verb.
-/// 2. Otherwise, if exactly one is running, that one — an unambiguous situation
+/// 2. Otherwise the one it JOINED: a browser another session started on the
+///    profile it asked for, where it owns a tab of its own.
+/// 3. Otherwise, if exactly one is running, that one — an unambiguous situation
 ///    should not require a parameter.
-/// 3. Otherwise None. With several browsers and no claim on any of them, a
+/// 4. Otherwise None. With several browsers and no claim on any of them, a
 ///    guess would drive somebody else's page; the caller must name a profile.
 ///
 /// Ethan's requirement is BOTH shapes: workers on DIFFERENT browsers are served
@@ -3099,10 +4560,11 @@ pub(crate) fn choose_target(
 /// being refused.
 pub fn port_for_session(session: &str) -> Option<u16> {
     let g = RUNNING.lock().expect("browser registry poisoned");
-    if !session.is_empty() {
-        if let Some(r) = g.values().find(|r| r.started_by == session) {
-            return Some(r.cdp_port);
-        }
+    if let Some(r) = latest_started_by(&g, session) {
+        return Some(r.cdp_port);
+    }
+    if let Some((port, _)) = joined_port(&g, session) {
+        return Some(port);
     }
     if g.len() == 1 {
         return g.values().next().map(|r| r.cdp_port);
@@ -3110,9 +4572,31 @@ pub fn port_for_session(session: &str) -> Option<u16> {
     None
 }
 
+/// The PROFILE of the browser `port_for_session` would pick, by the same two
+/// rules, so the profile-scope check (AMUX-5307) judges exactly the browser a
+/// driver verb is about to drive.
+pub fn profile_for_session(session: &str) -> Option<String> {
+    let g = RUNNING.lock().expect("browser registry poisoned");
+    if let Some(r) = latest_started_by(&g, session) {
+        return Some(r.profile.clone());
+    }
+    if let Some((_, profile)) = joined_port(&g, session) {
+        return Some(profile);
+    }
+    if g.len() == 1 {
+        return g.values().next().map(|r| r.profile.clone());
+    }
+    None
+}
+
 /// Every running browser's CDP port.
 pub fn all_ports() -> Vec<u16> {
-    RUNNING.lock().expect("browser registry poisoned").values().map(|r| r.cdp_port).collect()
+    RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .values()
+        .map(|r| r.cdp_port)
+        .collect()
 }
 
 #[cfg(test)]
@@ -3149,6 +4633,92 @@ mod multi_browser_tests {
     /// `blocking_lock` because this is a plain `#[test]` with no runtime, where
     /// it is the correct call. Inside an async test it would panic, which is
     /// why the others `.await` it.
+    /// A lane that started TWO browsers means the one it started last
+    /// (2026-10-06: `start netsuite` then `eval` ran on the older `claude`
+    /// profile's Console page). Pid is set against the expected answer so a
+    /// pid-only tie-break cannot pass, and both insertion orders are tried
+    /// so HashMap order cannot pass it either.
+    #[test]
+    fn a_lane_with_two_browsers_drives_the_one_it_started_last() {
+        let _reg = TEST_REGISTRY.blocking_lock();
+        for order in [["claude", "netsuite"], ["netsuite", "claude"]] {
+            test_clear_running();
+            for p in order {
+                let (pid, port) = if p == "claude" { (900, 9101) } else { (10, 9102) };
+                test_seed_running_port(p, "lane", pid, port);
+            }
+            {
+                let mut g = RUNNING.lock().expect("browser registry poisoned");
+                g.get_mut("claude").unwrap().started_at = 100;
+                g.get_mut("netsuite").unwrap().started_at = 200;
+            }
+            assert_eq!(port_for_session("lane"), Some(9102), "order {order:?}");
+            assert_eq!(profile_for_session("lane").as_deref(), Some("netsuite"), "order {order:?}");
+        }
+        test_clear_running();
+    }
+
+    /// A joined session's verbs keep the SHARED browser alive. With two
+    /// browsers running, neither the owner match nor the single-browser
+    /// fallback reached a joiner, so the browser it was driving read as idle
+    /// and the activity reaper released it (2026-10-26).
+    #[test]
+    fn a_joiner_stamps_activity_on_the_browser_it_joined() {
+        let _reg = TEST_REGISTRY.blocking_lock();
+        test_clear_running();
+        test_seed_running_port("shared", "owner-lane", 501, 9201);
+        test_seed_running_port("other", "someone-else", 502, 9202);
+        JOINED.lock().unwrap().insert("joiner-lane".into(), Join { profile: "shared".into(), tab: "T1".into(), pid: 0 });
+        assert_eq!(joiners_of("shared"), vec!["joiner-lane".to_string()]);
+        assert!(joiners_of("other").is_empty(), "joiners are per profile");
+        touch_verb_for_session("joiner-lane");
+        let stamp = |p: &str| running_all().into_iter().find(|r| r.0 == p).map(|r| r.5).unwrap();
+        assert!(stamp("shared") > 0, "the joined browser must carry the joiner's verb");
+        assert_eq!(stamp("other"), 0, "an unrelated browser must not be stamped");
+        JOINED.lock().unwrap().remove("joiner-lane");
+        test_clear_running();
+    }
+
+    /// A join belongs to the browser it joined. After that browser stops and
+    /// the profile starts again as someone else's browser, the stale join used
+    /// to route the joiner into the new one (2026-11-06).
+    #[test]
+    fn a_join_does_not_follow_its_profile_into_a_new_browser() {
+        let _reg = TEST_REGISTRY.blocking_lock();
+        test_clear_running();
+        test_seed_running_port("shared-j", "owner-lane", 601, 9301);
+        JOINED.lock().unwrap().insert("joiner-j".into(), Join { profile: "shared-j".into(), tab: "T1".into(), pid: 601 });
+        let port = |s: &str| joined_port(&RUNNING.lock().unwrap(), s);
+        assert_eq!(port("joiner-j"), Some((9301, "shared-j".to_string())), "the joined browser routes");
+        test_seed_running_port("shared-j", "next-owner", 777, 9302);
+        assert_eq!(port("joiner-j"), None, "a new browser of the profile is not the join");
+        assert!(joined_profile("joiner-j").is_none(), "the stale join is dropped");
+        test_clear_running();
+    }
+
+    /// The adopt path keeps a recent exit record for the SAME pid instead of
+    /// overwriting it with "died while the server was down", and still
+    /// records an unexplained death (other pid, or a stale record).
+    #[test]
+    fn adopt_keeps_a_recorded_exit_reason_for_the_same_pid() {
+        let now = 1_800_000_000;
+        let prev = serde_json::json!({"ts": now - 30, "pid": 4242, "reason": "stopped", "by": "activity-reaper"});
+        assert!(last_exit_explains(&prev, 4242, now));
+        assert!(!last_exit_explains(&prev, 4243, now), "another pid's record explains nothing");
+        let stale = serde_json::json!({"ts": now - 90_000, "pid": 4242, "reason": "stopped"});
+        assert!(!last_exit_explains(&stale, 4242, now), "a day-old record may be a recycled pid");
+    }
+
+    /// A start whose page never loaded says so to the caller, not only to the log.
+    #[test]
+    fn an_unsettled_start_carries_a_note() {
+        let blank = LaunchSettle { landed: "about:blank".into(), ready_state: String::new(), settled: false, waited_ms: 10_021 };
+        let note = unsettled_start_note(&blank).expect("an unsettled start must carry a note");
+        assert!(note.contains("about:blank") && note.contains("10021ms") && note.contains("run state again"), "{note}");
+        let done = LaunchSettle { landed: "https://x.test/".into(), ready_state: "complete".into(), settled: true, waited_ms: 300 };
+        assert_eq!(unsettled_start_note(&done), None);
+    }
+
     #[test]
     fn multiple_workers_can_use_same_and_different_browsers() {
         let _reg = TEST_REGISTRY.blocking_lock();
@@ -3161,12 +4731,22 @@ mod multi_browser_tests {
         let a = port_for_session("worker-a").expect("worker-a has a browser");
         let b = port_for_session("worker-b").expect("worker-b has a browser");
         assert_ne!(a, b, "two workers on two profiles must not share a port");
-        assert_eq!(running_snapshot_for("alpha").map(|x| x.1), Some("worker-a".into()));
-        assert_eq!(running_snapshot_for("beta").map(|x| x.1), Some("worker-b".into()));
+        assert_eq!(
+            running_snapshot_for("alpha").map(|x| x.1),
+            Some("worker-a".into())
+        );
+        assert_eq!(
+            running_snapshot_for("beta").map(|x| x.1),
+            Some("worker-b".into())
+        );
 
         // A third worker owning nothing, with TWO running: ambiguous, so it
         // must name a profile rather than be pointed at someone else's page.
-        assert_eq!(port_for_session("worker-c"), None, "ambiguous must not guess");
+        assert_eq!(
+            port_for_session("worker-c"),
+            None,
+            "ambiguous must not guess"
+        );
 
         // SAME BROWSER: with exactly one running, a worker that started nothing
         // still resolves to it — sharing, not refusal.
@@ -3174,7 +4754,10 @@ mod multi_browser_tests {
         test_seed_running_port("shared", "worker-a", 111, 9003);
         let owner = port_for_session("worker-a").expect("the owner resolves");
         let guest = port_for_session("worker-b").expect("a guest resolves to the same one");
-        assert_eq!(owner, guest, "two workers must be able to drive ONE browser");
+        assert_eq!(
+            owner, guest,
+            "two workers must be able to drive ONE browser"
+        );
 
         // THE INVARIANT THE PROFILE KEY EXISTS FOR: never two entries for one
         // profile, because two Chromes on one user_data_dir corrupt it.
@@ -3182,7 +4765,11 @@ mod multi_browser_tests {
         test_seed_running_port("same", "worker-a", 111, 9004);
         test_seed_running_port("same", "worker-b", 222, 9005);
         assert_eq!(running_all().len(), 1, "a profile is a slot, not a list");
-        assert_eq!(running_snapshot_for("same").map(|x| x.3), Some(222), "last write replaces");
+        assert_eq!(
+            running_snapshot_for("same").map(|x| x.3),
+            Some(222),
+            "last write replaces"
+        );
 
         // CONTROL: with nothing running nobody resolves — the rule must not
         // manufacture a browser, or "not running" becomes an invalid port.
@@ -3203,14 +4790,20 @@ pub async fn session_bindings() -> Vec<(String, String, bool)> {
         if let Ok(v) = cdp_list(p).await {
             if let Some(a) = v.as_array() {
                 live.extend(
-                    a.iter().filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string)),
+                    a.iter()
+                        .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string)),
                 );
             }
         }
     }
-    let map = NATIVE_TARGETS.lock().expect("native targets poisoned").clone();
-    let mut out: Vec<(String, String, bool)> =
-        map.into_iter().map(|(name, tid)| (name, tid.clone(), live.contains(&tid))).collect();
+    let map = NATIVE_TARGETS
+        .lock()
+        .expect("native targets poisoned")
+        .clone();
+    let mut out: Vec<(String, String, bool)> = map
+        .into_iter()
+        .map(|(name, tid)| (name, tid.clone(), live.contains(&tid)))
+        .collect();
     out.sort();
     out
 }
@@ -3218,11 +4811,17 @@ pub async fn session_bindings() -> Vec<(String, String, bool)> {
 // ---- observation caps (Python `_obs_cap`, D4: policy lives in env) --------
 
 pub fn obs_eval_cap() -> usize {
-    std::env::var("AMUX_OBS_EVAL_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(8000)
+    std::env::var("AMUX_OBS_EVAL_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8000)
 }
 
 pub fn obs_state_cap() -> usize {
-    std::env::var("AMUX_OBS_STATE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(24000)
+    std::env::var("AMUX_OBS_STATE_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24000)
 }
 
 /// Python `_obs_cap`: truncate AND say so — silent truncation reads as the
@@ -3356,23 +4955,105 @@ pub fn inspect_js(limit: usize, clear: bool) -> String {
 /// only when text was actually cut.
 const STATE_JS: &str = r#"
 (function(){
-  var SEL = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [onclick], [contenteditable="true"]';
-  var seen = [];
-  document.querySelectorAll(SEL).forEach(function(e){
-    var r = e.getBoundingClientRect();
-    if (!r.width && !r.height) return;
-    var st = getComputedStyle(e);
-    if (st.visibility === 'hidden' || st.display === 'none') return;
-    seen.push(e);
-  });
+  var SEL = 'a[href], button, input, select, textarea, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="option"], [role="combobox"], [role="textbox"], [onclick], [contenteditable="true"]';
+  // DOCUMENT GENERATION + OBSERVATION ID (grounded act). `gen` is minted once
+  // per document, so a navigation or reload gives a new one; the counter moves
+  // on every observation. /action with an `observation_id` refuses when either
+  // moved, so an index can never silently point at a different element after
+  // the page rerendered or navigated.
+  var gen = window.__amux_gen || (window.__amux_gen = Math.random().toString(36).slice(2, 10));
+  window.__amux_obs_n = (window.__amux_obs_n || 0) + 1;
+  var obs = gen + '.' + window.__amux_obs_n;
+  window.__amux_obs = obs;
+  var seen = [], meta = [], framesUnreachable = 0, shadowRoots = 0, frameCount = 0;
+  // Same-origin iframes and OPEN shadow roots are walked; a cross-origin frame
+  // cannot be read from page script and is COUNTED, never silently skipped.
+  function walk(root, frame, depth) {
+    var win = (root.ownerDocument || root).defaultView || window;
+    root.querySelectorAll(SEL).forEach(function(e){
+      var r = e.getBoundingClientRect();
+      if (!r.width && !r.height) return;
+      var st = win.getComputedStyle(e);
+      if (st.visibility === 'hidden' || st.display === 'none') return;
+      seen.push(e); meta.push(frame);
+    });
+    if (depth > 6) return;
+    root.querySelectorAll('*').forEach(function(h){
+      if (h.shadowRoot) { shadowRoots++; walk(h.shadowRoot, frame, depth + 1); }
+    });
+    root.querySelectorAll('iframe, frame').forEach(function(f, i){
+      frameCount++;
+      var d = null;
+      try { d = f.contentDocument; } catch (_) {}
+      if (!d || !d.documentElement) { framesUnreachable++; return; }
+      walk(d, frame.concat([f.getAttribute('name') || f.id || ('frame' + i)]), depth + 1);
+    });
+  }
+  walk(document, [], 0);
   window.__amux_els = seen;
+  window.__amux_meta = meta;
+  function frameOffset(e) {
+    var x = 0, y = 0, w = (e.ownerDocument && e.ownerDocument.defaultView) || window;
+    while (w && w !== window && w.frameElement) {
+      var fr = w.frameElement.getBoundingClientRect();
+      x += fr.left + w.frameElement.clientLeft; y += fr.top + w.frameElement.clientTop;
+      w = w.parent;
+    }
+    return [x, y];
+  }
+  function roleOf(e) {
+    var r = e.getAttribute('role');
+    if (r) return r;
+    var t = (e.tagName || '').toLowerCase(), ty = (e.getAttribute('type') || '').toLowerCase();
+    if (t === 'a') return 'link';
+    if (t === 'button' || t === 'summary') return 'button';
+    if (t === 'select') return 'combobox';
+    if (t === 'textarea') return 'textbox';
+    if (t === 'input') {
+      if (ty === 'checkbox' || ty === 'radio') return ty;
+      if (ty === 'submit' || ty === 'button' || ty === 'reset' || ty === 'image') return 'button';
+      if (ty === 'search') return 'searchbox';
+      if (ty === 'range') return 'slider';
+      return 'textbox';
+    }
+    if (e.isContentEditable) return 'textbox';
+    return 'generic';
+  }
+  function nameOf(e) {
+    var n = e.getAttribute('aria-label');
+    if (!n && e.getAttribute('aria-labelledby')) {
+      n = e.getAttribute('aria-labelledby').split(/\s+/).map(function(id){
+        var l = (e.ownerDocument || document).getElementById(id); return l ? l.innerText : '';
+      }).join(' ');
+    }
+    if (!n && e.labels && e.labels.length) n = e.labels[0].innerText;
+    n = n || e.getAttribute('alt') || e.innerText || e.getAttribute('title')
+        || (e.type !== 'password' ? e.value : '') || e.placeholder || e.getAttribute('name') || e.id || '';
+    return String(n).replace(/\s+/g, ' ').trim().slice(0, 80);
+  }
+  var vw = window.innerWidth, vh = window.innerHeight;
   var els = seen.slice(0, __EL_LIMIT__).map(function(e, i){
     var label = e.getAttribute('aria-label') || e.innerText || e.value || e.placeholder || e.name || e.id || '';
     label = String(label).replace(/\s+/g, ' ').trim().slice(0, 80);
-    return { index: i, tag: (e.tagName || '').toLowerCase(), label: label };
+    var r = e.getBoundingClientRect(), o = frameOffset(e);
+    var x = Math.round(r.left + o[0]), y = Math.round(r.top + o[1]);
+    var out = { index: i, ref: 'e' + i, tag: (e.tagName || '').toLowerCase(), label: label,
+                role: roleOf(e), name: nameOf(e),
+                rect: [x, y, Math.round(r.width), Math.round(r.height)],
+                in_viewport: x + r.width > 0 && y + r.height > 0 && x < vw && y < vh };
+    if (meta[i].length) out.frame = meta[i].join(' > ');
+    if (e.disabled || e.getAttribute('aria-disabled') === 'true') out.disabled = true;
+    if (e.type === 'checkbox' || e.type === 'radio') out.checked = !!e.checked;
+    else if (e.getAttribute('aria-checked')) out.checked = e.getAttribute('aria-checked') === 'true';
+    if (e.getAttribute('aria-expanded')) out.expanded = e.getAttribute('aria-expanded') === 'true';
+    if ((out.role === 'textbox' || out.role === 'searchbox' || out.role === 'combobox') && e.type !== 'password' && typeof e.value === 'string')
+      out.value = e.value.slice(0, 80);
+    return out;
   });
   return { url: location.href, title: document.title,
-           viewport: { w: window.innerWidth, h: window.innerHeight },
+           observation_id: obs,
+           document: { gen: gen, frames: frameCount, frames_unreachable: framesUnreachable, shadow_roots: shadowRoots },
+           viewport: { w: vw, h: vh },
            text: ((document.body && document.body.innerText) || '').slice(0, __TEXT_CAP__),
            elements: els,
            // NO SILENT CAPS (AMUX-3721). `seen` holds every visible match and is
@@ -3390,6 +5071,10 @@ const STATE_JS: &str = r#"
                 + 'so indices ' + els.length + '..' + (seen.length - 1) + ' work even though '
                 + 'they are not listed here. To find one, eval over window.__amux_els, or '
                 + 'click by CSS selector instead of index.')
+             : null,
+           frames_note: framesUnreachable
+             ? (framesUnreachable + ' cross-origin frame(s) could not be read from page script; '
+                + 'their elements are NOT in this list. Use a screenshot and click by x,y for those.')
              : null };
 })()
 "#;
@@ -3403,19 +5088,47 @@ pub fn state_js() -> String {
         .replace("__TEXT_CAP__", &(obs_state_cap() + 1).to_string())
 }
 
+/// The JS expression that resolves a caller's selector to one element (or null).
+///
+/// CSS goes to `document.querySelector`. Playwright-style `text=Label` (also
+/// `text="Label"`) is what agents reach for first, and native `querySelector`
+/// throws on it: 42 failed actions in 7 days were exactly that. It resolves to
+/// the SMALLEST visible element whose normalized text equals the label
+/// (case-insensitive), falling back to the smallest one that contains it, so
+/// `text=Scheduler` hits the button, not the page body around it.
+pub(crate) fn query_js(selector: &str) -> String {
+    let t = selector.trim();
+    if let Some(rest) = t.strip_prefix("text=") {
+        let label = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+        return format!(
+            "(function(){{var want={want}.replace(/\\s+/g,' ').trim().toLowerCase();\
+             var all=document.querySelectorAll('body *'),eq=null,has=null;\
+             for(var i=0;i<all.length;i++){{var e=all[i];\
+             if(!e.getClientRects().length)continue;\
+             var s=(e.innerText||e.textContent||'').replace(/\\s+/g,' ').trim().toLowerCase();\
+             if(!s)continue;\
+             if(s===want){{if(!eq||eq.contains(e))eq=e;}}\
+             else if(s.indexOf(want)>=0){{if(!has||has.contains(e))has=e;}}}}\
+             return eq||has;}})()",
+            want = json!(label)
+        );
+    }
+    format!("document.querySelector({})", json!(t))
+}
+
 /// Python `_bu_click_selector`'s resolve-then-click, verbatim in behavior:
 /// distinguishes no-match from hidden from clicked, because a click that
 /// silently hits nothing is indistinguishable from one that worked.
 fn selector_click_js(selector: &str) -> String {
     format!(
-        "(function(){{var e=document.querySelector({sel});\
+        "(function(){{var e=({sel});\
          if(!e)return 'NOMATCH';\
          e.scrollIntoView({{block:'center'}});\
          var r=e.getBoundingClientRect();\
          if(r.width===0&&r.height===0)return 'NOTVISIBLE';\
          e.click();\
          return 'OK|'+(e.tagName||'')+'|'+((e.textContent||'').trim().slice(0,60));}})()",
-        sel = json!(selector)
+        sel = query_js(selector)
     )
 }
 
@@ -3469,8 +5182,12 @@ pub async fn dispatch_key(c: &mut CdpClient, key: &str) -> anyhow::Result<()> {
     )
     .await?;
     if !text.is_empty() {
-        c.call("Input.dispatchKeyEvent", json!({ "type": "char", "text": text, "key": name }), t)
-            .await?;
+        c.call(
+            "Input.dispatchKeyEvent",
+            json!({ "type": "char", "text": text, "key": name }),
+            t,
+        )
+        .await?;
     }
     c.call(
         "Input.dispatchKeyEvent",
@@ -3557,11 +5274,11 @@ pub async fn set_input_files(
     // One probe, returning a verdict rather than a bare boolean, so a wrong
     // element type can say WHAT it found instead of "not found".
     let probe = format!(
-        "(()=>{{const el=document.querySelector({sel});if(!el)return 'NOELEMENT';\
+        "(()=>{{const el=({sel});if(!el)return 'NOELEMENT';\
          if(el.tagName!=='INPUT'||(el.type||'').toLowerCase()!=='file')\
          return 'NOTFILE:'+el.tagName+'/'+(el.type||'');\
          return el.multiple?'OK:multiple':'OK:single';}})()",
-        sel = json!(selector)
+        sel = query_js(selector)
     );
     let verdict = c.eval(&probe, 20).await?;
     let verdict = verdict.as_str().unwrap_or("");
@@ -3598,7 +5315,7 @@ pub async fn set_input_files(
         .call(
             "Runtime.evaluate",
             json!({
-                "expression": format!("document.querySelector({})", json!(selector)),
+                "expression": query_js(selector),
                 "returnByValue": false,
             }),
             ten,
@@ -3632,9 +5349,9 @@ pub async fn set_input_files(
     let attached = c
         .eval(
             &format!(
-                "(()=>{{const el=document.querySelector({sel});\
+                "(()=>{{const el=({sel});\
                  return el&&el.files?Array.from(el.files).map(f=>f.name+':'+f.size):[];}})()",
-                sel = json!(selector)
+                sel = query_js(selector)
             ),
             20,
         )
@@ -3682,12 +5399,381 @@ pub async fn click_index(c: &mut CdpClient, index: usize) -> anyhow::Result<Valu
     Ok(v)
 }
 
+// ---- grounded act: observe -> act -> verify ------------------------------
+//
+// The old click path answered "OK" when `element.click()` RAN, which says
+// nothing about whether the page did anything, and it addressed elements by
+// an index that could point somewhere else after a rerender. A review of the
+// browser surface (2026-09-26) named both as the main gap for agents: the
+// model sees one thing and must act through another addressing scheme, and a
+// fired click reads the same as a working one.
+//
+// So a grounded click (a) resolves a `ref` from /state and refuses it when the
+// document or the observation it came from has moved on, (b) waits for the
+// element to stop moving, checks it is enabled and that nothing covers its
+// centre, (c) sends a REAL pointer click at that point, and (d) reports what
+// happened afterwards (`observed_effect`) separately from the dispatch, with an
+// optional caller-stated postcondition (`expect`).
+
+/// `e12` -> 12. The ref is the /state list position, spelled so it cannot be
+/// mistaken for a count.
+pub fn parse_ref(r: &str) -> Option<usize> {
+    r.trim().strip_prefix('e').and_then(|n| n.parse().ok())
+}
+
+/// Keys `expect` understands. Anything else is a 400 naming these, so a typo
+/// cannot read as a met expectation.
+pub const EXPECT_KEYS: &[&str] = &[
+    "url_contains", "url_changed", "text", "text_gone", "selector", "value", "timeout_ms",
+];
+
+pub fn validate_expect(expect: &Value) -> Result<(), String> {
+    let Some(o) = expect.as_object() else {
+        return Err("expect must be an object".into());
+    };
+    if o.is_empty() {
+        return Err(format!("expect is empty; give at least one of {}", EXPECT_KEYS[..6].join(", ")));
+    }
+    for k in o.keys() {
+        if !EXPECT_KEYS.contains(&k.as_str()) {
+            return Err(format!("unknown expect key {k:?} (supported: {})", EXPECT_KEYS.join(", ")));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve element `index` for a pointer click. Returns a JSON object whose
+/// `code` is OK, STALE_DOCUMENT, STALE_OBSERVATION, NOELEMENT, STALE,
+/// DISABLED or NOTVISIBLE. On OK it carries top-level viewport coordinates
+/// (frame offsets applied) and `obscured_by` when another element covers the
+/// centre.
+pub fn ground_js(index: usize, observation_id: Option<&str>) -> String {
+    let want = observation_id.map(|o| json!(o)).unwrap_or(Value::Null);
+    format!(
+        r#"(async function(){{
+  var want = {want}, gen = window.__amux_gen || '', cur = window.__amux_obs || '';
+  if (want) {{
+    if (String(want).split('.')[0] !== gen) return {{code:'STALE_DOCUMENT', current: cur}};
+    if (want !== cur) return {{code:'STALE_OBSERVATION', current: cur}};
+  }}
+  var e = (window.__amux_els || [])[{index}];
+  if (!e) return {{code:'NOELEMENT'}};
+  if (!e.isConnected) return {{code:'STALE'}};
+  if (e.disabled || e.getAttribute('aria-disabled') === 'true') return {{code:'DISABLED'}};
+  try {{ e.scrollIntoView({{block:'center', inline:'center'}}); }} catch (_) {{}}
+  var last = '', stable = 0, t0 = Date.now(), r;
+  while (Date.now() - t0 < 1500) {{
+    await new Promise(function(res){{ requestAnimationFrame(function(){{ res(); }}); setTimeout(res, 50); }});
+    r = e.getBoundingClientRect();
+    var k = [r.left, r.top, r.width, r.height].map(Math.round).join(',');
+    if (k === last) {{ if (++stable >= 2) break; }} else {{ stable = 0; last = k; }}
+  }}
+  r = e.getBoundingClientRect();
+  if (!r.width && !r.height) return {{code:'NOTVISIBLE'}};
+  var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  var doc = e.ownerDocument || document, root = e.getRootNode ? e.getRootNode() : doc;
+  var hit = root.elementFromPoint ? root.elementFromPoint(cx, cy) : doc.elementFromPoint(cx, cy);
+  function inside(h) {{ while (h) {{ if (h === e) return true; h = h.parentNode || h.host || null; }} return false; }}
+  var obscured = null;
+  if (hit && !inside(hit)) {{
+    var cls = (typeof hit.className === 'string' && hit.className.trim()) ? '.' + hit.className.trim().split(/\s+/).slice(0, 2).join('.') : '';
+    obscured = (hit.tagName || '').toLowerCase() + (hit.id ? '#' + hit.id : '') + cls
+      + ' "' + String(hit.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 40) + '"';
+  }}
+  var x = 0, y = 0, w = doc.defaultView || window;
+  while (w && w !== window && w.frameElement) {{
+    var fr = w.frameElement.getBoundingClientRect();
+    x += fr.left + w.frameElement.clientLeft; y += fr.top + w.frameElement.clientTop; w = w.parent;
+  }}
+  return {{code:'OK', x: cx + x, y: cy + y, tag: (e.tagName || '').toLowerCase(),
+          name: String(e.getAttribute('aria-label') || e.innerText || e.value || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+          obscured_by: obscured, stable: stable >= 2}};
+}})()"#
+    )
+}
+
+/// Map a non-OK grounding code to (http status, body). STALE_* is a 409 the
+/// caller fixes by observing again; the rest are 400s about the element.
+pub fn ground_refusal(g: &Value, what: &str) -> Option<(u16, Value)> {
+    let code = g.get("code").and_then(Value::as_str).unwrap_or("");
+    let again = "call GET /api/browser/state again and act on its observation_id and refs";
+    Some(match code {
+        "OK" => return None,
+        "STALE_DOCUMENT" => (409, json!({"error": format!("{what} came from a document that is gone (the page navigated or reloaded)"), "code": "stale_document", "current_observation_id": g.get("current"), "hint": again})),
+        "STALE_OBSERVATION" => (409, json!({"error": format!("{what} came from an older observation; the element list was rebuilt since, so its refs may point elsewhere"), "code": "stale_observation", "current_observation_id": g.get("current"), "hint": again})),
+        "NOELEMENT" => (400, json!({"error": format!("no element matches {what}"), "code": "no_element", "hint": again})),
+        "STALE" => (409, json!({"error": format!("{what} is no longer in the page (it was removed or rerendered)"), "code": "stale_element", "hint": again})),
+        "DISABLED" => (409, json!({"error": format!("{what} is disabled"), "code": "disabled"})),
+        "NOTVISIBLE" => (400, json!({"error": format!("{what} has zero size (hidden or not laid out)"), "code": "not_visible"})),
+        _ => (502, json!({"error": format!("grounding {what} produced no result; the page may have navigated mid-call"), "raw": g})),
+    })
+}
+
+/// Snapshot taken just before a dispatch. Installs a mutation counter once
+/// per document so "did anything change" is a number, not a guess.
+pub const EFFECT_PRE_JS: &str = r#"(function(){
+  if (!window.__amux_gen) window.__amux_gen = Math.random().toString(36).slice(2, 10);
+  if (window.__amux_mc == null) window.__amux_mc = 0;
+  // One observer per root, counting into the top window. A document-level
+  // observer does not see inside shadow roots or iframes, so a click whose
+  // effect lands there would read as "nothing happened" without these.
+  function attach(root, depth) {
+    if (!root.__amux_mo) {
+      try {
+        root.__amux_mo = new MutationObserver(function(l){ window.__amux_mc += l.length; });
+        root.__amux_mo.observe(root, {subtree: true, childList: true, attributes: true, characterData: true});
+      } catch (_) {}
+    }
+    if (depth > 6) return;
+    root.querySelectorAll('*').forEach(function(h){ if (h.shadowRoot) attach(h.shadowRoot, depth + 1); });
+    root.querySelectorAll('iframe, frame').forEach(function(f){
+      var d = null; try { d = f.contentDocument; } catch (_) {}
+      if (d && d.documentElement) attach(d, depth + 1);
+    });
+  }
+  attach(document, 0);
+  return {url: location.href, title: document.title, gen: window.__amux_gen, mc: window.__amux_mc};
+})()"#;
+
+fn effect_post_js(expect: &Value, index: Option<usize>) -> String {
+    let idx = index.map(|i| i.to_string()).unwrap_or_else(|| "null".into());
+    format!(
+        r#"(function(){{
+  var E = {e}, I = {idx}, body = (document.body && document.body.innerText) || '';
+  var res = {{url: location.href, title: document.title, gen: window.__amux_gen || '', mc: window.__amux_mc || 0, ready: document.readyState}};
+  if (E.text != null) res.text = body.indexOf(String(E.text)) >= 0;
+  if (E.text_gone != null) res.text_gone = body.indexOf(String(E.text_gone)) < 0;
+  if (E.selector != null) {{
+    var q = null; try {{ q = document.querySelector(String(E.selector)); }} catch (_) {{}}
+    var b = q && q.getBoundingClientRect(); res.selector = !!(b && (b.width || b.height));
+  }}
+  if (E.value != null && I !== null) {{ var t = (window.__amux_els || [])[I]; res.value = t && 'value' in t ? String(t.value) : null; }}
+  return res;
+}})()"#,
+        e = expect
+    )
+}
+
+/// Which stated conditions hold in `post`, given `pre`. `timeout_ms` is not a
+/// condition.
+pub fn expect_results(expect: &Value, pre: &Value, post: &Value) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    let Some(o) = expect.as_object() else { return out };
+    let url = post.get("url").and_then(Value::as_str).unwrap_or("");
+    for (k, v) in o {
+        let met = match k.as_str() {
+            "url_contains" => v.as_str().is_some_and(|n| url.contains(n)),
+            "url_changed" => (url != pre.get("url").and_then(Value::as_str).unwrap_or("")) == v.as_bool().unwrap_or(true),
+            "text" | "text_gone" | "selector" => post.get(k).and_then(Value::as_bool).unwrap_or(false),
+            "value" => match (post.get("value").and_then(Value::as_str), v.as_str()) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            },
+            _ => continue,
+        };
+        out.insert(k.clone(), json!(met));
+    }
+    out
+}
+
+/// What visibly happened between `pre` and `post`, whether or not the caller
+/// stated an expectation.
+pub fn observed_effect(pre: &Value, post: Option<&Value>) -> Value {
+    let Some(post) = post else {
+        return json!({"navigating": true, "none_observed": false,
+                      "note": "the page did not answer after the action; it is most likely mid-navigation"});
+    };
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let navigated = s(pre, "gen") != s(post, "gen");
+    let url_changed = s(pre, "url") != s(post, "url");
+    let title_changed = s(pre, "title") != s(post, "title");
+    let mutations = if navigated {
+        Value::Null
+    } else {
+        json!(post.get("mc").and_then(Value::as_i64).unwrap_or(0) - pre.get("mc").and_then(Value::as_i64).unwrap_or(0))
+    };
+    let none = !navigated && !url_changed && !title_changed && mutations.as_i64() == Some(0);
+    json!({"navigated": navigated, "url_changed": url_changed, "url": s(post, "url"),
+           "title_changed": title_changed, "dom_mutations": mutations, "none_observed": none})
+}
+
+/// Read the post-action state until `expect` holds or the time runs out. With
+/// no expectation it settles briefly and reads once, so `observed_effect` is
+/// still reported. Evals that fail (a navigation tears the context down) are
+/// retried, never read as success.
+pub async fn verify_effect(
+    c: &mut CdpClient,
+    pre: &Value,
+    expect: Option<&Value>,
+    index: Option<usize>,
+) -> Value {
+    let started = std::time::Instant::now();
+    let empty = json!({});
+    let exp = expect.unwrap_or(&empty);
+    let budget_ms = if expect.is_some() {
+        exp.get("timeout_ms").and_then(Value::as_u64).unwrap_or(3000).clamp(100, 15000)
+    } else {
+        600
+    };
+    let js = effect_post_js(exp, index);
+    let mut post: Option<Value> = None;
+    let mut results = serde_json::Map::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(if expect.is_some() { 150 } else { budget_ms })).await;
+        if let Ok(v) = c.eval(&js, 5).await {
+            if v.is_object() {
+                results = expect_results(exp, pre, &v);
+                post = Some(v);
+            }
+        }
+        let all_met = expect.is_some() && !results.is_empty() && results.values().all(|b| b == &json!(true));
+        if expect.is_none() && post.is_some() {
+            break;
+        }
+        if all_met || started.elapsed().as_millis() as u64 >= budget_ms {
+            break;
+        }
+    }
+    let waited = started.elapsed().as_millis() as u64;
+    let effect = observed_effect(pre, post.as_ref());
+    let mut out = json!({"observed_effect": effect, "waited_ms": waited});
+    if expect.is_some() {
+        let unmet: Vec<&String> = results.iter().filter(|(_, v)| *v != &json!(true)).map(|(k, _)| k).collect();
+        let met = post.is_some() && unmet.is_empty();
+        out["expect"] = json!({"met": met, "results": results, "unmet": unmet, "timeout_ms": budget_ms,
+            "timeout_reason": if met { Value::Null } else if post.is_none() {
+                json!("the page never answered after the action (still navigating?)")
+            } else {
+                json!(format!("not met within {budget_ms}ms: {}", unmet.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")))
+            }});
+    }
+    out
+}
+
+/// Grounded pointer click on /state element `index`. Returns `Ok(Err((status,
+/// body)))` for a refusal the caller can act on, `Err` for a transport fault.
+pub async fn click_grounded(
+    c: &mut CdpClient,
+    index: usize,
+    observation_id: Option<&str>,
+    force: bool,
+    what: &str,
+) -> anyhow::Result<Result<Value, (u16, Value)>> {
+    let g = c.eval(&ground_js(index, observation_id), 20).await?;
+    if let Some(refusal) = ground_refusal(&g, what) {
+        return Ok(Err(refusal));
+    }
+    if let (Some(by), false) = (g.get("obscured_by").and_then(Value::as_str), force) {
+        return Ok(Err((409, json!({
+            "error": format!("{what} is covered at its centre by {by}"),
+            "code": "obscured", "obscured_by": by,
+            "hint": "close the overlay or dialog first, or pass force:true to click the point anyway"
+        }))));
+    }
+    let (x, y) = (g["x"].as_f64().unwrap_or(0.0), g["y"].as_f64().unwrap_or(0.0));
+    click_xy(c, x, y).await?;
+    Ok(Ok(json!({"ref": format!("e{index}"), "tag": g["tag"], "name": g["name"],
+                 "x": x.round(), "y": y.round(), "stable": g["stable"], "obscured_by": g["obscured_by"]})))
+}
+
 /// Navigate the page and wait (bounded) for `document.readyState` to reach
 /// `complete`; a slow page degrades to "still loading", never a hang. Then
 /// re-inject the capture shim (parity with Python `_bu_open` re-injecting
 /// per navigation) and run the landing check.
+/// Wait (bounded) until the launch tab has left about:blank and finished
+/// loading. Logs `browser_start_settle_timeout` when the page is still loading
+/// at the deadline, so a sweep sees starts that return early.
+/// What [`settle_launch_tab`] saw at the end of its wait.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchSettle {
+    pub landed: String,
+    pub ready_state: String,
+    pub settled: bool,
+    pub waited_ms: u64,
+}
+
+async fn settle_launch_tab(port: u16, session: &str, url: &str) -> LaunchSettle {
+    let budget = std::time::Duration::from_millis(
+        std::env::var("AMUX_BROWSER_START_SETTLE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000),
+    );
+    let began = std::time::Instant::now();
+    let deadline = began + budget;
+    let blank = |u: &str| u.is_empty() || u == "about:blank";
+    let mut ws = None;
+    let mut last_url = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(tabs) = cdp_list(port).await {
+            if let Some(t) = tabs.as_array().and_then(|ts| ts.iter().find(|t| t.get("type").and_then(Value::as_str) == Some("page"))) {
+                last_url = t.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+                if !blank(&last_url) {
+                    ws = t.get("webSocketDebuggerUrl").and_then(Value::as_str).map(str::to_string);
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    // The tab list shows a PENDING navigation's url, and the about:blank
+    // document it replaces already reads readyState "complete". So ask the
+    // document itself, and accept only a loaded document that is no longer
+    // about:blank. Measured: checking the list and readyState alone returned
+    // after 127 ms on a page that took 2 s, and the next read was still blank.
+    let mut ready = String::new();
+    if let Some(ws) = ws {
+        if let Ok(mut c) = CdpClient::connect(&ws).await {
+            while std::time::Instant::now() < deadline {
+                if let Ok(v) = c.eval("JSON.stringify([location.href, document.readyState])", 3).await {
+                    let pair: Vec<String> = v.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+                    if let [href, state] = pair.as_slice() {
+                        last_url = href.clone();
+                        ready = state.clone();
+                        if !blank(href) && state == "complete" {
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+        }
+    }
+    let ready = if blank(&last_url) { String::new() } else { ready };
+    let waited_ms = began.elapsed().as_millis() as u64;
+    let settled = ready == "complete";
+    if settled {
+        tracing::info!(session, url, landed = %last_url, waited_ms, measured = true, n_considered = 1,
+            verdict = "browser_start_settled", "browser start waited for the requested page to load");
+    } else {
+        tracing::warn!(session, url, landed = %last_url, ready_state = %ready, waited_ms, measured = true, n_considered = 1,
+            verdict = "browser_start_settle_timeout",
+            "browser start returned before the requested page finished loading; the first read may see a partial or blank page");
+    }
+    LaunchSettle { landed: last_url, ready_state: ready, settled, waited_ms }
+}
+
+/// The caller-facing sentence for a start whose page had not loaded. The
+/// timeout used to reach only the server log, so the worker got `ok: true`,
+/// read `about:blank` and had to discover the gap itself (2026-10-26, four
+/// times in one NetSuite session).
+pub fn unsettled_start_note(s: &LaunchSettle) -> Option<String> {
+    if s.settled {
+        return None;
+    }
+    let landed = if s.landed.is_empty() { "about:blank" } else { s.landed.as_str() };
+    Some(format!(
+        "the requested page had not finished loading after {}ms (tab is on {landed}, readyState {:?}); \
+         run state again before acting, and do not treat this page as the target yet",
+        s.waited_ms,
+        if s.ready_state.is_empty() { "unknown" } else { s.ready_state.as_str() }
+    ))
+}
+
 pub async fn navigate_and_settle(c: &mut CdpClient, url: &str) -> anyhow::Result<Value> {
-    c.call("Page.navigate", json!({ "url": url }), std::time::Duration::from_secs(20)).await?;
+    c.call(
+        "Page.navigate",
+        json!({ "url": url }),
+        std::time::Duration::from_secs(20),
+    )
+    .await?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut ready = String::new();
     loop {
@@ -3723,7 +5809,11 @@ pub async fn navigate_and_settle(c: &mut CdpClient, url: &str) -> anyhow::Result
     // survives the swap. The eval stays as a fallback for the case where the
     // history call is unavailable.
     let landed = match c
-        .call("Page.getNavigationHistory", json!({}), std::time::Duration::from_secs(10))
+        .call(
+            "Page.getNavigationHistory",
+            json!({}),
+            std::time::Duration::from_secs(10),
+        )
         .await
         .ok()
         .and_then(|v| {
@@ -3774,12 +5864,20 @@ pub async fn navigate_and_settle(c: &mut CdpClient, url: &str) -> anyhow::Result
 /// read `None` as "not minimised" — the pre-AMUX-4357 behaviour.
 pub async fn window_state(c: &mut CdpClient) -> Option<(u64, String)> {
     let w = c
-        .call("Browser.getWindowForTarget", json!({}), std::time::Duration::from_secs(5))
+        .call(
+            "Browser.getWindowForTarget",
+            json!({}),
+            std::time::Duration::from_secs(5),
+        )
         .await
         .ok()?;
     let id = w.get("windowId").and_then(Value::as_u64)?;
     let b = c
-        .call("Browser.getWindowBounds", json!({ "windowId": id }), std::time::Duration::from_secs(5))
+        .call(
+            "Browser.getWindowBounds",
+            json!({ "windowId": id }),
+            std::time::Duration::from_secs(5),
+        )
         .await
         .ok()?;
     let state = b.get("bounds")?.get("windowState")?.as_str()?.to_string();
@@ -3799,9 +5897,9 @@ pub async fn window_state(c: &mut CdpClient) -> Option<(u64, String)> {
 /// `Page.bringToFront` and `Target.activateTarget` restore the window, while
 /// `Page.navigate` and a new tab leave it minimised.
 pub async fn minimize_window(c: &mut CdpClient) -> anyhow::Result<u64> {
-    let (id, _) = window_state(c)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("Browser.getWindowForTarget reported no window for this target"))?;
+    let (id, _) = window_state(c).await.ok_or_else(|| {
+        anyhow::anyhow!("Browser.getWindowForTarget reported no window for this target")
+    })?;
     c.call(
         "Browser.setWindowBounds",
         json!({ "windowId": id, "bounds": { "windowState": "minimized" } }),
@@ -3836,7 +5934,10 @@ async fn minimize_launched(port: u16) -> bool {
     }) {
         Some(ws) => ws,
         None => {
-            tracing::warn!(port, "browser: no page target to minimise after launch (AMUX-4357)");
+            tracing::warn!(
+                port,
+                "browser: no page target to minimise after launch (AMUX-4357)"
+            );
             return false;
         }
     };
@@ -3874,7 +5975,11 @@ fn write_screenshot(r: &Value, home: &Path, session: &str) -> anyhow::Result<(Pa
     Ok((file, bytes.len()))
 }
 
-pub async fn screenshot_to_file(c: &mut CdpClient, home: &Path, session: &str) -> anyhow::Result<(PathBuf, usize)> {
+pub async fn screenshot_to_file(
+    c: &mut CdpClient,
+    home: &Path,
+    session: &str,
+) -> anyhow::Result<(PathBuf, usize)> {
     // Capturing evidence must never activate a user's desktop. Headless is the
     // start API default; explicitly headed/minimized windows stay where they are.
     let r = c.call("Page.captureScreenshot", json!({"format":"png", "fromSurface":true}),
@@ -3892,7 +5997,13 @@ pub async fn screenshot_to_file(c: &mut CdpClient, home: &Path, session: &str) -
 pub fn safe_file_component(s: &str) -> String {
     let cleaned: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.trim_matches(['.', '_']).is_empty() {
         "amux".into()
@@ -3914,7 +6025,10 @@ pub fn registry_save(home: &Path, reg: &serde_json::Map<String, Value>) -> anyho
     }
     // Write-then-rename, like Python: a torn write must not eat the registry.
     let tmp = path.with_file_name("profiles.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&Value::Object(reg.clone()))?)?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(&Value::Object(reg.clone()))?,
+    )?;
     std::fs::rename(&tmp, &path)?;
     Ok(())
 }
@@ -3922,7 +6036,12 @@ pub fn registry_save(home: &Path, reg: &serde_json::Map<String, Value>) -> anyho
 /// Ensure a profile is registered; add `host` to its domains, set `label`
 /// when given, bump `updated`. Returns the entry (Python
 /// `_bu_registry_register`).
-pub fn registry_register(home: &Path, name: &str, host: &str, label: &str) -> anyhow::Result<Value> {
+pub fn registry_register(
+    home: &Path,
+    name: &str,
+    host: &str,
+    label: &str,
+) -> anyhow::Result<Value> {
     let mut reg = registry_load(home);
     let mut entry = match reg.get(name) {
         Some(Value::Object(m)) => m.clone(),
@@ -3972,7 +6091,10 @@ pub fn pw_profiles(home: &Path) -> Vec<String> {
 /// other mutation in this module already follows (see module docs).
 pub fn delete_profile(home: &Path, name: &str) -> Result<Value, (u16, Value)> {
     if name == "default" {
-        return Err((400, json!({ "error": "refusing to delete the default profile" })));
+        return Err((
+            400,
+            json!({ "error": "refusing to delete the default profile" }),
+        ));
     }
     let dir = resolve_profile_dir(home, &chrome_user_data_dir(), name);
     if !dir.is_dir() {
@@ -4000,7 +6122,6 @@ pub fn delete_profile(home: &Path, name: &str) -> Result<Value, (u16, Value)> {
     }
     Ok(json!({ "ok": true, "deleted": name }))
 }
-
 
 // ---- identify: which of these windows is the one amux drives? -------------
 //
@@ -4142,7 +6263,11 @@ pub async fn raise_app_by_pid(pid: u32) -> Result<(), String> {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(if stderr.is_empty() { format!("osascript exited {}", out.status) } else { stderr })
+    Err(if stderr.is_empty() {
+        format!("osascript exited {}", out.status)
+    } else {
+        stderr
+    })
 }
 
 /// Label every page of ONE running browser, and optionally raise its window.
@@ -4179,9 +6304,13 @@ pub async fn identify_one(
                 .unwrap_or_default();
             out.pages = pages.len();
             for t in &pages {
-                let ws = t.get("webSocketDebuggerUrl").and_then(Value::as_str).unwrap_or("");
+                let ws = t
+                    .get("webSocketDebuggerUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 if ws.is_empty() {
-                    out.errors.push("a page target had no webSocketDebuggerUrl".into());
+                    out.errors
+                        .push("a page target had no webSocketDebuggerUrl".into());
                     continue;
                 }
                 match CdpClient::connect(ws).await {
@@ -4204,7 +6333,6 @@ pub async fn identify_one(
     out
 }
 
-
 #[cfg(test)]
 mod identify_tests {
     use super::*;
@@ -4217,13 +6345,22 @@ mod identify_tests {
     #[test]
     fn the_banner_names_the_profile_and_says_what_an_unlabelled_window_means() {
         let js = identify_js("hubspot", "gtm-engine", 12_000);
-        assert!(js.contains("\"hubspot\""), "the profile is not in the banner: {js}");
-        assert!(js.contains("\"gtm-engine\""), "the starting lane is not in the banner: {js}");
+        assert!(
+            js.contains("\"hubspot\""),
+            "the profile is not in the banner: {js}"
+        );
+        assert!(
+            js.contains("\"gtm-engine\""),
+            "the starting lane is not in the banner: {js}"
+        );
         assert!(
             js.contains("without this bar is your own"),
             "the banner never says what an UNLABELLED window is, which is the whole answer"
         );
-        assert!(js.contains("12000"), "the self-removal timeout is not the one asked for");
+        assert!(
+            js.contains("12000"),
+            "the self-removal timeout is not the one asked for"
+        );
     }
 
     /// A profile name is caller-supplied (`POST /profile/create {name}`), and
@@ -4252,7 +6389,10 @@ mod identify_tests {
         let js = identify_js("default", "amux", 900);
         assert!(js.contains("setTimeout"), "nothing schedules the removal");
         assert!(js.contains("remove()"), "nothing removes it");
-        assert!(js.contains("pointer-events:none"), "the banner can swallow clicks while it is up");
+        assert!(
+            js.contains("pointer-events:none"),
+            "the banner can swallow clicks while it is up"
+        );
     }
 
     #[test]
@@ -4263,7 +6403,11 @@ mod identify_tests {
         unsafe { std::env::set_var(key, "3000") };
         assert_eq!(identify_banner_ms(), 3000);
         unsafe { std::env::set_var(key, "0") };
-        assert_eq!(identify_banner_ms(), 12_000, "0 would mean a banner nobody can read");
+        assert_eq!(
+            identify_banner_ms(),
+            12_000,
+            "0 would mean a banner nobody can read"
+        );
         unsafe { std::env::set_var(key, "not-a-number") };
         assert_eq!(identify_banner_ms(), 12_000);
         match prior {
@@ -4317,11 +6461,23 @@ mod import_error_tests {
                 kind,
                 "some raw error",
             );
-            assert!(m.contains("the final rename into place"), "{kind:?}: no step: {m}");
+            assert!(
+                m.contains("the final rename into place"),
+                "{kind:?}: no step: {m}"
+            );
             assert!(m.contains("/from/here"), "{kind:?}: no source path: {m}");
-            assert!(m.contains("/to/there"), "{kind:?}: no destination path: {m}");
-            assert!(m.contains("some raw error"), "{kind:?}: the raw error was swallowed: {m}");
-            assert!(m.contains("Most likely:"), "{kind:?}: no cause offered: {m}");
+            assert!(
+                m.contains("/to/there"),
+                "{kind:?}: no destination path: {m}"
+            );
+            assert!(
+                m.contains("some raw error"),
+                "{kind:?}: the raw error was swallowed: {m}"
+            );
+            assert!(
+                m.contains("Most likely:"),
+                "{kind:?}: no cause offered: {m}"
+            );
         }
     }
 
@@ -4351,9 +6507,7 @@ mod import_error_tests {
     /// same useless thing.
     #[test]
     fn different_errnos_produce_different_causes() {
-        let mk = |k, raw| {
-            import_failure_message("s", Path::new("/a"), Path::new("/b"), k, raw)
-        };
+        let mk = |k, raw| import_failure_message("s", Path::new("/a"), Path::new("/b"), k, raw);
         let perm = mk(std::io::ErrorKind::PermissionDenied, "x");
         let nf = mk(std::io::ErrorKind::NotFound, "x");
         let ae = mk(std::io::ErrorKind::AlreadyExists, "x");
@@ -4439,7 +6593,10 @@ mod tests {
 
         // The reporter's shape: a blank tab listed FIRST, the real page after.
         // Chrome's /json/list order is Chrome's, not ours.
-        let tabs = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        let tabs = vec![
+            t("BLANK", "about:blank"),
+            t("STUDIO", "https://studio.mixpeek.com/x"),
+        ];
         let (choice, _) = choose_target(&tabs, None, &none, None);
         assert_eq!(
             choice,
@@ -4449,7 +6606,10 @@ mod tests {
 
         // chrome:// internals are blank-equivalent: a new-tab page is not what
         // a caller means either.
-        let tabs = vec![t("NEWTAB", "chrome://newtab/"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        let tabs = vec![
+            t("NEWTAB", "chrome://newtab/"),
+            t("STUDIO", "https://studio.mixpeek.com/x"),
+        ];
         assert_eq!(
             choose_target(&tabs, None, &none, None).0,
             TargetChoice::Rebind("STUDIO".into()),
@@ -4472,14 +6632,20 @@ mod tests {
         // tubescience walked back the first fix on exactly this, correctly — I
         // then reproduced it here, with screenshot and eval BOTH returning
         // about:blank, agreeing with each other and both wrong.
-        let stuck = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        let stuck = vec![
+            t("BLANK", "about:blank"),
+            t("STUDIO", "https://studio.mixpeek.com/x"),
+        ];
         let (choice, stale) = choose_target(&stuck, Some("BLANK"), &none, None);
         assert_eq!(
             choice,
             TargetChoice::Rebind("STUDIO".into()),
             "a session stuck on blank must self-heal when a real page exists"
         );
-        assert!(!stale, "self-healing off a blank tab is not the wedged-target case");
+        assert!(
+            !stale,
+            "self-healing off a blank tab is not the wedged-target case"
+        );
 
         // AND IT MUST NOT CHURN. With nothing better available the blank
         // binding is KEPT, or every verb rebinds on every call and the session
@@ -4502,7 +6668,10 @@ mod tests {
         // THE CONTROLS, so the preference cannot quietly override the rules it
         // sits inside. `avoid` still wins: a real page the caller just proved
         // unreachable must NOT be picked over a blank one.
-        let tabs = vec![t("BLANK", "about:blank"), t("DEAD", "https://studio.mixpeek.com/x")];
+        let tabs = vec![
+            t("BLANK", "about:blank"),
+            t("DEAD", "https://studio.mixpeek.com/x"),
+        ];
         assert_eq!(
             choose_target(&tabs, Some("DEAD"), &none, Some("DEAD")).0,
             TargetChoice::Rebind("BLANK".into()),
@@ -4510,7 +6679,10 @@ mod tests {
         );
         // And a peer's claim still wins over the preference.
         let claimed: std::collections::HashSet<String> = ["STUDIO".to_string()].into();
-        let tabs = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        let tabs = vec![
+            t("BLANK", "about:blank"),
+            t("STUDIO", "https://studio.mixpeek.com/x"),
+        ];
         assert_eq!(
             choose_target(&tabs, None, &claimed, None).0,
             TargetChoice::Rebind("BLANK".into()),
@@ -4520,16 +6692,17 @@ mod tests {
 
     #[test]
     fn a_listed_but_unreachable_target_is_abandoned_and_not_picked_up_again() {
-        let tab = |id: &str| {
-            json!({"id": id, "type": "page", "webSocketDebuggerUrl": format!("ws://127.0.0.1:9/devtools/page/{id}"), "url": "about:blank", "title": ""})
-        };
+        let tab = |id: &str| json!({"id": id, "type": "page", "webSocketDebuggerUrl": format!("ws://127.0.0.1:9/devtools/page/{id}"), "url": "about:blank", "title": ""});
         let none = std::collections::HashSet::new();
 
         // 1. The bound target is the one that just refused a socket. It must be
         //    abandoned, reported stale, and NOT handed back.
         let tabs = vec![tab("WEDGED"), tab("SPARE")];
         let (choice, stale) = choose_target(&tabs, Some("WEDGED"), &none, Some("WEDGED"));
-        assert!(stale, "the binding names the unreachable target, so it is stale");
+        assert!(
+            stale,
+            "the binding names the unreachable target, so it is stale"
+        );
         assert_eq!(
             choice,
             TargetChoice::Rebind("SPARE".into()),
@@ -4552,7 +6725,10 @@ mod tests {
         //    fix that unbound on every call would satisfy 1 and 2 and break every
         //    ordinary request.
         let (choice, stale) = choose_target(&tabs, Some("WEDGED"), &none, None);
-        assert!(!stale, "an ordinary resolve must never report a stale binding");
+        assert!(
+            !stale,
+            "an ordinary resolve must never report a stale binding"
+        );
         assert_eq!(
             choice,
             TargetChoice::KeepBound("WEDGED".into()),
@@ -4562,7 +6738,8 @@ mod tests {
         // 4. Avoiding a target must not reach into a PEER's tab. AC-336 is the
         //    card that says one lane never adopts another's; a recovery path that
         //    forgets it would be a regression wearing a fix's clothes.
-        let claimed: std::collections::HashSet<String> = ["SPARE".to_string()].into_iter().collect();
+        let claimed: std::collections::HashSet<String> =
+            ["SPARE".to_string()].into_iter().collect();
         let (choice, _) = choose_target(&tabs, Some("WEDGED"), &claimed, Some("WEDGED"));
         assert_eq!(
             choice,
@@ -4588,12 +6765,18 @@ mod tests {
     #[tokio::test]
     async fn an_answered_cdp_poll_never_reads_as_silence() {
         let answered: Result<reqwest::Response, reqwest::Error> =
-            Ok(axum::http::Response::builder().status(403).body("").unwrap().into());
+            Ok(axum::http::Response::builder()
+                .status(403)
+                .body("")
+                .unwrap()
+                .into());
         let d = describe_cdp_probe(&answered, "http://127.0.0.1:60005");
-        assert!(d.contains("403"), "the STATUS is the whole discriminator: {d}");
         assert!(
-            !d.to_lowercase().contains("never answered")
-                && !d.to_lowercase().contains("refused"),
+            d.contains("403"),
+            "the STATUS is the whole discriminator: {d}"
+        );
+        assert!(
+            !d.to_lowercase().contains("never answered") && !d.to_lowercase().contains("refused"),
             "a 403 is Chrome answering — calling it silence is the AMUX-3689 defect: {d}"
         );
 
@@ -4603,7 +6786,10 @@ mod tests {
             .timeout(std::time::Duration::from_secs(2))
             .send()
             .await;
-        assert!(refused.is_err(), "premise: nothing may be listening on 127.0.0.1:1");
+        assert!(
+            refused.is_err(),
+            "premise: nothing may be listening on 127.0.0.1:1"
+        );
         let d = describe_cdp_probe(&refused, "http://127.0.0.1:1");
         assert!(
             d.contains("refused") || d.contains("connection"),
@@ -4624,9 +6810,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let live = dir.join("amux-chrome-launch.stderr");
 
-        std::fs::write(&live, "first failure\nDevTools listening on ws://127.0.0.1:1/x\n").unwrap();
+        std::fs::write(
+            &live,
+            "first failure\nDevTools listening on ws://127.0.0.1:1/x\n",
+        )
+        .unwrap();
         let note = preserve_failed_stderr(&live);
-        assert!(note.contains("failed-"), "the message must NAME the kept file: {note:?}");
+        assert!(
+            note.contains("failed-"),
+            "the message must NAME the kept file: {note:?}"
+        );
         let kept: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -4635,14 +6828,19 @@ mod tests {
             .collect();
         assert_eq!(kept.len(), 1, "{kept:?}");
         let body = std::fs::read_to_string(dir.join(&kept[0])).unwrap();
-        assert!(body.contains("DevTools listening"), "the COPY must hold the evidence: {body:?}");
+        assert!(
+            body.contains("DevTools listening"),
+            "the COPY must hold the evidence: {body:?}"
+        );
 
         // Simulate the retry that used to erase it: truncate the live file and
         // preserve again. The first failure's copy must survive.
         std::fs::write(&live, "second failure\n").unwrap();
         preserve_failed_stderr(&live);
         assert!(
-            std::fs::read_to_string(dir.join(&kept[0])).unwrap().contains("DevTools listening"),
+            std::fs::read_to_string(dir.join(&kept[0]))
+                .unwrap()
+                .contains("DevTools listening"),
             "the retry erased the first failure's evidence, which is the whole bug"
         );
 
@@ -4651,8 +6849,11 @@ mod tests {
         // prune is tested on a known set rather than on however many distinct
         // millisecond stamps the loop happened to produce.
         for i in 0..9 {
-            std::fs::write(dir.join(format!("amux-chrome-launch.failed-{:010}.stderr", i)), "x")
-                .unwrap();
+            std::fs::write(
+                dir.join(format!("amux-chrome-launch.failed-{:010}.stderr", i)),
+                "x",
+            )
+            .unwrap();
         }
         std::fs::write(&live, "another\n").unwrap();
         preserve_failed_stderr(&live);
@@ -4660,7 +6861,9 @@ mod tests {
             .unwrap()
             .flatten()
             .filter(|e| {
-                e.file_name().to_string_lossy().starts_with("amux-chrome-launch.failed-")
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("amux-chrome-launch.failed-")
             })
             .count();
         assert_eq!(n, 5, "the pile must be pruned to the newest 5, found {n}");
@@ -4704,18 +6907,29 @@ mod tests {
             "a longer path that merely STARTS with this one is a different profile — killing \
              it would take out another session's staged login"
         );
-        assert!(!default_dir.contains(&40001), "helper processes die with their parent");
-        assert!(!default_dir.contains(&871), "unrelated processes are not candidates");
+        assert!(
+            !default_dir.contains(&40001),
+            "helper processes die with their parent"
+        );
+        assert!(
+            !default_dir.contains(&871),
+            "unrelated processes are not candidates"
+        );
 
         // The named profile finds only its own, which is the same rule read
         // from the other side.
         assert_eq!(
-            pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profiles/netsuite"),
+            pids_on_dir(
+                ps,
+                "--user-data-dir=/h/.amux/playwright-auth/profiles/netsuite"
+            ),
             vec![35459]
         );
 
         // A dir nobody is on is empty, not everything.
-        assert!(pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profiles/nope").is_empty());
+        assert!(
+            pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profiles/nope").is_empty()
+        );
     }
 
     /// EVERY live-Chrome test must hold this for its whole body.
@@ -4760,7 +6974,10 @@ mod tests {
         assert_eq!(resolve_profile_dir(home.path(), &chrome, "gh"), legacy);
 
         // unknown names resolve into the chrome user-data-dir
-        assert_eq!(resolve_profile_dir(home.path(), &chrome, "brandnew"), chrome.join("brandnew"));
+        assert_eq!(
+            resolve_profile_dir(home.path(), &chrome, "brandnew"),
+            chrome.join("brandnew")
+        );
     }
 
     #[test]
@@ -4802,20 +7019,37 @@ mod tests {
         let imported = import_chrome_profile(home.path(), &chrome, "ethan-tubescience")
             .unwrap()
             .expect("first use imports the Chrome profile");
-        let dest = home.path().join("playwright-auth/profiles/ethan-tubescience");
+        let dest = home
+            .path()
+            .join("playwright-auth/profiles/ethan-tubescience");
         assert_eq!(imported.source, source);
         assert_eq!(imported.destination, dest);
-        assert_eq!(std::fs::read(dest.join("Default/Network/Cookies")).unwrap(), b"logged-in");
-        assert_eq!(std::fs::read(dest.join("Default/Preferences")).unwrap(), b"prefs");
-        assert!(!dest.join("Default/Cache").exists(), "cache is recreated, not imported");
-        assert!(!dest.join("Default/LOCK").exists(), "a live profile's lock must not cross over");
+        assert_eq!(
+            std::fs::read(dest.join("Default/Network/Cookies")).unwrap(),
+            b"logged-in"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("Default/Preferences")).unwrap(),
+            b"prefs"
+        );
+        assert!(
+            !dest.join("Default/Cache").exists(),
+            "cache is recreated, not imported"
+        );
+        assert!(
+            !dest.join("Default/LOCK").exists(),
+            "a live profile's lock must not cross over"
+        );
 
         let state: Value =
             serde_json::from_slice(&std::fs::read(dest.join("Local State")).unwrap()).unwrap();
         assert_eq!(state["os_crypt"]["encrypted_key"], "keep-me");
         assert_eq!(state["profile"]["last_used"], "Default");
         assert_eq!(state["profile"]["last_active_profiles"], json!(["Default"]));
-        assert_eq!(state["profile"]["info_cache"]["Default"]["name"], "TubeScience");
+        assert_eq!(
+            state["profile"]["info_cache"]["Default"]["name"],
+            "TubeScience"
+        );
         assert!(state["profile"]["info_cache"].get("Other").is_none());
 
         let target = launch_target(home.path(), &chrome, "ethan-tubescience");
@@ -4824,7 +7058,9 @@ mod tests {
         assert_eq!(target.profile_directory, None);
         let inventory = list_profiles(home.path(), false);
         assert!(
-            inventory.iter().any(|p| p.name == "ethan-tubescience" && p.registered),
+            inventory
+                .iter()
+                .any(|p| p.name == "ethan-tubescience" && p.registered),
             "imported login state must be exempt from scratch-profile TTL cleanup"
         );
         assert!(
@@ -4844,8 +7080,14 @@ mod tests {
         assert!(escape.to_string().contains("[A-Za-z0-9._-]+"));
         let missing = import_chrome_profile(home.path(), &chrome, "missing").unwrap_err();
         assert!(missing.to_string().contains("does not exist"));
-        assert!(missing.downcast_ref::<ProfileMissing>().is_some(), "{missing}");
-        assert!(!home.path().join("playwright-auth/profiles/missing").exists());
+        assert!(
+            missing.downcast_ref::<ProfileMissing>().is_some(),
+            "{missing}"
+        );
+        assert!(!home
+            .path()
+            .join("playwright-auth/profiles/missing")
+            .exists());
     }
 
     #[test]
@@ -4863,19 +7105,67 @@ mod tests {
 
         let list = list_profiles(home.path(), true);
         let names: Vec<&str> = list.iter().map(|p| p.name.as_str()).collect();
-        assert!(names.contains(&"github"), "dir-backed profile listed: {names:?}");
-        assert!(names.contains(&"default"), "default profile listed: {names:?}");
+        assert!(
+            names.contains(&"github"),
+            "dir-backed profile listed: {names:?}"
+        );
+        assert!(
+            names.contains(&"default"),
+            "default profile listed: {names:?}"
+        );
 
         let gh = list.iter().find(|p| p.name == "github").unwrap();
         assert!(gh.registered);
         assert_eq!(gh.domains, vec!["github.com"]);
         assert_eq!(gh.label, "GH");
         assert!(gh.last_used.is_some(), "mtime-derived last_used");
-        assert!(gh.size_mb.unwrap() > 0.0, "walked size includes the 2KB cookie file");
+        assert!(
+            gh.size_mb.unwrap() > 0.0,
+            "walked size includes the 2KB cookie file"
+        );
 
         // sizes are opt-in
         let slim = list_profiles(home.path(), false);
         assert!(slim.iter().all(|p| p.size_mb.is_none()));
+    }
+
+    /// AMUX-5020. `registered` and `last_used` together cannot express
+    /// "the registry says this profile exists and the directory is gone".
+    ///
+    /// Measured live: 11 registry entries, 2 with no directory, and every field
+    /// in the listing reads as a normal never-opened profile — including the
+    /// `domains` the registry still carries, which is the part that lies. A
+    /// lane that starts it gets a fresh empty profile and is logged out.
+    #[test]
+    fn a_registered_profile_whose_directory_is_gone_is_distinguishable() {
+        let home = fake_home();
+        let profiles = home.path().join("playwright-auth/profiles");
+        std::fs::create_dir_all(profiles.join("present")).unwrap();
+        std::fs::create_dir_all(home.path().join("playwright-auth/profile")).unwrap();
+        std::fs::write(
+            home.path().join("playwright-auth/profiles.json"),
+            r#"{"present":{"domains":["a.example"],"label":"here"},
+                "gone":{"domains":["us.posthog.com"],"label":"PostHog"}}"#,
+        )
+        .unwrap();
+
+        let list = list_profiles(home.path(), false);
+        let gone = list.iter().find(|p| p.name == "gone").expect("registry entry is listed");
+        let present = list.iter().find(|p| p.name == "present").unwrap();
+
+        assert!(gone.registered, "the registry entry is still what makes it visible");
+        assert!(!gone.on_disk, "there is no directory behind it");
+        assert!(present.registered && present.on_disk, "the control is both");
+
+        // THE PART THAT LIES, asserted so nobody removes the field thinking
+        // last_used already covers it: the absent profile still advertises a
+        // domain it cannot be signed into.
+        assert_eq!(gone.domains, vec!["us.posthog.com"]);
+        assert!(gone.last_used.is_none());
+
+        // `default` exists here, so a listing where everything is on_disk is
+        // reachable and the field is not a constant.
+        assert!(list.iter().any(|p| p.name == "default" && p.on_disk));
     }
 
     #[test]
@@ -4893,7 +7183,10 @@ mod tests {
         std::fs::write(prof.join("Preferences"), "{}").unwrap();
 
         let present = locks_present(&prof);
-        assert!(present.contains(&"SingletonLock".to_string()), "lstat sees the dangling symlink");
+        assert!(
+            present.contains(&"SingletonLock".to_string()),
+            "lstat sees the dangling symlink"
+        );
         assert!(present.contains(&"SingletonCookie".to_string()));
 
         let cleaned = reconcile_locks_at_startup(home.path());
@@ -4903,7 +7196,10 @@ mod tests {
         assert!(removed.contains(&"SingletonLock".to_string()));
         assert!(removed.contains(&"SingletonCookie".to_string()));
         assert!(locks_present(&prof).is_empty(), "locks actually gone");
-        assert!(prof.join("Preferences").exists(), "profile CONTENTS untouched");
+        assert!(
+            prof.join("Preferences").exists(),
+            "profile CONTENTS untouched"
+        );
     }
 
     /// MO-3146: a live lock on the HUMAN Chrome dir must be detected before
@@ -4952,13 +7248,142 @@ mod tests {
     #[test]
     fn amux_owned_boundary() {
         let home = fake_home();
-        assert!(is_amux_owned(home.path(), &home.path().join("playwright-auth/profiles/x")));
-        assert!(is_amux_owned(home.path(), &home.path().join("playwright-auth/profile")));
+        assert!(is_amux_owned(
+            home.path(),
+            &home.path().join("playwright-auth/profiles/x")
+        ));
+        assert!(is_amux_owned(
+            home.path(),
+            &home.path().join("playwright-auth/profile")
+        ));
         assert!(!is_amux_owned(home.path(), &chrome_user_data_dir()));
         assert!(!is_amux_owned(home.path(), Path::new("/tmp/elsewhere")));
     }
 
     // ---- CDP client + driver mechanics (hermetic — fake WS, temp dirs) ----
+
+    /// A TIMEOUT IS NOT A VERB PROBLEM, so GET must not be tried for one.
+    ///
+    /// The fallback exists for pre-111 Chrome, which accepts GET and refuses
+    /// PUT. Against anything newer GET can never succeed, so running it after a
+    /// TIMEOUT converts a slow browser into a 405 that tells the reader to use
+    /// the verb amux already used. Measured 2026-09-23: worst request 27.5s
+    /// against a 5s PUT timeout. Reproduced on Chrome/153.0.8010.54: PUT 200,
+    /// GET 405 with exactly that body.
+    ///
+    /// The fake Chrome here answers PUT with 500, which is a failure that says
+    /// NOTHING about verbs, and then fails the test if a second request ever
+    /// arrives.
+    #[tokio::test]
+    async fn a_put_failure_that_is_not_a_verb_refusal_does_not_try_get() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                counter.fetch_add(1, Ordering::SeqCst);
+                // 500 on PUT: a real failure, and not a statement about verbs.
+                let body = if req.starts_with("PUT") {
+                    "boom"
+                } else {
+                    "GET SHOULD NEVER HAVE BEEN TRIED"
+                };
+                let resp = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let err = super::cdp_new_tab(port, "https://example.com")
+            .await
+            .expect_err("a 500 is still a failure");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("GET SHOULD NEVER HAVE BEEN TRIED"),
+            "the fallback ran on a non-verb failure: {msg}"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "exactly one request: the PUT. A second means GET was tried for a \
+             failure that says nothing about verbs."
+        );
+        assert!(
+            msg.contains("(PUT)") || msg.contains("PUT"),
+            "the error must name the verb that actually failed: {msg}"
+        );
+    }
+
+    /// A FALLBACK THAT HIDES WHY IT RAN TURNS ONE FAULT INTO A WRONG FIX.
+    ///
+    /// `cdp_new_tab` leads with PUT (Chrome 111+) and falls back to GET for
+    /// older builds. When BOTH fail, the caller used to see only GET's error,
+    /// and Chrome's is `405 ... Using unsafe HTTP verb GET to invoke
+    /// /json/new. This action supports only PUT verb` — an instruction to do
+    /// the thing the function already does. Measured 2026-09-23: three 502s on
+    /// GET /api/browser/screenshot carrying exactly that body (AMUX-5039).
+    ///
+    /// The fake Chrome here refuses both verbs, which is the only state in
+    /// which the two errors can disagree about the cause.
+    #[tokio::test]
+    async fn a_failed_put_survives_into_the_error_the_caller_reads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Two connections: the PUT attempt and the GET fallback.
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // Chrome's real refusal, verbatim, for whichever verb asked.
+                let verb = if req.starts_with("PUT") { "PUT" } else { "GET" };
+                let body = format!(
+                    "Using unsafe HTTP verb {verb} to invoke /json/new. \
+                     This action supports only PUT verb."
+                );
+                let resp = format!(
+                    "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let err = super::cdp_new_tab(port, "https://example.com")
+            .await
+            .expect_err("both verbs were refused");
+        let msg = err.to_string();
+        // THE PUT'S OUTCOME IS THE CAUSE and must be in what the caller reads.
+        assert!(
+            msg.contains("PUT answered HTTP 405"),
+            "the PUT's failure is what explains the fallback, and it was dropped: {msg}"
+        );
+        assert!(
+            msg.contains("fell back to GET"),
+            "the caller cannot tell which verb produced the body without this: {msg}"
+        );
+        // The port still has to be there; it is how a reader finds the browser.
+        assert!(msg.contains(&port.to_string()), "{msg}");
+    }
 
     /// The client's one job: match responses by id THROUGH interleaved
     /// events, and surface CDP errors as errors. A fake Chrome answers every
@@ -4997,8 +7422,14 @@ mod tests {
         let r = c.call("Page.navigate", json!({}), five).await.unwrap();
         assert_eq!(r["echo"], "Page.navigate");
         let r = c.call("Runtime.evaluate", json!({}), five).await.unwrap();
-        assert_eq!(r["echo"], "Runtime.evaluate", "second call matches its own id");
-        let err = c.call("Deliberate.fail", json!({}), five).await.unwrap_err();
+        assert_eq!(
+            r["echo"], "Runtime.evaluate",
+            "second call matches its own id"
+        );
+        let err = c
+            .call("Deliberate.fail", json!({}), five)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("boom"), "{err}");
     }
 
@@ -5006,30 +7437,42 @@ mod tests {
     async fn capture_never_raises_a_window_even_when_the_renderer_fails() {
         use std::sync::{Arc, Mutex};
         for fail_capture in [false, true] {
-            let seen=Arc::new(Mutex::new(Vec::<String>::new()));
-            let calls=seen.clone();
-            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr=listener.local_addr().unwrap();
-            let server=tokio::spawn(async move {
-                let (stream,_)=listener.accept().await.unwrap();
-                let mut ws=tokio_tungstenite::accept_async(stream).await.unwrap();
+            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+            let calls = seen.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
                 use tokio_tungstenite::tungstenite::Message;
-                while let Some(Ok(Message::Text(text)))=ws.next().await {
-                    let v:Value=serde_json::from_str(&text).unwrap();
-                    let method=v["method"].as_str().unwrap().to_string();
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    let method = v["method"].as_str().unwrap().to_string();
                     calls.lock().unwrap().push(method.clone());
-                    let response=if method=="Page.captureScreenshot" && !fail_capture {
+                    let response = if method == "Page.captureScreenshot" && !fail_capture {
                         json!({"id":v["id"],"result":{"data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="}})
-                    }else{json!({"id":v["id"],"error":{"message":"controlled renderer failure"}})};
+                    } else {
+                        json!({"id":v["id"],"error":{"message":"controlled renderer failure"}})
+                    };
                     ws.send(Message::Text(response.to_string())).await.unwrap();
                 }
             });
-            let mut c=CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
-            let home=fake_home();
-            let shot=screenshot_to_file(&mut c,home.path(),"background-capture").await;
-            if fail_capture {assert!(shot.unwrap_err().to_string().contains("without changing focus"));}
-            else {let (p,n)=shot.unwrap();assert!(p.exists() && n>0);}
-            assert_eq!(*seen.lock().unwrap(),vec!["Page.captureScreenshot".to_string()]);
+            let mut c = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+            let home = fake_home();
+            let shot = screenshot_to_file(&mut c, home.path(), "background-capture").await;
+            if fail_capture {
+                assert!(shot
+                    .unwrap_err()
+                    .to_string()
+                    .contains("without changing focus"));
+            } else {
+                let (p, n) = shot.unwrap();
+                assert!(p.exists() && n > 0);
+            }
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec!["Page.captureScreenshot".to_string()]
+            );
             server.abort();
         }
     }
@@ -5048,7 +7491,10 @@ mod tests {
                 Err(e) => e,
                 Ok(_) => panic!("{url}: non-loopback endpoint must be refused"),
             };
-            assert!(err.to_string().contains("refusing non-loopback"), "{url}: {err}");
+            assert!(
+                err.to_string().contains("refusing non-loopback"),
+                "{url}: {err}"
+            );
         }
     }
 
@@ -5056,7 +7502,10 @@ mod tests {
     fn obs_cap_truncates_and_says_so() {
         assert_eq!(obs_cap("short", 100), "short");
         let capped = obs_cap(&"x".repeat(50), 10);
-        assert!(capped.starts_with("xxxxxxxxxx\n…[truncated at 10 chars"), "{capped}");
+        assert!(
+            capped.starts_with("xxxxxxxxxx\n…[truncated at 10 chars"),
+            "{capped}"
+        );
         // Multibyte safety: a byte-index slice would panic here.
         let capped = obs_cap(&"é".repeat(50), 10);
         assert!(capped.contains("truncated at 10"), "{capped}");
@@ -5069,10 +7518,22 @@ mod tests {
     #[test]
     fn obs_truncation_reports_the_original_length_only_when_it_cut() {
         assert_eq!(obs_truncation("short", 100), None, "fits => no signal");
-        assert_eq!(obs_truncation(&"x".repeat(10), 10), None, "exactly at the cap is not truncated");
-        assert_eq!(obs_truncation(&"x".repeat(50), 10), Some(50), "over the cap => full length");
+        assert_eq!(
+            obs_truncation(&"x".repeat(10), 10),
+            None,
+            "exactly at the cap is not truncated"
+        );
+        assert_eq!(
+            obs_truncation(&"x".repeat(50), 10),
+            Some(50),
+            "over the cap => full length"
+        );
         // Counts CHARS, matching obs_cap, so a multibyte page is not mis-measured.
-        assert_eq!(obs_truncation(&"é".repeat(50), 10), Some(50), "multibyte counted by char");
+        assert_eq!(
+            obs_truncation(&"é".repeat(50), 10),
+            Some(50),
+            "multibyte counted by char"
+        );
     }
 
     #[test]
@@ -5087,13 +7548,56 @@ mod tests {
             ("STALE", "stale"),
         ] {
             let v = click_outcome(&json!(raw), "x", "h");
-            assert!(
-                v["error"].as_str().unwrap().contains(needle),
-                "{raw}: {v}"
-            );
+            assert!(v["error"].as_str().unwrap().contains(needle), "{raw}: {v}");
         }
         // Garbage (page navigated mid-click) is an error, not a silent ok.
         assert!(click_outcome(&json!(null), "x", "h")["error"].is_string());
+    }
+
+    #[test]
+    fn grounded_act_refs_and_expectations() {
+        assert_eq!(parse_ref("e12"), Some(12));
+        assert_eq!(parse_ref(" e0 "), Some(0));
+        assert_eq!(parse_ref("12"), None);
+        assert_eq!(parse_ref("ex"), None);
+        // An unknown expect key is refused by name, so a typo can never read
+        // as a met condition.
+        assert!(validate_expect(&json!({"url_contains": "/done"})).is_ok());
+        assert!(validate_expect(&json!({"urlcontains": "/done"})).unwrap_err().contains("urlcontains"));
+        assert!(validate_expect(&json!({})).is_err());
+        assert!(validate_expect(&json!("x")).is_err());
+        let pre = json!({"url": "https://a/1", "title": "A", "gen": "g1", "mc": 5});
+        // Same document, nothing changed: the one case that must say so.
+        let same = json!({"url": "https://a/1", "title": "A", "gen": "g1", "mc": 5});
+        let e = observed_effect(&pre, Some(&same));
+        assert_eq!(e["none_observed"], json!(true));
+        assert_eq!(e["dom_mutations"], json!(0));
+        // DOM changed in place.
+        let dom = json!({"url": "https://a/1", "title": "A", "gen": "g1", "mc": 9});
+        let e = observed_effect(&pre, Some(&dom));
+        assert_eq!((e["none_observed"].clone(), e["dom_mutations"].clone()), (json!(false), json!(4)));
+        // New document: mutations are not comparable across documents.
+        let nav = json!({"url": "https://a/2", "title": "B", "gen": "g2", "mc": 0});
+        let e = observed_effect(&pre, Some(&nav));
+        assert_eq!((e["navigated"].clone(), e["dom_mutations"].clone()), (json!(true), Value::Null));
+        // No answer at all is "navigating", never "nothing happened".
+        let e = observed_effect(&pre, None);
+        assert_eq!((e["navigating"].clone(), e["none_observed"].clone()), (json!(true), json!(false)));
+        let r = expect_results(&json!({"url_contains": "/2", "url_changed": true, "text": "hi", "timeout_ms": 5}), &pre,
+            &json!({"url": "https://a/2", "text": false}));
+        assert_eq!(r.get("url_contains"), Some(&json!(true)));
+        assert_eq!(r.get("url_changed"), Some(&json!(true)));
+        assert_eq!(r.get("text"), Some(&json!(false)));
+        assert!(!r.contains_key("timeout_ms"));
+        // Stale refs are 409s that point back at /state; OK is not a refusal.
+        assert!(ground_refusal(&json!({"code": "OK"}), "ref e1").is_none());
+        let (code, body) = ground_refusal(&json!({"code": "STALE_OBSERVATION", "current": "g.3"}), "ref e1").unwrap();
+        assert_eq!((code, body["code"].clone(), body["current_observation_id"].clone()), (409, json!("stale_observation"), json!("g.3")));
+        assert_eq!(ground_refusal(&json!({"code": "STALE_DOCUMENT"}), "ref e1").unwrap().0, 409);
+        assert_eq!(ground_refusal(&Value::Null, "ref e1").unwrap().0, 502);
+        let js = ground_js(3, Some("abc.2"));
+        assert!(js.contains("[3]") && js.contains("\"abc.2\""), "{js}");
+        assert!(ground_js(0, None).contains("var want = null"));
     }
 
     #[test]
@@ -5125,8 +7629,14 @@ mod tests {
             "elements_truncated",
             "elements_note",
             "seen.length > els.length",
+            "observation_id",
+            "frames_unreachable",
+            "ref: 'e' + i",
         ] {
-            assert!(js.contains(f), "state JS must disclose its cap, missing {f}: {js}");
+            assert!(
+                js.contains(f),
+                "state JS must disclose its cap, missing {f}: {js}"
+            );
         }
         // Selector JSON-encodes through format!: quotes must survive.
         let js = selector_click_js("a[href=\"x\"]");
@@ -5147,7 +7657,10 @@ mod tests {
         assert!(e["updated"].as_i64().unwrap() > 0);
         // And the listing path (registry_load) sees the same bytes.
         let reg = registry_load(home.path());
-        assert_eq!(reg["gh"]["domains"], json!(["github.com", "gist.github.com"]));
+        assert_eq!(
+            reg["gh"]["domains"],
+            json!(["github.com", "gist.github.com"])
+        );
     }
 
     #[test]
@@ -5156,7 +7669,10 @@ mod tests {
         std::fs::create_dir_all(home.path().join("playwright-auth/profiles/github")).unwrap();
         std::fs::create_dir_all(home.path().join("playwright-auth/profiles/.hidden")).unwrap();
         std::fs::create_dir_all(home.path().join("playwright-auth/profile")).unwrap();
-        assert_eq!(pw_profiles(home.path()), vec!["default".to_string(), "github".to_string()]);
+        assert_eq!(
+            pw_profiles(home.path()),
+            vec!["default".to_string(), "github".to_string()]
+        );
     }
 
     #[test]
@@ -5168,13 +7684,18 @@ mod tests {
 
         assert_eq!(delete_profile(home.path(), "default").unwrap_err().0, 400);
         assert_eq!(
-            delete_profile(home.path(), "amux-native-test-nonexistent-9f3a").unwrap_err().0,
+            delete_profile(home.path(), "amux-native-test-nonexistent-9f3a")
+                .unwrap_err()
+                .0,
             404
         );
         let ok = delete_profile(home.path(), "x").unwrap();
         assert_eq!(ok["deleted"], "x");
         assert!(!dir.exists());
-        assert!(registry_load(home.path()).get("x").is_none(), "registry entry pruned");
+        assert!(
+            registry_load(home.path()).get("x").is_none(),
+            "registry entry pruned"
+        );
     }
 
     #[test]
@@ -5183,6 +7704,56 @@ mod tests {
         assert_eq!(safe_file_component("../../etc/passwd"), ".._.._etc_passwd");
         assert_eq!(safe_file_component(""), "amux");
         assert_eq!(safe_file_component(".."), "amux");
+    }
+
+    /// The reaper sees a driver amux never carried (NetSuite, 2026-10-26: a
+    /// worker drove Chrome over raw CDP and lost the browser mid-report). Real
+    /// Chrome, the real `tick`, a 5s activity window: a page navigated over a
+    /// raw CDP socket every second keeps the browser open past the window,
+    /// and once the driving stops it is released.
+    #[tokio::test]
+    #[ignore = "launches a real Chrome; run explicitly with -- --ignored"]
+    async fn live_raw_cdp_driving_keeps_the_browser_open() {
+        let _serial = LIVE_BROWSER.lock().await;
+        if chrome_binary().is_none() {
+            eprintln!("no Chrome binary on this machine; skipping");
+            return;
+        }
+        let home = fake_home();
+        let info = start(home.path(), "default", "about:blank", "raw-cdp", "raw-cdp", true).await.expect("start");
+        let list = cdp_list(info.cdp_port).await.expect("list");
+        let ws = list.as_array().unwrap().iter().find(|t| t["type"] == "page").unwrap()["webSocketDebuggerUrl"]
+            .as_str().unwrap().to_string();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = stop.clone();
+        let driver = tokio::spawn(async move {
+            let mut c = CdpClient::connect(&ws).await.expect("raw cdp");
+            let mut i = 0;
+            while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+                i += 1;
+                let _ = c.call("Page.navigate", serde_json::json!({"url": format!("data:text/html,step{i}")}), Duration::from_secs(5)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        // 12s of raw driving against a 5s window: never released.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let reaped = crate::runtime_jobs::browser_reaper::tick_with_limits(home.path(), None, 0, 5, 0).await;
+            assert!(reaped.is_empty(), "released while a raw CDP driver was working: {reaped:?}");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = driver.await;
+        // Driving stopped (socket closed): released within a few windows.
+        let mut released = false;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !crate::runtime_jobs::browser_reaper::tick_with_limits(home.path(), None, 0, 5, 0).await.is_empty() {
+                released = true;
+                break;
+            }
+        }
+        assert!(released, "a browser nobody drives must still be released");
+        let _ = stop_profile_as(home.path(), "default", "raw-cdp").await;
     }
 
     /// Live-Chrome smoke test: launches a real Chrome on a THROWAWAY temp
@@ -5198,7 +7769,16 @@ mod tests {
         }
         let home = fake_home();
         // Use a scratch profile name so the target dir is amux-owned + temp.
-        let info = start(home.path(), "default", "about:blank", "live-smoke", "live-smoke", false).await.expect("start");
+        let info = start(
+            home.path(),
+            "default",
+            "about:blank",
+            "live-smoke",
+            "live-smoke",
+            false,
+        )
+        .await
+        .expect("start");
         assert!(info.cdp_port > 0);
         let tabs = cdp_list(info.cdp_port).await.expect("cdp /json/list");
         assert!(tabs.is_array());
@@ -5207,14 +7787,23 @@ mod tests {
         // resolves is served by the LOOPBACK CDP port of the child THIS
         // process spawned — same port, same registry pid — and a round-trip
         // eval proves the automation executed there.
-        let page = resolve_page("live-smoke", None).await.map_err(|e| match e {
-            DriverError::NotRunning => anyhow::anyhow!("not running"),
-            DriverError::Cdp(e) => e,
-        }).expect("resolve_page");
-        assert_eq!(page.cdp_port, info.cdp_port, "verb port IS the spawned child's port");
+        let page = resolve_page("live-smoke", None)
+            .await
+            .map_err(|e| match e {
+                DriverError::NotRunning => anyhow::anyhow!("not running"),
+                DriverError::Cdp(e) => e,
+            })
+            .expect("resolve_page");
+        assert_eq!(
+            page.cdp_port, info.cdp_port,
+            "verb port IS the spawned child's port"
+        );
         assert!(
-            page.ws_url.starts_with(&format!("ws://127.0.0.1:{}/", info.cdp_port))
-                || page.ws_url.starts_with(&format!("ws://localhost:{}/", info.cdp_port)),
+            page.ws_url
+                .starts_with(&format!("ws://127.0.0.1:{}/", info.cdp_port))
+                || page
+                    .ws_url
+                    .starts_with(&format!("ws://localhost:{}/", info.cdp_port)),
             "loopback CDP only: {}",
             page.ws_url
         );
@@ -5228,11 +7817,17 @@ mod tests {
             assert_eq!(reg_pid, info.pid, "acting Chrome is the registry's process");
             assert!(reg_pid.is_some());
             assert!(
-                guard.values().next().and_then(|r| r.child.as_ref()).is_some(),
+                guard
+                    .values()
+                    .next()
+                    .and_then(|r| r.child.as_ref())
+                    .is_some(),
                 "a browser this test SPAWNED must carry its Child handle"
             );
         }
-        let mut c = CdpClient::connect(&page.ws_url).await.expect("cdp ws connect");
+        let mut c = CdpClient::connect(&page.ws_url)
+            .await
+            .expect("cdp ws connect");
         let v = c.eval("1+1", 10).await.expect("eval");
         assert_eq!(v, json!(2));
 
@@ -5272,7 +7867,16 @@ mod tests {
             return;
         }
         let home = fake_home();
-        let info = start(home.path(), "default", "about:blank", "owner", "owner", false).await.expect("start");
+        let info = start(
+            home.path(),
+            "default",
+            "about:blank",
+            "owner",
+            "owner",
+            false,
+        )
+        .await
+        .expect("start");
 
         // The launch tab as CHROME reports it — the incident's artifact.
         let launch_tab = cdp_list(info.cdp_port)
@@ -5293,12 +7897,21 @@ mod tests {
             peer_page.target_id, launch_tab,
             "peer was handed the tab the owner launched — this is AC-336"
         );
-        assert_eq!(peer_page.cdp_port, info.cdp_port, "still one shared browser, per-lane tabs");
+        assert_eq!(
+            peer_page.cdp_port, info.cdp_port,
+            "still one shared browser, per-lane tabs"
+        );
 
         // The owner still gets the tab it launched, not the peer's new one.
         let owner_page = resolve_page("owner", None).await.expect("owner resolves");
-        assert_eq!(owner_page.target_id, launch_tab, "owner keeps the tab it launched");
-        assert_ne!(owner_page.target_id, peer_page.target_id, "two lanes, two tabs");
+        assert_eq!(
+            owner_page.target_id, launch_tab,
+            "owner keeps the tab it launched"
+        );
+        assert_ne!(
+            owner_page.target_id, peer_page.target_id,
+            "two lanes, two tabs"
+        );
 
         for s in ["owner", "peer"] {
             NATIVE_TARGETS.lock().unwrap().remove(s);
@@ -5320,7 +7933,9 @@ mod launch_args_tests {
     }
 
     fn is_bad(arg: &str) -> bool {
-        CHROME_BAD_FLAGS.iter().any(|b| arg == *b || arg.starts_with(&format!("{b}=")))
+        CHROME_BAD_FLAGS
+            .iter()
+            .any(|b| arg == *b || arg.starts_with(&format!("{b}=")))
     }
 
     /// MR-38: a kBadFlags entry without --test-type is the "unsupported
@@ -5332,7 +7947,11 @@ mod launch_args_tests {
     fn bad_flags_never_launch_without_test_type() {
         let args = chrome_launch_args(1234, &owned_target(), false, Some("PIN="), "");
         let bad: Vec<&String> = args.iter().filter(|a| is_bad(a)).collect();
-        assert_eq!(bad.len(), 1, "control: the SPKI pin must be in the list: {args:?}");
+        assert_eq!(
+            bad.len(),
+            1,
+            "control: the SPKI pin must be in the list: {args:?}"
+        );
         assert!(
             args.iter().any(|a| a == "--test-type"),
             "a kBadFlags entry is passed without --test-type — Chrome will show the \
@@ -5361,10 +7980,20 @@ mod launch_args_tests {
         };
         let args = chrome_launch_args(4321, &t, true, Some("PIN="), "  https://example.com/  ");
         assert_eq!(args[0], "--remote-debugging-port=4321");
-        assert_eq!(args[1], "--user-data-dir=/Users/x/Library/Application Support/Google/Chrome");
+        assert_eq!(
+            args[1],
+            "--user-data-dir=/Users/x/Library/Application Support/Google/Chrome"
+        );
         assert!(args.contains(&"--headless=new".to_string()), "{args:?}");
-        assert!(args.contains(&"--profile-directory=Profile 11".to_string()), "{args:?}");
-        assert_eq!(args.last().map(String::as_str), Some("https://example.com/"), "url is trimmed and last");
+        assert!(
+            args.contains(&"--profile-directory=Profile 11".to_string()),
+            "{args:?}"
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://example.com/"),
+            "url is trimmed and last"
+        );
         // An empty url adds no positional at all (Chrome would open a blank
         // window for "" — and the last arg must then be a flag).
         let none = chrome_launch_args(4321, &t, false, None, "   ");
@@ -5412,8 +8041,9 @@ mod spki_pin_tests {
         // Counter-case: a digest of the PEM FILE would also be Some(...) and
         // would look correct in every "did it return a value" check, while
         // matching nothing Chrome ever computes.
-        let file_hash = base64::engine::general_purpose::STANDARD
-            .encode(sha2::Sha256::digest(std::fs::read(tls.join("cert.pem")).unwrap()));
+        let file_hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(
+            std::fs::read(tls.join("cert.pem")).unwrap(),
+        ));
         assert_ne!(got, file_hash, "pin must not be a hash of the cert file");
 
         // Missing material must degrade to None (no flag), never to a guess.
@@ -5482,24 +8112,42 @@ mod last_exit_persistence_tests {
     #[test]
     fn a_displaced_browser_names_the_displacer_and_says_it_was_displaced() {
         let v = super::exit_record(
-            "displaced by a new start", "lane-b", "default", 4242, "lane-a", 1000,
+            "displaced by a new start",
+            "lane-b",
+            "default",
+            4242,
+            "lane-a",
+            1000,
         );
-        assert_eq!(v["by"], serde_json::json!("lane-b"), "the displacer must be named: {v}");
-        assert_eq!(v["started_by"], serde_json::json!("lane-a"), "the displaced owner must survive: {v}");
         assert_eq!(
-            v["reason"], serde_json::json!("displaced by a new start"),
+            v["by"],
+            serde_json::json!("lane-b"),
+            "the displacer must be named: {v}"
+        );
+        assert_eq!(
+            v["started_by"],
+            serde_json::json!("lane-a"),
+            "the displaced owner must survive: {v}"
+        );
+        assert_eq!(
+            v["reason"],
+            serde_json::json!("displaced by a new start"),
             "a displacement must not be recorded as a plain stop: {v}"
         );
 
         // A REAL stop still reads as one, so this did not just rename everything.
-        let stopped = super::exit_record("stopped", "activity-reaper", "default", 1, "lane-a", 1000);
+        let stopped =
+            super::exit_record("stopped", "activity-reaper", "default", 1, "lane-a", 1000);
         assert_eq!(stopped["reason"], serde_json::json!("stopped"));
         assert_eq!(stopped["by"], serde_json::json!("activity-reaper"));
 
         // AND AN UNNAMED ACTOR IS STILL NULL, NOT "". The two read identically to
         // a consumer and telling them apart is what the record is for (AMUX-3063).
         let anon = super::exit_record("stopped", "", "default", 1, "lane-a", 1000);
-        assert!(anon["by"].is_null(), "an unnamed actor must be null, not empty: {anon}");
+        assert!(
+            anon["by"].is_null(),
+            "an unnamed actor must be null, not empty: {anon}"
+        );
     }
 
     #[test]
@@ -5537,7 +8185,10 @@ mod last_exit_persistence_tests {
 
         // And the in-memory copy is still set, so the fast path is unchanged.
         let mem = LAST_EXIT.lock().expect("last-exit poisoned").clone();
-        assert!(mem.is_some(), "record_last_exit must still set the in-memory copy");
+        assert!(
+            mem.is_some(),
+            "record_last_exit must still set the in-memory copy"
+        );
         assert!(
             mem.expect("checked")["from_disk"].is_null(),
             "the in-memory copy must NOT claim it came from disk"
@@ -5556,7 +8207,8 @@ mod cdp_frame_attribution_tests {
     /// frame was truncated. The id is in the head, which survives that damage.
     #[test]
     fn a_truncated_response_still_yields_its_id() {
-        let truncated = format!("{}{}", r#"{"id":7,"result":{"value":""#, "x".repeat(200)) + r"\u00";
+        let truncated =
+            format!("{}{}", r#"{"id":7,"result":{"value":""#, "x".repeat(200)) + r"\u00";
         assert!(
             serde_json::from_str::<serde_json::Value>(&truncated).is_err(),
             "the fixture must actually be unparseable, or this test proves nothing"
@@ -5584,15 +8236,25 @@ mod cdp_frame_attribution_tests {
     fn another_commands_malformed_response_is_not_ours() {
         let other = r#"{"id":12,"result":{"value":"\u00"#;
         assert_eq!(CdpClient::cdp_frame_id_hint(other), Some(12));
-        assert_ne!(CdpClient::cdp_frame_id_hint(other), Some(7), "id 12 is not id 7");
+        assert_ne!(
+            CdpClient::cdp_frame_id_hint(other),
+            Some(7),
+            "id 12 is not id 7"
+        );
     }
 
     /// Whitespace and key order are the parser's problem, not ours, but the id
     /// must still be found when CDP pretty-prints or puts `id` later.
     #[test]
     fn the_id_is_found_despite_spacing_and_ordering() {
-        assert_eq!(CdpClient::cdp_frame_id_hint(r#"{"id": 42,"result":{"#), Some(42));
-        assert_eq!(CdpClient::cdp_frame_id_hint(r#"{"result":null,"id":99,"#), Some(99));
+        assert_eq!(
+            CdpClient::cdp_frame_id_hint(r#"{"id": 42,"result":{"#),
+            Some(42)
+        );
+        assert_eq!(
+            CdpClient::cdp_frame_id_hint(r#"{"result":null,"id":99,"#),
+            Some(99)
+        );
         assert_eq!(CdpClient::cdp_frame_id_hint("{}"), None);
         assert_eq!(CdpClient::cdp_frame_id_hint(""), None);
     }
@@ -5603,7 +8265,10 @@ mod cdp_frame_attribution_tests {
     /// decision no mutation can get at.
     #[test]
     fn only_our_own_id_makes_an_unparseable_frame_fatal() {
-        assert_eq!(CdpClient::unparseable_frame_verdict(Some(7), 7), FrameVerdict::Ours);
+        assert_eq!(
+            CdpClient::unparseable_frame_verdict(Some(7), 7),
+            FrameVerdict::Ours
+        );
         assert_eq!(
             CdpClient::unparseable_frame_verdict(Some(12), 7),
             FrameVerdict::Skip,
@@ -5627,5 +8292,191 @@ mod cdp_frame_attribution_tests {
             None,
             "an id past the head window is not searched for; the frame is skipped, not claimed"
         );
+    }
+}
+
+/// AMUX-4961: a Chrome that is still starting is neither absent nor dead.
+#[cfg(test)]
+mod startup_grace_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// BOTH kill branches read this predicate, and they fail in opposite
+    /// directions without it: the stray sweep reaps a launch it cannot see in
+    /// the in-memory registry, and the dead-CDP arm reaps one whose CDP has not
+    /// answered YET. Registering early without this only moves the kill from
+    /// the first branch to the second.
+    #[test]
+    fn a_launch_inside_its_grace_is_protected_and_one_past_it_is_not() {
+        let now = 1_000_000i64;
+        let starting = json!({"pid": 4242, "cdp_ready": false, "started_at": now - 5});
+        assert!(
+            record_is_starting(&starting, now, STARTUP_GRACE_S),
+            "a Chrome 5s into a 30s CDP wait must not be reaped"
+        );
+
+        // THE CONTROL, and the half that must not rot: the grace EXPIRES, so a
+        // launch that crashed without clearing its record becomes reclaimable
+        // rather than protecting a dead pid forever.
+        let expired = json!({"pid": 4242, "cdp_ready": false, "started_at": now - STARTUP_GRACE_S});
+        assert!(!record_is_starting(&expired, now, STARTUP_GRACE_S));
+        let long_gone = json!({"pid": 4242, "cdp_ready": false, "started_at": now - 86_400});
+        assert!(!record_is_starting(&long_gone, now, STARTUP_GRACE_S));
+    }
+
+    /// Once CDP answered, ordinary reconciliation applies again.
+    #[test]
+    fn a_browser_that_reached_cdp_is_not_treated_as_starting() {
+        let now = 1_000_000i64;
+        let ready = json!({"pid": 7, "cdp_ready": true, "started_at": now - 1});
+        assert!(!record_is_starting(&ready, now, STARTUP_GRACE_S));
+    }
+
+    /// A MISSING FIELD MEANS READY. Records written before `cdp_ready` existed
+    /// keep their old meaning, or an upgrade hands every stale record a one-time
+    /// 45s reprieve — a silent behaviour change on the very reconciliation path
+    /// this exists to make predictable.
+    #[test]
+    fn a_legacy_record_without_the_field_keeps_its_old_meaning() {
+        let now = 1_000_000i64;
+        let legacy = json!({"pid": 9, "started_at": now - 1});
+        assert!(!record_is_starting(&legacy, now, STARTUP_GRACE_S));
+    }
+}
+
+
+#[cfg(test)]
+mod query_js_tests {
+    use super::query_js;
+
+    #[test]
+    fn css_selectors_still_go_to_query_selector() {
+        assert_eq!(query_js("a[href=\"x\"]"), "document.querySelector(\"a[href=\\\"x\\\"]\")");
+    }
+
+    #[test]
+    fn playwright_text_selectors_resolve_by_visible_text_not_query_selector() {
+        for sel in ["text=Scheduler", "text=\"Scheduler\"", " text='Scheduler' "] {
+            let js = query_js(sel);
+            assert!(!js.contains("document.querySelector("), "{sel}: {js}");
+            assert!(js.contains("\"Scheduler\""), "{sel}: {js}");
+            assert!(js.contains("innerText"), "{sel}: {js}");
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pending_chrome_tests {
+    use super::PendingChrome;
+    #[tokio::test]
+    async fn cancelled_start_releases_its_exact_child() {
+        let child = tokio::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id().unwrap();
+        let peer = tokio::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut peer = peer;
+        drop(PendingChrome(Some(child)));
+        for _ in 0..100 {
+            if !super::pid_alive(pid) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!super::pid_alive(pid), "unpublished child survived cancellation");
+        assert!(peer.try_wait().unwrap().is_none(), "peer child was touched");
+        peer.kill().await.unwrap();
+    }
+    #[tokio::test]
+    async fn published_child_survives_for_server_readoption() {
+        let child = tokio::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut published = PendingChrome(Some(child)).publish();
+        assert!(published.try_wait().unwrap().is_none());
+        published.kill().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod adoption_activity_tests {
+    use super::*;
+    /// A browser adopted after a server restart is not "idle since it was
+    /// launched": its activity clock starts at adoption (2026-10-16, three
+    /// reaps of a driven browser right after deploys).
+    #[tokio::test]
+    async fn an_adopted_browser_gets_a_full_activity_window() {
+        // A stand-in CDP endpoint: adoption only needs /json/list to answer.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let body = "[]";
+                    let _ = sock.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await;
+                });
+            }
+        });
+        let home = tempfile::tempdir().unwrap();
+        let started = now_secs_i64() - 7200;
+        let record = serde_json::json!({
+            "profile": "adopt-activity-test", "cdp_port": port, "pid": std::process::id(),
+            "started_at": started, "started_by": "lane-x",
+            "user_data_dir": home.path().join("p").display().to_string(),
+        });
+        assert!(adopt_one(home.path(), &record).await, "a live CDP endpoint is adoptable");
+        let row = running_all().into_iter().find(|r| r.0 == "adopt-activity-test").expect("adopted");
+        RUNNING.lock().unwrap().remove("adopt-activity-test");
+        assert_eq!(row.2, started, "started_at keeps the launch time");
+        assert!(now_secs_i64() - row.5 <= 2, "the activity clock starts at adoption, not at launch (since_verb {}s)", now_secs_i64() - row.5);
+    }
+}
+
+#[cfg(test)]
+mod running_file_ownership_tests {
+    use super::*;
+    #[test]
+    fn session_cookies_are_kept_for_the_bounded_ttl_and_others_left_alone() {
+        let rows = vec![
+            serde_json::json!({"name": "JSESSIONID", "value": "v", "domain": ".netsuite.com", "path": "/", "session": true, "expires": -1}),
+            serde_json::json!({"name": "pref", "value": "x", "domain": ".netsuite.com", "path": "/", "session": false, "expires": 2_000_000_000.0}),
+        ];
+        let kept = session_cookies_to_keep(&rows, 1_000);
+        assert_eq!(kept.len(), 1, "only the session cookie needs keeping");
+        assert_eq!(kept[0]["name"], "JSESSIONID");
+        assert_eq!(kept[0]["session"], false);
+        let ttl = crate::integrations::browser_login_sync::SESSION_TTL_DAYS * 86_400;
+        assert_eq!(kept[0]["expires"], serde_json::json!(1_000 + ttl));
+        // The CDP parameters carry the new expiry, so Chrome stores it on disk.
+        let params = crate::integrations::computer::cookie_params(&kept);
+        assert_eq!(params[0]["expires"], serde_json::json!((1_000 + ttl) as f64));
+        assert!(session_cookies_to_keep(&rows[1..], 1_000).is_empty());
+    }
+
+    #[test]
+    fn parallel_profile_updates_preserve_peer_restart_records() {
+        let home = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(home.path().to_path_buf());
+        persist_running(&path, "keep", &path.join("keep"), 9000, 9001, 1, "peer", true);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(17));
+        let mut threads = Vec::new();
+        for i in 0..16 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let profile = format!("worker-{i}");
+                persist_running(&path, &profile, &path.join(&profile), 9100+i, 9101+u32::from(i), 1, &profile, true);
+                barrier.wait();
+                barrier.wait();
+                clear_running_for(&path, &profile);
+            }));
+        }
+        barrier.wait();
+        let before = read_running_file(&path);
+        barrier.wait();
+        for thread in threads { thread.join().unwrap(); }
+        assert_eq!(before.len(), 17, "a parallel start lost a profile's restart record");
+        let after = read_running_file(&path);
+        assert_eq!(after.len(), 1, "single-profile retirements changed their peer population");
+        assert_eq!(after["keep"]["pid"], 9001);
+        assert_eq!(after["keep"]["started_by"], "peer");
     }
 }

@@ -49,6 +49,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/templates", get(templates))
         .route("/api/git-check", get(git_check))
         .route("/api/git-branches", get(git_branches))
+        .route("/api/worktree-profiles", get(worktree_profiles))
         .route("/api/suggest-branch", post(suggest_branch))
         .route("/api/tmux-sessions", get(tmux_sessions))
         .route("/api/iterm2/sessions", get(iterm2_sessions))
@@ -85,7 +86,11 @@ async fn templates() -> Response {
         return Json(Value::Array(vec![])).into_response();
     };
     let mut dirs: Vec<_> = match std::fs::read_dir(&root) {
-        Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect(),
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
         Err(_) => return Json(Value::Array(vec![])).into_response(),
     };
     dirs.sort();
@@ -111,12 +116,77 @@ async fn templates() -> Response {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/worktree-profiles?dir=
+// ---------------------------------------------------------------------------
+
+/// The sparse profiles the create modal offers under "Use worktree"
+/// (AMUX-5341): the repo's own `scripts/worktree.sh profiles`, run from its
+/// committed bytes at origin/main. `supported: false` (not an error) for a
+/// repo without the script, which hides the picker.
+async fn worktree_profiles(RawQuery(q): RawQuery) -> Response {
+    use crate::api::session_verbs::{
+        parse_worktree_profiles, repo_toplevel, run_worktree_script, worktree_script_at,
+    };
+    let dir = qs_dir(&q);
+    if dir.is_empty() || !std::path::Path::new(&dir).is_dir() {
+        return Json(json!({"measured": false, "n_considered": 0, "supported": false,
+            "profiles": [], "why_unmeasured": "dir is not a directory"})).into_response();
+    }
+    let Some(repo) = repo_toplevel(&dir).await else {
+        return Json(json!({"measured": true, "n_considered": 0, "supported": false,
+            "profiles": [], "why": "not a git repository"})).into_response();
+    };
+    // CACHED PER (repo, origin/main sha): `profiles` sums tracked bytes over the
+    // whole tree (7.5s on Mixpeek, measured 2026-09-30), and its output only
+    // changes when origin/main moves. The sha lookup is the cheap part.
+    let sha = run("git", &["-C", &repo, "rev-parse", "--verify", "--quiet", "origin/main"], GIT_CHECK_TIMEOUT)
+        .await
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    static CACHE: std::sync::Mutex<Option<(String, String, Value)>> = std::sync::Mutex::new(None);
+    if !sha.is_empty() {
+        if let Some((r, s, v)) = CACHE.lock().ok().and_then(|g| g.clone()) {
+            if r == repo && s == sha {
+                let mut v = v;
+                v["cached"] = json!(true);
+                return Json(v).into_response();
+            }
+        }
+    }
+    let Some(script) = worktree_script_at(&repo, "origin/main").await else {
+        return Json(json!({"measured": true, "n_considered": 0, "supported": false,
+            "profiles": [], "why": "no scripts/worktree.sh at origin/main"})).into_response();
+    };
+    let out = run_worktree_script(&script, &repo, &["profiles"], Duration::from_secs(30)).await;
+    let stdout = out
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let profiles = parse_worktree_profiles(&stdout);
+    let body = json!({
+        "measured": out.is_some(), "n_considered": profiles.len(), "supported": true,
+        "profiles": profiles, "repo": repo, "at": sha,
+        "why_unmeasured": if out.is_none() { json!("worktree.sh profiles timed out") } else { Value::Null },
+    });
+    if out.is_some() && !sha.is_empty() {
+        if let Ok(mut g) = CACHE.lock() {
+            *g = Some((repo.clone(), sha.clone(), body.clone()));
+        }
+    }
+    Json(body).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/git-check?dir=  ·  GET /api/git-branches?dir=
 // ---------------------------------------------------------------------------
 
 fn qs_dir(q: &Option<String>) -> String {
     let params = parse_qs(q.as_deref().unwrap_or(""));
-    qs_get(&params, "dir").unwrap_or_default().trim().to_string()
+    qs_get(&params, "dir")
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 async fn git_check(RawQuery(q): RawQuery) -> Response {
@@ -131,9 +201,7 @@ async fn git_check(RawQuery(q): RawQuery) -> Response {
     )
     .await
     {
-        Some(out) => {
-            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
-        }
+        Some(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true",
         None => false,
     };
     Json(json!({"is_git": is_git})).into_response()
@@ -153,8 +221,7 @@ async fn git_branches(RawQuery(q): RawQuery) -> Response {
     else {
         return Json(json!({"branches": []})).into_response();
     };
-    Json(json!({"branches": sort_branches(&String::from_utf8_lossy(&out.stdout))}))
-        .into_response()
+    Json(json!({"branches": sort_branches(&String::from_utf8_lossy(&out.stdout))})).into_response()
 }
 
 /// py:71834 — drop `main`, then `session/*` first, alphabetical within each
@@ -197,7 +264,8 @@ async fn suggest_branch(Json(body): Json<Value>) -> Response {
         return Json(json!({"suggestions": fallback, "via": "deterministic"})).into_response();
     }
 
-    let mut ask = format!("Suggest 4 git branch names for a coding session.\nSession name: {name:?}");
+    let mut ask =
+        format!("Suggest 4 git branch names for a coding session.\nSession name: {name:?}");
     if !dir.is_empty() {
         ask.push_str(&format!("\nProject directory: {dir:?}"));
     }
@@ -238,10 +306,20 @@ fn slugify(name: &str) -> String {
     let s: String = name
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "session".into() } else { s }
+    if s.is_empty() {
+        "session".into()
+    } else {
+        s
+    }
 }
 
 fn deterministic_branches(name: &str) -> Vec<String> {
@@ -294,7 +372,11 @@ async fn tmux_sessions() -> Response {
     // is why every `-F` format in this repo agrees on that.
     let Some(out) = run(
         "tmux",
-        &["list-sessions", "-F", "#{session_name}:#{pane_current_path}"],
+        &[
+            "list-sessions",
+            "-F",
+            "#{session_name}:#{pane_current_path}",
+        ],
         OP_TIMEOUT,
     )
     .await
@@ -347,7 +429,10 @@ async fn iterm2_sessions() -> Response {
     // time this route 404'd — so when it legitimately cannot list panes, say
     // which of the two it was rather than leaving the UI to guess again.
     let (panes, err) = match out {
-        None => (vec![], Some("osascript did not answer within 5s".to_string())),
+        None => (
+            vec![],
+            Some("osascript did not answer within 5s".to_string()),
+        ),
         Some(o) if !o.status.success() => (
             vec![],
             Some(
@@ -358,11 +443,18 @@ async fn iterm2_sessions() -> Response {
                     .collect::<String>(),
             ),
         ),
-        Some(o) => (parse_iterm2_panes(&String::from_utf8_lossy(&o.stdout)), None),
+        Some(o) => (
+            parse_iterm2_panes(&String::from_utf8_lossy(&o.stdout)),
+            None,
+        ),
     };
     let mut body = json!({"panes": panes});
     if let Some(e) = err {
-        body["error"] = json!(if e.is_empty() { "iTerm2 is not running".into() } else { e });
+        body["error"] = json!(if e.is_empty() {
+            "iTerm2 is not running".into()
+        } else {
+            e
+        });
     }
     Json(body).into_response()
 }
@@ -413,7 +505,12 @@ mod tests {
         let got = deterministic_branches("My Worker!! 2");
         assert_eq!(
             got,
-            vec!["session/my-worker---2", "feat/my-worker---2", "wip/my-worker---2", "my-worker---2"]
+            vec![
+                "session/my-worker---2",
+                "feat/my-worker---2",
+                "wip/my-worker---2",
+                "my-worker---2"
+            ]
         );
         // An empty/garbage name still yields usable names rather than "session/".
         assert_eq!(deterministic_branches("***")[0], "session/session");
@@ -429,7 +526,12 @@ mod tests {
                    Let me know if you want more!";
         assert_eq!(
             parse_suggestions(raw),
-            vec!["feat/offline-queue", "session/offline-queue", "offline-upload-queue", "oq"],
+            vec![
+                "feat/offline-queue",
+                "session/offline-queue",
+                "offline-upload-queue",
+                "oq"
+            ],
             "only bare branch-shaped tokens survive"
         );
     }

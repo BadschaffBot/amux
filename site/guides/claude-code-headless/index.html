@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -20,36 +20,62 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Guides","item":"https://amux.io/guides/"},{"@type":"ListItem","position":3,"name":"Claude Code Headless","item":"https://amux.io/guides/claude-code-headless/"}]}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"Claude Code Headless Mode: The Complete Self-Hosting Guide (2026)","description":"Run Claude Code without the interactive terminal. Full guide to headless flags, auth options, CI/CD patterns, parallel fleets, cost tracking, and self-hosting.","url":"https://amux.io/guides/claude-code-headless/","datePublished":"2026-04-16","dateModified":"2026-08-14","author":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}}}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"HowTo","name":"Run Claude Code in Headless Mode","description":"Step-by-step guide to running Claude Code non-interactively for automation, CI/CD, and parallel agent workflows.","step":[{"@type":"HowToStep","name":"Install Claude Code","text":"Install the Claude Code CLI via npm: npm install -g @anthropic-ai/claude-code"},{"@type":"HowToStep","name":"Choose an auth method","text":"Either authenticate your Max subscription via claude login, or set ANTHROPIC_API_KEY for per-token billing."},{"@type":"HowToStep","name":"Run with --print flag","text":"Use claude --print \"your prompt\" to get a single non-interactive response written to stdout."},{"@type":"HowToStep","name":"Enable auto-approval","text":"Add --dangerously-skip-permissions for fully unattended runs, or configure a permission policy file for selective approval."},{"@type":"HowToStep","name":"Capture structured output","text":"Use --output-format json to get machine-readable responses including token usage and cost."},{"@type":"HowToStep","name":"Wrap in a supervisor","text":"For production use, wrap headless runs in a supervisor (tmux, systemd, or amux) that handles crash recovery, context compaction, and cost monitoring."}]}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is Claude Code headless mode?","acceptedAnswer":{"@type":"Answer","text":"Headless mode runs Claude Code non-interactively — without the TUI prompt loop. You pass a task, it completes the task, it writes output to stdout or a file, and exits. This is how you use Claude Code inside CI/CD pipelines, cron jobs, parallel agent fleets, or any automated workflow where there is no human to watch the terminal."}},{"@type":"Question","name":"How do I run Claude Code non-interactively?","acceptedAnswer":{"@type":"Answer","text":"Use the --print flag (or -p): claude --print \"your task here\". Claude Code will execute the task and write the response to stdout without entering the interactive prompt loop. Combine with --output-format json to get structured output, and --dangerously-skip-permissions to auto-approve tool calls for fully unattended operation."}},{"@type":"Question","name":"Can I use Claude Code headless with my Max subscription?","acceptedAnswer":{"@type":"Answer","text":"Yes. Headless mode uses the same authentication as interactive mode. If you've logged in with claude login, your Max subscription covers headless usage under the same quota. The headless flag only changes how the interface behaves, not how billing works."}},{"@type":"Question","name":"Should I use my Max subscription or an API key for headless runs?","acceptedAnswer":{"@type":"Answer","text":"It depends on volume. Max subscriptions are flat-rate but rate-limited on a weekly window — good for predictable workloads under the cap. API keys (ANTHROPIC_API_KEY) are pay-per-token with no rate cap — good for bursty or team-shared workloads. Heavy overnight runs that burst above the Max ceiling typically benefit from API keys, while steady solo usage is cheaper on Max."}},{"@type":"Question","name":"How do I run Claude Code in Docker or on a server?","acceptedAnswer":{"@type":"Answer","text":"Install Node.js and the Claude Code CLI in your container image, mount your project as a volume, set ANTHROPIC_API_KEY as an env var, and invoke claude --print in your entrypoint. For persistent background operation, use a supervisor like tmux, systemd, or amux — Claude Code itself is not a daemon and will exit after each headless invocation."}},{"@type":"Question","name":"How do I track cost for headless Claude Code runs?","acceptedAnswer":{"@type":"Answer","text":"Use --output-format json to get per-invocation token counts in the response. For ongoing session tracking, parse the JSONL transcript file that Claude Code writes to ~/.claude/projects/. Each message includes input_tokens, output_tokens, and cache stats. A control plane like amux aggregates these into per-session and per-day dashboards automatically."}},{"@type":"Question","name":"Can I run multiple Claude Code agents in parallel headlessly?","acceptedAnswer":{"@type":"Answer","text":"Yes. Each headless invocation is a separate process with its own conversation directory. You can run dozens in parallel by launching them in separate tmux panes, subprocess children, or container instances. The main practical limits are system memory, API rate limits, and the coordination overhead of knowing what each agent is doing — which is what an agent control plane solves."}},{"@type":"Question","name":"Is it safe to use --dangerously-skip-permissions?","acceptedAnswer":{"@type":"Answer","text":"Only in isolated environments. The flag auto-approves all tool calls including file writes, shell commands, and network requests. Use it in ephemeral containers, worktrees, or VMs where damage is contained. Never use it on your main development machine with access to production credentials. For safer unattended operation, write a permission policy file that allows specific tools and denies others."}},{"@type":"Question","name":"What is the Claude Code resume dialog and how do I handle it in headless mode?","acceptedAnswer":{"@type":"Answer","text":"When Claude Code starts in a directory that contains a previous session, it shows an interactive prompt: 'Would you like to resume this session? 1. Yes / 2. No'. In headless automation this dialog silently stalls the process with no timeout and no error. A quick workaround is to pre-pipe the answer: echo '1' | claude --print 'your task'. If you use amux, its auto_answer_resume_dialog setting (ON by default) handles this automatically so unattended overnight runs never block on the dialog."}},{"@type":"Question","name":"How do I check on a headless agent from my phone?","acceptedAnswer":{"@type":"Answer","text":"If you use amux, open the iOS app or the PWA and tap the Simple tab on any worker card. It shows a plain-English summary of what the agent is currently working on, synthesised from its last conversation turn. You can also use the voice orchestration feature in the + menu to dispatch new tasks or steering prompts by voice, and the Messages tab groups conversation history by day so you can jump to any overnight window without scrolling."}}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"Claude Code Headless Mode: The Complete Self-Hosting Guide (2026)","description":"Run Claude Code without the interactive terminal. Full guide to headless flags, auth options, CI/CD patterns, parallel fleets, cost tracking, and self-hosting.","url":"https://amux.io/guides/claude-code-headless/","datePublished":"2026-04-16","dateModified":"2026-10-24","author":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}}}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"HowTo","name":"Run Claude Code in Headless Mode","description":"Step-by-step guide to running Claude Code non-interactively for automation, CI/CD, and parallel agent workflows.","step":[{"@type":"HowToStep","name":"Install Claude Code","text":"Install the Claude Code CLI via npm: npm install -g @anthropic-ai/claude-code"},{"@type":"HowToStep","name":"Choose an auth method","text":"Either authenticate your Max subscription via claude login, or set ANTHROPIC_API_KEY for per-token billing."},{"@type":"HowToStep","name":"Run with --print flag","text":"Use claude --print \"your prompt\" to get a single non-interactive response written to stdout."},{"@type":"HowToStep","name":"Enable auto-approval","text":"Add --dangerously-skip-permissions for fully unattended runs, or configure a permission policy file for selective approval."},{"@type":"HowToStep","name":"Capture structured output","text":"Use --output-format json to get machine-readable responses including token usage and cost."},{"@type":"HowToStep","name":"Wrap in a supervisor","text":"For production use, wrap headless runs in a supervisor: systemd for process restarts, and amux for usage-limit resume, stall alerts, and cost monitoring."}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is Claude Code headless mode?","acceptedAnswer":{"@type":"Answer","text":"Headless mode runs Claude Code non-interactively — without the TUI prompt loop. You pass a task, it completes the task, it writes output to stdout or a file, and exits. This is how you use Claude Code inside CI/CD pipelines, cron jobs, parallel agent fleets, or any automated workflow where there is no human to watch the terminal."}},{"@type":"Question","name":"How do I run Claude Code non-interactively?","acceptedAnswer":{"@type":"Answer","text":"Use the --print flag (or -p): claude --print \"your task here\". Claude Code will execute the task and write the response to stdout without entering the interactive prompt loop. Combine with --output-format json to get structured output, and --dangerously-skip-permissions to auto-approve tool calls for fully unattended operation."}},{"@type":"Question","name":"Can I use Claude Code headless with my Max subscription?","acceptedAnswer":{"@type":"Answer","text":"Yes. Headless mode uses the same authentication as interactive mode. If you've logged in with claude login, your Max subscription covers headless usage under the same quota. The headless flag only changes how the interface behaves, not how billing works."}},{"@type":"Question","name":"Should I use my Max subscription or an API key for headless runs?","acceptedAnswer":{"@type":"Answer","text":"It depends on volume. Max subscriptions are flat-rate but rate-limited on a weekly window — good for predictable workloads under the cap. API keys (ANTHROPIC_API_KEY) are pay-per-token with no rate cap — good for bursty or team-shared workloads. Heavy overnight runs that burst above the Max ceiling typically benefit from API keys, while steady solo usage is cheaper on Max."}},{"@type":"Question","name":"How do I run Claude Code in Docker or on a server?","acceptedAnswer":{"@type":"Answer","text":"Install Node.js and the Claude Code CLI in your container image, mount your project as a volume, set ANTHROPIC_API_KEY as an env var, and invoke claude --print in your entrypoint. For persistent background operation, use a supervisor like tmux, systemd, or amux — Claude Code itself is not a daemon and will exit after each headless invocation."}},{"@type":"Question","name":"How do I track cost for headless Claude Code runs?","acceptedAnswer":{"@type":"Answer","text":"Use --output-format json to get per-invocation token counts in the response. For ongoing session tracking, parse the JSONL transcript file that Claude Code writes to ~/.claude/projects/. Each message includes input_tokens, output_tokens, and cache stats. A control plane like amux aggregates these into per-session and per-day dashboards automatically."}},{"@type":"Question","name":"Can I run multiple Claude Code agents in parallel headlessly?","acceptedAnswer":{"@type":"Answer","text":"Yes. Each headless invocation is a separate process with its own conversation directory. You can run dozens in parallel by launching them in separate tmux panes, subprocess children, or container instances. The main practical limits are system memory, API rate limits, and the coordination overhead of knowing what each agent is doing — which is what an agent control plane solves."}},{"@type":"Question","name":"Is it safe to use --dangerously-skip-permissions?","acceptedAnswer":{"@type":"Answer","text":"Only in isolated environments. The flag auto-approves all tool calls including file writes, shell commands, and network requests. Use it in ephemeral containers, worktrees, or VMs where damage is contained. Never use it on your main development machine with access to production credentials. For safer unattended operation, write a permission policy file that allows specific tools and denies others."}},{"@type":"Question","name":"What is the Claude Code resume dialog and how do I handle it in headless mode?","acceptedAnswer":{"@type":"Answer","text":"When Claude Code starts in a directory that contains a previous session, it shows an interactive prompt: 'Would you like to resume this session? 1. Yes / 2. No'. In headless automation this dialog silently stalls the process with no timeout and no error. A quick workaround is to pre-pipe the answer: echo '1' | claude --print 'your task'. amux does not answer the dialog for you; it shows the session as waiting on the dashboard and phone, and stall detection alerts you."}},{"@type":"Question","name":"How do I check on a headless agent from my phone?","acceptedAnswer":{"@type":"Answer","text":"If you use amux, open the iOS app or the PWA and tap the Simple tab on any worker card. It shows a plain-English summary of what the agent is currently working on, synthesised from its last conversation turn. You can also use the voice orchestration feature in the + menu to dispatch new tasks or steering prompts by voice, and the Messages tab groups conversation history by day so you can jump to any overnight window without scrolling."}},{"@type":"Question","name":"Where should I run headless Claude Code so it keeps working overnight?","acceptedAnswer":{"@type":"Answer","text":"On a machine that stays on: your own VPS or Mac mini under a supervisor such as systemd or amux, or amux Cloud, which gives you a dedicated always-on server at yourname.amux.io from $39/mo with usage-limit resume and phone control included. A laptop stops the agents when it sleeps, and CI runners have job time limits."}}]}</script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">&rsaquo;</span> <a href="/guides/">Guides</a> <span class="sep">&rsaquo;</span> <span>Claude Code Headless</span></div>
     <h1>Claude Code Headless Mode</h1>
-    <p class="subtitle">How to run Claude Code without the interactive terminal &mdash; for CI/CD, overnight batches, parallel AI engineering teams, and API-driven workflows. The complete self-hosting guide. <em>Updated August 2026.</em></p>
+    <p class="subtitle">How to run Claude Code without the interactive terminal &mdash; for CI/CD, overnight batches, parallel AI engineering teams, and API-driven workflows. The complete self-hosting guide. <em>Updated October 2026.</em></p>
 
-    <!-- EXP-015: top-of-page CTA on high-traffic guides with low CVR -->
-    <div style="background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.25);border-radius:8px;padding:14px 20px;margin:20px 0;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
-      <div style="flex:1;min-width:200px;font-size:.9rem">
-        <strong>Want to run 10+ headless agents in parallel?</strong> <span style="color:var(--muted)">amux orchestrates, monitors, and self-heals an entire fleet of headless Claude Code sessions from one dashboard or your phone.</span>
+    <!-- EXP-134: rate-limit pain angle for headless users -->
+
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem 1.4rem;margin:1.5rem 0;font-size:0.88rem;line-height:1.7;">
+      <strong>Short answer:</strong> run <code>claude -p "your task"</code> (short for <code>--print</code>) and Claude Code does the task without the interactive prompt, prints the result and exits. Add <code>--output-format json</code> for scripts and a permission mode for unattended runs. For anything longer than one turn, run it on a machine that stays on under a supervisor that restarts it; <a href="#where-to-run">where to run it</a> compares the options.
+    </div>
+
+    <div class="cta-box" data-cta-loc="cloud-inline-top">
+      <p style="margin:0;"><strong>amux Cloud:</strong> your headless agents keep running when your laptop sleeps, resume on their own after usage limits, and you steer them from your phone. You get your own server at <code>yourname.amux.io</code>, from $39/mo.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-top:1rem;">
+        <a class="btn btn-primary" href="/start/?source=claude-code-headless">Start amux Cloud</a>
+        <a class="btn" href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">Self-host free on GitHub</a>
       </div>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="posthog&&posthog.capture('exp015_headless_topofpage_cta_click',{page:window.location.pathname})" style="background:rgba(16,185,129,.15);color:var(--text);border:1px solid rgba(16,185,129,.4);padding:8px 16px;border-radius:6px;font-weight:600;text-decoration:none;font-size:.88rem;white-space:nowrap;flex-shrink:0">View amux on GitHub ★</a>
     </div>
 
     <nav class="toc" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem 1.6rem;margin:2rem 0;">
@@ -61,11 +87,13 @@
         <li><a href="#permissions" style="color:var(--dim);text-decoration:none;">Permission Modes for Unattended Runs</a></li>
         <li><a href="#patterns" style="color:var(--dim);text-decoration:none;">Six Common Headless Patterns</a></li>
         <li><a href="#supervision" style="color:var(--dim);text-decoration:none;">Supervision: tmux, systemd, and Control Planes</a></li>
+        <li><a href="#where-to-run" style="color:var(--dim);text-decoration:none;">Where Should Headless Claude Code Run?</a></li>
         <li><a href="#cost" style="color:var(--dim);text-decoration:none;">Tracking Cost and Token Usage</a></li>
         <li><a href="#parallel" style="color:var(--dim);text-decoration:none;">Running Headless Agents in Parallel</a></li>
         <li><a href="#docker" style="color:var(--dim);text-decoration:none;">Headless Claude Code in Docker</a></li>
         <li><a href="#pitfalls" style="color:var(--dim);text-decoration:none;">Common Pitfalls</a></li>
         <li><a href="#with-amux" style="color:var(--dim);text-decoration:none;">Headless Claude Code with amux</a></li>
+        <li><a href="#oct-2026" style="color:var(--dim);text-decoration:none;">What Changed in October 2026</a></li>
         <li><a href="#faq" style="color:var(--dim);text-decoration:none;">FAQ</a></li>
       </ol>
     </nav>
@@ -340,8 +368,8 @@ git add README.md &amp;&amp; git commit -m "docs: daily refresh" || true</code><
           </tr>
           <tr>
             <td><strong>Agent control plane (<a href="/guides/agent-control-plane/">what is this?</a>)</strong></td>
-            <td>All of the above + observability, cost tracking, orchestration, self-healing</td>
-            <td>&mdash;</td>
+            <td>Persistent sessions, observability, cost tracking, orchestration, usage-limit resume, stall alerts</td>
+            <td>Restarting a crashed agent process is not built into amux; pair it with systemd, or the optional macOS <code>scripts/tmux-watchdog.sh</code></td>
           </tr>
         </tbody>
       </table>
@@ -372,6 +400,34 @@ RestartSec=60
 WantedBy=multi-user.target</code></pre>
 
     <p>This works for one or two agents. It does not scale to ten. The moment you have a fleet, you need fleet-level tooling.</p>
+
+    <!-- ───────────────────────────── SECTION: WHERE TO RUN ───────────────────────────── -->
+    <h2 id="where-to-run">Where Should Headless Claude Code Run?</h2>
+
+    <p>A headless agent only works while the machine under it is awake. A laptop is fine for one-shot tasks you watch; anything overnight, scheduled or long-running needs a machine that stays on, and somebody has to keep that machine patched and the agents alive.</p>
+
+    <div style="overflow-x:auto;margin:2rem 0;">
+      <table class="data-table">
+        <thead><tr><th>Where</th><th>Good for</th><th>Watch out for</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Your laptop</strong></td><td>One-shot tasks, trying flags, short batches</td><td>Stops when the lid closes or the machine sleeps</td></tr>
+          <tr><td><strong>CI runner</strong> (GitHub Actions and similar)</td><td>PR review, lint fixes, gates on every push</td><td>Job time limits; no session to come back to</td></tr>
+          <tr><td><strong>Your own VPS or Mac mini</strong></td><td>Overnight and scheduled agents, full control</td><td>You set up the supervisor, updates, backups and remote access</td></tr>
+          <tr><td><strong><a href="/cloud/">amux Cloud</a></strong></td><td>A team of agents running around the clock, managed from your phone</td><td>Paid: from $39/mo for a dedicated server</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>amux Cloud gives you your own always-on server at <code>yourname.amux.io</code> with amux already running: agents resume after usage limits, the amux server is restarted by its OS service if it dies, scheduled tasks fire on time, and the dashboard and iOS app show every agent's live terminal. You sign in with your own Claude subscription or an API key. If you would rather run the box yourself, the same software installs free with <code>curl -fsSL https://amux.io/install.sh | bash</code>.</p>
+
+    <div class="cta-box" data-cta-loc="cloud-inline-mid">
+      <p style="margin:0;"><strong>Skip the server setup.</strong> Your agents keep running when your laptop sleeps; steer them from your phone. Dedicated server, ready in about three minutes, from $39/mo.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-top:1rem;">
+        <a class="btn btn-primary" href="/start/?source=claude-code-headless">Start amux Cloud</a>
+        <a class="btn" href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">Self-host free on GitHub</a>
+      </div>
+      <p style="font-size:0.88rem;color:var(--fg-dim);margin:1rem 0 0;">Running agents across several client repos? <a href="/start/?plan=team&amp;source=claude-code-headless" style="color:var(--accent);">Cloud Team</a> is $69/mo with 8 vCPU and 16 GB RAM.</p>
+    </div>
 
     <!-- ───────────────────────────── SECTION: COST ───────────────────────────── -->
     <h2 id="cost">Tracking Cost and Token Usage</h2>
@@ -510,13 +566,13 @@ $ docker run --rm \
       <li><strong>Unbounded parallelism.</strong> Launching 50 agents in parallel against the API will burn through your rate limit in minutes. Cap concurrency with <code>xargs -P</code>, a semaphore, or a queue.</li>
       <li><strong>No cost limits.</strong> A retry loop on a bad prompt can spend $100 in an hour. Always set per-invocation or per-day budget guards.</li>
       <li><strong>Not saving session IDs.</strong> If you don&rsquo;t capture <code>session_id</code> from the JSON output, you can&rsquo;t resume. You can&rsquo;t post-mortem. You can&rsquo;t debug.</li>
-      <li id="resume-dialog-pitfall"><strong>The resume dialog trap.</strong> When Claude Code starts in a directory where a previous session existed, it shows an interactive prompt: &ldquo;Would you like to resume this session? 1. Yes / 2. No&rdquo;. This completely blocks unattended automation &mdash; the agent pauses waiting for input, and the whole overnight run stalls with no error, no exit code, and no indication of what happened. A bare workaround is to pipe an answer in: <code>echo "1" | claude --print ...</code>. The cleaner fix is amux&rsquo;s built-in <strong>auto-answer resume dialog</strong> setting (<code>Settings &rarr; auto_answer_resume_dialog</code>, default ON) which automatically answers &ldquo;1&rdquo; (Yes) so sessions keep flowing without human intervention.</li>
+      <li id="resume-dialog-pitfall"><strong>The resume dialog trap.</strong> When Claude Code starts in a directory where a previous session existed, it shows an interactive prompt: &ldquo;Would you like to resume this session? 1. Yes / 2. No&rdquo;. This completely blocks unattended automation &mdash; the agent pauses waiting for input, and the whole overnight run stalls with no error, no exit code, and no indication of what happened. A bare workaround is to pipe an answer in: <code>echo "1" | claude --print ...</code>. amux does not answer this prompt for you; the session shows as waiting in the dashboard and on your phone, and stall detection flags the board work it was on.</li>
     </ul>
 
     <!-- ───────────────────────────── SECTION: WITH AMUX ───────────────────────────── -->
     <h2 id="with-amux">Run an AI Engineering Team Headless with amux</h2>
 
-    <p>amux is an open-source <a href="/guides/agent-control-plane/">agent control plane</a> that gives you an AI engineering team you can run unattended from a single dashboard or your phone. It orchestrates Claude Code, OpenAI Codex CLI, and Gemini CLI sessions in parallel &mdash; handling supervision, observability, cost tracking, and orchestration in a single Rust binary, without requiring any of the scripting above.</p>
+    <p>amux is a self-hosted <a href="/guides/agent-control-plane/">agent control plane</a> that gives you an AI engineering team you can run unattended from a single dashboard or your phone. It orchestrates Claude Code, OpenAI Codex CLI, and Gemini CLI sessions in parallel &mdash; handling supervision, observability, cost tracking, and orchestration in a single Rust binary, without requiring any of the scripting above.</p>
 
     <p>The difference is most visible in a side-by-side:</p>
 
@@ -535,14 +591,14 @@ $ docker run --rm \
             <td>Web dashboard with per-session live output</td>
           </tr>
           <tr>
-            <td><strong>Crash recovery</strong></td>
+            <td><strong>Recovery</strong></td>
             <td>systemd unit per agent + <code>Restart=on-failure</code></td>
-            <td>Built-in watchdog auto-restarts and replays last message</td>
+            <td>Resumes after usage limits; workers return after a macOS reboot; stall alerts</td>
           </tr>
           <tr>
             <td><strong>Context overflow</strong></td>
             <td>Agent fails; you rerun manually tomorrow</td>
-            <td>Auto-compacts and continues; no work lost</td>
+            <td>Claude Code compacts its own context; amux lets you set the threshold</td>
           </tr>
           <tr>
             <td><strong>Cost tracking</strong></td>
@@ -565,14 +621,9 @@ $ docker run --rm \
 
     <p>Install with Homebrew (recommended), pipx, or uvx:</p>
 
-    <pre><code><span class="comment"># Homebrew (macOS / Linux)</span>
-$ brew install mixpeek/amux/amux
+    <pre>$ curl -fsSL https://amux.io/install.sh | bash
 
-<span class="comment"># or pipx</span>
-$ pipx install amux
-
-<span class="comment"># or uvx (no install, run directly)</span>
-$ uvx amux serve</code></pre>
+</pre>
 
     <pre><code>$ amux register myproject --dir ~/Dev/myproject --yolo
 $ amux start worker-1 worker-2 worker-3
@@ -580,11 +631,11 @@ $ amux serve  <span class="comment"># → https://localhost:8824</span></code></
 
     <p>Under the hood, <code>amux start</code> launches Claude Code (or Codex CLI, or Gemini CLI &mdash; your choice) in headless mode inside a tmux session per agent, with <code>--dangerously-skip-permissions</code> enabled by the <code>--yolo</code> project flag and cost-tracking auto-wired from the JSONL transcripts. The dashboard at <code>localhost:8824</code> shows live output, per-session cost, and a kanban board for task claiming &mdash; everything the supervision and cost sections of this guide described, already built.</p>
 
-    <p><strong>Auto-answer resume dialog:</strong> amux ships with <code>auto_answer_resume_dialog</code> ON by default, so the <a href="#resume-dialog-pitfall">resume dialog trap</a> never blocks your overnight runs. No extra config needed.</p>
+    <p><strong>Resume dialog:</strong> amux does not answer the <a href="#resume-dialog-pitfall">resume dialog</a> for you. It shows a blocked session as waiting on the dashboard and phone, and stall detection fires an owner alert so you can answer it.</p>
 
     <p><strong>Append-only execution log:</strong> Every headless session gets an event-sourced execution log &mdash; an append-only record of what each agent did, every tool call, every decision. You can replay the log after a failed overnight run to see exactly where things went wrong, without having been watching the terminal. This is the observability primitive that makes headless AI engineering teams debuggable.</p>
 
-    <p>amux is MIT-licensed and has over 300 stars on <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>. There is also a <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">native iOS app</a> for monitoring your agent fleet from your phone.</p>
+    <p>amux is source-available (MIT + Commons Clause) and has over 500 stars on <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>. There is also a <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">native iOS app</a> for monitoring your agent fleet from your phone.</p>
 
     <p>If you&rsquo;re running one or two headless agents, the raw <code>claude --print</code> approach from earlier in this guide is perfectly fine. If you&rsquo;re running five or more, or anything overnight, use a control plane &mdash; either amux or something equivalent. The scripting to replicate its features yourself is a weekend project, but maintaining that scripting as Claude Code evolves is not.</p>
 
@@ -601,6 +652,46 @@ $ amux serve  <span class="comment"># → https://localhost:8824</span></code></
 
     <p>All three work from the iOS app (<a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">App Store</a>) and the installable PWA on any device that can reach your amux server.</p>
 
+    <!-- ───────────────────────────── SECTION: OCTOBER 2026 ───────────────────────────── -->
+    <h2 id="oct-2026">What Changed in October 2026</h2>
+
+    <p>Claude Code and amux both shipped features in October 2026 that directly affect headless workflows. Here is what is new:</p>
+
+    <div style="overflow-x:auto;margin:2rem 0;">
+      <table class="data-table">
+        <thead><tr><th>Feature</th><th>What it does</th><th>Why it matters for headless</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>Account rotation</strong></td>
+            <td>amux tracks 5-hour and 7-day usage windows per account. When one account hits its ceiling, amux automatically shifts to the next verified account in the pool.</td>
+            <td>Overnight runs that previously stalled on a rate limit now continue uninterrupted. No manual intervention needed.</td>
+          </tr>
+          <tr>
+            <td><strong>Workspace isolation per worker</strong></td>
+            <td>Each worker gets its own git worktree, <code>TMPDIR</code>, and push strategy. Enable per worker with <code>AMUX_WORKSPACE_ISOLATION=1</code>.</td>
+            <td>Eliminates the file-contention class of headless failures when multiple agents touch shared paths concurrently.</td>
+          </tr>
+          <tr>
+            <td><strong>Vault secrets</strong></td>
+            <td>Project-scoped secrets vault. Secrets resolve at session start without reaching the model or any log file.</td>
+            <td>Headless agents that need credentials (DB URLs, API keys) can fetch them safely without passing them on the command line or in env vars.</td>
+          </tr>
+          <tr>
+            <td><strong>Standing approvals</strong></td>
+            <td>Pre-approve specific tool patterns once per project. The agent does not pause to prompt; the decision is already recorded.</td>
+            <td>Extends the behavior of <code>--dangerously-skip-permissions</code> but with fine-grained allow/deny rather than all-or-nothing.</td>
+          </tr>
+          <tr>
+            <td><strong>Goal keeper</strong></td>
+            <td>A <code>/goal</code> set for a session gets re-prompted to Claude if the session drifts. amux detects drift from behavior signals, not just idle time.</td>
+            <td>Long-running overnight batches that wander off-task get pulled back without human intervention.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>The account rotation feature is covered in detail in the <a href="/guides/claude-code-account-rotation/">Claude Code account rotation guide</a>.</p>
+
     <!-- ───────────────────────────── SECTION: FAQ ───────────────────────────── -->
     <h2 id="faq">FAQ</h2>
 
@@ -612,6 +703,10 @@ $ amux serve  <span class="comment"># → https://localhost:8824</span></code></
       <details class="faq-item">
         <summary>How do I run Claude Code non-interactively?</summary>
         <p>Use <code>claude --print "your task"</code>. For fully unattended runs, add <code>--dangerously-skip-permissions</code> or a permission policy file. For machine-readable output with token counts and cost, add <code>--output-format json</code>.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Where should I run headless Claude Code so it keeps working overnight?</summary>
+        <p>On a machine that stays on: your own VPS or Mac mini under a supervisor such as systemd or amux, or amux Cloud, which gives you a dedicated always-on server at yourname.amux.io from $39/mo with usage-limit resume and phone control included. A laptop stops the agents when it sleeps, and CI runners have job time limits.</p>
       </details>
       <details class="faq-item">
         <summary>Can I use my Max subscription for headless runs?</summary>
@@ -642,12 +737,16 @@ $ amux serve  <span class="comment"># → https://localhost:8824</span></code></
         <p>The REPL loops until you exit; <code>--print</code> runs a single turn and returns. The REPL prompts for tool approvals interactively; <code>--print</code> combined with permission flags is fully non-interactive. Both share authentication and session state.</p>
       </details>
       <details class="faq-item">
+        <summary>What happens when a headless agent hits the Claude Code rate limit?</summary>
+        <p>The agent stalls. Claude Code prints a message about the 5-hour usage window and stops accepting prompts until the window resets. For overnight runs, this means your entire fleet is down until you notice and intervene &mdash; which may be hours later. The cleanest solution is account rotation: keep a pool of verified Claude Code accounts in amux, and when one account hits its ceiling, the fleet automatically shifts to the next one. The <a href="/guides/claude-code-account-rotation/">account rotation guide</a> walks through setup.</p>
+      </details>
+      <details class="faq-item">
         <summary>Can I resume a headless session later?</summary>
         <p>Yes. Capture the <code>session_id</code> from JSON output and pass <code>--resume &lt;session-id&gt;</code> on the next invocation. The conversation picks up exactly where it left off.</p>
       </details>
       <details class="faq-item">
         <summary>What is the Claude Code resume dialog and how do I handle it in headless mode?</summary>
-        <p>When Claude Code starts in a directory that contains a previous session, it shows an interactive prompt asking whether to resume: &ldquo;Would you like to resume this session? 1. Yes / 2. No&rdquo;. In headless automation this dialog silently stalls the process &mdash; there is no timeout and no error; the agent just stops. A quick workaround is to pre-pipe the answer: <code>echo "1" | claude --print "your task"</code>. If you use amux, its <code>auto_answer_resume_dialog</code> setting (ON by default) handles this automatically across all sessions, so unattended overnight runs never block on the dialog.</p>
+        <p>When Claude Code starts in a directory that contains a previous session, it shows an interactive prompt asking whether to resume: &ldquo;Would you like to resume this session? 1. Yes / 2. No&rdquo;. In headless automation this dialog silently stalls the process &mdash; there is no timeout and no error; the agent just stops. A quick workaround is to pre-pipe the answer: <code>echo "1" | claude --print "your task"</code>. amux does not answer the dialog for you; it shows the session as waiting on the dashboard and phone, and stall detection alerts you.</p>
       </details>
       <details class="faq-item">
         <summary>How do I check on a headless agent from my phone?</summary>
@@ -661,63 +760,50 @@ $ amux serve  <span class="comment"># → https://localhost:8824</span></code></
         <li><a href="/guides/agent-control-plane/" style="color:var(--dim);">What Is an Agent Control Plane?</a></li>
         <li><a href="/guides/setting-up-yolo-mode/" style="color:var(--dim);">Setting Up YOLO Mode for Headless Agents</a></li>
         <li><a href="/guides/running-10-plus-agents/" style="color:var(--dim);">Running 10+ Agents in Parallel</a></li>
-        <li><a href="/guides/self-healing-configuration/" style="color:var(--dim);">Self-Healing Configuration</a></li>
+        <li><a href="/guides/self-healing-configuration/" style="color:var(--dim);">Recovery configuration</a></li>
         <li><a href="/guides/token-spend-tracking/" style="color:var(--dim);">Token Spend Tracking</a></li>
         <li><a href="/guides/claude-code-max-plan/" style="color:var(--dim);">How to 10x Your Claude Code Max Plan</a></li>
+        <li><a href="/guides/claude-code-account-rotation/" style="color:var(--dim);">Claude Code Account Rotation (Never Hit a Rate Limit)</a></li>
       </ul>
     </div>
 
     <div class="exp007-cta" style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:20px 24px;margin:32px 0;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
       <div style="flex:1;min-width:200px">
-        <div style="font-weight:600;font-size:1rem;margin-bottom:4px">Try amux — 304 stars on GitHub</div>
-        <div style="color:var(--fg-dim);font-size:.9rem">Self-healing headless agent fleet. Open source, single Rust binary, zero dependencies.</div>
+        <div style="font-weight:600;font-size:1rem;margin-bottom:4px">Try amux — 525+ stars on GitHub</div>
+        <div style="color:var(--fg-dim);font-size:.9rem">Headless agent fleet with usage-limit resume and account rotation. Open source, single Rust binary, zero dependencies.</div>
       </div>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="posthog&&posthog.capture('exp007_compare_github_cta_click',{page:window.location.pathname})" style="background:#6366f1;color:#fff;padding:10px 20px;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0">View on GitHub ★</a>
     </div>
 
-  </main>
-
-  <footer class="site-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" style="font-size:0.92rem;font-weight:700;color:var(--text);text-decoration:none;">amux</a>
-          <p>Open-source control plane for AI agents. Runtime, observability, orchestration, and cost control &mdash; in one file.</p>
-        </div>
-        <div class="footer-link-cols">
-          <div class="footer-col">
-            <strong>Product</strong>
-            <a href="/guides/getting-started/">Getting Started</a>
-            <a href="/guides/rest-api-reference/">API Reference</a>
-            <a href="https://cloud.amux.io">Cloud</a>
-            <a href="/pricing/">Pricing</a>
-            <a href="/changelog/">Changelog</a>
-          </div>
-          <div class="footer-col">
-            <strong>Resources</strong>
-            <a href="/guides/">Guides</a>
-            <a href="/blog/">Blog</a>
-            <a href="/faq/">FAQ</a>
-            <a href="/glossary/">Glossary</a>
-            <a href="/demos/">Demos</a>
-          </div>
-          <div class="footer-col">
-            <strong>Compare</strong>
-            <a href="/compare/amux-vs-claude-managed-agents/">vs Managed Agents</a>
-            <a href="/compare/amux-vs-cursor/">vs Cursor</a>
-            <a href="/compare/amux-vs-devin/">vs Devin</a>
-            <a href="/compare/">All comparisons</a>
-          </div>
-          <div class="footer-col">
-            <strong>More</strong>
-            <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-            <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-            <a href="/llms.txt">llms.txt</a>
-          </div>
-        </div>
+    <div class="cta-box" data-cta-loc="cloud-inline-end">
+      <h3>Or let amux Cloud run it for you</h3>
+      <p>Your agents keep running when your laptop sleeps, and you steer them from your phone with the web app or the iOS app. You get your own always-on server at <code>yourname.amux.io</code> from $39/mo, signed in with your own Claude, ChatGPT or Gemini account or an API key.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-top:1rem;">
+        <a class="btn btn-primary" href="/start/?source=claude-code-headless">Start amux Cloud</a>
+        <a class="btn" href="/pricing/">See pricing</a>
       </div>
     </div>
-  </footer>
+
+  </main>
+
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
+    </div>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
   
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='\u2605 '+d.stargazers_count}).catch(function(){})</script>
 </body>

@@ -1,16 +1,16 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
   <title>amux vs AutoGen (Microsoft) — 2026 Comparison</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="amux vs AutoGen compared (2026): AutoGen is a framework for programming multi-agent reasoning systems. amux is a runtime for operating AI coding agent teams with self-healing, kanban, and mobile management. Different layers — often used together.">
+  <meta name="description" content="amux vs AutoGen compared (2026): AutoGen is a framework for programming multi-agent reasoning systems. amux is a runtime for operating AI coding agent teams with usage-limit and reboot recovery, kanban, and mobile management. Different layers — often used together.">
   <meta name="keywords" content="amux vs autogen, autogen alternative, microsoft autogen comparison, autogen vs amux, multi-agent framework comparison 2026, autogen coding agents">
   <link rel="canonical" href="https://amux.io/compare/amux-vs-autogen/">
   <meta property="og:title" content="amux vs AutoGen (Microsoft) — 2026 Comparison">
-  <meta property="og:description" content="AutoGen programs multi-agent reasoning pipelines. amux operates AI coding agent teams with self-healing, kanban, and mobile management. Here's when to use each.">
+  <meta property="og:description" content="AutoGen programs multi-agent reasoning pipelines. amux operates AI coding agent teams with usage-limit and reboot recovery, kanban, and mobile management. Here's when to use each.">
   <meta property="og:url" content="https://amux.io/compare/amux-vs-autogen/">
   <meta property="og:image" content="https://amux.io/og-image.png">
   <meta property="og:type" content="article">
@@ -20,50 +20,71 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Compare","item":"https://amux.io/compare/"},{"@type":"ListItem","position":3,"name":"amux vs AutoGen","item":"https://amux.io/compare/amux-vs-autogen/"}]}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"amux vs AutoGen (Microsoft) — 2026 Comparison","description":"AutoGen programs multi-agent reasoning pipelines. amux operates AI coding agent teams with self-healing, kanban, and mobile management. Here's when to use each — and how they compose.","url":"https://amux.io/compare/amux-vs-autogen/","datePublished":"2026-07-25","dateModified":"2026-07-25","author":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}}}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is the difference between amux and AutoGen?","acceptedAnswer":{"@type":"Answer","text":"AutoGen (by Microsoft Research, 59,000+ GitHub stars) is a Python framework for programming multi-agent conversation systems — you write code to define how agents talk to each other, what tools they can call, and how they collaborate. amux is an operational control plane for running AI coding agent teams (Claude Code, Codex, Gemini CLI) in parallel with self-healing, a web dashboard, shared kanban, and mobile monitoring. The key distinction: AutoGen builds the reasoning architecture; amux operates the execution environment. Many teams use both — AutoGen to orchestrate complex agent logic, amux to run and monitor the resulting agent sessions."}},{"@type":"Question","name":"Can AutoGen replace amux for running Claude Code agents?","acceptedAnswer":{"@type":"Answer","text":"Not directly. AutoGen is designed to orchestrate LLM agents via Python — you define agents, conversation patterns, and group chats in code. amux is a runtime for tmux-backed Claude Code sessions with a web UI, self-healing crash recovery, SQLite kanban, token tracking, and mobile management. AutoGen can trigger Claude Code as a sub-process or tool, but it doesn't provide the persistent session management, crash recovery, or operational dashboard that amux offers. If you want to run Claude Code agents overnight with monitoring, amux is the right layer."}},{"@type":"Question","name":"Does AutoGen work with Claude (Anthropic)?","acceptedAnswer":{"@type":"Answer","text":"Yes. AutoGen supports Anthropic's Claude models through its LiteLLM integration. You can configure an AutoGen agent to use claude-sonnet-5, claude-opus-5, or any other Anthropic model by setting the model_client to use the Anthropic provider. amux also supports Anthropic's Claude Code natively as its primary runtime, along with OpenAI Codex CLI and Gemini CLI."}},{"@type":"Question","name":"When should I use AutoGen vs amux?","acceptedAnswer":{"@type":"Answer","text":"Use AutoGen when you're building a custom multi-agent application — research pipelines, automated reasoning systems, group chat orchestration, or any workflow where you need to program agent conversation patterns in Python. Use amux when you want to operate an AI coding agent team right now — run Claude Code, Codex, or Gemini CLI sessions in parallel, with crash recovery, mobile monitoring, a shared task board, and cost tracking. The clearest signal: if you're writing Python to define agent behavior, AutoGen is your tool. If you're running agents to write code in your repos, amux is your tool."}},{"@type":"Question","name":"Can AutoGen and amux be used together?","acceptedAnswer":{"@type":"Answer","text":"Yes, and this is the recommended pattern for teams that need both high-level orchestration and reliable execution. The most common composition: use an AutoGen GroupChat or ConversationPattern to orchestrate the overall workflow, and have the AutoGen agents call amux's REST API to launch, monitor, and steer the Claude Code sessions doing the actual coding work. amux exposes a full REST API at /api/sessions, /api/board, /api/notes, and more — AutoGen agents can POST to /api/sessions to start a coding agent and GET /api/sessions/:name/peek to read its output."}}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"amux vs AutoGen (Microsoft) — 2026 Comparison","description":"AutoGen programs multi-agent reasoning pipelines. amux operates AI coding agent teams with usage-limit and reboot recovery, kanban, and mobile management. Here's when to use each — and how they compose.","url":"https://amux.io/compare/amux-vs-autogen/","datePublished":"2026-07-25","dateModified":"2026-09-28","author":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}}}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is the difference between amux and AutoGen?","acceptedAnswer":{"@type":"Answer","text":"AutoGen (by Microsoft Research, 59,000+ GitHub stars) is a Python framework for programming multi-agent conversation systems — you write code to define how agents talk to each other, what tools they can call, and how they collaborate. amux is an operational control plane for running AI coding agent teams (Claude Code, Codex, Gemini CLI) in parallel with usage-limit and reboot recovery, a web dashboard, shared kanban, and mobile monitoring. The key distinction: AutoGen builds the reasoning architecture; amux operates the execution environment. Many teams use both — AutoGen to orchestrate complex agent logic, amux to run and monitor the resulting agent sessions."}},{"@type":"Question","name":"Can AutoGen replace amux for running Claude Code agents?","acceptedAnswer":{"@type":"Answer","text":"Not directly. AutoGen is designed to orchestrate LLM agents via Python — you define agents, conversation patterns, and group chats in code. amux is a runtime for tmux-backed Claude Code sessions with a web UI, usage-limit and reboot recovery, SQLite kanban, token tracking, and mobile management. AutoGen can trigger Claude Code as a sub-process or tool, but it doesn't provide the persistent session management, usage-limit resume, or operational dashboard that amux offers. If you want to run Claude Code agents overnight with monitoring, amux is the right layer."}},{"@type":"Question","name":"Does AutoGen work with Claude (Anthropic)?","acceptedAnswer":{"@type":"Answer","text":"Yes. AutoGen supports Anthropic's Claude models through its LiteLLM integration. You can configure an AutoGen agent to use claude-sonnet-5, claude-opus-5, or any other Anthropic model by setting the model_client to use the Anthropic provider. amux also supports Anthropic's Claude Code natively as its primary runtime, along with OpenAI Codex CLI and Gemini CLI."}},{"@type":"Question","name":"When should I use AutoGen vs amux?","acceptedAnswer":{"@type":"Answer","text":"Use AutoGen when you're building a custom multi-agent application — research pipelines, automated reasoning systems, group chat orchestration, or any workflow where you need to program agent conversation patterns in Python. Use amux when you want to operate an AI coding agent team right now — run Claude Code, Codex, or Gemini CLI sessions in parallel, with usage-limit and reboot recovery, mobile monitoring, a shared task board, and cost tracking. The clearest signal: if you're writing Python to define agent behavior, AutoGen is your tool. If you're running agents to write code in your repos, amux is your tool."}},{"@type":"Question","name":"Can AutoGen and amux be used together?","acceptedAnswer":{"@type":"Answer","text":"Yes, and this is the recommended pattern for teams that need both high-level orchestration and reliable execution. The most common composition: use an AutoGen GroupChat or ConversationPattern to orchestrate the overall workflow, and have the AutoGen agents call amux's REST API to launch, monitor, and steer the Claude Code sessions doing the actual coding work. amux exposes a full REST API at /api/sessions, /api/board, /api/notes, and more — AutoGen agents can POST to /api/sessions to start a coding agent and GET /api/sessions/:name/peek to read its output."}}]}</script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/compare/">Compare</a> <span class="sep">›</span> <span>amux vs AutoGen</span></div>
 
     <h1>amux vs AutoGen (Microsoft)</h1>
-    <p class="subtitle">AutoGen programs multi-agent reasoning pipelines. amux operates AI coding agent teams. Different layers of the stack — often used together. Updated July 2026.</p>
+    <p class="subtitle">AutoGen programs multi-agent reasoning pipelines. amux operates AI coding agent teams. Different layers of the stack — often used together. Updated September 2026.</p>
 
-    <p><strong>The short answer:</strong> AutoGen (59,000+ GitHub stars, Microsoft Research) is a Python <em>framework</em> for building multi-agent conversation systems — you write code to define how agents reason together. amux is an open-source <em>runtime</em> for operating AI coding agent teams (Claude Code, Codex, Gemini CLI) with self-healing, a web dashboard, a shared kanban board, and mobile monitoring. They solve different problems at different levels of the stack.</p>
+    <!-- EXP-103 top-of-page CTA -->
 
-    <!-- EXP-007 -->
-    <div style="border:1px solid #4f46e5;border-radius:8px;padding:1rem 1.25rem;margin:1.5rem 0;display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;background:rgba(79,70,229,.07)">
-      <div>
-        <strong style="color:#818cf8">Run an AI engineering team from one dashboard</strong>
-        <p style="margin:0.25rem 0 0;font-size:0.875rem;color:var(--fg-dim)">313+ developers use amux to run Claude Code, Codex &amp; Gemini CLI sessions in parallel — with self-healing, kanban, and mobile monitoring.</p>
-      </div>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener"
-         style="background:#4f46e5;color:#fff;padding:0.5rem 1rem;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;font-size:0.875rem"
-         onclick="posthog.capture('exp007_compare_github_cta_click',{page:window.location.pathname})">View on GitHub ★</a>
-    </div>
+    <h2>What's new in September 2026</h2>
+    <ul>
+      <li><strong>Standing approvals</strong> (AMUX-5270): pre-approve entire action categories so agents work overnight without asking for permission — filesystem writes, git commits, shell commands, API calls. <a href="/guides/ai-agent-standing-approvals/">Guide →</a></li>
+      <li><strong>Auto-approve</strong> (AMUX-5301): scoped per-ask policies route sign-in, key, and grant requests back to the worker queue rather than waking the owner at 3 AM.</li>
+      <li><strong>CUA computer-use sandboxes</strong> (AMUX-5300): rung 3 of the browser access ladder — full sandboxed desktop for native apps, OS dialogs, and anything a headless browser cannot reach. <a href="/guides/ai-agent-computer-use/">Guide →</a></li>
+      <li><strong>Scoped browser profiles</strong> (AMUX-5307): restrict which agents can access which saved auth profiles — per-session, per-group, or global.</li>
+      <li><strong>Chrome CDP profile sync</strong>: save logins from your real Chrome browser into amux profiles, so agents can authenticate to sites without manual credential entry.</li>
+      <li><strong>Goal keeper</strong>: the harness re-prompts agents until a declared goal is met — agents tell amux their goal and it follows up at turn boundaries until done.</li>
+    </ul>
+
+    <p><strong>The short answer:</strong> AutoGen (59,000+ GitHub stars, Microsoft Research) is a Python <em>framework</em> for building multi-agent conversation systems — you write code to define how agents reason together. amux is a self-hosted <em>runtime</em> for operating AI coding agent teams (Claude Code, Codex, Gemini CLI) with usage-limit and reboot recovery, a web dashboard, a shared kanban board, and mobile monitoring. They solve different problems at different levels of the stack.</p>
 
     <h2>The Core Distinction</h2>
     <p>AutoGen and amux operate at different layers of the AI agent stack:</p>
     <ul>
       <li><strong>AutoGen</strong> — the <em>intelligence layer</em>. You program how agents reason, what tools they call, and how they converse. A GroupChat with an AssistantAgent and a UserProxyAgent is an AutoGen concern.</li>
-      <li><strong>amux</strong> — the <em>operations layer</em>. You run, monitor, and heal the agent sessions doing the actual work. A fleet of Claude Code tmux sessions with crash recovery and mobile monitoring is an amux concern.</li>
+      <li><strong>amux</strong> — the <em>operations layer</em>. You run and monitor the agent sessions doing the actual work. A fleet of Claude Code tmux sessions with usage-limit resume and mobile monitoring is an amux concern.</li>
     </ul>
-    <p>The clearest analogy: AutoGen is to agent logic what Kubernetes is to application logic — it defines the orchestration pattern. amux is to coding agent sessions what a container runtime is to containers — it keeps them alive, visible, and manageable.</p>
+    <p>The clearest analogy: AutoGen is to agent logic what Kubernetes is to application logic — it defines the orchestration pattern. amux is to coding agent sessions what a container runtime is to containers — it keeps them visible and manageable.</p>
 
     <h2>Comparison Table</h2>
     <div style="overflow-x:auto">
@@ -83,17 +104,17 @@
         </tr>
         <tr>
           <td><strong>GitHub stars</strong></td>
-          <td>313+ (July 2026)</td>
-          <td>59,000+ (July 2026)</td>
+          <td>505+ (September 2026)</td>
+          <td>59,000+ (September 2026)</td>
         </tr>
         <tr>
           <td><strong>Made by</strong></td>
-          <td>Mixpeek (open source, MIT)</td>
+          <td>Mixpeek (open source, MIT + Commons Clause)</td>
           <td>Microsoft Research (open source)</td>
         </tr>
         <tr>
           <td><strong>Language</strong></td>
-          <td>Python server + inline JS dashboard</td>
+          <td>Rust binary + static JS dashboard</td>
           <td>Python (primary), .NET support</td>
         </tr>
         <tr>
@@ -112,8 +133,8 @@
           <td>AutoGen Studio (visual builder, separate install)</td>
         </tr>
         <tr>
-          <td><strong>Self-healing</strong></td>
-          <td>Built-in watchdog: crash recovery, context compaction, stuck detection</td>
+          <td><strong>Recovery</strong></td>
+          <td>Built in: resumes after usage limits, workers return after a macOS reboot, stall alerts</td>
           <td>Must implement manually in your agent code</td>
         </tr>
         <tr>
@@ -138,7 +159,7 @@
         </tr>
         <tr>
           <td><strong>Installation</strong></td>
-          <td><code>brew install mixpeek/amux/amux</code> · <code>pipx install amux</code> · <code>uvx amux serve</code></td>
+          <td><code>curl -fsSL https://amux.io/install.sh | bash</code></td>
           <td><code>pip install pyautogen</code> (0.2) or <code>pip install autogen-agentchat</code> (0.4)</td>
         </tr>
         <tr>
@@ -176,12 +197,12 @@
     <p>The two versions coexist: install <code>pyautogen</code> for 0.2, <code>autogen-agentchat</code> for 0.4. Community consensus in mid-2026 is that 0.2 is more practical for most use cases; 0.4 is for teams building distributed production systems.</p>
 
     <h2>amux in Depth</h2>
-    <p>amux is an open-source control plane for running an AI engineering team from a single dashboard. It manages the operational reality of running Claude Code, OpenAI Codex CLI, or Gemini CLI sessions at scale: crash recovery, context overflow handling, cost tracking, work coordination, and mobile monitoring.</p>
+    <p>amux is a self-hosted control plane for running an AI engineering team from a single dashboard. It manages the operational reality of running Claude Code, OpenAI Codex CLI, or Gemini CLI sessions at scale: usage-limit resume, reboot recovery, cost tracking, work coordination, and mobile monitoring.</p>
 
     <p>Key operational capabilities that AutoGen doesn't provide:</p>
     <ul>
-      <li><strong>Self-healing watchdog</strong> — detects when Claude Code silently crashes (SIGKILL, OOM, pane going blank), distinguishes a crash from an intentional <code>/exit</code>, and auto-restarts only the crashed sessions. Crash-loop cap: 3 crashes in 15 minutes → stop + alert.</li>
-      <li><strong>Context compaction</strong> — when a session approaches its context limit, amux triggers Claude Code's built-in compaction and the session continues without data loss. No manual intervention.</li>
+      <li><strong>Recovery</strong> — when a provider usage limit hits, amux holds delivery and resumes at the reset time. The amux server restarts through launchd or systemd, and on macOS every worker comes back in its own conversation after a reboot. Stall detection flags stuck work and sends owner alerts.</li>
+      <li><strong>Context compaction</strong> — Claude Code compacts its own context as it fills, and amux lets you set the compaction threshold per session.</li>
       <li><strong>Atomic task claiming</strong> — the kanban board uses SQLite compare-and-swap so multiple agents can pull from the same task queue without duplicate work. Essential for fleet-scale automation.</li>
       <li><strong>Multi-runtime</strong> — Claude Code (primary), OpenAI Codex CLI, and Gemini CLI. If one provider's rate limits are saturating, distribute across runtimes.</li>
       <li><strong>Mobile dashboard</strong> — a PWA and native iOS app with real-time SSE updates. Monitor and steer your fleet from your phone. Sessions restore their state after iOS evicts the backgrounded app.</li>
@@ -207,7 +228,7 @@ output = requests.get(
 ).json()["output"]</code></pre>
 
     <h3>Pattern 2: amux as AutoGen's code-execution backend</h3>
-    <p>Use amux's REST API as a custom code-execution tool in an AutoGen agent. Instead of AutoGen running code in a local subprocess or Docker container, it sends code to a persistent Claude Code session in amux. This gives you the same coding-specialized model behavior with amux's session persistence and self-healing on top.</p>
+    <p>Use amux's REST API as a custom code-execution tool in an AutoGen agent. Instead of AutoGen running code in a local subprocess or Docker container, it sends code to a persistent Claude Code session in amux. This gives you the same coding-specialized model behavior with amux's session persistence and usage-limit resume on top.</p>
     <pre><code style="font-size:0.82rem"># AutoGen tool definition: "run this in a coding agent session"
 def run_in_coding_agent(task: str, session_name: str = "code-worker") -> str:
     """Send a task to an amux-managed Claude Code session."""
@@ -216,7 +237,7 @@ def run_in_coding_agent(task: str, session_name: str = "code-worker") -> str:
     return r.json().get("status", "sent")</code></pre>
 
     <h3>Pattern 3: Parallel AutoGen + amux monitoring</h3>
-    <p>Run AutoGen workflows in their own amux sessions. A data-analysis AutoGen workflow runs as a session named <code>autogen-research</code>; a coding AutoGen workflow runs as <code>autogen-code</code>. amux's dashboard shows both alongside your Claude Code sessions, and the self-healing watchdog applies equally to all tmux panes — regardless of what Python code is running inside them.</p>
+    <p>Run AutoGen workflows in their own amux sessions. A data-analysis AutoGen workflow runs as a session named <code>autogen-research</code>; a coding AutoGen workflow runs as <code>autogen-code</code>. amux's dashboard shows both alongside your Claude Code sessions, and stall detection and usage-limit handling apply to them the same way.</p>
 
     <h2>Decision Guide</h2>
     <div style="overflow-x:auto">
@@ -228,7 +249,7 @@ def run_in_coding_agent(task: str, session_name: str = "code-worker") -> str:
         <tr><td>Build a group chat where multiple LLM agents collaborate</td><td>AutoGen</td></tr>
         <tr><td>Monitor 10+ coding agent sessions from your phone at midnight</td><td>amux</td></tr>
         <tr><td>Define a ConversableAgent that calls your own tools</td><td>AutoGen</td></tr>
-        <tr><td>Recover automatically from Claude Code crashes and context overflows</td><td>amux</td></tr>
+        <tr><td>Resume Claude Code agents after usage limits and reboots</td><td>amux</td></tr>
         <tr><td>Visualize AutoGen workflow execution with a no-code editor</td><td>AutoGen Studio</td></tr>
         <tr><td>Coordinate dozens of agents with atomic task claiming on a shared queue</td><td>amux</td></tr>
         <tr><td>Both: orchestrate high-level workflow AND operate the execution sessions</td><td>AutoGen + amux together</td></tr>
@@ -239,12 +260,12 @@ def run_in_coding_agent(task: str, session_name: str = "code-worker") -> str:
     <h2>FAQ</h2>
     <details>
       <summary><strong>Is AutoGen better than amux for coding tasks?</strong></summary>
-      <p style="margin-top:0.75rem">They're not directly comparable for coding tasks — they solve different parts of the problem. AutoGen provides the reasoning patterns (how agents collaborate, how they decide what to do next). amux provides the execution infrastructure (keeping the coding sessions running, recovering from crashes, showing you what's happening). For coding specifically, most teams find that running Claude Code inside amux is more practical than using AutoGen's UserProxyAgent code execution — Claude Code is a coding-specialist model with CLAUDE.md context and yolo mode, which AutoGen doesn't replicate.</p>
+      <p style="margin-top:0.75rem">They're not directly comparable for coding tasks — they solve different parts of the problem. AutoGen provides the reasoning patterns (how agents collaborate, how they decide what to do next). amux provides the execution infrastructure (keeping the coding sessions running through usage limits, flagging stalls, showing you what's happening). For coding specifically, most teams find that running Claude Code inside amux is more practical than using AutoGen's UserProxyAgent code execution — Claude Code is a coding-specialist model with CLAUDE.md context and yolo mode, which AutoGen doesn't replicate.</p>
     </details>
 
     <details>
-      <summary><strong>Does AutoGen have crash recovery for long-running sessions?</strong></summary>
-      <p style="margin-top:0.75rem">Not built-in. AutoGen conversation objects live in Python memory — if the process dies, the conversation is lost. You have to implement your own persistence and recovery logic using AutoGen's checkpointing APIs or external state stores. amux's self-healing watchdog handles crash detection and recovery automatically for tmux-backed sessions, including Claude Code's context compaction when the context window fills up. This is one of the main reasons teams use both together.</p>
+      <summary><strong>Does AutoGen have recovery for long-running sessions?</strong></summary>
+      <p style="margin-top:0.75rem">Not built-in. AutoGen conversation objects live in Python memory — if the process dies, the conversation is lost. You have to implement your own persistence and recovery logic using AutoGen's checkpointing APIs or external state stores. amux keeps tmux-backed sessions going through usage limits (delivery resumes at the provider's reset) and, on macOS, brings every worker back in its own conversation after a reboot. Restarting a crashed agent process is not built into the amux server today; an optional macOS script (scripts/tmux-watchdog.sh, not installed by default) restarts crashed Claude Code workers. Stall detection and alerts tell you when a session stops.</p>
     </details>
 
     <details>
@@ -254,22 +275,22 @@ def run_in_coding_agent(task: str, session_name: str = "code-worker") -> str:
 
     <details>
       <summary><strong>How does amux compare to AutoGen Studio?</strong></summary>
-      <p style="margin-top:0.75rem">AutoGen Studio is a visual builder for creating and testing AutoGen workflows — it's a no-code editor on top of the AutoGen framework. amux is an operational dashboard for running any tmux-backed coding agent session (Claude Code, Codex, Gemini CLI). They're almost completely different tools: AutoGen Studio helps you design agent logic; amux helps you run agents at scale with monitoring and self-healing. You can use both — design your AutoGen workflow in Studio, then run it as a managed session inside amux.</p>
+      <p style="margin-top:0.75rem">AutoGen Studio is a visual builder for creating and testing AutoGen workflows — it's a no-code editor on top of the AutoGen framework. amux is an operational dashboard for running any tmux-backed coding agent session (Claude Code, Codex, Gemini CLI). They're almost completely different tools: AutoGen Studio helps you design agent logic; amux helps you run agents at scale with monitoring, stall alerts and usage-limit resume. You can use both — design your AutoGen workflow in Studio, then run it as a managed session inside amux.</p>
     </details>
 
     <details>
       <summary><strong>What does amux add that Claude Code Agent Teams doesn't?</strong></summary>
-      <p style="margin-top:0.75rem">Claude Code's built-in Agent Teams (<code>claude --agent-teams</code>) spawns parallel Claude Code sub-agents using git worktrees for a single high-level task. When the task is done, the sub-agents exit. amux is persistent infrastructure: sessions survive across tasks, the kanban board persists state, the watchdog runs continuously, and you can monitor and steer everything from a mobile app. Agent Teams is a one-shot fan-out; amux is an always-on fleet. Both are useful — Agent Teams for a single complex task, amux for ongoing parallel development across many tasks and sessions.</p>
+      <p style="margin-top:0.75rem">Claude Code's built-in Agent Teams (<code>claude --agent-teams</code>) spawns parallel Claude Code sub-agents using git worktrees for a single high-level task. When the task is done, the sub-agents exit. amux is persistent infrastructure: sessions survive across tasks, the kanban board persists state, stall detection runs continuously, and you can monitor and steer everything from a mobile app. Agent Teams is a one-shot fan-out; amux is an always-on fleet. Both are useful — Agent Teams for a single complex task, amux for ongoing parallel development across many tasks and sessions.</p>
     </details>
 
     <h2>Summary</h2>
-    <p><strong>AutoGen builds the brain; amux runs the hands.</strong> AutoGen is the right tool when you need to program sophisticated agent reasoning — group chats, tool-calling pipelines, conversation patterns. amux is the right tool when you need to operate AI coding agent sessions at scale — crash recovery, mobile monitoring, task coordination, and cost tracking.</p>
+    <p><strong>AutoGen builds the brain; amux runs the hands.</strong> AutoGen is the right tool when you need to program sophisticated agent reasoning — group chats, tool-calling pipelines, conversation patterns. amux is the right tool when you need to operate AI coding agent sessions at scale: usage-limit resume, mobile monitoring, task coordination, and cost tracking.</p>
     <p>The best AI engineering teams use both: AutoGen to orchestrate complex workflows, amux to run and monitor the coding sessions executing those workflows. They complement each other naturally because they operate at different layers of the same stack.</p>
 
     <div class="cta-box">
       <h3>Run an AI engineering team from one dashboard</h3>
-      <p>Self-healing, multi-runtime (Claude Code · Codex · Gemini CLI), open source (MIT).</p>
-      <pre><code>brew install mixpeek/amux/amux
+      <p>Usage-limit and reboot recovery, multi-runtime (Claude Code · Codex · Gemini CLI), open source (MIT + Commons Clause).</p>
+      <pre><code>curl -fsSL https://amux.io/install.sh | bash
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
 amux serve  # → https://localhost:8824</code></pre>
@@ -287,51 +308,24 @@ amux serve  # → https://localhost:8824</code></pre>
     </nav>
 
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-langraph/">vs LangGraph</a></li>
-            <li><a href="/compare/amux-vs-crewai/">vs CrewAI</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>

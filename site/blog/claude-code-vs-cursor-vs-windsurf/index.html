@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -20,7 +20,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
 
   <script type="application/ld+json">{
     "@context":"https://schema.org",
@@ -63,7 +62,7 @@
       {"@type":"Question","name":"Which AI coding tool has the best code quality?","acceptedAnswer":{"@type":"Answer","text":"As of May 2026, Claude Code with Opus 4.7 leads SWE-bench Verified at 82%. Cursor's Composer 2 model scores 73.7 on SWE-bench Multilingual. Windsurf's SWE-1.6 improves 10%+ over SWE-1.5 on SWE-Bench Pro. However, both Cursor and Windsurf also support Claude Opus 4.7 as an optional model, so you can get top-tier code quality from any tool by choosing the right model."}},
       {"@type":"Question","name":"What happened to Windsurf? Did OpenAI buy it?","acceptedAnswer":{"@type":"Answer","text":"OpenAI announced a $3B acquisition of Windsurf (then Codeium) in 2025, but the deal fell through, reportedly due to Microsoft's contractual rights over OpenAI acquisitions. Google hired Windsurf's CEO and ~40 senior engineers. Cognition AI (makers of Devin) then acquired the remaining company — IP, product, brand, and 210 employees — for approximately $250M in December 2025. Windsurf now ships with Devin integration and Cognition's proprietary SWE-1 model family."}},
       {"@type":"Question","name":"Claude Code vs Cursor pricing: which is cheaper?","acceptedAnswer":{"@type":"Answer","text":"Both start at $20/month for their Pro tiers, but the pricing models differ significantly. Claude Code (via Claude Pro) gives you access to Claude Code in terminal, web, desktop, and IDE extensions with usage limits that reset monthly. Cursor Pro gives you $20 in monthly model credits plus unlimited Tab completions and Auto mode. For heavy agentic use, Claude Max ($100-200/month) or Cursor Pro+ ($60/month) offer higher limits. Windsurf Pro at $15/month is the cheapest option with unlimited Cascade and free SWE-1.6 model usage."}},
-      {"@type":"Question","name":"Which tool is best for running multiple AI agents in parallel?","acceptedAnswer":{"@type":"Answer","text":"Claude Code is the strongest choice for parallel agent workflows. It runs as a CLI that can be spawned in multiple terminal sessions, supports subagents within each session, and has a full Agent SDK for programmatic control. Cursor's Background Agents run up to 8 parallel agents on cloud VMs. Windsurf (via Devin integration) supports autonomous agent tasks. For orchestrating large fleets of agents (10-50+), tools like amux wrap around Claude Code to provide fleet management, crash recovery, and task coordination."}},
+      {"@type":"Question","name":"Which tool is best for running multiple AI agents in parallel?","acceptedAnswer":{"@type":"Answer","text":"Claude Code is the strongest choice for parallel agent workflows. It runs as a CLI that can be spawned in multiple terminal sessions, supports subagents within each session, and has a full Agent SDK for programmatic control. Cursor's Background Agents run up to 8 parallel agents on cloud VMs. Windsurf (via Devin integration) supports autonomous agent tasks. For orchestrating large fleets of agents (10-50+), tools like amux wrap around Claude Code to provide fleet management, usage-limit resume, and task coordination."}},
       {"@type":"Question","name":"Do I need an IDE or can I just use Claude Code in the terminal?","acceptedAnswer":{"@type":"Answer","text":"Claude Code works entirely in the terminal — no IDE required. Many power users prefer this workflow because it's faster, scriptable, and better suited for automation. Claude Code also has VS Code and JetBrains extensions, a desktop app, and a web interface at claude.ai/code if you want a GUI. Cursor and Windsurf are IDE-first tools that require their desktop applications. The choice comes down to whether you prefer terminal or GUI workflows."}}
     ]
   }</script>
@@ -121,18 +120,39 @@
       .axis-grid{grid-template-columns:1fr}
     }
   </style>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
@@ -142,8 +162,8 @@
     <p class="subtitle">Three tools dominate AI-assisted coding in 2026: <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> by <a href="https://anthropic.com/" target="_blank" rel="noopener">Anthropic</a>, <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a> by <a href="https://www.cursor.com/" target="_blank" rel="noopener">Anysphere</a>, and <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a> by <a href="https://cognition.ai/" target="_blank" rel="noopener">Cognition AI</a>. Each takes a fundamentally different approach to the same problem. This guide compares them honestly so you can pick the right one &mdash; or use all three together.</p>
 
     <!-- EXP-082: top-of-page CTA — compare blog, September 2026 refresh, started 2026-09-07 -->
-    <div style="background:var(--green,#2e7d32);color:#000;border-radius:8px;padding:0.85rem 1.25rem;margin:1.25rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
-      <span style="font-weight:600">Run 50 Claude Code agents while you code in Cursor or Windsurf. Open source, single Rust binary, 394+ stars.</span>
+    <div style="background:var(--green,#2e7d32);color:var(--bg);border-radius:8px;padding:0.85rem 1.25rem;margin:1.25rem 0;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem">
+      <span style="font-weight:600">Run 50 Claude Code agents while you code in Cursor or Windsurf. Free to self-host, single Rust binary, 394+ stars.</span>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="background:#000;color:#fff;padding:0.45rem 1rem;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;font-size:0.9rem" onclick="posthog&&posthog.capture('exp082_compare_blog_topofpage_cta_click')">View amux on GitHub ★</a>
     </div>
 
@@ -554,8 +574,8 @@
             <td class="p">Via Devin platform</td>
           </tr>
           <tr>
-            <td>Crash recovery</td>
-            <td class="y">Self-healing (amux)</td>
+            <td>Recovery</td>
+            <td class="y">Usage limits, reboots, stall alerts (amux)</td>
             <td class="y">Cloud-managed</td>
             <td class="y">Cloud-managed</td>
           </tr>
@@ -629,7 +649,7 @@
       </div>
       <div class="axis-card">
         <h4>Fleet orchestration</h4>
-        <p><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> wraps around <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> to manage 10&ndash;50+ agent sessions: web dashboard, crash recovery, task coordination via kanban board, mobile monitoring.</p>
+        <p><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> wraps around <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> to manage 10&ndash;50+ agent sessions: web dashboard, usage-limit resume, task coordination via kanban board, mobile monitoring.</p>
       </div>
     </div>
 
@@ -639,22 +659,21 @@
       <h3><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> &mdash; orchestrate the fleet</h3>
       <div class="tool-meta">
         <span>By <a href="https://mixpeek.com/" target="_blank" rel="noopener">Mixpeek</a></span>
-        <span>Open source (MIT)</span>
+        <span>Source-available (MIT + Commons Clause)</span>
         <span><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a></span>
       </div>
-      <p>Whether you pick <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a>, <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a>, or <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a> as your primary tool, you&rsquo;ll eventually want to run multiple <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agents for batch work. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> is the open-source control plane: spawn dozens of agents, monitor them from a web dashboard or mobile PWA, auto-recover from crashes, and coordinate tasks through a shared kanban board.</p>
+      <p>Whether you pick <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a>, <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a>, or <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a> as your primary tool, you&rsquo;ll eventually want to run multiple <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agents for batch work. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> is the self-hosted control plane: spawn dozens of agents, monitor them from a web dashboard or mobile PWA, resume them after usage limits, and coordinate tasks through a shared kanban board.</p>
       <ul>
         <li><strong>Complements any IDE</strong> &mdash; keeps working in the background while you use <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a> or <a href="https://windsurf.com/" target="_blank" rel="noopener">Windsurf</a></li>
-        <li><strong>Self-healing watchdog</strong> &mdash; detects context overflow, API errors, and session corruption, then auto-restarts</li>
+        <li><strong>Recovery</strong> &mdash; holds delivery through usage limits and resumes at the provider's reset, brings every worker back in its own conversation after a macOS reboot, and flags stalled board work with an owner alert</li>
         <li><strong>REST API + kanban</strong> &mdash; programmatic session management with atomic task claiming</li>
         <li><strong>Single Rust binary, zero dependencies</strong> &mdash; installs in one command</li>
       </ul>
     </div>
 
     <pre><code><span class="dim"># Install amux and run 5 Claude Code agents on your project</span>
-brew install mixpeek/amux/amux
-amux register myproject --dir ~/Dev/myproject --yolo
-amux scale myproject --count 5
+curl -fsSL https://amux.io/install.sh | bash
+for i in 1 2 3 4 5; do amux register myproject-$i --dir ~/Dev/myproject --yolo; amux start myproject-$i --detach; done
 amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
 
     <!-- ═══════════════════════════════════════════════════════════════
@@ -707,7 +726,7 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
       <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:0.8rem;">
         <summary style="padding:1rem 1.2rem;cursor:pointer;font-weight:600;font-size:0.92rem;">Which tool is best for running multiple AI agents in parallel?</summary>
         <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
-          <p><a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> is the strongest for parallel agent workflows. It runs as a CLI that can be spawned in multiple terminal sessions, supports subagents within each session, and has a full <a href="https://code.claude.com/docs/en/agent-sdk/overview" target="_blank" rel="noopener">Agent SDK</a>. <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a>&rsquo;s Background Agents run up to 8 parallel on cloud VMs. For orchestrating large fleets (10&ndash;50+ agents), <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> wraps around <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> with fleet management, crash recovery, and task coordination.</p>
+          <p><a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> is the strongest for parallel agent workflows. It runs as a CLI that can be spawned in multiple terminal sessions, supports subagents within each session, and has a full <a href="https://code.claude.com/docs/en/agent-sdk/overview" target="_blank" rel="noopener">Agent SDK</a>. <a href="https://www.cursor.com/" target="_blank" rel="noopener">Cursor</a>&rsquo;s Background Agents run up to 8 parallel on cloud VMs. For orchestrating large fleets (10&ndash;50+ agents), <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> wraps around <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> with fleet management, usage-limit resume, and task coordination.</p>
         </div>
       </details>
 
@@ -722,7 +741,7 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
     <!-- ───────── CTA ───────── -->
     <div style="background:var(--accent-dim);border:1px solid var(--amber);border-radius:8px;padding:1.4rem 1.6rem;margin:3rem 0 2rem;text-align:center;">
       <p style="font-size:1rem;font-weight:600;margin:0 0 0.5rem;">Run 50 Claude Code agents while you use Cursor.</p>
-      <p style="font-size:0.88rem;color:var(--dim);margin:0 0 1rem;">amux orchestrates the fleet. Open source, single Rust binary, installs in one command.</p>
+      <p style="font-size:0.88rem;color:var(--dim);margin:0 0 1rem;">amux orchestrates the fleet. Free to self-host, single Rust binary, installs in one command.</p>
       <a href="/guides/getting-started/" style="display:inline-block;background:var(--amber);color:var(--bg);padding:0.6rem 1.4rem;border-radius:6px;text-decoration:none;font-weight:600;font-size:0.88rem;">Get Started</a>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="display:inline-block;background:var(--surface);color:var(--text);padding:0.6rem 1.4rem;border-radius:6px;text-decoration:none;font-weight:600;font-size:0.88rem;margin-left:0.6rem;border:1px solid var(--border);">View on GitHub</a>
     </div>
@@ -741,51 +760,24 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
     </div>
 
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
   <script>
     fetch('https://api.github.com/repos/mixpeek/amux')
       .then(r=>r.json())

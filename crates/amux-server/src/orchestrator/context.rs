@@ -73,6 +73,70 @@ fn memory_layer(level: ScopeLevel) -> (u32, &'static str) {
     }
 }
 
+/// Browser guidance shared by normal CLI workers and orchestrated tasks.
+pub(crate) const BROWSER_SELECTION_GUIDE: &str = "For browser work: `amux browser profiles` explains each profile's identity, purpose, role and scope. Choose the account AND organization/use case matching the task; personal/customer/restricted/QA accounts are not substitutes. `amux browser for URL` recommends with reasons; identity/role filters are at /api/browser/profile-for. Owner-selected Chrome/CUA choices are saved per Amux profile; inspect /api/browser/routing/config to verify the matching Chrome identity and profile route. Use `amux browser route config` to inspect the owner choices. Start with `amux browser route start '{\"profile\":\"chosen-profile\",\"url\":\"https://target\"}'`, then `amux browser route state`, `amux browser route shot`, and `amux browser route action JSON` (Amux → configured Chrome CDP → CUA). `amux browser route help` describes the action payloads. Verify live site access and the intended effect after each action. Read back form values before submitting; if a form rejects them, correct the observed validation problem before advancing. If the browser runs but cannot accomplish the goal, use `amux browser route advance '{\"reason\":\"describe the unmet goal\"}'`. This moves forward to the next configured backend without repeating an action or changing accounts. Cold CUA provisioning can take up to 30 minutes. While a background route request runs, use `amux browser route status`; pending means wait for that task, not another state/action request. Never kill processes to recover a browser; use route stop for your own lane. Observe state/screenshot after every handoff before acting; mutations are not replayed. On CUA use route shot, read the returned PNG, then observed x,y clicks, typing and keys. If CUA cannot accomplish the goal, report the failure instead of claiming success.";
+
+/// Resolution target for a worker: itself plus its group (looked up from
+/// the worker row; a worker with no row still resolves as itself plus
+/// globals). One spelling shared by assembly and re-supply.
+fn resolution_target(conn: &Connection, worker: &WorkerId) -> rusqlite::Result<ResolutionTarget> {
+    let group: Option<GroupId> = crate::db::queries::get_worker(conn, worker.as_str())?
+        .and_then(|row| row.group_id)
+        .and_then(|g| GroupId::parse(&g).ok());
+    Ok(ResolutionTarget {
+        worker: Some(worker.clone()),
+        group,
+    })
+}
+
+/// Deterministic memory-only fragments for `worker`, most general scope
+/// first. Reads the canonical store through the ONE visibility predicate
+/// (`db::memories::list_visible`, Invariant 2), which already excludes
+/// soft-deleted, expired, and superseded entries, so provenance, expiry,
+/// supersession, and trust boundaries arrive preserved, not re-derived.
+/// Untrimmed: callers apply their own budget (`assemble_context_*` trims
+/// the whole assembly; re-supply trims the memory set to its own cap).
+pub fn memory_fragments(
+    conn: &Connection,
+    worker: &WorkerId,
+) -> rusqlite::Result<Vec<ContextFragment>> {
+    let target = resolution_target(conn, worker)?;
+    let mut fragments = Vec::new();
+    // Memory layers: org -> global -> group -> worker (general to specific,
+    // so the more specific layer lands closer to the task and can override
+    // in the model's reading, the same precedence direction as Invariant 2).
+    for e in memories::list_visible(conn, &target)? {
+        let (priority, source) = memory_layer(e.scope.level());
+        fragments.push(ContextFragment {
+            priority,
+            source: source.into(),
+            content: format!("{}: {}", e.name, e.content),
+            trust: match &e.provenance {
+                amux_core::memory::MemoryProvenance::Imported { .. } => TrustLevel::Untrusted,
+                _ => TrustLevel::Trusted,
+            },
+            provenance: serde_json::to_string(&e.provenance).unwrap_or_else(|_| "unknown".into()),
+        });
+    }
+    Ok(fragments)
+}
+
+/// Bounded memory-only snapshot for lifecycle re-supply (#73). Returns
+/// `None` when the worker sees no live memories, in which case the caller
+/// must deliver no turn at all rather than an empty one. `Some` is trimmed
+/// to `max_chars` with the same deterministic omission receipts as assembly.
+pub fn memory_snapshot(
+    conn: &Connection,
+    worker: &WorkerId,
+    max_chars: usize,
+) -> rusqlite::Result<Option<ContextSnapshot>> {
+    let fragments = memory_fragments(conn, worker)?;
+    if fragments.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ContextSnapshot::build(trim_to_budget(fragments, max_chars))))
+}
+
 /// Assemble the context snapshot for assigning `task` to `worker`.
 ///
 /// Deterministic by construction: every input is read from the DB in this
@@ -102,34 +166,24 @@ pub fn assemble_context_with_budget(
     max_chars: usize,
 ) -> rusqlite::Result<ContextSnapshot> {
     let now = chrono::Utc::now();
-    // Resolution target: the worker plus its group (looked up from the
-    // worker row; a worker with no row still resolves as itself + globals).
-    let group: Option<GroupId> = crate::db::queries::get_worker(conn, worker.as_str())?
-        .and_then(|row| row.group_id)
-        .and_then(|g| GroupId::parse(&g).ok());
-    let target = ResolutionTarget {
-        worker: Some(worker.clone()),
-        group: group.clone(),
-    };
+    // Resolution target through the shared spelling (worker plus its
+    // group); the group half is also needed for guide-rule scoping below.
+    let group = resolution_target(conn, worker)?.group;
 
     let mut fragments: Vec<ContextFragment> = Vec::new();
 
-    // Memory layers: org -> global -> group -> worker (general to specific,
-    // so the more specific layer lands closer to the task and can override
-    // in the model's reading — the same precedence direction as Invariant 2).
-    for e in memories::list_visible(conn, &target)? {
-        let (priority, source) = memory_layer(e.scope.level());
-        fragments.push(ContextFragment {
-            priority,
-            source: source.into(),
-            content: format!("{}: {}", e.name, e.content),
-            trust: match &e.provenance {
-                amux_core::memory::MemoryProvenance::Imported { .. } => TrustLevel::Untrusted,
-                _ => TrustLevel::Trusted,
-            },
-            provenance: serde_json::to_string(&e.provenance).unwrap_or_else(|_| "unknown".into()),
-        });
-    }
+    fragments.push(ContextFragment {
+        priority: 32,
+        source: "browser:selection-guide".into(),
+        content: BROWSER_SELECTION_GUIDE.into(),
+        trust: TrustLevel::Trusted,
+        provenance: "browser-capability".into(),
+    });
+
+    // Memory layers through the shared builder: assignment assembly and
+    // lifecycle re-supply render the same store state identically. No
+    // budget is applied here; the whole assembly is trimmed once below.
+    fragments.extend(memory_fragments(conn, worker)?);
 
     // Active failure-derived rules are real context, with a stable harness
     // hash recorded beside them. Scope spellings are intentionally simple:
@@ -230,9 +284,8 @@ pub fn assemble_context_with_budget(
         }
     }
 
-    let mut attempt_stmt = conn.prepare(
-        "SELECT record FROM _amux_attempts WHERE task_id=?1 ORDER BY attempt ASC",
-    )?;
+    let mut attempt_stmt =
+        conn.prepare("SELECT record FROM _amux_attempts WHERE task_id=?1 ORDER BY attempt ASC")?;
     let attempts: Vec<String> = attempt_stmt
         .query_map([task.id.as_str()], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
@@ -326,7 +379,11 @@ fn trim_to_budget(mut fragments: Vec<ContextFragment>, max_chars: usize) -> Vec<
         total = total.saturating_sub(removed.content.chars().count());
         let mut h = Sha256::new();
         h.update(removed.content.as_bytes());
-        omitted.push(format!("{}:{}", removed.source, hex::encode(&h.finalize()[..6])));
+        omitted.push(format!(
+            "{}:{}",
+            removed.source,
+            hex::encode(&h.finalize()[..6])
+        ));
     }
     if !omitted.is_empty() {
         fragments.push(ContextFragment {
@@ -490,9 +547,8 @@ pub fn record_snapshot(
     worker_id: &WorkerId,
     snap: &ContextSnapshot,
 ) -> rusqlite::Result<bool> {
-    let fragments = serde_json::to_string(&snap.fragments).map_err(|e| {
-        rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-    })?;
+    let fragments = serde_json::to_string(&snap.fragments)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     let semantic = issue_by_internal_id(conn, task_id)?.map(|r| r.id);
     let checkpoint_version = semantic
         .as_deref()
@@ -601,7 +657,9 @@ mod tests {
             tid(n),
             "Fix the login redirect loop",
             amux_core::board::ItemType::Code,
-            Actor::Human { name: "ethan".into() },
+            Actor::Human {
+                name: "ethan".into(),
+            },
             "2026-08-01T00:00:00Z".parse().unwrap(),
         );
         t.desc = "Users bounce between /login and /".into();
@@ -610,13 +668,60 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_task_receives_browser_identity_and_handoff_guidance() {
+        let c = conn();
+        let snap = assemble_context(&c, &wid(1), &task(1)).unwrap();
+        let example = BROWSER_SELECTION_GUIDE
+            .split("route advance '")
+            .nth(1)
+            .unwrap()
+            .split("'`")
+            .next()
+            .unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(example).expect("worker example must be literal valid JSON");
+        assert_eq!(payload["reason"], "describe the unmet goal");
+        let guide = snap
+            .fragments
+            .iter()
+            .find(|f| f.source == "browser:selection-guide")
+            .expect("browser capability is available by default");
+        for requirement in [
+            "identity",
+            "purpose",
+            "scope",
+            "amux browser profiles",
+            "amux browser for URL",
+            "Amux → configured Chrome CDP → CUA",
+            "mutations are not replayed",
+        ] {
+            assert!(
+                guide.content.contains(requirement),
+                "missing worker instruction: {requirement}"
+            );
+        }
+    }
+
+    #[test]
     fn layers_ordered_global_before_group_before_worker_then_task() {
         let c = conn();
         let (w, g) = (wid(1), gid(2));
         seed_worker_in_group(&c, &w, &g);
         seed_memory(&c, 10, Scope::Global, "house-rules", "no em-dashes");
-        seed_memory(&c, 11, Scope::Group { id: g.clone() }, "team-notes", "deploy fridays");
-        seed_memory(&c, 12, Scope::Worker { id: w.clone() }, "my-notes", "auth in src/auth.rs");
+        seed_memory(
+            &c,
+            11,
+            Scope::Group { id: g.clone() },
+            "team-notes",
+            "deploy fridays",
+        );
+        seed_memory(
+            &c,
+            12,
+            Scope::Worker { id: w.clone() },
+            "my-notes",
+            "auth in src/auth.rs",
+        );
         // Another worker's memory must NOT appear in this context.
         seed_memory(&c, 13, Scope::Worker { id: wid(99) }, "not-mine", "secret");
 
@@ -628,6 +733,7 @@ mod tests {
                 "memory:global",
                 "memory:group",
                 "memory:worker",
+                "browser:selection-guide",
                 "harness_version",
                 "task"
             ],
@@ -641,6 +747,7 @@ mod tests {
                 PRIO_MEMORY_GLOBAL,
                 PRIO_MEMORY_GROUP,
                 PRIO_MEMORY_WORKER,
+                32,
                 PRIO_GUIDES,
                 PRIO_TASK
             ]
@@ -648,7 +755,7 @@ mod tests {
         // Isolation: the other worker's memory is absent.
         assert!(!snap.fragments.iter().any(|f| f.content.contains("secret")));
         // Task fragment carries title, desc and deps.
-        let task_frag = &snap.fragments[4];
+        let task_frag = snap.fragments.iter().find(|f| f.source == "task").unwrap();
         assert!(task_frag.content.contains("Fix the login redirect loop"));
         assert!(task_frag.content.contains("Users bounce"));
         assert!(task_frag.content.contains(tid(900).as_str()));
@@ -679,7 +786,10 @@ mod tests {
         let snap = assemble_context(&c, &w, &t).unwrap();
         let key = format!("{}:{}:1", t.id, w);
 
-        assert!(record_snapshot(&c, &key, &t.id, &w, &snap).unwrap(), "first: recorded");
+        assert!(
+            record_snapshot(&c, &key, &t.id, &w, &snap).unwrap(),
+            "first: recorded"
+        );
         assert!(
             !record_snapshot(&c, &key, &t.id, &w, &snap).unwrap(),
             "second: same key, NOT re-recorded"
