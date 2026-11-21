@@ -2521,6 +2521,105 @@ struct RuntimeBoardTruth {
 /// state is needed here.
 type TaskMarker = (f64, Option<String>, bool, String);
 
+// Keep event ordering by (timestamp, id), even when a late insert has an old
+// timestamp. The caller appends these after command markers, as before.
+type ClaimEvents = BTreeMap<String, Vec<(i64, TaskMarker)>>;
+type ClaimRow = (i64, String, String, Option<String>, f64);
+
+#[derive(Default)]
+struct ClaimCache {
+    store: std::sync::Weak<crate::db::Store>,
+    last_id: i64,
+    events: std::sync::Arc<ClaimEvents>,
+    refreshing: bool,
+}
+
+fn claim_cache() -> &'static std::sync::Mutex<ClaimCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ClaimCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(ClaimCache::default()))
+}
+
+fn fold_claim_rows(events: &mut ClaimEvents, rows: Vec<ClaimRow>) {
+    let mut touched = BTreeSet::new();
+    for (id, session, kind, data, ts) in rows {
+        let parsed = data.as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let card_id = parsed["issue"].as_str().map(str::trim)
+            .filter(|id| !id.is_empty()).map(str::to_string);
+        let cardless = kind == "task.cardless" && cardless_event_allowed(&parsed);
+        if kind == "task.cardless" && !cardless { continue; }
+        if card_id.is_some() || cardless {
+            touched.insert(session.clone());
+            events.entry(session).or_default().push((id, (ts, card_id, cardless, kind)));
+        }
+    }
+    for session in touched {
+        let markers = events.get_mut(&session).unwrap();
+        markers.sort_by(|a, b| a.1.0.total_cmp(&b.1.0).then(a.0.cmp(&b.0)));
+    }
+}
+
+fn wait_for_claim_refresh(rx: &std::sync::mpsc::Receiver<()>, deadline: std::time::Duration) -> bool {
+    rx.recv_timeout(deadline).is_ok()
+}
+
+// A single detached reader owns each refresh. A stalled SQLite read never owns
+// the cache lock or the request thread, and cannot spawn unbounded readers.
+fn cached_claim_events(store: &crate::db::SharedStore) -> ClaimEvents {
+    let key = std::sync::Arc::downgrade(store);
+    let mut cache = claim_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if !cache.store.ptr_eq(&key) {
+        *cache = ClaimCache { store: key.clone(), ..ClaimCache::default() };
+    }
+    if !cache.refreshing {
+        cache.refreshing = true;
+        let last_id = cache.last_id;
+        let events = cache.events.clone();
+        let worker_store = store.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<Vec<ClaimRow>> {
+                let conn = worker_store.dedicated_read()?;
+                let mut stmt = conn.prepare("SELECT id, session, type, data, ts FROM session_events WHERE id > ?1 AND type IN ('task.claimed','task.cardless') ORDER BY id")?;
+                let rows = stmt.query_map([last_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })();
+            let result = result.map(|rows| {
+                let newest = rows.last().map(|row| row.0).unwrap_or(last_id);
+                if rows.is_empty() {
+                    (newest, events)
+                } else {
+                    let mut updated = (*events).clone();
+                    fold_claim_rows(&mut updated, rows);
+                    (newest, std::sync::Arc::new(updated))
+                }
+            });
+            let mut cache = claim_cache().lock().unwrap_or_else(|e| e.into_inner());
+            if cache.store.ptr_eq(&key) {
+                match result {
+                    Ok((newest, events)) => {
+                        cache.last_id = newest;
+                        cache.events = events;
+                    }
+                    Err(err) => tracing::warn!(target: "amux::sessions", %err, "claim refresh failed; serving stale claims"),
+                }
+                cache.refreshing = false;
+            }
+            drop(cache);
+            let _ = tx.send(());
+        });
+        drop(cache);
+        if !wait_for_claim_refresh(&rx, std::time::Duration::from_secs(2)) {
+            tracing::warn!(target: "amux::sessions", "claim refresh deadline exceeded; serving stale claims");
+        }
+        cache = claim_cache().lock().unwrap_or_else(|e| e.into_inner());
+    } else {
+        tracing::warn!(target: "amux::sessions", "claim refresh still running; serving stale claims");
+    }
+    if cache.store.ptr_eq(&std::sync::Arc::downgrade(store)) { (*cache.events).clone() } else { ClaimEvents::new() }
+}
+
 /// A cardless event must carry the semantic classification which licensed it.
 /// Transport intent (`[no-board]`) is not such a classification: a substantive
 /// turn remains work even when its sender asked not to mint a duplicate card.
@@ -2934,7 +3033,7 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     // Never reserve one of the request pool's readers while external probes
     // run. Cheap board/status requests remain independent of fleet discovery.
     let conn = store.dedicated_read()?;
-    let arr = build_array(&conn)?;
+    let arr = build_array(&conn, store)?;
     let json = serde_json::to_string(&arr)?;
     match race_verdict(
         epoch_start,
@@ -4005,7 +4104,7 @@ fn branch_from_head_file(dir: &str) -> Option<String> {
     }
 }
 
-fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
+fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> rusqlite::Result<Vec<serde_json::Value>> {
     let mut signals = FleetSignals::load(conn);
     // Before any status is derived: the pane is the only signal that can
     // contradict a self-report, and a report that nothing can contradict is
@@ -4180,40 +4279,8 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
                 }
             }
         }
-        if let Ok(mut events) = conn.prepare(
-            "SELECT session, type, data, ts FROM session_events \
-             WHERE type IN ('task.claimed','task.cardless') ORDER BY ts ASC, id ASC",
-        ) {
-            let rows = events.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, f64>(3)?,
-                ))
-            })?;
-            for row in rows {
-                let (session, kind, data, ts) = row?;
-                let parsed = data
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                let card_id = parsed["issue"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string);
-                let cardless = kind == "task.cardless" && cardless_event_allowed(&parsed);
-                if kind == "task.cardless" && !cardless {
-                    continue;
-                }
-                if card_id.is_some() || cardless {
-                    task_markers
-                        .entry(session)
-                        .or_default()
-                        .push((ts, card_id, cardless, kind));
-                }
-            }
+        for (session, events) in cached_claim_events(store) {
+            task_markers.entry(session).or_default().extend(events.into_iter().map(|(_, marker)| marker));
         }
         let now = signals.now as i64;
         for v in out.iter_mut() {
@@ -4732,6 +4799,30 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn claim_refresh_timeout_returns_without_waiting_for_reader() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        assert!(!super::wait_for_claim_refresh(&rx, std::time::Duration::from_millis(10)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn claim_fold_incremental_matches_full_with_late_timestamps() {
+        let rows = vec![
+            (1, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"A"}"#.into()), 30.0),
+            (2, "lane".into(), "task.cardless".into(), Some(r#"{"reason":"control-prompt"}"#.into()), 10.0),
+            (3, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"B"}"#.into()), 10.0),
+        ];
+        let mut full = super::ClaimEvents::new();
+        super::fold_claim_rows(&mut full, rows.clone());
+        let mut incremental = super::ClaimEvents::new();
+        super::fold_claim_rows(&mut incremental, rows[..1].to_vec());
+        super::fold_claim_rows(&mut incremental, rows[1..].to_vec());
+        assert_eq!(full, incremental);
+        assert_eq!(full["lane"].iter().map(|row| row.0).collect::<Vec<_>>(), vec![2, 3, 1]);
+    }
+
     use super::*;
     static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
