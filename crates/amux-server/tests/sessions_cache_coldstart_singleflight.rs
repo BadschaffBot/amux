@@ -70,7 +70,7 @@ fn cold_sessions_cache_has_exactly_one_builder_and_does_not_lease_the_request_po
         "the heavyweight projection must not lease a request-pool reader while probing tmux/git"
     );
     assert_eq!(
-        SRC.matches("build_array(&conn)").count(),
+        SRC.matches("build_array(&conn, store)").count(),
         1,
         "there must be exactly one build call site, protected by the single flight"
     );
