@@ -297,7 +297,7 @@ pub fn reconcile_orphans(conn: &Connection, now: i64) -> rusqlite::Result<usize>
 }
 
 /// A receipt identifies the exact execution and saved card revision that ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PickupOutcomeReceipt {
     pub card: String,
     pub attempt: i64,
@@ -306,7 +306,8 @@ pub struct PickupOutcomeReceipt {
     pub outcome: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum OutcomeRoute {
     Review,
     Recovery,
