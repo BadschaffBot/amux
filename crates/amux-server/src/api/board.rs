@@ -5767,11 +5767,17 @@ pub async fn get_item(
         let verified_gate = bs::effective_gate_trail(&conn, &row, TaskStatus::Verified, &groups);
         let verification = crate::db::verification_store::coverage(&conn, &row, &verified_gate.criteria)?;
         let attempts = crate::db::attempts::list_for_card(&conn, &row.id)?;
-        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts)))
+        let pickup_outcome = match attempts.last() {
+            Some(attempt) => crate::db::attempts::consume_pickup_outcome(
+                &conn, &row.id, attempt.attempt, attempt.generation, row.version,
+            )?,
+            None => None,
+        };
+        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts, pickup_outcome)))
     })
     .await;
     match joined {
-        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts)))) => {
+        Ok(Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, attempts, pickup_outcome)))) => {
             // Weak ETag for read-modify-write callers (AMUX-1711 parity).
             let mut headers = HeaderMap::new();
             if let Ok(v) = format!("W/\"{}-{}\"", row.id, row.rev).parse() {
@@ -5791,6 +5797,10 @@ pub async fn get_item(
                 }
             }
             body["attempts"] = json!(attempts);
+            body["pickup_outcome"] = match pickup_outcome {
+                Some((receipt, route)) => json!({"receipt": receipt, "route": route}),
+                None => serde_json::Value::Null,
+            };
             (StatusCode::OK, headers, Json(body)).into_response()
         }
         Ok(Ok(None)) => not_found(&id),
