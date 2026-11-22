@@ -952,8 +952,6 @@ const ATTR_STATE_DDL: &str = "CREATE TABLE IF NOT EXISTS token_ledger_attr_state
 struct AttrPlan {
     /// Claim windows that overlap the pending ts range, oldest first.
     wins: Vec<(String, String, i64, i64)>,
-    /// The ts range of rows still to attribute, or `None` when there are none.
-    range: Option<(i64, i64)>,
     /// The rowid this pass starts after (0 for a full re-derivation).
     base: i64,
     /// The highest ledger rowid in the snapshot: the watermark this pass settles to.
@@ -1022,7 +1020,7 @@ fn plan_attribution(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<A
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let Some((lo, hi)) = lo.zip(hi) else {
-        return Ok(AttrPlan { wins: Vec::new(), range: None, base, new_wm: max_rowid, fp });
+        return Ok(AttrPlan { wins: Vec::new(), base, new_wm: max_rowid, fp });
     };
 
     // The live source, bounded to attempts that can overlap [lo, hi]. A window
@@ -1092,7 +1090,7 @@ fn plan_attribution(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<A
                 && *from <= hi && *to >= lo
         })
         .collect();
-    Ok(AttrPlan { wins, range: Some((lo, hi)), base, new_wm: max_rowid, fp })
+    Ok(AttrPlan { wins, base, new_wm: max_rowid, fp })
 }
 
 pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
