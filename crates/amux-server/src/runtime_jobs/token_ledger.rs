@@ -997,15 +997,17 @@ fn plan_attribution(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<A
         [],
         |r| r.get(0),
     )?;
-    let (stored_wm, stored_fp): (i64, String) = if has_state {
-        conn.query_row(
+    // A table with no row yet (a first pass that failed before settling) is the zero state too.
+    let stored: Option<(i64, String)> = if has_state {
+        rusqlite::OptionalExtension::optional(conn.query_row(
             "SELECT rowid_wm, claim_fp FROM token_ledger_attr_state WHERE id = 1",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+        ))?
     } else {
-        (0, String::new())
+        None
     };
+    let (stored_wm, stored_fp) = stored.unwrap_or((0, String::new()));
     let fp = attribution_fingerprint(conn)?;
     let max_rowid: i64 =
         conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM token_ledger", [], |r| r.get(0))?;
