@@ -285,7 +285,16 @@ pub fn open_holds_for_worker(conn: &Connection, worker: &str) -> rusqlite::Resul
 /// count names a bypass path worth routing through `advance`.
 pub fn reconcile_orphans(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
     ensure_table(conn)?;
-    conn.execute(
+    conn.execute_batch("SAVEPOINT reconcile_pickup_outcomes")?;
+    let result = (|| {
+        conn.execute(
+        "INSERT OR IGNORE INTO pickup_outcome_receipts (card, attempt, generation, card_version, outcome) \
+         SELECT a.card, a.attempt, a.generation, i.version, 'orphaned' \
+         FROM task_attempts a JOIN issues i ON i.id = a.card \
+         WHERE a.ended_at IS NULL AND NOT (i.status = 'doing' AND i.lease_owner IS NOT NULL AND i.deleted IS NULL)",
+        [],
+    )?;
+        let closed = conn.execute(
         "UPDATE task_attempts SET ended_at = ?1, outcome = 'orphaned', ended_by = 'amux:attempt-reconcile', \
              to_status = (SELECT status FROM issues i WHERE i.id = task_attempts.card), \
              reason = 'card left its lease without passing a lease choke point' \
@@ -293,7 +302,21 @@ pub fn reconcile_orphans(conn: &Connection, now: i64) -> rusqlite::Result<usize>
              SELECT 1 FROM issues i WHERE i.id = task_attempts.card AND i.status = 'doing' \
                AND i.lease_owner IS NOT NULL AND i.deleted IS NULL)",
         [now],
-    )
+    )?;
+        Ok(closed)
+    })();
+    match result {
+        Ok(closed) => {
+            conn.execute_batch("RELEASE reconcile_pickup_outcomes")?;
+            Ok(closed)
+        }
+        Err(error) => {
+            conn.execute_batch(
+                "ROLLBACK TO reconcile_pickup_outcomes; RELEASE reconcile_pickup_outcomes",
+            )?;
+            Err(error)
+        }
+    }
 }
 
 /// A receipt identifies the exact execution and saved card revision that ended.
@@ -455,6 +478,18 @@ mod tests {
         let gone = list_for_card(&conn, "GONE").unwrap();
         assert_eq!(gone[0].outcome.as_deref(), Some("orphaned"));
         assert_eq!(gone[0].to_status.as_deref(), Some("discarded"));
+        let version: i64 = conn
+            .query_row("SELECT version FROM issues WHERE id='GONE'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            consume_pickup_outcome(&conn, "GONE", 1, 1, version)
+                .unwrap()
+                .unwrap()
+                .1,
+            OutcomeRoute::Recovery
+        );
         assert_eq!(
             running_attempt_numbers(&conn).unwrap().get("KEEP"),
             Some(&1)
