@@ -5278,7 +5278,7 @@ type TaskMarker = (f64, Option<String>, bool, String);
 
 // Keep event ordering by (timestamp, id), even when a late insert has an old
 // timestamp. The caller appends these after command markers, as before.
-type ClaimEvents = BTreeMap<String, Vec<(i64, TaskMarker)>>;
+type ClaimEvents = BTreeMap<String, BTreeMap<(Option<String>, bool, String), (i64, TaskMarker)>>;
 type ClaimRow = (i64, String, String, Option<String>, f64);
 
 #[derive(Default)]
@@ -5295,7 +5295,6 @@ fn claim_cache() -> &'static std::sync::Mutex<ClaimCache> {
 }
 
 fn fold_claim_rows(events: &mut ClaimEvents, rows: Vec<ClaimRow>) {
-    let mut touched = BTreeSet::new();
     for (id, session, kind, data, ts) in rows {
         let parsed = data.as_deref()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
@@ -5305,13 +5304,14 @@ fn fold_claim_rows(events: &mut ClaimEvents, rows: Vec<ClaimRow>) {
         let cardless = kind == "task.cardless" && cardless_event_allowed(&parsed);
         if kind == "task.cardless" && !cardless { continue; }
         if card_id.is_some() || cardless {
-            touched.insert(session.clone());
-            events.entry(session).or_default().push((id, (ts, card_id, cardless, kind)));
+            let key = (card_id.clone(), cardless, kind.clone());
+            let markers = events.entry(session).or_default();
+            let candidate = (id, (ts, card_id, cardless, kind));
+            let entry = markers.entry(key).or_insert_with(|| candidate.clone());
+            if candidate.1.0.total_cmp(&entry.1.0).then(candidate.0.cmp(&entry.0)).is_gt() {
+                *entry = candidate;
+            }
         }
-    }
-    for session in touched {
-        let markers = events.get_mut(&session).unwrap();
-        markers.sort_by(|a, b| a.1.0.total_cmp(&b.1.0).then(a.0.cmp(&b.0)));
     }
 }
 
@@ -7944,6 +7944,8 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
             }
         }
         for (session, events) in cached_claim_events(store) {
+            let mut events: Vec<_> = events.into_values().collect();
+            events.sort_by(|a, b| a.1.0.total_cmp(&b.1.0).then(a.0.cmp(&b.0)));
             task_markers.entry(session).or_default().extend(events.into_iter().map(|(_, marker)| marker));
         }
         let now = signals.now as i64;
@@ -8846,7 +8848,14 @@ pub(crate) mod tests {
         super::fold_claim_rows(&mut incremental, rows[..1].to_vec());
         super::fold_claim_rows(&mut incremental, rows[1..].to_vec());
         assert_eq!(full, incremental);
-        assert_eq!(full["lane"].iter().map(|row| row.0).collect::<Vec<_>>(), vec![2, 3, 1]);
+        assert_eq!(full["lane"].len(), 3);
+        let repeated = vec![
+            (4, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"A"}"#.into()), 5.0),
+            (5, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"A"}"#.into()), 30.0),
+        ];
+        super::fold_claim_rows(&mut full, repeated);
+        assert_eq!(full["lane"].len(), 3);
+        assert!(full["lane"].values().any(|row| row.0 == 5));
     }
 
     use super::*;
