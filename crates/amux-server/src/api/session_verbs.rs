@@ -13472,6 +13472,70 @@ pub(crate) fn block_reason_explain(reason: &str, name: &str) -> String {
     }
 }
 
+/// Most content-bearing notices (see [`NON_COALESCING_GUARDS`]) delivered in
+/// ONE prompt. `AMUX_STEER_BATCH_MAX`, default 20; 1 restores one-per-turn.
+///
+/// WHY (2026-11-21, SchaffServe). One row per lane per turn makes the drain
+/// rate one notice per agent turn, and every delivered notice STARTS a turn.
+/// Measured: Review-C4 held 198 `board-progress` rows (35 cards, oldest 511
+/// min), Review-C2 150 (646 min); they drained about 30 an hour, so hand-offs
+/// queued behind them waited 5-10 hours and the lane was never idle - the
+/// "boundary that never came". 515 of 539 queued rows fleet-wide were this one
+/// guard. Notes are content and never coalesce (AMUX-3938), so nothing is
+/// folded or dropped here: every notice arrives whole, several per prompt.
+pub(crate) fn steer_batch_max() -> usize {
+    std::env::var("AMUX_STEER_BATCH_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(20)
+}
+
+/// Character budget for one batched prompt. Single steers of 12k chars already
+/// deliver cleanly (steering_history, 7 days), so a batch stays under that.
+pub(crate) const STEER_BATCH_MAX_CHARS: usize = 12_000;
+
+/// Which of a lane's LATER content-bearing rows ride along with `head_id`.
+/// `lane_rows` is that lane's `(id, text)` rows, oldest first. Strict prefix
+/// after the head: order is preserved and nothing is skipped, so a row that
+/// does not fit simply heads the next delivery.
+pub(crate) fn steer_batch_extras(
+    lane_rows: &[(String, String)],
+    head_id: &str,
+    max_rows: usize,
+    max_chars: usize,
+) -> Vec<(String, String)> {
+    let Some(pos) = lane_rows.iter().position(|(id, _)| id == head_id) else {
+        return Vec::new();
+    };
+    let mut used = lane_rows[pos].1.chars().count();
+    lane_rows[pos + 1..]
+        .iter()
+        .take(max_rows.saturating_sub(1))
+        .take_while(|(_, text)| {
+            used += text.chars().count();
+            used <= max_chars
+        })
+        .cloned()
+        .collect()
+}
+
+/// The prompt for a batch. One notice is sent exactly as queued.
+pub(crate) fn steer_batch_text(head: &str, extras: &[(String, String)]) -> String {
+    if extras.is_empty() {
+        return head.to_string();
+    }
+    let n = extras.len() + 1;
+    let mut out = format!(
+        "[amux: {n} board notices delivered together, oldest first. They are separate \
+         messages; read and handle every one.]"
+    );
+    for (i, text) in std::iter::once(head).chain(extras.iter().map(|(_, t)| t.as_str())).enumerate() {
+        out.push_str(&format!("\n\n--- notice {} of {n} ---\n{text}", i + 1));
+    }
+    out
+}
+
 /// How long a queued message may wait for an idle boundary before it is
 /// delivered mid-turn anyway. `AMUX_STEER_MAX_AGE_S`, default 10 minutes.
 pub(crate) fn steer_max_age_s() -> f64 {
@@ -14184,6 +14248,18 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     let mut lane_blocks: std::collections::HashMap<String, Option<&'static str>> =
         std::collections::HashMap::new();
     let mut delivered = 0usize;
+    // Content-bearing rows per lane, oldest first, so one delivery can carry
+    // several (see `steer_batch_max`).
+    let batch_max = steer_batch_max();
+    let mut batchable: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    if batch_max > 1 {
+        for (id, session, text, _, guard, _) in &queued {
+            if non_coalescing(guard) {
+                batchable.entry(session.clone()).or_default().push((id.clone(), text.clone()));
+            }
+        }
+    }
     for (id, session, text, queued_at, guard, sender) in queued {
         if id.starts_with("board-drive-resume:") {
             let current = state.store.read().ok().map(|conn| resume_id_is_current(&conn, &session, &id));
@@ -14502,7 +14578,12 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // from_steering=true is still passed: it makes the callee REFUSE rather
         // than re-queue if the lane starts generating between this check and the
         // send, so a lost race leaves the row where it is instead of duplicating.
-        let (ok, msg) = send_text_inner(state, &session, &text, SendMode::drained(mid_turn, false)).await;
+        let extras = batchable
+            .get(&session)
+            .map(|rows| steer_batch_extras(rows, &id, batch_max, STEER_BATCH_MAX_CHARS))
+            .unwrap_or_default();
+        let body = steer_batch_text(&text, &extras);
+        let (ok, msg) = send_text_inner(state, &session, &body, SendMode::drained(mid_turn, false)).await;
         if !ok {
             skip(&session, &id, &format!("send-refused: {msg}"));
             continue; // NEXT ROW for this lane, not the next lane
@@ -14555,6 +14636,53 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await;
+        // The notices that rode along were delivered by the same send: each
+        // leaves the queue with its own history row, event and log line.
+        if !extras.is_empty() {
+            let (rows, sess2, outcome2) = (extras.clone(), session.clone(), msg.clone());
+            let _ = state
+                .store
+                .write_async(move |conn| {
+                    for (xid, xtext) in &rows {
+                        let Ok(xq) = conn.query_row(
+                            "SELECT queued_at FROM steering_queue WHERE id=?",
+                            [xid],
+                            |r| r.get::<_, f64>(0),
+                        ) else {
+                            continue; // already gone (reactive path took it)
+                        };
+                        let (src_guard, src_sender) = steer_row_source(conn, xid);
+                        conn.execute("DELETE FROM steering_queue WHERE id=?", [xid])?;
+                        conn.execute(
+                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                             VALUES(?,?,?,?,?,?,?,?)",
+                            rusqlite::params![xid, sess2, redact_secrets(xtext), xq, now_f64(), outcome2, src_guard, src_sender],
+                        )?;
+                    }
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .await;
+            for (xid, xtext) in &extras {
+                emit_event(
+                    state,
+                    &session,
+                    "message.delivered",
+                    Some(json!({
+                        "id": xid,
+                        "via": "steering",
+                        "mode": "batched",
+                        "batched_with": id,
+                        "submission": msg,
+                        "preview": chars_truncate(&redact_secrets(xtext), 120),
+                    })),
+                    Some(format!("steer-delivered:{xid}")),
+                    "steering",
+                )
+                .await;
+                tracing::info!(session = %session, id = %xid, batched_with = %id, detail = %msg, mode = "batched", "steering delivered");
+            }
+            delivered += extras.len();
+        }
         delivered += 1;
         delivered_lanes.insert(session.clone());
         steer_skips().lock().unwrap().remove(&session);
@@ -35161,5 +35289,62 @@ mod spawn_argv_secret_tests {
             "the pane's shell already exists when set-environment runs, so without the \
              import the provider never sees the key"
         );
+    }
+}
+
+#[cfg(test)]
+mod steer_batch_tests {
+    use super::{steer_batch_extras, steer_batch_text, STEER_BATCH_MAX_CHARS};
+
+    /// THE STALLED CASE, replayed (SchaffServe 2026-11-21): Review-C4 held 198
+    /// `board-progress` notices averaging 576 chars. One per turn at about 110 s
+    /// a turn is 6 hours; the target is every notice out within 15 turns, in
+    /// order, none lost or altered.
+    #[test]
+    fn a_198_notice_backlog_drains_in_a_few_turns_with_every_notice_intact() {
+        let mut queue: Vec<(String, String)> = (0..198)
+            .map(|i| (format!("steer-{i}"), format!("[review requested on CW-{}: t] {}", i % 35, "x".repeat(540))))
+            .collect();
+        let original = queue.clone();
+        let (mut turns, mut seen) = (0usize, Vec::new());
+        while !queue.is_empty() {
+            let head = queue[0].clone();
+            let extras = steer_batch_extras(&queue, &head.0, 20, STEER_BATCH_MAX_CHARS);
+            let body = steer_batch_text(&head.1, &extras);
+            assert!(body.contains(&head.1));
+            for (_, t) in &extras {
+                assert!(body.contains(t.as_str()), "a batched notice must arrive whole");
+            }
+            // Budget holds on the notices themselves; the frame adds ~35 chars each.
+            assert!(body.chars().count() <= STEER_BATCH_MAX_CHARS + 40 * (extras.len() + 2));
+            seen.push(head);
+            seen.extend(extras.iter().cloned());
+            queue.drain(..extras.len() + 1);
+            turns += 1;
+        }
+        assert_eq!(seen, original, "every notice exactly once, oldest first");
+        assert!(turns <= 15, "198 notices took {turns} turns; one-per-turn took 198");
+    }
+
+    #[test]
+    fn one_notice_is_sent_exactly_as_queued_and_limits_hold() {
+        let rows: Vec<(String, String)> =
+            (0..5).map(|i| (format!("s{i}"), format!("note {i}"))).collect();
+        assert_eq!(steer_batch_text("note 0", &[]), "note 0");
+        // max_rows = 1 is the off switch.
+        assert!(steer_batch_extras(&rows, "s0", 1, 12_000).is_empty());
+        // Row cap, and only rows AFTER the head.
+        let got = steer_batch_extras(&rows, "s2", 2, 12_000);
+        assert_eq!(got, vec![("s3".to_string(), "note 3".to_string())]);
+        // Char cap: an oversize head goes alone, and a row that does not fit
+        // stops the batch instead of being skipped (order preserved).
+        assert!(steer_batch_extras(&rows, "s0", 20, 3).is_empty());
+        assert_eq!(steer_batch_extras(&rows, "s0", 20, 12).len(), 1);
+        // A head that is not in the lane's batchable rows rides alone.
+        assert!(steer_batch_extras(&rows, "other", 20, 12_000).is_empty());
+        let body = steer_batch_text("note 0", &rows[1..3]);
+        assert!(body.starts_with("[amux: 3 board notices"));
+        assert!(body.contains("--- notice 3 of 3 ---\nnote 2"));
+        assert!(body.is_ascii());
     }
 }
