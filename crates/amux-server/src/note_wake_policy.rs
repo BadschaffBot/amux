@@ -83,7 +83,7 @@ pub fn evaluate(event: NoteWakeEvent) -> WakeDecision {
 /// Which card a wake for this event lands on.
 ///
 /// A review progress note targets only the review card: `review_card_id` is
-/// returned and the implementation card is never named. Every other wake
+/// returned, or no target if it is absent; the implementation card is never named. Every other wake
 /// targets the card the event happened on. Returns `None` when the event does
 /// not wake anything.
 pub fn wake_target<'a>(
@@ -98,7 +98,7 @@ pub fn wake_target<'a>(
         && matches!(event.author, NoteAuthor::Worker | NoteAuthor::System)
         && event.card_is_review;
     if review_progress {
-        return review_card_id.or(Some(card_id));
+        return review_card_id;
     }
     Some(card_id)
 }
@@ -149,7 +149,7 @@ mod note_wake_policy_tests {
     fn review_progress_targets_only_the_review_card() {
         let e = ev(NoteEventKind::Note, NoteAuthor::Worker, true);
         assert_eq!(wake_target(e, "IMPL-1", Some("REVIEW-1")), Some("REVIEW-1"));
-        assert_eq!(wake_target(e, "REVIEW-1", None), Some("REVIEW-1"));
+        assert_eq!(wake_target(e, "IMPL-1", None), None);
     }
 
     #[test]
