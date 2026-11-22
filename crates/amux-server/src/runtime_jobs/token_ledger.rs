@@ -1152,11 +1152,17 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
                         trunc.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     n += 1;
-                    if started.elapsed().as_millis() >= HOLD_BUDGET_MS {
+                    // A later window must not take the unfinished tail of this
+                    // one. Retry from the same base before visiting it.
+                    if trunc.load(std::sync::atomic::Ordering::Relaxed)
+                        || started.elapsed().as_millis() >= HOLD_BUDGET_MS
+                    {
                         break;
                     }
                 }
-                if start_at + n == windows.len() {
+                if start_at + n == windows.len()
+                    || trunc.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     // The watermark moves only when nothing was cut short. A
                     // truncated pass keeps the old base and settles only the
                     // fingerprint, which is correct: the next pass rescans from
@@ -2005,6 +2011,31 @@ mod tests {
 
         attribute_tasks(&st).await.unwrap();
         assert_eq!(task_counts(&st).get("AMUX-3"), Some(&(extra as i64)), "the tail is attributed");
+    }
+
+    #[tokio::test]
+    async fn truncated_earlier_window_keeps_precedence_over_overlapping_window() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        st.write(move |conn| {
+            crate::db::attempts::ensure_table(conn)?;
+            conn.execute(
+                "INSERT INTO task_attempts (card, attempt, worker, generation, started_at, ended_at) \
+                 VALUES ('EARLY', 1, 'lane-p', 1, ?1, ?3), \
+                        ('LATE', 1, 'lane-p', 1, ?2, ?3)",
+                rusqlite::params![now - 900, now - 600, now - 100],
+            )?;
+            insert_turn(conn, now - 300, "lane-p", "overlap", ROWS_PER_UPDATE as usize + 1);
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+
+        attribute_tasks(&st).await.unwrap();
+        assert_eq!(task_counts(&st).get("EARLY"), Some(&ROWS_PER_UPDATE));
+        assert_eq!(task_counts(&st).get(""), Some(&1));
+        assert_eq!(task_counts(&st).get("LATE"), None);
+        attribute_tasks(&st).await.unwrap();
+        assert_eq!(task_counts(&st).get("EARLY"), Some(&(ROWS_PER_UPDATE + 1)));
+        assert_eq!(task_counts(&st).get("LATE"), None);
     }
 
     async fn ledger(store: &SharedStore) -> Vec<(String, String, i64)> {
