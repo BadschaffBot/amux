@@ -101,6 +101,7 @@ pub mod provider;
 pub mod push;
 pub mod runtime_jobs;
 pub mod activation;
+pub mod note_wake_policy;
 pub mod tls;
 
 use std::sync::Arc;
