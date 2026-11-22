@@ -53,7 +53,12 @@ pub fn ensure_table(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_card_attempt ON task_attempts(card, attempt);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_running ON task_attempts(card) WHERE ended_at IS NULL;
-        CREATE INDEX IF NOT EXISTS idx_task_attempts_worker ON task_attempts(worker, started_at);",
+        CREATE INDEX IF NOT EXISTS idx_task_attempts_worker ON task_attempts(worker, started_at);
+        CREATE TABLE IF NOT EXISTS pickup_outcome_receipts (
+            card TEXT NOT NULL, attempt INTEGER NOT NULL, generation INTEGER NOT NULL,
+            card_version INTEGER NOT NULL, outcome TEXT NOT NULL,
+            PRIMARY KEY(card, attempt)
+        );",
     )
 }
 
@@ -107,6 +112,15 @@ fn close_running(
     reason: Option<&str>,
     now: i64,
 ) -> rusqlite::Result<usize> {
+    // This runs in the lease change transaction, after the card is saved.
+    // The attempt's generation belongs to the holding, not the new lease.
+    conn.execute(
+        "INSERT OR IGNORE INTO pickup_outcome_receipts (card, attempt, generation, card_version, outcome) \
+         SELECT a.card, a.attempt, a.generation, i.version, ?2 \
+         FROM task_attempts a JOIN issues i ON i.id = a.card \
+         WHERE a.card = ?1 AND a.ended_at IS NULL",
+        params![card, if outcome == "review" { "ready" } else { outcome }],
+    )?;
     conn.execute(
         "UPDATE task_attempts SET ended_at = ?2, outcome = ?3, to_status = ?4, ended_by = ?5, reason = ?6 \
          WHERE card = ?1 AND ended_at IS NULL",
@@ -282,6 +296,68 @@ pub fn reconcile_orphans(conn: &Connection, now: i64) -> rusqlite::Result<usize>
     )
 }
 
+/// A receipt identifies the exact execution and saved card revision that ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickupOutcomeReceipt {
+    pub card: String,
+    pub attempt: i64,
+    pub generation: i64,
+    pub card_version: i64,
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeRoute {
+    Review,
+    Recovery,
+    None,
+}
+
+/// Consume only a receipt for the current card revision. Old receipts remain
+/// durable evidence but cannot route a newer version or another attempt.
+pub fn consume_pickup_outcome(
+    conn: &Connection,
+    card: &str,
+    attempt: i64,
+    generation: i64,
+    card_version: i64,
+) -> rusqlite::Result<Option<(PickupOutcomeReceipt, OutcomeRoute)>> {
+    use rusqlite::OptionalExtension;
+    let result = conn.query_row(
+        "SELECT r.outcome FROM pickup_outcome_receipts r JOIN issues i ON i.id=r.card \
+         WHERE r.card=?1 AND r.attempt=?2 AND r.generation=?3 AND r.card_version=?4 \
+           AND i.version=r.card_version AND i.deleted IS NULL \
+           AND NOT EXISTS (SELECT 1 FROM task_attempts a WHERE a.card=r.card AND a.attempt>r.attempt)",
+        params![card, attempt, generation, card_version], |r| r.get::<_, String>(0),
+    ).optional();
+    let outcome = match result {
+        Err(e)
+            if e.to_string()
+                .contains("no such table: pickup_outcome_receipts") =>
+        {
+            return Ok(None)
+        }
+        other => other?,
+    };
+    Ok(outcome.map(|outcome| {
+        let route = match outcome.as_str() {
+            "ready" | "review" => OutcomeRoute::Review,
+            "failed" | "abandoned" | "orphaned" => OutcomeRoute::Recovery,
+            _ => OutcomeRoute::None,
+        };
+        (
+            PickupOutcomeReceipt {
+                card: card.into(),
+                attempt,
+                generation,
+                card_version,
+                outcome,
+            },
+            route,
+        )
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +457,48 @@ mod tests {
         assert_eq!(
             running_attempt_numbers(&conn).unwrap().get("KEEP"),
             Some(&1)
+        );
+    }
+
+    #[test]
+    fn attempts_pickup_receipt_routes_only_its_exact_current_identity() {
+        let conn = crate::db::migrate::test_memdb();
+        card(&conn, "C", "doing", Some("a"));
+        assert!(consume_pickup_outcome(&conn, "C", 1, 1, 0)
+            .unwrap()
+            .is_none());
+        record_lease_change(&conn, "C", None, Some("a"), 1, "doing", "a", None, 1).unwrap();
+        let version: i64 = conn
+            .query_row("SELECT version FROM issues WHERE id='C'", [], |r| r.get(0))
+            .unwrap();
+        record_lease_change(&conn, "C", Some("a"), None, 2, "review", "a", None, 2).unwrap();
+        let (receipt, route) = consume_pickup_outcome(&conn, "C", 1, 1, version)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.outcome, "ready");
+        assert_eq!(route, OutcomeRoute::Review);
+        assert!(consume_pickup_outcome(&conn, "C", 2, 1, version)
+            .unwrap()
+            .is_none());
+        assert!(consume_pickup_outcome(&conn, "C", 1, 2, version)
+            .unwrap()
+            .is_none());
+        assert!(consume_pickup_outcome(&conn, "C", 1, 1, version + 1)
+            .unwrap()
+            .is_none());
+        conn.execute("UPDATE issues SET version=version+1 WHERE id='C'", [])
+            .unwrap();
+        assert!(consume_pickup_outcome(&conn, "C", 1, 1, version)
+            .unwrap()
+            .is_none());
+        record_lease_change(&conn, "C", None, Some("a"), 3, "doing", "a", None, 3).unwrap();
+        record_lease_change(&conn, "C", Some("a"), None, 4, "quarantined", "a", None, 4).unwrap();
+        assert_eq!(
+            consume_pickup_outcome(&conn, "C", 2, 3, version + 1)
+                .unwrap()
+                .unwrap()
+                .1,
+            OutcomeRoute::Recovery
         );
     }
 }
