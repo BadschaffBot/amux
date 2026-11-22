@@ -943,14 +943,25 @@ async fn async_main() {
         .expect("server run");
 }
 
-/// Turn off SQLite's global memory statistics (its mem0 mutex is taken on every
-/// malloc/free). Must run before the first Connection is opened in the process;
-/// returns the SQLite result code (SQLITE_OK = 0, SQLITE_MISUSE if too late).
+/// Process-wide SQLite settings. Must run before the first Connection is opened
+/// in the process; returns the SQLite result code (SQLITE_OK = 0, SQLITE_MISUSE
+/// if too late).
+/// - MEMSTATUS off: its mem0 mutex is taken on every malloc/free.
+/// - Page cache bulk allocation of 32 MiB per cache (AMUX_DB_PCACHE_BULK_KIB):
+///   each connection takes its cache pages from one block it keeps, instead of
+///   one malloc/free per page per read (see `db::tune_read_connection`).
 pub fn disable_sqlite_memstatus() -> i32 {
+    use rusqlite::ffi;
+    use std::os::raw::{c_int, c_void};
+    let bulk_kib = std::env::var("AMUX_DB_PCACHE_BULK_KIB").ok().and_then(|v| v.parse::<c_int>().ok()).unwrap_or(32768);
     // SAFETY: sqlite3_config is only valid before initialisation; callers run it first.
-    let rc = unsafe { rusqlite::ffi::sqlite3_config(rusqlite::ffi::SQLITE_CONFIG_MEMSTATUS, 0 as std::os::raw::c_int) };
-    if rc != rusqlite::ffi::SQLITE_OK {
-        eprintln!("sqlite3_config(MEMSTATUS,0) failed rc={rc}; memstatus stays on");
+    // PAGECACHE with a null buffer only sets the bulk size (negative = KiB).
+    let rc = unsafe {
+        let rc = ffi::sqlite3_config(ffi::SQLITE_CONFIG_MEMSTATUS, 0 as c_int);
+        if rc == ffi::SQLITE_OK { ffi::sqlite3_config(ffi::SQLITE_CONFIG_PAGECACHE, std::ptr::null_mut::<c_void>(), 0 as c_int, -bulk_kib) } else { rc }
+    };
+    if rc != ffi::SQLITE_OK {
+        eprintln!("sqlite3_config(MEMSTATUS/PAGECACHE) failed rc={rc}; SQLite process settings not applied");
     }
     rc
 }

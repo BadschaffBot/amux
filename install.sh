@@ -153,6 +153,14 @@ else
 [build]
 target-dir = "$SHARED_TARGET_DIR"
 incremental = false
+
+# AMUX-502 (2026-11-21): rusqlite's bundled SQLite is compiled with
+# SQLITE_ENABLE_MEMORY_MANAGEMENT, which puts every connection's page cache
+# behind ONE process-wide mutex taken on every page fetch and release. With
+# ~70 reader threads that was 8-20 cores of kernel time. Undefine it.
+# Store::open warns verdict=sqlite_shared_page_cache when a build lacks this.
+[env]
+LIBSQLITE3_FLAGS = "-USQLITE_ENABLE_MEMORY_MANAGEMENT"
 EOF
   # jobs cap: opt-in, NOT unconditional like incremental above. Cargo's
   # default (jobs = nproc) is correct almost everywhere in this fleet — one

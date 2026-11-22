@@ -114,6 +114,61 @@ pub struct WriteReply {
 pub struct GatedConn {
     conn: r2d2::PooledConnection<SqliteConnectionManager>,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    reg: Option<(Arc<Readers>, u64)>,
+}
+impl Drop for GatedConn {
+    fn drop(&mut self) {
+        let Some((readers, id)) = self.reg.take() else { return };
+        let Some((_, since, site)) = readers.out.lock().unwrap_or_else(|e| e.into_inner()).remove(&id) else { return };
+        // A connection held this long may be pinning the WAL (an open statement
+        // keeps its read snapshot): name the call site so it can be fixed.
+        if since.elapsed() >= READ_HELD_LONG {
+            tracing::warn!(verdict = "read_conn_held_long", site = %site, held_ms = since.elapsed().as_millis() as u64,
+                "pooled read connection held a long time; if a statement stayed open it pinned the WAL");
+        }
+    }
+}
+const READ_HELD_LONG: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Pooled read connections currently checked out: lets the WAL valve interrupt
+/// their statements and lets a long hold name its call site.
+/// ponytail: `dedicated_read` connections are not registered (not interruptible);
+/// register them too if `wal_valve` logs keep ending busy with no pooled reader.
+#[derive(Default)]
+pub(crate) struct Readers {
+    next: std::sync::atomic::AtomicU64,
+    out: std::sync::Mutex<std::collections::HashMap<u64, (rusqlite::InterruptHandle, std::time::Instant, &'static std::panic::Location<'static>)>>,
+}
+impl Readers {
+    fn add(self: &Arc<Self>, conn: &Connection, site: &'static std::panic::Location<'static>) -> (Arc<Self>, u64) {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.out.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (conn.get_interrupt_handle(), std::time::Instant::now(), site));
+        (self.clone(), id)
+    }
+    /// Interrupt the running statement (a no-op for an idle connection) of
+    /// every reader checked out for at least `min_age`. Logs who was hit;
+    /// returns how many.
+    fn interrupt(&self, min_age: std::time::Duration) -> usize {
+        let out = self.out.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0;
+        for (h, since, site) in out.values().filter(|(_, since, _)| since.elapsed() >= min_age) {
+            h.interrupt();
+            n += 1;
+            tracing::warn!(verdict = "wal_valve_interrupt", site = %site, held_ms = since.elapsed().as_millis() as u64,
+                "WAL over hard limit: interrupted this reader's running statement, if any");
+        }
+        n
+    }
+}
+
+/// Queue a request for every permit and keep it pending. The semaphore is
+/// FIFO, so new readers wait behind it until the returned value is dropped.
+/// Never waits itself.
+fn close_gate(sem: &Arc<tokio::sync::Semaphore>, n: u32) -> impl Sized {
+    use std::future::Future;
+    let mut fut = Box::pin(sem.clone().acquire_many_owned(n));
+    let got = fut.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+    (fut, got)
 }
 impl std::ops::Deref for GatedConn {
     type Target = Connection;
@@ -155,11 +210,19 @@ fn env_i64(name: &str, default: i64) -> i64 {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
-/// Read connections: map the file and keep a big page cache so page reads stop
-/// being read() syscalls. Kept out of `configure_connection` (see its doc).
+/// Read connections: no mmap, and a page cache no bigger than the per-cache
+/// bulk allocation (`configure_sqlite_process`, 32 MiB). Measured 2026-11-21 on
+/// a copy of the live DB with 64 readers and a writer:
+/// - mmap: SQLite unmaps the whole file at every read transaction that sees a
+///   change, so with constant writes readers convoy on the process mmap lock
+///   (p95 1.1 s, max 8 s).
+/// - a cache bigger than the bulk allocation: every page past it is a malloc
+///   freed again at the next change; glibc hands the memory back and re-faults
+///   it, about 20 cores of kernel time (the 8-15 cores seen live).
+/// Kept out of `configure_connection` (see its doc).
 fn tune_read_connection(c: &Connection) -> rusqlite::Result<()> {
-    c.pragma_update(None, "mmap_size", env_i64("AMUX_DB_MMAP_BYTES", 4 << 30))?;
-    c.pragma_update(None, "cache_size", env_i64("AMUX_DB_CACHE_KIB", -262144))?;
+    c.pragma_update(None, "mmap_size", env_i64("AMUX_DB_MMAP_BYTES", 0))?;
+    c.pragma_update(None, "cache_size", env_i64("AMUX_DB_CACHE_KIB", -32768))?;
     Ok(())
 }
 
@@ -192,34 +255,33 @@ pub(crate) fn session_events_retention(conn: &Connection, now: f64, retain_days:
     )
 }
 
-/// Writer-thread upkeep: PASSIVE checkpoint every 30 s, TRUNCATE attempt and
-/// session_events retention every 10 min. Runs between requests, one attempt.
+/// Writer-thread upkeep. Every 30 s: PASSIVE checkpoint, then if the WAL is
+/// over `soft` bytes a TRUNCATE that waits briefly for in-flight readers
+/// (SQLite's own cure for checkpoint starvation: the writer is held, readers
+/// are not). If that is still busy and the WAL is over `hard` bytes, the
+/// valve: interrupt statements running over 5 s and copy the backlog, then
+/// hold new pooled readers at the gate (about 1 s at most), interrupt what is
+/// still running, TRUNCATE. Every 10 min: session_events retention.
 struct Maint {
     passive: std::time::Instant,
     slow: std::time::Instant,
-    /// Read gate + its total permit count, so TRUNCATE can drain readers.
+    /// Read gate + its total permit count, so the valve can hold new readers.
     gate: Option<(Arc<tokio::sync::Semaphore>, u32)>,
-    /// True while a drain is in progress; `dedicated_read` waits briefly on it.
+    /// True while the valve is open; `dedicated_read` waits briefly on it.
     draining: Arc<std::sync::atomic::AtomicBool>,
+    readers: Arc<Readers>,
+    soft: u64,
+    hard: u64,
 }
-/// How long the drain may hold new readers back before it gives up.
+/// Longest a `dedicated_read` waits for the valve before going ahead anyway.
 const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 impl Maint {
-    fn new(gate: Option<(Arc<tokio::sync::Semaphore>, u32)>, draining: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        Self { passive: std::time::Instant::now(), slow: std::time::Instant::now(), gate, draining }
-    }
-    /// TRUNCATE with readers drained through the gate. If the drain deadline
-    /// passes, release and skip: requests are never held longer than it.
-    /// Returns (drained, checkpoint result).
-    fn truncate_drained(&self, conn: &Connection, deadline: std::time::Duration) -> (bool, Option<(i64, i64, i64)>) {
-        use std::sync::atomic::Ordering::SeqCst;
-        let Some((sem, n)) = &self.gate else { return (false, Self::ckpt(conn, "TRUNCATE")) };
-        self.draining.store(true, SeqCst);
-        let held = block_acquire_many(sem, *n, deadline);
-        let out = if held.is_some() { (true, Self::ckpt(conn, "TRUNCATE")) } else { (false, None) };
-        drop(held);
-        self.draining.store(false, SeqCst);
-        out
+    fn new(gate: Option<(Arc<tokio::sync::Semaphore>, u32)>, draining: Arc<std::sync::atomic::AtomicBool>, readers: Arc<Readers>) -> Self {
+        Self {
+            passive: std::time::Instant::now(), slow: std::time::Instant::now(), gate, draining, readers,
+            soft: env_i64("AMUX_WAL_SOFT_BYTES", 64 << 20).max(0) as u64,
+            hard: env_i64("AMUX_WAL_HARD_BYTES", 192 << 20).max(0) as u64,
+        }
     }
     fn wal_bytes(conn: &Connection) -> u64 {
         conn.path().and_then(|p| std::fs::metadata(format!("{p}-wal")).ok()).map(|m| m.len()).unwrap_or(0)
@@ -227,19 +289,53 @@ impl Maint {
     fn ckpt(conn: &Connection, mode: &str) -> Option<(i64, i64, i64)> {
         conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).ok()
     }
+    /// TRUNCATE, waiting at most `wait` for readers. True when the WAL was reset.
+    fn truncate_wait(conn: &Connection, wait: std::time::Duration) -> bool {
+        let _ = conn.busy_timeout(wait);
+        let r = Self::ckpt(conn, "TRUNCATE");
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+        matches!(r, Some((0, _, _)))
+    }
+    /// Reset a WAL of `wal` bytes if over the limits. Returns (reset, valve used, readers interrupted).
+    fn truncate(&self, conn: &Connection, wal: u64) -> (bool, bool, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if wal <= self.soft { return (false, false, 0); }
+        if Self::truncate_wait(conn, std::time::Duration::from_millis(250)) { return (true, false, 0); }
+        if wal <= self.hard { return (false, false, 0); }
+        // Valve. First, with readers still flowing: stop the old statements
+        // that pin the backlog and copy it into the database (the slow I/O).
+        let mut killed = self.readers.interrupt(READ_HELD_LONG);
+        if killed > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Self::ckpt(conn, "PASSIVE");
+        }
+        // Then the short pause: no new readers, let quick ones finish, stop the rest, reset.
+        self.draining.store(true, SeqCst);
+        let closed = self.gate.as_ref().map(|(sem, n)| close_gate(sem, *n));
+        let mut ok = Self::truncate_wait(conn, std::time::Duration::from_millis(700));
+        if !ok {
+            killed += self.readers.interrupt(std::time::Duration::ZERO);
+            ok = Self::truncate_wait(conn, std::time::Duration::from_millis(300));
+        }
+        drop(closed);
+        self.draining.store(false, SeqCst);
+        (ok, true, killed)
+    }
     fn tick(&mut self, conn: &Connection) {
         if self.passive.elapsed() >= std::time::Duration::from_secs(30) {
             self.passive = std::time::Instant::now();
             let r = Self::ckpt(conn, "PASSIVE");
-            tracing::info!(verdict = "wal_selfclean", mode = "PASSIVE", result = ?r, wal_bytes = Self::wal_bytes(conn), "wal checkpoint");
+            let wal = Self::wal_bytes(conn);
+            tracing::info!(verdict = "wal_selfclean", mode = "PASSIVE", result = ?r, wal_bytes = wal, "wal checkpoint");
+            if wal > self.soft {
+                let t0 = std::time::Instant::now();
+                let (reset, valve, interrupted) = self.truncate(conn, wal);
+                tracing::info!(verdict = "wal_selfclean", mode = "TRUNCATE", reset, valve, interrupted,
+                    took_ms = t0.elapsed().as_millis() as u64, wal_before = wal, wal_bytes = Self::wal_bytes(conn), "wal checkpoint");
+            }
         }
         if self.slow.elapsed() >= std::time::Duration::from_secs(600) {
             self.slow = std::time::Instant::now();
-            // One attempt, no wait: a busy TRUNCATE is logged and skipped.
-            let _ = conn.busy_timeout(std::time::Duration::ZERO);
-            let (drained, r) = self.truncate_drained(conn, DRAIN_DEADLINE);
-            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-            tracing::info!(verdict = "wal_selfclean", mode = "TRUNCATE", drained, busy = r.map(|x| x.0 != 0), result = ?r, wal_bytes = Self::wal_bytes(conn), "wal checkpoint");
             let days = std::env::var("AMUX_SESSION_EVENTS_RETAIN_DAYS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0);
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
             match session_events_retention(conn, now, days, 5000) {
@@ -262,8 +358,9 @@ pub struct Store {
     pub(crate) read_pool: ReadPool,
     /// FIFO gate: at most N concurrent pooled reads (AMUX_DB_READ_PERMITS, 16).
     read_gate: Arc<tokio::sync::Semaphore>,
-    /// Set by the writer while it drains readers for a TRUNCATE checkpoint.
+    /// Set by the writer while the WAL valve holds readers back.
     read_draining: Arc<std::sync::atomic::AtomicBool>,
+    readers: Arc<Readers>,
     /// AF-937: held only for its lifetime -- an RAII guard, not state. An
     /// flock on a sidecar file next to `db_path`, acquired in
     /// [`claim_sole_writer`] at open time. The OS releases it automatically
@@ -461,7 +558,19 @@ impl Store {
         let read_permits = env_i64("AMUX_DB_READ_PERMITS", 16).max(1) as usize;
         let read_gate = Arc::new(tokio::sync::Semaphore::new(read_permits));
         let read_draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let maint = Maint::new(Some((read_gate.clone(), read_permits as u32)), read_draining.clone());
+        let readers = Arc::new(Readers::default());
+        let maint = Maint::new(Some((read_gate.clone(), read_permits as u32)), read_draining.clone(), readers.clone());
+        // rusqlite's bundled SQLite defines SQLITE_ENABLE_MEMORY_MANAGEMENT, which
+        // puts every connection's page cache behind one process-wide mutex taken
+        // on every page fetch and release: 8-20 cores of kernel time with ~70
+        // reader threads (2026-11-21). The build must undefine it:
+        // LIBSQLITE3_FLAGS=-USQLITE_ENABLE_MEMORY_MANAGEMENT (install.sh writes
+        // it to .cargo/config.toml).
+        if conn.query_row("SELECT sqlite_compileoption_used('ENABLE_MEMORY_MANAGEMENT')", [], |r| r.get::<_, bool>(0)).unwrap_or(false) {
+            tracing::warn!(verdict = "sqlite_shared_page_cache",
+                "SQLite was built with ENABLE_MEMORY_MANAGEMENT: all page caches share one mutex; \
+                 rebuild with LIBSQLITE3_FLAGS=-USQLITE_ENABLE_MEMORY_MANAGEMENT");
+        }
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>();
         let (events_tx, _) = tokio::sync::broadcast::channel(4096);
         let events_for_writer = events_tx.clone();
@@ -536,6 +645,7 @@ impl Store {
             read_pool,
             read_gate,
             read_draining,
+            readers,
             writer_lock,
             db_path: Arc::new(db_path.to_path_buf()),
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -724,7 +834,9 @@ impl Store {
     /// Silent on the happy path: a healthy acquire is microseconds, so the
     /// threshold below is never reached in normal operation and this stays off
     /// a hot path rather than logging 200k times a day.
+    #[track_caller]
     pub fn read(&self) -> anyhow::Result<GatedConn> {
+        let site = std::panic::Location::caller();
         let t0 = std::time::Instant::now();
         let Some(permit) = block_acquire(&self.read_gate, std::time::Duration::from_secs(5)) else {
             tracing::warn!(verdict = "read_pool_exhausted", waited_ms = t0.elapsed().as_millis() as u64,
@@ -746,7 +858,8 @@ impl Store {
                         "read pool acquire was slow; the pool is saturated and every waiter                          is pinning a thread (AF-640)"
                     );
                 }
-                Ok(GatedConn { conn, _permit: Some(permit) })
+                let reg = Some(self.readers.add(&conn, site));
+                Ok(GatedConn { conn, _permit: Some(permit), reg })
             }
             Err(e) => {
                 let st = self.read_pool.state();
@@ -785,8 +898,8 @@ impl Store {
         if self.db_path.as_path() == Path::new(":memory:") {
             return Ok(ProjectionRead::Pooled(self.read()?));
         }
-        // Wait (bounded) while the writer is draining readers for a TRUNCATE,
-        // so a new dedicated snapshot does not start under it.
+        // Wait (bounded) while the WAL valve is open, so a new dedicated
+        // snapshot does not start under it.
         let wait_until = std::time::Instant::now() + DRAIN_DEADLINE;
         while self.read_draining.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < wait_until {
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1907,40 +2020,81 @@ mod dbgate_tests {
         assert!(block_acquire(&sem, std::time::Duration::from_millis(50)).is_some());
     }
 
-    /// Readers hold the WAL open so TRUNCATE can never reset it. Draining the
-    /// gate must let TRUNCATE succeed (busy=0, WAL file emptied), and a held
-    /// permit must make the drain give up at its deadline instead of blocking.
-    #[test]
-    fn truncate_succeeds_while_readers_drained_through_gate() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("d.db");
-        let w = Connection::open(&path).unwrap();
+    fn wal_fixture(dir: &std::path::Path, soft: u64, hard: u64) -> (Connection, Maint, Arc<tokio::sync::Semaphore>) {
+        let w = Connection::open(dir.join("d.db")).unwrap();
         configure_connection(&w).unwrap();
         tune_writer_connection(&w).unwrap();
         w.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);").unwrap();
         let sem = Arc::new(tokio::sync::Semaphore::new(4));
-        let m = Maint::new(Some((sem.clone(), 4)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        // A "reader": open read txn, holding one permit.
-        let permit = block_acquire(&sem, std::time::Duration::from_millis(50)).unwrap();
-        let r = Connection::open(&path).unwrap();
+        let mut m = Maint::new(Some((sem.clone(), 4)), Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(Readers::default()));
+        (m.soft, m.hard) = (soft, hard);
+        (w, m, sem)
+    }
+
+    /// A reader that ends within the wait must not stop the reset (this is the
+    /// case busy_timeout 0 lost all day on 2026-11-21); one that outlasts it
+    /// must, below the hard limit, cost only the short wait and touch nobody.
+    #[test]
+    fn truncate_waits_out_a_short_reader_and_skips_a_long_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, m, sem) = wal_fixture(dir.path(), 0, u64::MAX);
+        let r = Connection::open(dir.path().join("d.db")).unwrap();
         r.execute_batch("BEGIN; SELECT * FROM t;").unwrap();
         for i in 0..50 { w.execute("INSERT INTO t VALUES(?1)", [i]).unwrap(); }
-        // Reader still holds a permit: drain times out, skipped, nothing blocked long.
         let t0 = std::time::Instant::now();
-        let (drained, res) = m.truncate_drained(&w, std::time::Duration::from_millis(100));
-        assert!(!drained && res.is_none());
-        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
-        assert!(!m.draining.load(std::sync::atomic::Ordering::SeqCst), "flag cleared after skip");
-        // Reader finishes and releases its permit; drain now succeeds.
-        r.execute_batch("COMMIT").unwrap();
-        drop(r);
-        drop(permit);
+        assert_eq!(m.truncate(&w, Maint::wal_bytes(&w)), (false, false, 0), "long reader: skipped, no valve under hard");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
         assert!(Maint::wal_bytes(&w) > 0);
-        let (drained, res) = m.truncate_drained(&w, std::time::Duration::from_secs(2));
-        assert!(drained);
-        assert_eq!(res.unwrap().0, 0, "TRUNCATE must not be busy");
+        let t = std::thread::spawn(move || { std::thread::sleep(std::time::Duration::from_millis(100)); r.execute_batch("COMMIT").unwrap(); });
+        assert_eq!(m.truncate(&w, Maint::wal_bytes(&w)), (true, false, 0));
         assert_eq!(Maint::wal_bytes(&w), 0, "WAL reset to zero");
-        assert_eq!(sem.available_permits(), 4, "all permits released");
+        t.join().unwrap();
+        assert_eq!(sem.available_permits(), 4);
+        assert_eq!(m.truncate(&w, 0), (false, false, 0), "under soft: nothing to do");
+    }
+
+    /// Over the hard limit with a statement that will not end: the valve holds
+    /// new readers at the gate, interrupts it, resets the WAL, reopens the gate.
+    #[test]
+    fn valve_interrupts_a_running_reader_and_resets_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, m, sem) = wal_fixture(dir.path(), 0, 0);
+        let r = Connection::open(dir.path().join("d.db")).unwrap();
+        let _reg = m.readers.add(&r, std::panic::Location::caller());
+        let (started_tx, started_rx) = mpsc::channel();
+        let t = std::thread::spawn(move || {
+            // Reads `t` (takes a WAL snapshot), then spins for minutes unless interrupted.
+            let mut st = r.prepare("WITH RECURSIVE c(x) AS (SELECT count(*) FROM t UNION ALL SELECT x+1 FROM c WHERE x < 20000000000) SELECT x FROM c").unwrap();
+            let mut rows = st.query([]).unwrap();
+            rows.next().unwrap();
+            started_tx.send(()).unwrap();
+            loop { match rows.next() { Ok(Some(_)) => {}, other => return other.map(|_| ()) } }
+        });
+        started_rx.recv().unwrap();
+        for i in 0..50 { w.execute("INSERT INTO t VALUES(?1)", [i]).unwrap(); }
+        let gate = sem.clone();
+        let (reset, valve, interrupted) = m.truncate(&w, Maint::wal_bytes(&w));
+        assert_eq!((reset, valve, interrupted), (true, true, 1));
+        assert_eq!(Maint::wal_bytes(&w), 0, "WAL reset to zero");
+        assert!(matches!(t.join().unwrap(), Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::OperationInterrupted));
+        assert_eq!(gate.available_permits(), 4, "gate reopened");
+        assert!(!m.draining.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// While the gate is closed a new reader waits; it gets in once reopened.
+    #[test]
+    fn close_gate_holds_new_readers_until_dropped() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let held = block_acquire(&sem, std::time::Duration::from_millis(50)).unwrap();
+        let closed = close_gate(&sem, 4);
+        assert!(block_acquire(&sem, std::time::Duration::from_millis(50)).is_none(), "3 permits free but the gate is closed");
+        drop(closed);
+        assert!(block_acquire(&sem, std::time::Duration::from_millis(50)).is_some());
+        drop(held);
+        let closed = close_gate(&sem, 4); // nobody out: the close takes every permit at once
+        assert!(block_acquire(&sem, std::time::Duration::from_millis(50)).is_none());
+        drop(closed);
+        assert_eq!(sem.available_permits(), 4);
     }
 
     #[test]
