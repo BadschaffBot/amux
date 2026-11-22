@@ -933,92 +933,203 @@ fn claim_windows(
     wins
 }
 
-pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
-    let now = chrono::Utc::now().timestamp();
-    // READ PHASE, off the writer. The snapshot can be a moment stale relative
-    // to the write below and it does not matter: a claim recorded in that gap
-    // is picked up on the next cycle, and the UPDATE only ever fills rows that
-    // are still unattributed, so nothing is overwritten by arriving late.
-    let (wins, bounds) = store
-        .read_async(move |conn| {
-            // Separate MIN and MAX let SQLite seek from each end of the
-            // (task, ts) index instead of scanning every unattributed row.
-            // A blank session cannot match any claim window.
-            let bounds: (Option<i64>, Option<i64>) = conn.query_row(
-                "SELECT (SELECT MIN(ts) FROM token_ledger WHERE task='' AND session<>''), \
-                        (SELECT MAX(ts) FROM token_ledger WHERE task='' AND session<>'')",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            let (Some(lo), Some(hi)) = bounds else {
-                return Ok((Vec::new(), None));
-            };
-            let mut attempts: Vec<(String, String, i64, i64)> = Vec::new();
-            // The live source. `min(a, b)` is SQLite's two-argument scalar min.
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT card, worker, started_at, \
-                        min(COALESCE(ended_at, ?1), started_at + ?2) \
-                 FROM task_attempts \
-                 WHERE COALESCE(worker,'') <> '' AND COALESCE(card,'') <> '' \
-                 ORDER BY started_at",
-            ) {
-                if let Ok(rows) = stmt.query_map([now, MAX_CLAIM_WINDOW_S], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                }) {
-                    attempts.extend(rows.flatten());
-                }
-            }
+/// The persisted attribution cursor, one row (AMUX-444 child 1).
+///
+/// `rowid_wm` is the highest `token_ledger` rowid that every settled pass has
+/// evaluated. `claim_fp` fingerprints the claim sources: the highest
+/// `task_attempts` rowid, latest attempt close time, and highest `task.claimed`
+/// event id. A fingerprint that moved means a claim window appeared or changed
+/// since the last settled pass, so that pass re-derives from the start rather
+/// than trusting the watermark. Both columns are written in the SAME
+/// transaction as the attributions they describe, so a rollback leaves neither
+/// moved.
+const ATTR_STATE_DDL: &str = "CREATE TABLE IF NOT EXISTS token_ledger_attr_state (\
+     id INTEGER PRIMARY KEY CHECK (id = 1), \
+     rowid_wm INTEGER NOT NULL, \
+     claim_fp TEXT NOT NULL)";
 
-            // The historical source: one interval per claim, ending at that
-            // lane's next claim. `data` carries {"issue": "<id>", ...}.
-            let claims: Vec<(String, String, i64)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT session, data, CAST(ts AS INTEGER) FROM session_events \
-                     WHERE type='task.claimed' AND COALESCE(session,'') <> '' \
-                     ORDER BY session, ts",
-                )?;
-                let rows = stmt.query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                        r.get::<_, i64>(2)?,
-                    ))
-                })?;
-                rows.flatten().collect()
-            };
-            Ok((claim_windows(attempts, claims, now), Some((lo, hi))))
-        })
-        .await?;
+/// One read-only snapshot of what an attribution pass must do.
+struct AttrPlan {
+    /// Claim windows that overlap the pending ts range, oldest first.
+    wins: Vec<(String, String, i64, i64)>,
+    /// The ts range of rows still to attribute, or `None` when there are none.
+    range: Option<(i64, i64)>,
+    /// The rowid this pass starts after (0 for a full re-derivation).
+    base: i64,
+    /// The highest ledger rowid in the snapshot: the watermark this pass settles to.
+    new_wm: i64,
+    /// The claim-source fingerprint read in the same snapshot as the windows.
+    fp: String,
+}
 
-    let Some((lo, hi)) = bounds else {
-        // Nothing is unattributed. Taking the writer to prove that is the cost
-        // this whole job used to pay unconditionally.
-        return Ok(());
+fn attribution_fingerprint(conn: &rusqlite::Connection) -> rusqlite::Result<String> {
+    let has_attempts: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_attempts')",
+        [],
+        |r| r.get(0),
+    )?;
+    let (attempts, latest_close) = if has_attempts {
+        conn.query_row(
+            "SELECT COALESCE(MAX(rowid), 0), COALESCE(MAX(ended_at), 0) FROM task_attempts",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+    } else {
+        (0, 0)
     };
-    let pending: Vec<(String, String, i64, i64)> = wins
+    let claims: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM session_events WHERE type='task.claimed'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(format!("{attempts}:{latest_close}:{claims}"))
+}
+
+/// Read-only. Derives the pending ts range from the rows past the watermark,
+/// then loads ONLY the claim and attempt windows that can overlap that range.
+///
+/// Claims need one neighbour on each side to get their window end right: the
+/// last claim before the range (it may still be open at its start) and the
+/// first claim after it (which ends the last in-range claim). Anything earlier
+/// ends before the range starts and cannot match a row.
+fn plan_attribution(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<AttrPlan> {
+    // The state table may not exist yet (first ever pass); that is the zero state.
+    let has_state: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='token_ledger_attr_state')",
+        [],
+        |r| r.get(0),
+    )?;
+    let (stored_wm, stored_fp): (i64, String) = if has_state {
+        conn.query_row(
+            "SELECT rowid_wm, claim_fp FROM token_ledger_attr_state WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    } else {
+        (0, String::new())
+    };
+    let fp = attribution_fingerprint(conn)?;
+    let max_rowid: i64 =
+        conn.query_row("SELECT COALESCE(MAX(rowid), 0) FROM token_ledger", [], |r| r.get(0))?;
+    // A moved claim fingerprint, or a ledger shorter than the watermark, means the
+    // watermark cannot be trusted: start from the beginning.
+    let base = if fp == stored_fp && stored_wm <= max_rowid { stored_wm } else { 0 };
+
+    let (lo, hi): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT CAST(MIN(ts) AS INTEGER), CAST(MAX(ts) AS INTEGER) FROM token_ledger \
+         WHERE rowid > ?1 AND task='' AND session<>''",
+        [base],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let Some((lo, hi)) = lo.zip(hi) else {
+        return Ok(AttrPlan { wins: Vec::new(), range: None, base, new_wm: max_rowid, fp });
+    };
+
+    // The live source, bounded to attempts that can overlap [lo, hi]. A window
+    // ends at the earlier of its close (or now, while open) and start+cap.
+    let has_attempts: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_attempts')",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut attempts: Vec<(String, String, i64, i64)> = Vec::new();
+    if has_attempts {
+        let mut stmt = conn.prepare(
+            "SELECT card, worker, started_at, min(COALESCE(ended_at, ?1), started_at + ?2) \
+             FROM task_attempts \
+             WHERE COALESCE(worker,'') <> '' AND COALESCE(card,'') <> '' \
+               AND started_at <= ?4 AND COALESCE(ended_at, ?1) >= ?3 AND started_at + ?2 >= ?3 \
+             ORDER BY started_at",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![now, MAX_CLAIM_WINDOW_S, lo, hi], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        for row in rows {
+            attempts.push(row?);
+        }
+    }
+
+    // The historical source: the last claim before the range, every claim in it,
+    // and the first claim after it, per lane. Ordered (session, ts) as
+    // claim_windows requires.
+    let claims: Vec<(String, String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT session, data, ts FROM ( \
+                 SELECT session, data, CAST(ts AS INTEGER) AS ts, \
+                        ROW_NUMBER() OVER (PARTITION BY session ORDER BY CAST(ts AS INTEGER) DESC) AS rn \
+                 FROM session_events \
+                 WHERE type='task.claimed' AND COALESCE(session,'') <> '' AND CAST(ts AS INTEGER) < ?1) \
+             WHERE rn = 1 \
+             UNION ALL \
+             SELECT session, data, CAST(ts AS INTEGER) FROM session_events \
+             WHERE type='task.claimed' AND COALESCE(session,'') <> '' \
+               AND CAST(ts AS INTEGER) BETWEEN ?1 AND ?2 \
+             UNION ALL \
+             SELECT session, data, ts FROM ( \
+                 SELECT session, data, CAST(ts AS INTEGER) AS ts, \
+                        ROW_NUMBER() OVER (PARTITION BY session ORDER BY CAST(ts AS INTEGER)) AS rn \
+                 FROM session_events \
+                 WHERE type='task.claimed' AND COALESCE(session,'') <> '' \
+                   AND CAST(ts AS INTEGER) > ?2) \
+             WHERE rn = 1 \
+             ORDER BY 1, 3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![lo, hi], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let wins = claim_windows(attempts, claims, now)
         .into_iter()
         .filter(|(task, session, from, to)| {
             !session.trim().is_empty() && !task.trim().is_empty() && to >= from
-                // Overlaps the unattributed range, so the UPDATE can match.
+                // Overlaps the pending range, so the UPDATE can match.
                 && *from <= hi && *to >= lo
         })
         .collect();
-    if pending.is_empty() {
-        return Ok(());
-    }
-    // BOUND THE HOLD, not the total work (AMUX-4750). Moving the derivation out
-    // left ~10,000 UPDATEs, and at ~0.4ms each that is still a ~4s hold on the
-    // single writer, which is a floor under every non-GET request in the fleet.
-    // Chunking does not make the job cheaper; it stops any one interactive write
-    // being stuck behind all of it. 500 x ~0.4ms is ~200ms, inside the 250ms
-    // this card asks for, and the loop yields the writer between chunks.
-    let pending = std::sync::Arc::new(pending);
+    Ok(AttrPlan { wins, range: Some((lo, hi)), base, new_wm: max_rowid, fp })
+}
+
+pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    // READ PHASE, off the writer. Snapshot-consistent: the windows, the pending
+    // range, the watermark this pass settles to and the claim fingerprint all
+    // come from one read. A claim recorded after the snapshot moves the
+    // fingerprint, so the next pass re-derives instead of trusting the watermark.
+    let plan = store.read_async(move |conn| Ok(plan_attribution(conn, now)?)).await?;
+    let AttrPlan { wins, base, new_wm, fp, .. } = plan;
+    let pending = std::sync::Arc::new(wins);
+    // Set when any window hit ROWS_PER_UPDATE: its tail is still unattributed, so
+    // the watermark must not move past it. The next pass resumes from `base`.
+    let truncated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fp = std::sync::Arc::new(fp);
+
+    // BOUND THE HOLD, not the total work (AMUX-4750). Each acquisition applies
+    // windows until HOLD_BUDGET_MS, then yields the writer. The chunk that
+    // applies the LAST window also settles the watermark, in the same
+    // transaction, so a crash or rollback before that commit leaves the watermark
+    // where it was and the next pass redoes the work. Every UPDATE only fills
+    // rows still task='', so redoing it is harmless.
     let mut done = 0usize;
-    while done < pending.len() {
+    loop {
         let consumed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (windows, counter, start_at) = (pending.clone(), consumed.clone(), done);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (windows, counter, done_flag, trunc, fp_now, start_at) = (
+            pending.clone(),
+            consumed.clone(),
+            finished.clone(),
+            truncated.clone(),
+            fp.clone(),
+            done,
+        );
         store
             .write_async(move |conn| {
+                conn.execute_batch(ATTR_STATE_DDL)?;
                 let started = std::time::Instant::now();
                 // rowid-IN, because a plain UPDATE..LIMIT needs a nonstandard
                 // SQLite build flag — the same shape the retention trims use.
@@ -1030,11 +1141,39 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
                 )?;
                 let mut n = 0usize;
                 for (task, session, from, to) in &windows[start_at..] {
-                    stmt.execute(rusqlite::params![task, session, from, to, ROWS_PER_UPDATE])?;
+                    let changed = stmt.execute(rusqlite::params![
+                        task,
+                        session,
+                        from,
+                        to,
+                        ROWS_PER_UPDATE
+                    ])?;
+                    if changed as i64 >= ROWS_PER_UPDATE {
+                        trunc.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     n += 1;
                     if started.elapsed().as_millis() >= HOLD_BUDGET_MS {
                         break;
                     }
+                }
+                if start_at + n == windows.len() {
+                    // The watermark moves only when nothing was cut short. A
+                    // truncated pass keeps the old base and settles only the
+                    // fingerprint, which is correct: the next pass rescans from
+                    // base and finds the remaining rows.
+                    let wm = if trunc.load(std::sync::atomic::Ordering::Relaxed) {
+                        base
+                    } else {
+                        new_wm
+                    };
+                    conn.execute(
+                        "INSERT INTO token_ledger_attr_state (id, rowid_wm, claim_fp) \
+                         VALUES (1, ?1, ?2) \
+                         ON CONFLICT(id) DO UPDATE SET \
+                           rowid_wm = excluded.rowid_wm, claim_fp = excluded.claim_fp",
+                        rusqlite::params![wm, fp_now.as_str()],
+                    )?;
+                    done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 counter.store(n, std::sync::atomic::Ordering::Relaxed);
                 Ok(WriteOutcome {
@@ -1043,10 +1182,11 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
                 })
             })
             .await?;
+        if finished.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let n = consumed.load(std::sync::atomic::Ordering::Relaxed);
-        // A zero would mean the closure applied nothing, which cannot happen
-        // while windows remain — but looping on it forever is the failure mode
-        // worth refusing outright rather than reasoning about.
+        // A zero with windows still left would loop forever. Refuse that outright.
         if n == 0 {
             tracing::warn!(
                 target: "amux::token_ledger",
@@ -1688,6 +1828,183 @@ mod tests {
             "a turn 40h BEFORE the claim is outside the window and must stay unattributed"
         );
         assert_eq!(task_of("conv-blank"), "", "blank sessions stay unattributed");
+    }
+
+    /// Insert one unattributed ledger turn at `ts` on `session`.
+    fn insert_turn(conn: &rusqlite::Connection, ts: i64, session: &str, conv: &str, n: usize) {
+        for _ in 0..n {
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
+                 cache_write, output, cost_usd, task) VALUES (?1,?2,?3,'m',10,0,0,1,0.5,'')",
+                rusqlite::params![ts, session, conv],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Record a `task.claimed` event for `card` on `session` at `ts`.
+    fn insert_claim(conn: &rusqlite::Connection, ts: i64, session: &str, card: &str) {
+        conn.execute(
+            "INSERT INTO session_events (ts, session, type, data, source) \
+             VALUES (?1, ?2, 'task.claimed', ?3, 'test')",
+            rusqlite::params![ts, session, format!("{{\"issue\":\"{card}\"}}")],
+        )
+        .unwrap();
+    }
+
+    fn task_counts(st: &SharedStore) -> std::collections::BTreeMap<String, i64> {
+        let conn = st.read().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT task, COUNT(*) FROM token_ledger GROUP BY task")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .unwrap()
+            .flatten()
+            .collect()
+    }
+
+    fn watermark(st: &SharedStore) -> Option<i64> {
+        st.read()
+            .unwrap()
+            .query_row("SELECT rowid_wm FROM token_ledger_attr_state WHERE id = 1", [], |r| r.get(0))
+            .ok()
+    }
+
+    #[test]
+    fn closing_an_attempt_changes_the_claim_fingerprint() {
+        let st = store();
+        st.write(|conn| {
+            crate::db::attempts::ensure_table(conn)?;
+            conn.execute(
+                "INSERT INTO task_attempts (card, attempt, worker, generation, started_at) \
+                 VALUES ('AMUX-4', 1, 'lane-f', 1, 100)",
+                [],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+        let before = {
+            let conn = st.read().unwrap();
+            attribution_fingerprint(&conn).unwrap()
+        };
+        st.write(|conn| {
+            conn.execute("UPDATE task_attempts SET ended_at=200 WHERE card='AMUX-4'", [])?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+        {
+            let conn = st.read().unwrap();
+            assert_ne!(before, attribution_fingerprint(&conn).unwrap());
+        }
+    }
+
+    /// AMUX-444 child 1. Each pass attributes only the rows the watermark has not
+    /// settled, and the watermark advances to the top of what it evaluated.
+    #[tokio::test]
+    async fn successive_batches_attribute_what_is_new_and_advance_the_watermark() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        st.write(move |conn| {
+            insert_claim(conn, now - 600, "lane-a", "AMUX-1");
+            insert_turn(conn, now - 500, "lane-a", "conv-1", 3);
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+        attribute_tasks(&st).await.unwrap();
+        let wm1 = watermark(&st).expect("first pass writes the watermark");
+        assert_eq!(task_counts(&st).get("AMUX-1"), Some(&3), "batch 1 attributed");
+
+        st.write(move |conn| {
+            insert_turn(conn, now - 400, "lane-a", "conv-2", 2);
+            insert_turn(conn, now - 400, "lane-b", "conv-3", 4);
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+        attribute_tasks(&st).await.unwrap();
+        let wm2 = watermark(&st).unwrap();
+        assert!(wm2 > wm1, "the watermark moved past batch 2");
+        let counts = task_counts(&st);
+        assert_eq!(counts.get("AMUX-1"), Some(&5), "batch 2's lane-a turns joined the claim");
+        assert_eq!(counts.get(""), Some(&4), "lane-b has no claim and stays unattributed");
+    }
+
+    /// A claim recorded AFTER the watermark has passed the turns it covers must
+    /// still reach them: the fingerprint moves and the next pass re-derives.
+    #[tokio::test]
+    async fn a_late_claim_reaches_turns_the_watermark_already_settled() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        st.write(move |conn| {
+            insert_turn(conn, now - 300, "lane-c", "conv-late", 2);
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+        attribute_tasks(&st).await.unwrap();
+        attribute_tasks(&st).await.unwrap();
+        assert_eq!(task_counts(&st).get(""), Some(&2), "no claim yet: still unattributed");
+
+        st.write(move |conn| {
+            insert_claim(conn, now - 900, "lane-c", "AMUX-9");
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+        attribute_tasks(&st).await.unwrap();
+        assert_eq!(task_counts(&st).get("AMUX-9"), Some(&2), "the late claim reached settled rows");
+    }
+
+    /// The attribution UPDATEs and the watermark share one transaction. A failure
+    /// on the watermark write must roll the attributions back too.
+    #[tokio::test]
+    async fn a_failed_watermark_write_rolls_back_the_attributions() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        st.write(move |conn| {
+            insert_claim(conn, now - 600, "lane-d", "AMUX-2");
+            insert_turn(conn, now - 300, "lane-d", "conv-rb", 2);
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS token_ledger_attr_state (\
+                 id INTEGER PRIMARY KEY CHECK (id = 1), rowid_wm INTEGER NOT NULL, claim_fp TEXT NOT NULL); \
+                 CREATE TRIGGER boom BEFORE INSERT ON token_ledger_attr_state \
+                 BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+        assert!(attribute_tasks(&st).await.is_err(), "the injected failure surfaces");
+        assert_eq!(task_counts(&st).get("AMUX-2"), None, "the UPDATEs rolled back with it");
+        assert_eq!(task_counts(&st).get(""), Some(&2));
+        assert_eq!(watermark(&st), None, "no watermark was settled");
+
+        st.write(move |conn| {
+            conn.execute_batch("DROP TRIGGER boom;")?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+        attribute_tasks(&st).await.unwrap();
+        assert_eq!(task_counts(&st).get("AMUX-2"), Some(&2), "the retry attributes them");
+    }
+
+    /// A window larger than ROWS_PER_UPDATE leaves a tail. The watermark must not
+    /// move past that tail, or the next pass would never see it.
+    #[tokio::test]
+    async fn a_truncated_window_holds_the_watermark_until_its_tail_is_attributed() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        let extra = ROWS_PER_UPDATE as usize + 1;
+        st.write(move |conn| {
+            insert_claim(conn, now - 900, "lane-e", "AMUX-3");
+            insert_turn(conn, now - 300, "lane-e", "conv-big", extra);
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+        attribute_tasks(&st).await.unwrap();
+        assert_eq!(task_counts(&st).get("AMUX-3"), Some(&ROWS_PER_UPDATE), "first pass is capped");
+        assert_eq!(watermark(&st), Some(0), "the watermark holds below the unfinished tail");
+
+        attribute_tasks(&st).await.unwrap();
+        assert_eq!(task_counts(&st).get("AMUX-3"), Some(&(extra as i64)), "the tail is attributed");
     }
 
     async fn ledger(store: &SharedStore) -> Vec<(String, String, i64)> {
