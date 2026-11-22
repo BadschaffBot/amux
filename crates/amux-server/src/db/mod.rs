@@ -128,12 +128,21 @@ impl std::ops::DerefMut for GatedConn {
 fn block_acquire(sem: &Arc<tokio::sync::Semaphore>, timeout: std::time::Duration)
     -> Option<tokio::sync::OwnedSemaphorePermit>
 {
+    block_acquire_many(sem, 1, timeout)
+}
+
+/// Same as [`block_acquire`] but for `n` permits at once. The semaphore is
+/// FIFO, so while this waits every later reader queues behind it: that is what
+/// drains the pool instead of starving the checkpoint.
+fn block_acquire_many(sem: &Arc<tokio::sync::Semaphore>, n: u32, timeout: std::time::Duration)
+    -> Option<tokio::sync::OwnedSemaphorePermit>
+{
     use std::future::Future;
     struct W(std::thread::Thread);
     impl std::task::Wake for W { fn wake(self: Arc<Self>) { self.0.unpark(); } }
     let waker = std::task::Waker::from(Arc::new(W(std::thread::current())));
     let mut cx = std::task::Context::from_waker(&waker);
-    let mut fut = Box::pin(sem.clone().acquire_owned());
+    let mut fut = Box::pin(sem.clone().acquire_many_owned(n));
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) { return r.ok(); }
@@ -185,9 +194,33 @@ pub(crate) fn session_events_retention(conn: &Connection, now: f64, retain_days:
 
 /// Writer-thread upkeep: PASSIVE checkpoint every 30 s, TRUNCATE attempt and
 /// session_events retention every 10 min. Runs between requests, one attempt.
-struct Maint { passive: std::time::Instant, slow: std::time::Instant }
+struct Maint {
+    passive: std::time::Instant,
+    slow: std::time::Instant,
+    /// Read gate + its total permit count, so TRUNCATE can drain readers.
+    gate: Option<(Arc<tokio::sync::Semaphore>, u32)>,
+    /// True while a drain is in progress; `dedicated_read` waits briefly on it.
+    draining: Arc<std::sync::atomic::AtomicBool>,
+}
+/// How long the drain may hold new readers back before it gives up.
+const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 impl Maint {
-    fn new() -> Self { Self { passive: std::time::Instant::now(), slow: std::time::Instant::now() } }
+    fn new(gate: Option<(Arc<tokio::sync::Semaphore>, u32)>, draining: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self { passive: std::time::Instant::now(), slow: std::time::Instant::now(), gate, draining }
+    }
+    /// TRUNCATE with readers drained through the gate. If the drain deadline
+    /// passes, release and skip: requests are never held longer than it.
+    /// Returns (drained, checkpoint result).
+    fn truncate_drained(&self, conn: &Connection, deadline: std::time::Duration) -> (bool, Option<(i64, i64, i64)>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some((sem, n)) = &self.gate else { return (false, Self::ckpt(conn, "TRUNCATE")) };
+        self.draining.store(true, SeqCst);
+        let held = block_acquire_many(sem, *n, deadline);
+        let out = if held.is_some() { (true, Self::ckpt(conn, "TRUNCATE")) } else { (false, None) };
+        drop(held);
+        self.draining.store(false, SeqCst);
+        out
+    }
     fn wal_bytes(conn: &Connection) -> u64 {
         conn.path().and_then(|p| std::fs::metadata(format!("{p}-wal")).ok()).map(|m| m.len()).unwrap_or(0)
     }
@@ -204,9 +237,9 @@ impl Maint {
             self.slow = std::time::Instant::now();
             // One attempt, no wait: a busy TRUNCATE is logged and skipped.
             let _ = conn.busy_timeout(std::time::Duration::ZERO);
-            let r = Self::ckpt(conn, "TRUNCATE");
+            let (drained, r) = self.truncate_drained(conn, DRAIN_DEADLINE);
             let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-            tracing::info!(verdict = "wal_selfclean", mode = "TRUNCATE", busy = r.map(|x| x.0 != 0), result = ?r, wal_bytes = Self::wal_bytes(conn), "wal checkpoint");
+            tracing::info!(verdict = "wal_selfclean", mode = "TRUNCATE", drained, busy = r.map(|x| x.0 != 0), result = ?r, wal_bytes = Self::wal_bytes(conn), "wal checkpoint");
             let days = std::env::var("AMUX_SESSION_EVENTS_RETAIN_DAYS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(30.0);
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
             match session_events_retention(conn, now, days, 5000) {
@@ -229,6 +262,8 @@ pub struct Store {
     pub(crate) read_pool: ReadPool,
     /// FIFO gate: at most N concurrent pooled reads (AMUX_DB_READ_PERMITS, 16).
     read_gate: Arc<tokio::sync::Semaphore>,
+    /// Set by the writer while it drains readers for a TRUNCATE checkpoint.
+    read_draining: Arc<std::sync::atomic::AtomicBool>,
     /// AF-937: held only for its lifetime -- an RAII guard, not state. An
     /// flock on a sidecar file next to `db_path`, acquired in
     /// [`claim_sole_writer`] at open time. The OS releases it automatically
@@ -423,6 +458,10 @@ impl Store {
         tune_writer_connection(&conn)?;
         migrate::apply_all_guarded(&mut conn, db_path)?;
 
+        let read_permits = env_i64("AMUX_DB_READ_PERMITS", 16).max(1) as usize;
+        let read_gate = Arc::new(tokio::sync::Semaphore::new(read_permits));
+        let read_draining = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let maint = Maint::new(Some((read_gate.clone(), read_permits as u32)), read_draining.clone());
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>();
         let (events_tx, _) = tokio::sync::broadcast::channel(4096);
         let events_for_writer = events_tx.clone();
@@ -432,7 +471,7 @@ impl Store {
         // runtime's worker pool.
         std::thread::Builder::new()
             .name("amux-writer".into())
-            .spawn(move || writer_loop(conn, write_rx, events_for_writer))
+            .spawn(move || writer_loop(conn, write_rx, events_for_writer, maint))
             .expect("spawn writer thread");
 
         let manager = SqliteConnectionManager::file(db_path).with_init(|c| {
@@ -495,7 +534,8 @@ impl Store {
         Ok(Store {
             write_tx,
             read_pool,
-            read_gate: Arc::new(tokio::sync::Semaphore::new(env_i64("AMUX_DB_READ_PERMITS", 16).max(1) as usize)),
+            read_gate,
+            read_draining,
             writer_lock,
             db_path: Arc::new(db_path.to_path_buf()),
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -745,6 +785,12 @@ impl Store {
         if self.db_path.as_path() == Path::new(":memory:") {
             return Ok(ProjectionRead::Pooled(self.read()?));
         }
+        // Wait (bounded) while the writer is draining readers for a TRUNCATE,
+        // so a new dedicated snapshot does not start under it.
+        let wait_until = std::time::Instant::now() + DRAIN_DEADLINE;
+        while self.read_draining.load(std::sync::atomic::Ordering::SeqCst) && std::time::Instant::now() < wait_until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let conn = Connection::open_with_flags(
             self.db_path.as_ref(),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -886,8 +932,8 @@ fn writer_loop(
     conn: Connection,
     rx: mpsc::Receiver<WriteRequest>,
     events_tx: tokio::sync::broadcast::Sender<StateEvent>,
+    mut maint: Maint,
 ) {
-    let mut maint = Maint::new();
     loop {
         let req = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(r) => r,
@@ -1859,6 +1905,42 @@ mod dbgate_tests {
         assert!(block_acquire(&sem, std::time::Duration::from_millis(100)).is_none(), "second must time out");
         drop(p);
         assert!(block_acquire(&sem, std::time::Duration::from_millis(50)).is_some());
+    }
+
+    /// Readers hold the WAL open so TRUNCATE can never reset it. Draining the
+    /// gate must let TRUNCATE succeed (busy=0, WAL file emptied), and a held
+    /// permit must make the drain give up at its deadline instead of blocking.
+    #[test]
+    fn truncate_succeeds_while_readers_drained_through_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.db");
+        let w = Connection::open(&path).unwrap();
+        configure_connection(&w).unwrap();
+        tune_writer_connection(&w).unwrap();
+        w.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES(1);").unwrap();
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let m = Maint::new(Some((sem.clone(), 4)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        // A "reader": open read txn, holding one permit.
+        let permit = block_acquire(&sem, std::time::Duration::from_millis(50)).unwrap();
+        let r = Connection::open(&path).unwrap();
+        r.execute_batch("BEGIN; SELECT * FROM t;").unwrap();
+        for i in 0..50 { w.execute("INSERT INTO t VALUES(?1)", [i]).unwrap(); }
+        // Reader still holds a permit: drain times out, skipped, nothing blocked long.
+        let t0 = std::time::Instant::now();
+        let (drained, res) = m.truncate_drained(&w, std::time::Duration::from_millis(100));
+        assert!(!drained && res.is_none());
+        assert!(t0.elapsed() < std::time::Duration::from_secs(2));
+        assert!(!m.draining.load(std::sync::atomic::Ordering::SeqCst), "flag cleared after skip");
+        // Reader finishes and releases its permit; drain now succeeds.
+        r.execute_batch("COMMIT").unwrap();
+        drop(r);
+        drop(permit);
+        assert!(Maint::wal_bytes(&w) > 0);
+        let (drained, res) = m.truncate_drained(&w, std::time::Duration::from_secs(2));
+        assert!(drained);
+        assert_eq!(res.unwrap().0, 0, "TRUNCATE must not be busy");
+        assert_eq!(Maint::wal_bytes(&w), 0, "WAL reset to zero");
+        assert_eq!(sem.available_permits(), 4, "all permits released");
     }
 
     #[test]
