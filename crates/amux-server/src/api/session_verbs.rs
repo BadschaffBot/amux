@@ -2859,17 +2859,19 @@ fn rollout_identity(path: &Path) -> Option<(String, f64)> {
     // can hide the other candidate), but fleet readers need not reopen every
     // historical header for every worker. Unreadable headers are not cached: a newborn
     // rollout may still be writing its first line.
-    type IdentityCache = std::collections::HashMap<PathBuf, (std::time::Instant, Option<(String, f64)>)>;
+    //
+    // CW-3832: a header that was read and decided is FINAL, so it is kept for
+    // the life of the process. It used to expire after 30 s (and every insert
+    // purged all older entries), so each lane with no recorded session id made
+    // every fleet load re-open all 9,473 rollouts and re-read 205 MB of first
+    // lines every 30 s. When the page cache had dropped those pages the reads
+    // went to disk and every amux server on the box stalled 90-220 s at once.
+    type IdentityCache = std::collections::HashMap<PathBuf, Option<(String, f64)>>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<IdentityCache>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Ok(c) = cache.lock() {
-        if let Some((at, identity)) = c.get(path) {
-            // CW-3832: a rollout's first row never changes once written, so a
-            // resolved identity is kept; only a miss is retried after 30 s.
-            // (Expiring hits re-opened all 9,369 rollouts every 30 s.)
-            if identity.is_some() || at.elapsed().as_secs() < 30 {
-                return identity.clone();
-            }
+        if let Some(identity) = c.get(path) {
+            return identity.clone();
         }
     }
     let Ok(f) = std::fs::File::open(path) else { return None };
@@ -2878,21 +2880,17 @@ fn rollout_identity(path: &Path) -> Option<(String, f64)> {
     use std::io::BufRead;
     reader.read_line(&mut line).ok()?;
     let v: Value = serde_json::from_str(line.trim()).ok()?;
-    if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
-        return None;
-    }
-    // A spawned agent shares the cwd and may start in the same window, but
-    // its turn boundaries describe that agent, never the worker's main turn.
-    let identity = if v.pointer("/payload/source").is_some_and(Value::is_object) {
+    let identity = if v.get("type").and_then(|t| t.as_str()) != Some("session_meta")
+        || v.pointer("/payload/source").is_some_and(Value::is_object)
+    {
         None
     } else {
-        let cwd = normalize_work_dir(v.pointer("/payload/cwd").and_then(|c| c.as_str())?);
-        let started = v.get("timestamp").and_then(Value::as_str).and_then(parse_iso8601)?;
-        Some((cwd, started))
+        v.pointer("/payload/cwd").and_then(|c| c.as_str()).map(normalize_work_dir).zip(
+            v.get("timestamp").and_then(Value::as_str).and_then(parse_iso8601),
+        )
     };
     if let Ok(mut c) = cache.lock() {
-        c.retain(|_, (at, _)| at.elapsed().as_secs() < 30);
-        c.insert(path.to_path_buf(), (std::time::Instant::now(), identity.clone()));
+        c.insert(path.to_path_buf(), identity.clone());
     }
     identity
 }
