@@ -2864,7 +2864,10 @@ fn rollout_identity(path: &Path) -> Option<(String, f64)> {
     let cache = CACHE.get_or_init(Default::default);
     if let Ok(c) = cache.lock() {
         if let Some((at, identity)) = c.get(path) {
-            if at.elapsed().as_secs() < 30 {
+            // CW-3832: a rollout's first row never changes once written, so a
+            // resolved identity is kept; only a miss is retried after 30 s.
+            // (Expiring hits re-opened all 9,369 rollouts every 30 s.)
+            if identity.is_some() || at.elapsed().as_secs() < 30 {
                 return identity.clone();
             }
         }
