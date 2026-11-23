@@ -70,7 +70,7 @@ fn cold_sessions_cache_has_exactly_one_builder_and_does_not_lease_the_request_po
         "the heavyweight projection must not lease a request-pool reader while probing tmux/git"
     );
     assert_eq!(
-        SRC.matches("build_array(&conn)").count(),
+        SRC.matches("build_array(&conn, store)").count(),
         1,
         "there must be exactly one build call site, protected by the single flight"
     );
@@ -154,10 +154,10 @@ fn runtime_updates_preserve_the_last_structurally_safe_snapshot() {
         .and_then(|tail| tail.split("let json = serde_json::to_string").next())
         .expect("session build epoch snapshot moved or disappeared");
     assert!(snapshot.contains("let runtime_epoch_start ="));
-    assert!(snapshot.contains("let arr = build_array(&conn)?;"));
+    assert!(snapshot.contains("let arr = build_array(&conn, store)?;"));
     assert!(
         snapshot.find("let runtime_epoch_start =")
-            < snapshot.find("let arr = build_array(&conn)?;"),
+            < snapshot.find("let arr = build_array(&conn, store)?;"),
         "runtime epoch must be captured before the data it describes is read"
     );
     assert!(
