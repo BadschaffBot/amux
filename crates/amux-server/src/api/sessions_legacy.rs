@@ -1051,6 +1051,13 @@ fn sessions_with_codex_tool_children(
     active
 }
 
+/// What a fleet load reads from SQLite (see [`FleetSignals::read_db`]).
+pub(crate) struct FleetDb {
+    reports: serde_json::Value,
+    transitions: BTreeMap<String, (String, f64)>,
+    started: BTreeMap<String, f64>,
+}
+
 pub struct FleetSignals {
     /// Gemini has no structured report/rollout bridge; its idle UI is its only
     /// boundary signal and must still be sampled after it stops repainting.
@@ -1173,6 +1180,75 @@ impl FleetSignals {
     }
 
     fn load_scoped(conn: &rusqlite::Connection, lane: Option<&str>, probe: std::sync::Arc<FleetProbe>) -> Self {
+        Self::from_parts(Self::read_db(conn), lane, probe)
+    }
+
+    /// The database third of a load: three small queries. CW-3832: split out so
+    /// a caller holding a POOLED reader can run this, drop the reader, and do
+    /// the tmux, /proc and rollout-file work (`from_parts`) without it. On
+    /// 2026-11-23 that file work stalled for 90-220 s several times (prod and
+    /// staging at the same seconds); every board list kept its reader for the
+    /// whole stall and the pool drained.
+    pub(crate) fn read_db(conn: &rusqlite::Connection) -> FleetDb {
+        let reports = conn
+            .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        // Both event queries tolerate the table being absent (a fresh Rust-only
+        // AMUX_HOME): no events simply means the activity fallback decides.
+        let mut transitions = BTreeMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT session, type, MAX(ts) FROM session_events \
+             WHERE type IN ('session.working','session.idle','session.waiting') \
+             GROUP BY session",
+        ) {
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, f64>(2)?,
+                ))
+            });
+            if let Ok(rows) = rows {
+                for row in rows.flatten() {
+                    let st = match row.1.as_str() {
+                        "session.working" => "active",
+                        "session.waiting" => "waiting",
+                        _ => "idle",
+                    };
+                    transitions.insert(row.0, (st.to_string(), row.2));
+                }
+            }
+        }
+        let mut started = BTreeMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT session, MAX(ts) FROM session_events \
+             WHERE type='session.started' GROUP BY session",
+        ) {
+            if let Ok(rows) =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+            {
+                for (s, ts) in rows.flatten() {
+                    started.insert(s, ts);
+                }
+            }
+        }
+        FleetDb { reports, transitions, started }
+    }
+
+    /// [`Self::load`] for a caller that owns a pooled reader: the reader is
+    /// released before any tmux or file work.
+    pub(crate) fn load_releasing(conn: crate::db::GatedConn) -> Self {
+        let db = Self::read_db(&conn);
+        drop(conn);
+        Self::from_parts(db, None, fleet_probe())
+    }
+
+    pub(crate) fn from_parts(db: FleetDb, lane: Option<&str>, probe: std::sync::Arc<FleetProbe>) -> Self {
+        let FleetDb { reports, transitions, started } = db;
         let mut activity = BTreeMap::new();
         let mut created = BTreeMap::new();
         let mut running = BTreeSet::new();
@@ -1414,52 +1490,6 @@ impl FleetSignals {
             for s in seen {
                 if !any_live.contains(&s) {
                     shell_only.insert(s);
-                }
-            }
-        }
-        let reports = conn
-            .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(serde_json::Value::Null);
-        // Both event queries tolerate the table being absent (a fresh Rust-only
-        // AMUX_HOME): no events simply means the activity fallback decides.
-        let mut transitions = BTreeMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT session, type, MAX(ts) FROM session_events \
-             WHERE type IN ('session.working','session.idle','session.waiting') \
-             GROUP BY session",
-        ) {
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, f64>(2)?,
-                ))
-            });
-            if let Ok(rows) = rows {
-                for row in rows.flatten() {
-                    let st = match row.1.as_str() {
-                        "session.working" => "active",
-                        "session.waiting" => "waiting",
-                        _ => "idle",
-                    };
-                    transitions.insert(row.0, (st.to_string(), row.2));
-                }
-            }
-        }
-        let mut started = BTreeMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT session, MAX(ts) FROM session_events \
-             WHERE type='session.started' GROUP BY session",
-        ) {
-            if let Ok(rows) =
-                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
-            {
-                for (s, ts) in rows.flatten() {
-                    started.insert(s, ts);
                 }
             }
         }

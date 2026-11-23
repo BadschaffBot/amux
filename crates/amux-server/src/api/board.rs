@@ -3914,10 +3914,9 @@ pub async fn list_board(
         };
         // The `stale` flag needs the active-session set only when an
         // in-progress card is present (Python computes it in `_load_board`).
-        let signals = kept
+        let need_signals = kept
             .iter()
-            .any(|r| matches!(r.status.as_str(), "doing" | "review"))
-            .then(|| crate::api::sessions_legacy::FleetSignals::load(&conn));
+            .any(|r| matches!(r.status.as_str(), "doing" | "review"));
         // RR-0052: the running attempt number for leased rows, one query over
         // the running set, only when a leased row is in the page at all.
         let attempt_nums = if kept.iter().any(|r| r.lease_owner.is_some()) {
@@ -3925,10 +3924,18 @@ pub async fn list_board(
         } else {
             Default::default()
         };
-        // CW-3832: the pane captures and status derivation need no database;
-        // this reader used to stay out across them (31 s per board list in prod).
-        drop(conn);
-        let working = signals.map(crate::api::sessions_legacy::active_sessions_from).unwrap_or_default();
+        // CW-3832: only three small queries of the fleet load need the database.
+        // The reader is released before the tmux, /proc and rollout-file work,
+        // which is where a board list used to sit for 31 s (and 90-220 s when
+        // that work stalled) with a pooled reader out.
+        let working = if need_signals {
+            crate::api::sessions_legacy::active_sessions_from(
+                crate::api::sessions_legacy::FleetSignals::load_releasing(conn),
+            )
+        } else {
+            drop(conn);
+            Default::default()
+        };
         Ok((kept, term_total, term_kept, working, attempt_nums))
     })
     .await;

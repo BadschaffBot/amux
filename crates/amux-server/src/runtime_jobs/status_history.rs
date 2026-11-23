@@ -155,14 +155,13 @@ pub fn tick(state: &AppState) -> (u32, u32, u32) {
     let Ok(conn) = state.store.read() else {
         return (0, 0, 0);
     };
-    let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
     let prev = last_recorded(&conn);
+    let mut signals = crate::api::sessions_legacy::FleetSignals::load_releasing(conn); // CW-3832: reader released before file work
     // DROP THE POOLED CONNECTION BEFORE THE TMUX FAN-OUT (reviewer note, random
     // 2026-08-26). `capture_panes` shells out across ~52 lanes and needs no DB;
     // holding an r2d2 handle across it kept a pooled connection checked out for
     // the whole fan-out. Writers take their own connection, so this was never a
     // stall, only waste.
-    drop(conn);
     // The same evidence the badge weighs. Without this the job would derive a
     // status from signals the dashboard does not have, and record a history
     // that disagrees with the thing it exists to explain.

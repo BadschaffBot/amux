@@ -1437,7 +1437,7 @@ fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
     };
-    let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
+    let mut signals = crate::api::sessions_legacy::FleetSignals::load_releasing(conn); // CW-3832: reader released before file work
     if signals.running.is_empty() {
         // No tmux fleet is a real state (a fresh box), but it is also exactly
         // what a failed `tmux list-sessions` looks like — and that has shipped
@@ -1546,7 +1546,7 @@ fn self_reports_check(state: &AppState) -> Vec<InvariantResult> {
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
     };
-    let signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
+    let signals = crate::api::sessions_legacy::FleetSignals::load_releasing(conn); // CW-3832
     if signals.running.is_empty() {
         // Same reasoning as status_pane_check: no fleet is a real state but also
         // what a failed `tmux list-sessions` looks like. Not a pass.

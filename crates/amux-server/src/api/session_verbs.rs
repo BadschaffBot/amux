@@ -13942,7 +13942,7 @@ pub(crate) async fn boundary_signals(
         Some(match (lane.as_deref(), lane_probe) {
             (Some(name), Some(probe)) => crate::api::sessions_legacy::FleetSignals::load_lane(&conn, name, probe),
             _ => {
-                let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
+                let mut signals = crate::api::sessions_legacy::FleetSignals::load_releasing(conn);
                 signals.capture_panes();
                 signals
             }
