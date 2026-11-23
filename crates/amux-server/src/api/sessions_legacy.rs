@@ -2392,7 +2392,12 @@ pub(crate) fn scan_subagent_activity() -> BTreeMap<String, f64> {
 /// this (Python: `_session_prev_status[sess] == "active"`, py:15671-15697).
 /// Shares `FleetSignals` with the session list: one derivation, two readers.
 pub fn active_python_sessions(conn: &rusqlite::Connection) -> BTreeSet<String> {
-    let mut signals = FleetSignals::load(conn);
+    active_sessions_from(FleetSignals::load(conn))
+}
+
+/// The tmux and file half of [`active_python_sessions`]. CW-3832: callers on
+/// the request path load the signals, DROP their pooled reader, then call this.
+pub(crate) fn active_sessions_from(mut signals: FleetSignals) -> BTreeSet<String> {
     // The board must see the same evidence the session list sees, or a lane
     // reads active on one screen and idle on the other. Bounded: only lanes
     // that painted inside the contradiction window are probed.

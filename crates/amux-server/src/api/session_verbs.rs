@@ -2795,7 +2795,25 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
 /// Codex nests them `YYYY/MM/DD/`; the walk is depth-bounded (3) so it cannot
 /// wander, and `session_jsonl_path`'s "newest mtime wins" discipline is applied
 /// the same way here.
-fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
+/// CW-3832: `codex_rollout_path` runs once per Codex lane on every fleet load,
+/// and each call walked and stat-ed every rollout ever written (9,369 files,
+/// 45 lanes). One walk is shared for 2 s. Tests always walk.
+fn codex_rollout_files() -> std::sync::Arc<Vec<(std::time::SystemTime, PathBuf)>> {
+    type Slot = Option<(std::time::Instant, String, std::sync::Arc<Vec<(std::time::SystemTime, PathBuf)>>)>;
+    static SLOT: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, root, files)) = slot.as_ref() {
+        if !cfg!(test) && *root == home && at.elapsed() < std::time::Duration::from_secs(2) {
+            return files.clone();
+        }
+    }
+    let files = std::sync::Arc::new(walk_codex_rollout_files());
+    *slot = Some((std::time::Instant::now(), home, files.clone()));
+    files
+}
+
+fn walk_codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
     // Codex writes to the OS home (`~/.codex`), NOT amux's `home()` (`~/.amux`);
     // the two differ and the first cut pointed at `~/.amux/.codex`, so every
     // resolution missed, which the debug trace in `codex_transcript_events`
@@ -3110,7 +3128,28 @@ pub(crate) fn codex_rollout_turn_signal(name: &str) -> Option<CodexTurnSignal> {
         return None;
     }
     let path = codex_rollout_path(name)?;
-    let mut signal = codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000))?;
+    // CW-3832: every fleet load re-read and re-parsed up to 32 MB of JSON per
+    // Codex lane (seconds of CPU and GBs of short-lived heap per load, with a
+    // pooled reader held). The answer is a function of the file, so keep it
+    // until the file's length or mtime changes.
+    type Memo = std::collections::HashMap<String, (PathBuf, u64, std::time::SystemTime, Option<CodexTurnSignal>)>;
+    static MEMO: std::sync::LazyLock<std::sync::Mutex<Memo>> = std::sync::LazyLock::new(Default::default);
+    let stamp = std::fs::metadata(&path).ok().and_then(|m| Some((m.len(), m.modified().ok()?)));
+    let hit = stamp.and_then(|(len, mtime)| {
+        let memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        memo.get(name).filter(|(p, l, t, _)| *p == path && *l == len && *t == mtime).map(|e| e.3.clone())
+    });
+    let parsed = match hit {
+        Some(signal) => signal,
+        None => {
+            let signal = codex_turn_signal_from_events(&iter_jsonl_tail(&path, 32_000_000));
+            if let Some((len, mtime)) = stamp {
+                MEMO.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), (path.clone(), len, mtime, signal.clone()));
+            }
+            signal
+        }
+    };
+    let mut signal = parsed?;
     signal.rollout_file = path.file_name().map(|p| p.to_string_lossy().into_owned());
     if matches!(signal.boundary.as_str(), "turn_aborted" | "turn.aborted") {
         let now = chrono::Utc::now().timestamp() as f64;
