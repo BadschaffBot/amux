@@ -372,6 +372,195 @@ fn run_bounded(
     String::from_utf8(out.stdout).ok().map(|s| s.trim().to_string())
 }
 
+/// Line tmux prints after each pane in a batched capture. No `#` (tmux would
+/// expand it) and no control bytes (tmux sanitizes them outside a UTF-8 locale).
+const CAPTURE_END: &str = "@@amux-capture-end@@:";
+
+/// Split a batched capture's stdout into `(lane, capture)` in tmux's order.
+/// Each capture is trimmed exactly as `run_bounded` trims a single capture, and
+/// non-UTF-8 is `None` as there. A block with no end line (cut off) is dropped.
+fn parse_batched_capture(stdout: &[u8]) -> Vec<(String, Option<String>)> {
+    let mut got = Vec::new();
+    let mut block: Vec<u8> = Vec::new();
+    for line in stdout.split(|b| *b == b'\n') {
+        if let Some(name) = line.strip_prefix(CAPTURE_END.as_bytes()) {
+            let raw = String::from_utf8(std::mem::take(&mut block)).ok();
+            got.push((String::from_utf8_lossy(name).into_owned(), raw.map(|s| s.trim().to_string())));
+        } else {
+            block.extend_from_slice(line);
+            block.push(b'\n');
+        }
+    }
+    got
+}
+
+/// Capture `names` with ONE tmux client: `capture-pane ; display-message END`
+/// per lane (CW-3832). tmux drops the rest of a command chain at the first
+/// target it cannot find, so a vanished lane is skipped and the chain resumes
+/// after it. A timeout stops the chunk; uncaptured lanes come back absent,
+/// which callers already treat as "no evidence" (see `capture_pane_bounded`).
+fn capture_chunk(names: &[String]) -> Vec<(String, Option<String>)> {
+    use std::process::{Command, Stdio};
+    let budget = std::time::Duration::from_secs_f64(env_secs("AMUX_PANE_CAPTURE_TIMEOUT_S", 3.0));
+    let deadline = std::time::Instant::now() + budget;
+    let mut out = Vec::new();
+    let mut rest = names;
+    while !rest.is_empty() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut cmd = Command::new("tmux");
+        for (i, n) in rest.iter().enumerate() {
+            if i > 0 {
+                cmd.arg(";");
+            }
+            let pt = pane_target(&format!("amux-{n}"));
+            cmd.args(["capture-pane", "-t", &pt, "-p", "-e", "-S", "-30", ";", "display-message", "-p"]);
+            cmd.arg(format!("{CAPTURE_END}{n}"));
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+        let Some(o) = run_bounded_output(cmd, left, "capture-batch") else { break };
+        let got = parse_batched_capture(&o.stdout);
+        let done = got.len();
+        if done > rest.len() || got.iter().zip(rest).any(|((g, _), want)| g != want) {
+            break; // ponytail: never seen from tmux; drop the chunk rather than mislabel panes
+        }
+        out.extend(got);
+        if o.status.success() || done >= rest.len() {
+            break;
+        }
+        out.push((rest[done].clone(), None)); // the target tmux could not find
+        rest = &rest[done + 1..];
+    }
+    out
+}
+
+/// Pane captures for `names`, shared across every caller (CW-3832).
+///
+/// Before: one `tmux capture-pane` child per running lane per caller, and the
+/// session list, the board, status history and the invariant monitor each
+/// filled their own cache, so concurrent misses multiplied the spawns (112
+/// lanes -> 112+ clients per caller per cycle; the 2026-11-23 drain).
+/// Now: one tmux client per 40 lanes, and a single-flight cache: the lock is
+/// held across the fill, so a concurrent caller waits for that fill and then
+/// reads it. Failed captures are cached as absent for the TTL too, so a
+/// wedged tmux is asked once per TTL, not once per caller.
+fn capture_panes_batched(names: &[String]) -> BTreeMap<String, String> {
+    #[cfg(test)]
+    if fleet_suppressed() {
+        return BTreeMap::new();
+    }
+    type Cache = BTreeMap<String, (std::time::Instant, Option<String>)>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
+    let ttl = std::time::Duration::from_secs_f64(env_secs("AMUX_PANE_CACHE_TTL_S", 2.0));
+    let mut cache = CACHE
+        .get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    cache.retain(|_, (t, _)| now.duration_since(*t) < ttl);
+    let missing: Vec<String> = names.iter().filter(|n| !cache.contains_key(*n)).cloned().collect();
+    if !missing.is_empty() {
+        let got: Vec<(String, Option<String>)> = std::thread::scope(|s| {
+            let hs: Vec<_> = missing.chunks(40).map(|c| s.spawn(move || capture_chunk(c))).collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+        });
+        let at = std::time::Instant::now();
+        for n in &missing {
+            cache.insert(n.clone(), (at, None));
+        }
+        for (n, raw) in got {
+            cache.insert(n, (at, raw));
+        }
+    }
+    names
+        .iter()
+        .filter_map(|n| Some((n.clone(), cache.get(n)?.1.clone()?)))
+        .collect()
+}
+
+/// `ps -eo pid=,ppid=,state=,comm=` read straight from /proc, without a child
+/// process (CW-3832): the same four whitespace-separated fields per process,
+/// which is all `sessions_with_codex_tool_children` and the ppid set read.
+fn proc_ps_snapshot() -> Option<String> {
+    let mut out = String::new();
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name.to_str().filter(|p| p.bytes().all(|b| b.is_ascii_digit())) else { continue };
+        let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat")) else { continue };
+        if let Some(line) = ps_line_from_stat(pid, &String::from_utf8_lossy(&stat)) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+/// `/proc/<pid>/stat` is `pid (comm) state ppid ...`; comm may hold spaces and
+/// parens, so it ends at the LAST ')'.
+fn ps_line_from_stat(pid: &str, stat: &str) -> Option<String> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let mut rest = stat.get(close + 1..)?.split_whitespace();
+    let state = rest.next()?;
+    let ppid = rest.next()?;
+    Some(format!("{pid} {ppid} {state} {}", stat.get(open + 1..close)?))
+}
+
+/// The fleet-wide tmux and process reads `FleetSignals::load` derives from.
+pub(crate) struct FleetProbe {
+    sessions: Option<std::process::Output>,
+    panes_dead: Option<String>,
+    panes_pids: Option<String>,
+    procs: Option<String>,
+}
+
+fn run_fleet_probe(lane: Option<&str>) -> FleetProbe {
+    let format = "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}";
+    let mut lsc = std::process::Command::new("tmux");
+    let mut dead = std::process::Command::new("tmux");
+    let mut pids = std::process::Command::new("tmux");
+    if let Some(name) = lane {
+        let pt = FleetSignals::lane_probe_target(name);
+        lsc.args(["display-message", "-p", "-t", &pt, format]);
+        dead.args(["list-panes", "-t", &pt, "-F", "#{session_name}:#{pane_dead}"]);
+        pids.args(["list-panes", "-t", &pt, "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
+    } else {
+        lsc.args(["list-sessions", "-F", format]);
+        dead.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"]);
+        pids.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
+    }
+    lsc.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    dead.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    pids.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+    FleetProbe {
+        sessions: run_bounded_output(lsc, probe_budget(), "list-sessions"),
+        panes_dead: run_bounded(dead, probe_budget(), "list-panes/dead"),
+        panes_pids: run_bounded(pids, probe_budget(), "list-panes/pids"),
+        procs: proc_ps_snapshot(),
+    }
+}
+
+/// The fleet-wide probe, shared by every caller inside `AMUX_FLEET_PROBE_TTL_S`
+/// (CW-3832). Single flight: the lock is held across a refresh, so N callers
+/// that miss together cost one probe, not N. Call it BEFORE taking a pooled
+/// SQLite reader so the reader is never held across the tmux round trips.
+pub(crate) fn fleet_probe() -> std::sync::Arc<FleetProbe> {
+    type Slot = Option<(std::time::Instant, std::sync::Arc<FleetProbe>)>;
+    static SLOT: std::sync::Mutex<Slot> = std::sync::Mutex::new(None);
+    let ttl = std::time::Duration::from_secs_f64(env_secs("AMUX_FLEET_PROBE_TTL_S", 2.0));
+    let mut slot = SLOT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, probe)) = slot.as_ref() {
+        if at.elapsed() < ttl {
+            return probe.clone();
+        }
+    }
+    let probe = std::sync::Arc::new(run_fleet_probe(None));
+    *slot = Some((std::time::Instant::now(), probe.clone()));
+    probe
+}
+
 /// Derive the waiting_reason from a pane capture: "permission_prompt",
 /// "user_input", "rate_limit", or "" (not waiting / unknown).
 ///
@@ -975,17 +1164,13 @@ impl FleetSignals {
         // child exits with no timeout; a wedged tmux held this request open for
         // 697s on 2026-08-28. `run_bounded_output` rather than `run_bounded`
         // because the WARN below needs `status` and `stderr`.
-        let mut lsc = std::process::Command::new("tmux");
-        let format = "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}";
-        if let Some(name) = lane {
-            let pt = Self::lane_probe_target(name);
-            lsc.args(["display-message", "-p", "-t", &pt, format]);
-        } else {
-            lsc.args(["list-sessions", "-F", format]);
-        }
-        lsc.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-        let tmux_out = run_bounded_output(lsc, probe_budget(), "list-sessions").ok_or(());
+        // CW-3832: the four reads come from one shared, single-flight probe
+        // (fleet-wide) or a direct one (a single lane); see `fleet_probe`.
+        let probe = match lane {
+            Some(_) => std::sync::Arc::new(run_fleet_probe(lane)),
+            None => fleet_probe(),
+        };
+        let tmux_out = probe.sessions.clone().ok_or(());
         match &tmux_out {
             Ok(o) if !o.status.success() => tracing::warn!(
                 status = %o.status,
@@ -1023,20 +1208,11 @@ impl FleetSignals {
         // entirely an artifact. A liveness filter that can empty the fleet is
         // worse than the bug it fixes.
         // BOUNDED (AF-301) — was a bare `.output()`.
-        let all_panes_dead = {
-            let mut c = std::process::Command::new("tmux");
-            if let Some(name) = lane {
-                let pt = Self::lane_probe_target(name);
-                c.args(["list-panes", "-t", &pt, "-F", "#{session_name}:#{pane_dead}"]);
-            } else {
-                c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"]);
-            }
-            c.stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null());
-            run_bounded(c, probe_budget(), "list-panes/dead")
-                .map(|out| sessions_with_all_panes_dead(&out))
-                .unwrap_or_default()
-        };
+        let all_panes_dead = probe
+            .panes_dead
+            .as_deref()
+            .map(sessions_with_all_panes_dead)
+            .unwrap_or_default();
         if !all_panes_dead.is_empty() {
             tracing::warn!(
                 target: "sessions",
@@ -1072,18 +1248,7 @@ impl FleetSignals {
         let mut provider_child_activity = BTreeSet::new();
         let mut provider_children_measured = false;
         // BOUNDED (AF-301) — was a bare `.output()`.
-        let panes_probe = {
-            let mut c = std::process::Command::new("tmux");
-            if let Some(name) = lane {
-                let pt = Self::lane_probe_target(name);
-                c.args(["list-panes", "-t", &pt, "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
-            } else {
-                c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"]);
-            }
-            c.stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null());
-            run_bounded(c, probe_budget(), "list-panes/pids")
-        };
+        let panes_probe = probe.panes_pids.clone();
         if let Some(o) = panes_probe {
             const SHELLS: [&str; 8] = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"];
             let mut any_live: BTreeSet<String> = BTreeSet::new();
@@ -1164,13 +1329,7 @@ impl FleetSignals {
             // shell-pane set rather than a scheduling-dependent slice of it.
             let mut ppids_with_children: std::collections::BTreeSet<String> =
                 std::collections::BTreeSet::new();
-            let ps_probe = {
-                let mut c = std::process::Command::new("ps");
-                c.args(["-eo", "pid=,ppid=,state=,comm="])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null());
-                run_bounded(c, probe_budget(), "ps/ppid")
-            };
+            let ps_probe = probe.procs.clone();
             match &ps_probe {
                 Some(out) => {
                     provider_children_measured = !out.trim().is_empty();
@@ -1650,26 +1809,12 @@ impl FleetSignals {
             .filter(|n| self.pane_probe_candidate(n))
             .map(String::from)
             .collect();
-        for chunk in names.chunks(12) {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|name| {
-                    let n = name.clone();
-                    std::thread::spawn(move || {
-                        let pt = pane_target(&format!("amux-{n}"));
-                        capture_pane_bounded(&pt, &n).map(|raw| (n, raw))
-                    })
-                })
-                .collect();
-            for h in handles {
-                if let Ok(Some((n, raw))) = h.join() {
-                    // Churn evidence (AMUX-3433): only REAL captures record —
-                    // a cache hit re-serves the same frame and adds no
-                    // information about repainting.
-                    note_pane_frame(&n, &raw, self.now, self.contradiction_window());
-                    self.panes.insert(n, raw);
-                }
-            }
+        // One shared, batched capture (CW-3832); see `capture_panes_batched`.
+        for (n, raw) in capture_panes_batched(&names) {
+            // Churn evidence (AMUX-3433): a frame served from the shared cache
+            // is the same content, so it adds no distinct hash.
+            note_pane_frame(&n, &raw, self.now, self.contradiction_window());
+            self.panes.insert(n, raw);
         }
         // Store even an EMPTY result: "nothing was painting" is an answer, and
         // a cache that only remembers hits re-probes hardest exactly when the
@@ -4806,35 +4951,14 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
                 .collect();
             let names: Vec<(String, bool)> =
                 names.into_iter().filter(|(n, _)| !raws.contains_key(n)).collect();
-            for chunk in names.chunks(12) {
-                let handles: Vec<_> = chunk
-                    .iter()
-                    .map(|(name, running)| {
-                        let n = name.clone();
-                        let running = *running;
-                        std::thread::spawn(move || {
-                            if running {
-                                let pt = pane_target(&format!("amux-{n}"));
-                                // BOUNDED (AF-301). This was a bare `.output()`
-                                // capture-pane — the exact operation
-                                // `capture_pane_bounded` exists to bound, done
-                                // unbounded, in the same file. It runs on a
-                                // spawned thread rather than the async runtime,
-                                // so a wedge here blocks the `h.join()` below
-                                // instead of a worker; still unbounded, still
-                                // holds the request open.
-                                Some((n.clone(), capture_pane_bounded(&pt, &n)?))
-                            } else {
-                                let raw = stopped_session_raw(&n);
-                                (!raw.is_empty()).then_some((n, raw))
-                            }
-                        })
-                    })
-                    .collect();
-                for h in handles {
-                    if let Ok(Some((n, p))) = h.join() {
-                        raws.insert(n, p);
-                    }
+            // Running lanes: one shared, batched capture (CW-3832), not one
+            // tmux client per lane. Stopped lanes: the saved log tail.
+            let live: Vec<String> = names.iter().filter(|(_, r)| *r).map(|(n, _)| n.clone()).collect();
+            raws.extend(capture_panes_batched(&live));
+            for (n, _) in names.iter().filter(|(_, r)| !*r) {
+                let raw = stopped_session_raw(n);
+                if !raw.is_empty() {
+                    raws.insert(n.clone(), raw);
                 }
             }
             if let Ok(mut c) = preview_cache().lock() {
@@ -7604,5 +7728,189 @@ mod discovery_race_tests {
         assert_eq!(retry_after_hint(&raced), Some("1"));
         assert_eq!(retry_after_hint(&busy), Some("5"));
         assert_eq!(retry_after_hint(&untyped), None);
+    }
+}
+
+#[cfg(test)]
+mod batched_probe_cw3832 {
+    use super::*;
+
+    #[test]
+    fn batched_capture_parse_matches_single_capture_trim() {
+        let out = format!("  a1\nA2  \n\n\n{CAPTURE_END}lane-a\n{CAPTURE_END}lane-b\nc\n{CAPTURE_END}lane-c\ncut-off\n");
+        let got = parse_batched_capture(out.as_bytes());
+        assert_eq!(
+            got,
+            vec![
+                ("lane-a".into(), Some("a1\nA2".into())),
+                ("lane-b".into(), Some(String::new())),
+                ("lane-c".into(), Some("c".into())),
+            ]
+        );
+        let mut bad = b"\xff\xfe\n".to_vec();
+        bad.extend_from_slice(format!("{CAPTURE_END}x\n").as_bytes());
+        assert_eq!(parse_batched_capture(&bad), vec![("x".into(), None)]);
+    }
+
+    #[test]
+    fn stat_line_gives_ps_fields_even_with_spaces_and_parens_in_comm() {
+        assert_eq!(
+            ps_line_from_stat("42", "42 (tmux: server) S 1 42 42 0 -1").as_deref(),
+            Some("42 1 S tmux: server")
+        );
+        assert_eq!(ps_line_from_stat("7", "7 (a) b) R 3 0").as_deref(), Some("7 3 R a) b"));
+        assert_eq!(ps_line_from_stat("9", "garbage"), None);
+    }
+
+    /// The /proc snapshot answers what `ps -eo pid=,ppid=,state=,comm=` did:
+    /// same pid -> (ppid, first comm token) for every long-lived process.
+    #[test]
+    fn proc_snapshot_matches_ps_on_this_host() {
+        let parse = |s: &str| -> BTreeMap<String, (String, String)> {
+            s.lines()
+                .filter_map(|l| {
+                    let mut f = l.split_whitespace();
+                    let pid = f.next()?.to_string();
+                    let ppid = f.next()?.to_string();
+                    let _state = f.next()?;
+                    Some((pid, (ppid, f.next().unwrap_or("").to_string())))
+                })
+                .collect()
+        };
+        let ps = std::process::Command::new("ps").args(["-eo", "pid=,ppid=,state=,comm="]).output().unwrap();
+        let ps = parse(&String::from_utf8_lossy(&ps.stdout));
+        let mine = parse(&proc_ps_snapshot().unwrap());
+        let common: Vec<_> = ps.keys().filter(|k| mine.contains_key(*k)).collect();
+        assert!(common.len() * 10 >= ps.len() * 9, "most pids seen by both: {} of {}", common.len(), ps.len());
+        for k in common {
+            assert_eq!(ps[k].0, mine[k].0, "ppid of {k}");
+            // ps prints non-printable comm bytes as '?'; compare printable ones.
+            if mine[k].1.chars().all(|c| c.is_ascii_graphic()) {
+                assert_eq!(ps[k].1, mine[k].1, "comm of {k}");
+            }
+        }
+    }
+
+    /// Fields equal to the old per-lane probe on a fixture fleet: each lane's
+    /// batched capture equals its own `tmux capture-pane`, and a lane missing
+    /// mid-chain is skipped without losing the lanes after it. Runs only on a
+    /// private tmux server (TMUX_TMPDIR set, TMUX unset), never the fleet's.
+    #[test]
+    fn batched_capture_equals_per_lane_capture_on_a_private_tmux() {
+        if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_TMPDIR").is_none() {
+            eprintln!("skipped: needs a private tmux server (set TMUX_TMPDIR, unset TMUX)");
+            return;
+        }
+        let tmux = |args: &[&str]| std::process::Command::new("tmux").args(args).output().unwrap();
+        let names: Vec<String> = (0..5).map(|i| format!("cw3832t-{i}")).collect();
+        for (i, n) in names.iter().enumerate() {
+            if i == 2 {
+                continue; // never created: the chain must survive it
+            }
+            let st = format!("amux-{n}");
+            tmux(&["new-session", "-d", "-s", &st, &format!("printf 'line {i}\\n\\033[1mbold\\033[0m {n}\\n'; sleep 60")]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let mut got: BTreeMap<String, Option<String>> = capture_chunk(&names).into_iter().collect();
+        for (i, n) in names.iter().enumerate() {
+            let pt = pane_target(&format!("amux-{n}"));
+            let single = capture_pane_bounded(&pt, n);
+            assert_eq!(got.remove(n).flatten(), single, "lane {n}");
+            if i != 2 {
+                assert!(single.as_deref().unwrap_or("").contains(&format!("line {i}")), "fixture painted {n}");
+            }
+        }
+        for n in &names {
+            let stq = crate::backend::tmux::session_target(&format!("amux-{n}"));
+            tmux(&["kill-session", "-t", &stq]);
+        }
+    }
+
+    fn cpu_now(tmux_server: Option<u32>) -> (f64, f64, f64) {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        let (mut u, mut s) = (tv(ru.ru_utime), tv(ru.ru_stime));
+        unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru) };
+        u += tv(ru.ru_utime);
+        s += tv(ru.ru_stime);
+        let srv = tmux_server
+            .and_then(|p| std::fs::read_to_string(format!("/proc/{p}/stat")).ok())
+            .and_then(|st| {
+                let f: Vec<f64> = st[st.rfind(')')? + 2..].split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                Some((f.get(11)? + f.get(12)?) / 100.0)
+            })
+            .unwrap_or(0.0);
+        (u, s, srv)
+    }
+
+    /// CW-3832 measurement, not a check: 120 sleep panes on a PRIVATE tmux,
+    /// one probe cycle the old way (3 tmux + ps + one capture-pane per lane in
+    /// threads of 12) vs the new way (3 tmux + /proc + batched captures).
+    /// `TMUX_TMPDIR=<scratch> cargo test ... bench_probe_cycle -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_probe_cycle_old_vs_new() {
+        assert!(std::env::var_os("TMUX").is_none() && std::env::var_os("TMUX_TMPDIR").is_some(), "private tmux only");
+        let n: usize = std::env::var("BENCH_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+        let cycles: usize = std::env::var("BENCH_CYCLES").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+        let tmux = |args: &[&str]| std::process::Command::new("tmux").args(args).output().unwrap();
+        let names: Vec<String> = (0..n).map(|i| format!("cw3832b-{i}")).collect();
+        for n in &names {
+            let st = format!("amux-{n}");
+            tmux(&["new-session", "-d", "-x", "200", "-y", "50", "-s", &st, "seq 1 60; sleep 3600"]);
+        }
+        let srv = String::from_utf8(tmux(&["display-message", "-p", "#{pid}"]).stdout).unwrap().trim().parse().ok();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let run = |label: &str, f: &dyn Fn()| {
+            let (u0, s0, v0) = cpu_now(srv);
+            let t0 = std::time::Instant::now();
+            for _ in 0..cycles {
+                f();
+            }
+            let wall = t0.elapsed().as_secs_f64() / cycles as f64;
+            let (u1, s1, v1) = cpu_now(srv);
+            let c = cycles as f64;
+            println!(
+                "BENCH {label}: lanes={n} per_cycle wall_ms={:.1} user_ms={:.1} sys_ms={:.1} tmux_server_ms={:.1}",
+                wall * 1e3, (u1 - u0) / c * 1e3, (s1 - s0) / c * 1e3, (v1 - v0) / c * 1e3
+            );
+        };
+        run("old", &|| {
+            for args in [
+                &["list-sessions", "-F", "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}"][..],
+                &["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"][..],
+                &["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"][..],
+            ] {
+                let mut c = std::process::Command::new("tmux");
+                c.args(args).stdout(std::process::Stdio::piped());
+                let _ = run_bounded(c, probe_budget(), "bench-old");
+            }
+            let mut ps = std::process::Command::new("ps");
+            ps.args(["-eo", "pid=,ppid=,state=,comm="]).stdout(std::process::Stdio::piped());
+            let _ = run_bounded(ps, probe_budget(), "ps/ppid");
+            for chunk in names.chunks(12) {
+                let hs: Vec<_> = chunk
+                    .iter()
+                    .map(|n| {
+                        let n = n.clone();
+                        std::thread::spawn(move || capture_pane_bounded(&pane_target(&format!("amux-{n}")), &n))
+                    })
+                    .collect();
+                for h in hs {
+                    let _ = h.join();
+                }
+            }
+        });
+        std::env::set_var("AMUX_PANE_CACHE_TTL_S", "0");
+        run("new", &|| {
+            let _ = run_fleet_probe(None);
+            let got = capture_panes_batched(&names);
+            assert_eq!(got.len(), names.len());
+        });
+        for n in &names {
+            let stq = crate::backend::tmux::session_target(&format!("amux-{n}"));
+            tmux(&["kill-session", "-t", &stq]);
+        }
     }
 }

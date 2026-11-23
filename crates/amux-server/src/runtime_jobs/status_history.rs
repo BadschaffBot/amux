@@ -151,6 +151,7 @@ pub fn is_change(prev: Option<&(String, String)>, status: &str, decided_by: &str
 
 /// One pass. Returns (lanes seen, rows recorded, rows pruned).
 pub fn tick(state: &AppState) -> (u32, u32, u32) {
+    crate::api::sessions_legacy::fleet_probe(); // CW-3832: probe before taking a pooled reader
     let Ok(conn) = state.store.read() else {
         return (0, 0, 0);
     };

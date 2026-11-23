@@ -370,6 +370,7 @@ const NEEDSYOU_VIEW_CAP: usize = 10;
 async fn derived_board(State(state): State<AppState>) -> Response {
     let store = state.store.clone();
     let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
+        crate::api::sessions_legacy::fleet_probe(); // CW-3832: probe before taking a pooled reader
         let conn = store.read()?;
         let rows =
             bs::list_issues(&conn, &[], &[], ArchivedFilter::ActiveOnly)?;
@@ -3885,6 +3886,7 @@ pub async fn list_board(
     let quota = qp_truthy(p.quota.as_deref());
     let store = state.store.clone();
     let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
+        crate::api::sessions_legacy::fleet_probe(); // CW-3832: probe before taking a pooled reader
         let conn = store.read()?;
         // Fused filter+cap with lazy hydration (AMUX-3491): the old
         // list_issues + cap_terminal pair decoded every undeleted row's

@@ -13891,6 +13891,7 @@ pub(crate) async fn boundary_signals(
     let store = state.store.clone();
     let lane = lane.map(str::to_string);
     crate::db::interactions::spawn_blocking(move || {
+        crate::api::sessions_legacy::fleet_probe(); // CW-3832: probe before taking a pooled reader
         let conn = store.read().ok()?;
         Some(match lane.as_deref() {
             Some(name) => crate::api::sessions_legacy::FleetSignals::load_lane(&conn, name),
@@ -16689,6 +16690,7 @@ async fn get_dispatch(
             let store = state.store.clone();
             let nm = name.to_string();
             let joined = crate::db::interactions::spawn_blocking(move || -> anyhow::Result<_> {
+                crate::api::sessions_legacy::fleet_probe(); // CW-3832: probe before taking a pooled reader
                 let conn = store.read()?;
                 let mut fs = crate::api::sessions_legacy::FleetSignals::load(&conn);
                 fs.capture_panes();

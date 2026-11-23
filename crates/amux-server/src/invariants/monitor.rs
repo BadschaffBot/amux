@@ -1433,6 +1433,7 @@ fn arrival_follows_boot_check(state: &AppState) -> Vec<InvariantResult> {
 
 fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "status.agrees_with_pane";
+    crate::api::sessions_legacy::fleet_probe(); // CW-3832: probe before taking a pooled reader
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
     };
@@ -1541,6 +1542,7 @@ async fn pane_scope_oom_kill_check() -> Vec<InvariantResult> {
 /// 2026-08-13 outage, where baked-in report hooks POSTed to the dead 8822).
 fn self_reports_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "session.self_reports_landing";
+    crate::api::sessions_legacy::fleet_probe(); // CW-3832: probe before taking a pooled reader
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
     };
