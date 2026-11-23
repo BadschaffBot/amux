@@ -197,7 +197,13 @@ fn block_acquire_many(sem: &Arc<tokio::sync::Semaphore>, n: u32, timeout: std::t
     impl std::task::Wake for W { fn wake(self: Arc<Self>) { self.0.unpark(); } }
     let waker = std::task::Waker::from(Arc::new(W(std::thread::current())));
     let mut cx = std::task::Context::from_waker(&waker);
-    let mut fut = Box::pin(sem.clone().acquire_many_owned(n));
+    // CW-3832: `unconstrained`, because this is also called from inside async
+    // jobs (board-drive, bootstrap, orchestrator). A tokio task has a budget of
+    // 128 operations per poll; once a job that never yields has spent it, the
+    // semaphore answers Pending with every permit free and defers the wake to a
+    // yield that cannot happen while we park here. That was the once-a-minute
+    // `read_pool_exhausted waited_ms=5000` on a gate with 1000 permits.
+    let mut fut = Box::pin(tokio::task::unconstrained(sem.clone().acquire_many_owned(n)));
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let std::task::Poll::Ready(r) = fut.as_mut().poll(&mut cx) { return r.ok(); }
@@ -2093,6 +2099,16 @@ mod dbgate_tests {
     }
 
     /// While the gate is closed a new reader waits; it gets in once reopened.
+    /// CW-3832. Fails on the pre-fix code at about the 129th acquire: the
+    /// task's coop budget is spent and the semaphore reports Pending.
+    #[tokio::test]
+    async fn block_acquire_ignores_the_task_coop_budget() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        for i in 0..400 {
+            assert!(block_acquire(&sem, std::time::Duration::from_millis(100)).is_some(), "acquire {i} saw a free gate as busy");
+        }
+    }
+
     #[test]
     fn close_gate_holds_new_readers_until_dropped() {
         let sem = Arc::new(tokio::sync::Semaphore::new(4));
