@@ -554,6 +554,17 @@ impl Store {
         configure_connection(&conn)?;
         tune_writer_connection(&conn)?;
         migrate::apply_all_guarded(&mut conn, db_path)?;
+        // CW-3832: indexes for two hot lookups that ran as full scans (the
+        // breaker's window count and MIN(at), every 3 s; a card's messages, on
+        // every card GET). Idempotent and outside the numbered migrations on
+        // purpose: an older binary ignores them, so rollback needs no schema
+        // step. Not fatal: without them the queries are slow, not wrong.
+        if let Err(e) = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_amux_state_events_at ON _amux_state_events(at);
+             CREATE INDEX IF NOT EXISTS idx_cmd_history_card ON cmd_history(card_id) WHERE card_id IS NOT NULL;",
+        ) {
+            tracing::warn!(verdict = "hot_index_missing", error = %e, "could not create hot-path indexes; window_stats and card GET will scan");
+        }
 
         let read_permits = env_i64("AMUX_DB_READ_PERMITS", 16).max(1) as usize;
         let read_gate = Arc::new(tokio::sync::Semaphore::new(read_permits));

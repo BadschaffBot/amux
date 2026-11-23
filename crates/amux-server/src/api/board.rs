@@ -5665,8 +5665,14 @@ pub async fn get_item(
         };
         let mut messages = Vec::new();
         let mut msg_stmt = conn.prepare(
-            "SELECT id,text,type,session,ts,origin,card_id FROM cmd_history \
-             WHERE card_id IN (?1,?2) OR (session=?3 AND instr(text,?2)>0) ORDER BY ts DESC,id DESC LIMIT 100",
+            // CW-3832: was one WHERE with an OR, which no index serves, so every
+            // card GET scanned all of cmd_history (65 ms, 16k page reads; the
+            // fleet sends 12 card GETs/s). Same rows, as two indexed searches.
+            "SELECT id,text,type,session,ts,origin,card_id FROM ( \
+               SELECT id,text,type,session,ts,origin,card_id FROM cmd_history WHERE card_id IN (?1,?2) \
+               UNION \
+               SELECT id,text,type,session,ts,origin,card_id FROM cmd_history WHERE session=?3 AND instr(text,?2)>0 \
+             ) ORDER BY ts DESC,id DESC LIMIT 100",
         )?;
         messages.extend(
             msg_stmt

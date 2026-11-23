@@ -595,8 +595,12 @@ impl Runtime {
         let cutoff = cutoff_at.to_rfc3339();
         let cutoff_epoch = cutoff_at.timestamp();
         let completed: u32 = conn.query_row(
+            // CW-3832: `+entity_type` keeps the planner off the (entity_type,
+            // entity_id) index, which visited every task row ever journaled
+            // (272k rows, 1.0 s per 3 s tick); with it the search is the
+            // window's slice of idx_amux_state_events_at (Store::open).
             r#"SELECT COUNT(*) FROM _amux_state_events WHERE at > ?1
-             AND entity_type = 'task' AND mutation LIKE '%"to":"verified"%'"#,
+             AND +entity_type = 'task' AND mutation LIKE '%"to":"verified"%'"#,
             params![cutoff], |r| r.get(0))?;
         let attempt_failures: u32 = conn.query_row(
             "SELECT COUNT(*) FROM _amux_attempts WHERE at > ?1",
