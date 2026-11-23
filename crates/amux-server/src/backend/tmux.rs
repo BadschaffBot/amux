@@ -486,17 +486,49 @@ impl SessionBackend for TmuxBackend {
             .filter(|n| n.starts_with("amux-"))
             .map(str::to_string)
             .collect();
-        // Probe all sessions concurrently (was sequential — 2 tmux calls per
-        // session × 50 sessions = 88s startup blackout, AMUX-3969b). Bounded
-        // to 10 at a time so we do not fork-bomb the tmux server.
+        // ONE pane census for the whole fleet (CW-3832) instead of
+        // has-session + list-panes per session: 2 tmux clients per session per
+        // tick was the board server's dominant spawn load (~9.6k clients per
+        // 80 s at 120 lanes). Same answer as `status_by_ref`: the first pane of
+        // the session's active window.
+        let census = self
+            .run(
+                &[
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    "#{session_name}:#{window_active}:#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}",
+                ],
+                OP_TIMEOUT,
+            )
+            .await;
+        let known = match &census {
+            Ok(out) if out.status.success() => {
+                first_active_pane_status(&String::from_utf8_lossy(&out.stdout))
+            }
+            _ => std::collections::BTreeMap::new(),
+        };
+        // What the census cannot settle (a session it did not list, or a dead
+        // pane with no recorded status: the AMUX-4636 /proc read) still goes
+        // through `status_by_ref`, concurrently and bounded to 10 at a time
+        // (AMUX-3969b) so we do not fork-bomb the tmux server.
         use futures::stream::{self, StreamExt};
         let sessions: Vec<Result<BackendSession>> = stream::iter(names)
-            .map(|name| async move {
-                let status = self.status_by_ref(&name).await?;
+            .map(|name| {
+                let settled = known
+                    .get(&name)
+                    .filter(|s| **s != BackendStatus::Crashed { signal: None })
+                    .cloned();
+                async move {
+                let status = match settled {
+                    Some(status) => status,
+                    None => self.status_by_ref(&name).await?,
+                };
                 Ok(BackendSession {
                     backend_ref: name,
                     status,
                 })
+                }
             })
             .buffer_unordered(10)
             .collect()
@@ -535,6 +567,23 @@ impl SessionBackend for TmuxBackend {
 /// recorded exit status (Completed), else the process ended without either —
 /// reported as Crashed(None) because claiming an exit code nobody measured
 /// would be theatre (ethos rule 7).
+/// `session:window_active:dead:status:signal` lines -> the status of each
+/// session's first pane in its active window, which is the line
+/// `list-panes -t =session:` puts first. Session names cannot hold ':'.
+fn first_active_pane_status(
+    output: &str,
+) -> std::collections::BTreeMap<String, BackendStatus> {
+    let mut out = std::collections::BTreeMap::new();
+    for line in output.lines() {
+        let Some((name, rest)) = line.split_once(':') else { continue };
+        let Some((active, pane)) = rest.split_once(':') else { continue };
+        if active == "1" && !name.is_empty() {
+            out.entry(name.to_string()).or_insert_with(|| parse_pane_dead(pane));
+        }
+    }
+    out
+}
+
 fn parse_pane_dead(line: &str) -> BackendStatus {
     let mut parts = line.split(':');
     let dead = parts.next().unwrap_or("").trim();
@@ -826,5 +875,54 @@ mod argv_secret_tests {
     fn an_empty_value_is_not_a_secret() {
         assert!(env_pair_is_argv_safe("ANTHROPIC_API_KEY", ""));
         assert!(env_pair_is_argv_safe("OPENAI_API_KEY", ""));
+    }
+}
+
+#[cfg(test)]
+mod census_cw3832 {
+    use super::*;
+
+    #[test]
+    fn census_takes_the_first_pane_of_the_active_window() {
+        let out = "amux-a:0:1:0:\namux-a:1:0::\namux-a:1:1:3:\namux-b:1:1:2:\namux-c:1:1::9\nbad\n:1:0::\n";
+        let got = first_active_pane_status(out);
+        assert_eq!(got.get("amux-a"), Some(&BackendStatus::Running));
+        assert_eq!(got.get("amux-b"), Some(&BackendStatus::Completed { exit_code: 2 }));
+        assert_eq!(got.get("amux-c"), Some(&BackendStatus::Crashed { signal: Some(9) }));
+        assert_eq!(got.len(), 3);
+    }
+
+    /// Fields equal to the old per-session probe: reconcile's census answer
+    /// for each session equals `status_by_ref`. Private tmux only.
+    #[tokio::test]
+    async fn census_reconcile_equals_per_session_status_on_a_private_tmux() {
+        if std::env::var_os("TMUX").is_some() || std::env::var_os("TMUX_TMPDIR").is_none() {
+            eprintln!("skipped: needs a private tmux server (set TMUX_TMPDIR, unset TMUX)");
+            return;
+        }
+        let t = |args: &[&str]| std::process::Command::new("tmux").args(args).output().unwrap();
+        t(&["new-session", "-d", "-s", "amux-cw3832c-live", "sleep 60"]);
+        t(&["new-session", "-d", "-s", "amux-cw3832c-done", "sleep 60"]);
+        let pt = pane_target("amux-cw3832c-done");
+        t(&["set-option", "-t", &pt, "remain-on-exit", "on"]);
+        t(&["respawn-pane", "-k", "-t", &pt, "exit 3"]);
+        t(&["new-session", "-d", "-s", "amux-cw3832c-twowin", "sleep 60"]);
+        let st = session_target("amux-cw3832c-twowin");
+        t(&["new-window", "-d", "-t", &st, "sleep 60"]);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let b = TmuxBackend::new();
+        let got = b.reconcile().await.unwrap();
+        let mine: Vec<_> = got.iter().filter(|s| s.backend_ref.starts_with("amux-cw3832c-")).collect();
+        assert_eq!(mine.len(), 3);
+        for s in mine {
+            assert_eq!(s.status, b.status_by_ref(&s.backend_ref).await.unwrap(), "{}", s.backend_ref);
+            if s.backend_ref.ends_with("done") {
+                assert_eq!(s.status, BackendStatus::Completed { exit_code: 3 });
+            }
+        }
+        for n in ["amux-cw3832c-live", "amux-cw3832c-done", "amux-cw3832c-twowin"] {
+            let st = session_target(n);
+            t(&["kill-session", "-t", &st]);
+        }
     }
 }
