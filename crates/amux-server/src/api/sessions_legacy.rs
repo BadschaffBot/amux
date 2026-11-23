@@ -5276,6 +5276,166 @@ struct RuntimeBoardTruth {
 /// state is needed here.
 type TaskMarker = (f64, Option<String>, bool, String);
 
+// Keep event ordering by (timestamp, id), even when a late insert has an old
+// timestamp. The caller appends these after command markers, as before.
+type ClaimEvents = BTreeMap<String, BTreeMap<(Option<String>, bool, String), (i64, TaskMarker)>>;
+type ClaimRow = (i64, String, String, Option<String>, f64);
+
+#[derive(Default)]
+struct ClaimCache {
+    store: std::sync::Weak<crate::db::Store>,
+    last_id: i64,
+    events: std::sync::Arc<ClaimEvents>,
+    /// Per-session index over `events`, rebuilt only when new rows fold in, so a request looks up
+    /// just this lane's Doing cards and never clones or replays markers for historical cards.
+    index: std::sync::Arc<ClaimIndex>,
+    refreshing: bool,
+}
+
+type IdMarker = (i64, TaskMarker);
+
+#[derive(Default)]
+struct SessionClaims {
+    by_card: BTreeMap<String, Vec<IdMarker>>,
+    newest: Option<IdMarker>,
+    newest_cardless: Option<IdMarker>,
+}
+
+type ClaimIndex = BTreeMap<String, SessionClaims>;
+
+fn marker_order(a: &IdMarker, b: &IdMarker) -> std::cmp::Ordering {
+    a.1.0.total_cmp(&b.1.0).then(a.0.cmp(&b.0))
+}
+
+fn build_claim_index(events: &ClaimEvents) -> ClaimIndex {
+    events
+        .iter()
+        .map(|(session, markers)| {
+            let mut sc = SessionClaims::default();
+            for (id, marker) in markers.values() {
+                let entry = (*id, marker.clone());
+                if sc.newest.as_ref().is_none_or(|n| marker_order(&entry, n).is_gt()) {
+                    sc.newest = Some(entry.clone());
+                }
+                if marker.2
+                    && sc.newest_cardless.as_ref().is_none_or(|n| marker_order(&entry, n).is_gt())
+                {
+                    sc.newest_cardless = Some(entry.clone());
+                }
+                if let Some(card) = &marker.1 {
+                    sc.by_card.entry(card.clone()).or_default().push(entry);
+                }
+            }
+            (session.clone(), sc)
+        })
+        .collect()
+}
+
+/// The only cached markers `select_runtime_marker` can pick or react to: those on this lane's
+/// Doing cards, the newest marker overall and the newest cardless one. Ordered by (ts, id).
+fn claim_candidates(sc: &SessionClaims, doing_cards: &[&str]) -> Vec<TaskMarker> {
+    let mut out: Vec<&IdMarker> = Vec::new();
+    for card in doing_cards {
+        if let Some(v) = sc.by_card.get(*card) {
+            out.extend(v.iter());
+        }
+    }
+    out.extend(sc.newest.iter());
+    out.extend(sc.newest_cardless.iter());
+    out.sort_by(|a, b| marker_order(a, b));
+    out.dedup_by_key(|m| m.0);
+    out.into_iter().map(|m| m.1.clone()).collect()
+}
+
+fn claim_cache() -> &'static std::sync::Mutex<ClaimCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ClaimCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(ClaimCache::default()))
+}
+
+fn fold_claim_rows(events: &mut ClaimEvents, rows: Vec<ClaimRow>) {
+    for (id, session, kind, data, ts) in rows {
+        let parsed = data.as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let card_id = parsed["issue"].as_str().map(str::trim)
+            .filter(|id| !id.is_empty()).map(str::to_string);
+        let cardless = kind == "task.cardless" && cardless_event_allowed(&parsed);
+        if kind == "task.cardless" && !cardless { continue; }
+        if card_id.is_some() || cardless {
+            let key = (card_id.clone(), cardless, kind.clone());
+            let markers = events.entry(session).or_default();
+            let candidate = (id, (ts, card_id, cardless, kind));
+            let entry = markers.entry(key).or_insert_with(|| candidate.clone());
+            if candidate.1.0.total_cmp(&entry.1.0).then(candidate.0.cmp(&entry.0)).is_gt() {
+                *entry = candidate;
+            }
+        }
+    }
+}
+
+fn wait_for_claim_refresh(rx: &std::sync::mpsc::Receiver<()>, deadline: std::time::Duration) -> bool {
+    rx.recv_timeout(deadline).is_ok()
+}
+
+// A single detached reader owns each refresh. A stalled SQLite read never owns
+// the cache lock or the request thread, and cannot spawn unbounded readers.
+fn cached_claim_events(store: &crate::db::SharedStore) -> std::sync::Arc<ClaimIndex> {
+    let key = std::sync::Arc::downgrade(store);
+    let mut cache = claim_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if !cache.store.ptr_eq(&key) {
+        *cache = ClaimCache { store: key.clone(), ..ClaimCache::default() };
+    }
+    if !cache.refreshing {
+        cache.refreshing = true;
+        let last_id = cache.last_id;
+        let events = cache.events.clone();
+        let index = cache.index.clone();
+        let worker_store = store.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<Vec<ClaimRow>> {
+                let conn = worker_store.dedicated_read()?;
+                let mut stmt = conn.prepare("SELECT id, session, type, data, ts FROM session_events WHERE id > ?1 AND type IN ('task.claimed','task.cardless') ORDER BY id")?;
+                let rows = stmt.query_map([last_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })();
+            let result = result.map(|rows| {
+                let newest = rows.last().map(|row| row.0).unwrap_or(last_id);
+                if rows.is_empty() {
+                    (newest, events, index)
+                } else {
+                    let mut updated = (*events).clone();
+                    fold_claim_rows(&mut updated, rows);
+                    let built = std::sync::Arc::new(build_claim_index(&updated));
+                    (newest, std::sync::Arc::new(updated), built)
+                }
+            });
+            let mut cache = claim_cache().lock().unwrap_or_else(|e| e.into_inner());
+            if cache.store.ptr_eq(&key) {
+                match result {
+                    Ok((newest, events, index)) => {
+                        cache.last_id = newest;
+                        cache.events = events;
+                        cache.index = index;
+                    }
+                    Err(err) => tracing::warn!(target: "amux::sessions", %err, "claim refresh failed; serving stale claims"),
+                }
+                cache.refreshing = false;
+            }
+            drop(cache);
+            let _ = tx.send(());
+        });
+        drop(cache);
+        if !wait_for_claim_refresh(&rx, std::time::Duration::from_secs(2)) {
+            tracing::warn!(target: "amux::sessions", "claim refresh deadline exceeded; serving stale claims");
+        }
+        cache = claim_cache().lock().unwrap_or_else(|e| e.into_inner());
+    } else {
+        tracing::warn!(target: "amux::sessions", "claim refresh still running; serving stale claims");
+    }
+    if cache.store.ptr_eq(&std::sync::Arc::downgrade(store)) { cache.index.clone() } else { std::sync::Arc::new(ClaimIndex::new()) }
+}
+
 /// A cardless event must carry the semantic classification which licensed it.
 /// Transport intent (`[no-board]`) is not such a classification: a substantive
 /// turn remains work even when its sender asked not to mint a duplicate card.
@@ -5944,7 +6104,7 @@ fn legacy_sessions_array_built(store: &crate::db::SharedStore) -> anyhow::Result
     phase(1);
     let conn = store.dedicated_read()?;
     phase(2);
-    let arr = build_array(&conn)?;
+    let arr = build_array(&conn, store)?;
     phase(3);
     record_task_changes(store, &conn, &arr);
     phase(4);
@@ -7597,7 +7757,7 @@ fn branch_from_head_file(dir: &str) -> Option<String> {
     }
 }
 
-fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
+fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> rusqlite::Result<Vec<serde_json::Value>> {
     let mut signals = FleetSignals::load(conn);
     // Before any status is derived: the pane is the only signal that can
     // contradict a self-report, and a report that nothing can contradict is
@@ -7844,41 +8004,7 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
                 }
             }
         }
-        if let Ok(mut events) = conn.prepare(
-            "SELECT session, type, data, ts FROM session_events \
-             WHERE type IN ('task.claimed','task.cardless') ORDER BY ts ASC, id ASC",
-        ) {
-            let rows = events.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, f64>(3)?,
-                ))
-            })?;
-            for row in rows {
-                let (session, kind, data, ts) = row?;
-                let parsed = data
-                    .as_deref()
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-                    .unwrap_or(serde_json::Value::Null);
-                let card_id = parsed["issue"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_string);
-                let cardless = kind == "task.cardless" && cardless_event_allowed(&parsed);
-                if kind == "task.cardless" && !cardless {
-                    continue;
-                }
-                if card_id.is_some() || cardless {
-                    task_markers
-                        .entry(session)
-                        .or_default()
-                        .push((ts, card_id, cardless, kind));
-                }
-            }
-        }
+        let claim_index = cached_claim_events(store);
         let now = signals.now as i64;
         for v in out.iter_mut() {
             let Some(name) = v["name"].as_str().map(String::from) else {
@@ -7919,8 +8045,28 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             }
             let runtime_status = v["status"].as_str().unwrap_or("").to_string();
             let running = v["running"].as_bool().unwrap_or(false);
-            let selection = task_markers
-                .get(&name)
+            // Command markers first, then only this lane's candidate cached claims
+            // (its Doing cards, newest, newest cardless); history is never cloned.
+            let lane_markers: Option<Vec<TaskMarker>> = {
+                let cached = claim_index.get(&name).map(|sc| {
+                    let doing_cards: Vec<&str> = doing_by_id
+                        .iter()
+                        .filter(|(_, (owner, _, _))| owner == &name)
+                        .map(|(id, _)| id.as_str())
+                        .collect();
+                    claim_candidates(sc, &doing_cards)
+                });
+                match (task_markers.get(&name), cached) {
+                    (None, None) => None,
+                    (cmd, cached) => {
+                        let mut all = cmd.cloned().unwrap_or_default();
+                        all.extend(cached.unwrap_or_default());
+                        (!all.is_empty()).then_some(all)
+                    }
+                }
+            };
+            let selection = lane_markers
+                .as_ref()
                 .map(|markers| {
                     select_runtime_marker(
                         markers,
@@ -8758,6 +8904,63 @@ mod status_authority_tests {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn claim_refresh_timeout_returns_without_waiting_for_reader() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        assert!(!super::wait_for_claim_refresh(&rx, std::time::Duration::from_millis(10)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn claim_fold_incremental_matches_full_with_late_timestamps() {
+        let rows = vec![
+            (1, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"A"}"#.into()), 30.0),
+            (2, "lane".into(), "task.cardless".into(), Some(r#"{"reason":"control-prompt"}"#.into()), 10.0),
+            (3, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"B"}"#.into()), 10.0),
+        ];
+        let mut full = super::ClaimEvents::new();
+        super::fold_claim_rows(&mut full, rows.clone());
+        let mut incremental = super::ClaimEvents::new();
+        super::fold_claim_rows(&mut incremental, rows[..1].to_vec());
+        super::fold_claim_rows(&mut incremental, rows[1..].to_vec());
+        assert_eq!(full, incremental);
+        assert_eq!(full["lane"].len(), 3);
+        let repeated = vec![
+            (4, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"A"}"#.into()), 5.0),
+            (5, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"A"}"#.into()), 30.0),
+        ];
+        super::fold_claim_rows(&mut full, repeated);
+        assert_eq!(full["lane"].len(), 3);
+        assert!(full["lane"].values().any(|row| row.0 == 5));
+    }
+
+    #[test]
+    fn candidate_set_selects_same_marker_as_full_history() {
+        let mut rows = Vec::new();
+        for i in 0..50i64 {
+            rows.push((i + 1, "lane".to_string(), "task.claimed".to_string(),
+                Some(format!(r#"{{"issue":"C{i}"}}"#)), 10.0 + i as f64));
+        }
+        rows.push((100, "lane".into(), "task.cardless".into(),
+            Some(r#"{"reason":"control-prompt"}"#.into()), 70.0));
+        let mut events = super::ClaimEvents::new();
+        super::fold_claim_rows(&mut events, rows);
+        let full: Vec<super::TaskMarker> = events["lane"].values().map(|v| v.1.clone()).collect();
+        let index = super::build_claim_index(&events);
+        let mut doing = BTreeMap::new();
+        for c in ["C3", "C7"] { doing.insert(c.to_string(), ("lane".to_string(), "t".to_string(), 0i64)); }
+        for started in [0.0, 30.0, 80.0] {
+            let want = super::select_runtime_marker(&full, started, "lane", &doing);
+            let cands = super::claim_candidates(&index["lane"], &["C3", "C7"]);
+            assert!(cands.len() <= 4);
+            let got = super::select_runtime_marker(&cands, started, "lane", &doing);
+            assert_eq!(want.marker, got.marker);
+            assert_eq!(want.conflicting_live_claims, got.conflicting_live_claims);
+            assert_eq!(want.newer_cardless_suppressed, got.newer_cardless_suppressed);
+        }
+    }
+
     use super::*;
 
     /// A probe that times out keeps the last listing for two minutes, so a
