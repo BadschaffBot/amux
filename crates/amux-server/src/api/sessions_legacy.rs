@@ -499,6 +499,27 @@ fn proc_ps_snapshot() -> Option<String> {
     Some(out)
 }
 
+/// `pgrep -P <pid>` from the kernel's own child list, without a child
+/// process (CW-3832): each pgrep scanned all ~1700 /proc entries, ~80 ms of
+/// CPU, and the fleet ran one per lane per check. Pids one per line, like
+/// pgrep; an unknown pid has no children, like pgrep's empty output.
+pub(crate) fn proc_children(pid: &str) -> String {
+    let mut out = String::new();
+    if !pid.bytes().all(|b| b.is_ascii_digit()) || pid.is_empty() {
+        return out;
+    }
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return out };
+    for t in tasks.flatten() {
+        if let Ok(kids) = std::fs::read_to_string(t.path().join("children")) {
+            for k in kids.split_whitespace() {
+                out.push_str(k);
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 /// `/proc/<pid>/stat` is `pid (comm) state ppid ...`; comm may hold spaces and
 /// parens, so it ends at the LAST ')'.
 fn ps_line_from_stat(pid: &str, stat: &str) -> Option<String> {
@@ -7752,6 +7773,34 @@ mod batched_probe_cw3832 {
         let mut bad = b"\xff\xfe\n".to_vec();
         bad.extend_from_slice(format!("{CAPTURE_END}x\n").as_bytes());
         assert_eq!(parse_batched_capture(&bad), vec![("x".into(), None)]);
+    }
+
+    #[test]
+    fn proc_children_matches_pgrep() {
+        let mut kids: Vec<_> = (0..3)
+            .map(|_| std::process::Command::new("sleep").arg("30").spawn().unwrap())
+            .collect();
+        let me = std::process::id().to_string();
+        let sorted = |s: String| {
+            let mut v: Vec<String> = s.lines().map(str::to_string).collect();
+            v.sort();
+            v
+        };
+        let pgrep = std::process::Command::new("pgrep").args(["-P", &me]).output().unwrap();
+        let want = sorted(String::from_utf8_lossy(&pgrep.stdout).into_owned());
+        let got = sorted(proc_children(&me));
+        for k in &mut kids {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+        // Other test threads may spawn children too, so check only ours.
+        for k in &kids {
+            let id = k.id().to_string();
+            assert!(want.contains(&id), "pgrep sees {id}");
+            assert!(got.contains(&id), "proc_children sees {id}: {got:?}");
+        }
+        assert_eq!(proc_children("999999999"), "");
+        assert_eq!(proc_children("../1"), "");
     }
 
     #[test]

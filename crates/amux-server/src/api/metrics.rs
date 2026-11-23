@@ -540,7 +540,8 @@ fn collect_session_metrics() -> Vec<serde_json::Value> {
 }
 
 fn collect_descendants(pid: u64, out: &mut Vec<u64>) {
-    if let Some(pgrep_out) = cmd_output("pgrep", &["-P", &pid.to_string()]) {
+    {
+        let pgrep_out = crate::api::sessions_legacy::proc_children(&pid.to_string());
         for line in pgrep_out.lines() {
             if let Ok(child) = line.trim().parse::<u64>() {
                 out.push(child);

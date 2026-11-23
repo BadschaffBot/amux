@@ -6665,8 +6665,8 @@ async fn pane_has_live_child(name: &str) -> Option<bool> {
     if pid.is_empty() {
         return None;
     }
-    let ch = run_cmd("pgrep", &["-P", &pid], OP_TIMEOUT).await?;
-    let listed = String::from_utf8_lossy(&ch.stdout).to_string();
+    // CW-3832: the kernel's child list, not a pgrep that scans all of /proc.
+    let listed = crate::api::sessions_legacy::proc_children(&pid);
     let kids: Vec<&str> = listed.split_whitespace().collect();
     if kids.is_empty() {
         return Some(false);
@@ -15569,13 +15569,8 @@ pub async fn pipe_reconcile_tick() -> usize {
         };
         let Some(name) = sess.strip_prefix("amux-") else { continue };
         let pipe: i64 = pipe.parse().unwrap_or(1); // unparsable -> assume piped, never re-arm blind
-        let children = tokio::process::Command::new("pgrep")
-            .args(["-P", pid])
-            .output()
-            .await
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
-            .unwrap_or(0);
+        // CW-3832: the kernel's child list, not a pgrep over all of /proc.
+        let children = crate::api::sessions_legacy::proc_children(pid).lines().count();
         if !should_rearm_pipe(pipe, children, writer_changed) {
             continue;
         }
