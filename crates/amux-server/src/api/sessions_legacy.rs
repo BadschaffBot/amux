@@ -430,7 +430,9 @@ fn capture_chunk(names: &[String]) -> Vec<(String, Option<String>)> {
         if o.status.success() || done >= rest.len() {
             break;
         }
-        out.push((rest[done].clone(), None)); // the target tmux could not find
+        // The target tmux could not find. A single capture of it exits 1 with
+        // empty stdout, which `run_bounded` returns as Some(""): keep that.
+        out.push((rest[done].clone(), Some(String::new())));
         rest = &rest[done + 1..];
     }
     out
@@ -7785,7 +7787,8 @@ mod batched_probe_cw3832 {
         for k in common {
             assert_eq!(ps[k].0, mine[k].0, "ppid of {k}");
             // ps prints non-printable comm bytes as '?'; compare printable ones.
-            if mine[k].1.chars().all(|c| c.is_ascii_graphic()) {
+            // kworkers rename themselves between the two reads.
+            if mine[k].1.chars().all(|c| c.is_ascii_graphic()) && !mine[k].1.starts_with("kworker") {
                 assert_eq!(ps[k].1, mine[k].1, "comm of {k}");
             }
         }
