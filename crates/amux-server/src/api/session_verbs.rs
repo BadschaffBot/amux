@@ -13891,11 +13891,15 @@ pub(crate) async fn boundary_signals(
     let store = state.store.clone();
     let lane = lane.map(str::to_string);
     crate::db::interactions::spawn_blocking(move || {
-        crate::api::sessions_legacy::fleet_probe(); // CW-3832: probe before taking a pooled reader
+        // CW-3832: every tmux round trip happens before the pooled reader is taken.
+        let lane_probe = lane.as_deref().map(crate::api::sessions_legacy::FleetSignals::probe_lane);
+        if lane_probe.is_none() {
+            crate::api::sessions_legacy::fleet_probe();
+        }
         let conn = store.read().ok()?;
-        Some(match lane.as_deref() {
-            Some(name) => crate::api::sessions_legacy::FleetSignals::load_lane(&conn, name),
-            None => {
+        Some(match (lane.as_deref(), lane_probe) {
+            (Some(name), Some(probe)) => crate::api::sessions_legacy::FleetSignals::load_lane(&conn, name, probe),
+            _ => {
                 let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
                 signals.capture_panes();
                 signals

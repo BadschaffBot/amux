@@ -1138,15 +1138,26 @@ fn no_current_hook_report(report: Option<&Value>, started: f64) -> bool {
 
 impl FleetSignals {
     pub fn load(conn: &rusqlite::Connection) -> Self {
-        Self::load_scoped(conn, None)
+        Self::load_scoped(conn, None, fleet_probe())
+    }
+
+    /// The tmux half of [`Self::load_lane`]. CW-3832: run it BEFORE taking a
+    /// pooled reader, so a slow tmux never pins a SQLite connection (this site
+    /// held one for 209 s in the 2026-11-23 10:23 pool hang).
+    pub(crate) fn probe_lane(name: &str) -> (std::sync::Arc<FleetProbe>, Option<String>) {
+        let pt = pane_target(&format!("amux-{name}"));
+        (std::sync::Arc::new(run_fleet_probe(Some(name))), capture_pane_bounded(&pt, name))
     }
 
     /// Fresh send-time check of one worker, using the Workers derivation.
     /// Only this worker's rollout and pane are read; a fleet tick loads once.
-    pub(crate) fn load_lane(conn: &rusqlite::Connection, name: &str) -> Self {
-        let mut signals = Self::load_scoped(conn, Some(name));
-        let pt = pane_target(&format!("amux-{name}"));
-        if let Some(raw) = capture_pane_bounded(&pt, name) {
+    pub(crate) fn load_lane(
+        conn: &rusqlite::Connection,
+        name: &str,
+        (probe, pane): (std::sync::Arc<FleetProbe>, Option<String>),
+    ) -> Self {
+        let mut signals = Self::load_scoped(conn, Some(name), probe);
+        if let Some(raw) = pane {
             signals.panes.insert(name.to_string(), raw);
         }
         signals
@@ -1161,7 +1172,7 @@ impl FleetSignals {
         pane_target(&format!("amux-{name}"))
     }
 
-    fn load_scoped(conn: &rusqlite::Connection, lane: Option<&str>) -> Self {
+    fn load_scoped(conn: &rusqlite::Connection, lane: Option<&str>, probe: std::sync::Arc<FleetProbe>) -> Self {
         let mut activity = BTreeMap::new();
         let mut created = BTreeMap::new();
         let mut running = BTreeSet::new();
@@ -1189,10 +1200,6 @@ impl FleetSignals {
         // because the WARN below needs `status` and `stderr`.
         // CW-3832: the four reads come from one shared, single-flight probe
         // (fleet-wide) or a direct one (a single lane); see `fleet_probe`.
-        let probe = match lane {
-            Some(_) => std::sync::Arc::new(run_fleet_probe(lane)),
-            None => fleet_probe(),
-        };
         let tmux_out = probe.sessions.clone().ok_or(());
         match &tmux_out {
             Ok(o) if !o.status.success() => tracing::warn!(

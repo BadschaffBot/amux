@@ -134,7 +134,27 @@ pub fn build_hash() -> String {
     }).clone()
 }
 
+/// CW-3832: hand freed heap back to the kernel once a minute. glibc keeps
+/// freed memory inside its arenas (prod: 51 x 64 MB heaps, 5 GB RSS for a far
+/// smaller live set, growing all day), so RSS tracked the high-water mark of
+/// every burst instead of what is in use. `AMUX_MALLOC_TRIM_SECS=0` turns it off.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn spawn_heap_trim() {
+    let secs = std::env::var("AMUX_MALLOC_TRIM_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(60);
+    if secs == 0 {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("amux-heap-trim".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        // SAFETY: malloc_trim takes no pointers and is thread-safe in glibc.
+        unsafe { libc::malloc_trim(0) };
+    });
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn spawn_heap_trim() {}
+
 pub fn run() {
+    spawn_heap_trim();
     let maintenance = tokio::runtime::Builder::new_multi_thread()
         .thread_name("amux-maintenance")
         .enable_all()
