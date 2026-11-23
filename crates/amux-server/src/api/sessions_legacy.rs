@@ -5286,7 +5286,23 @@ struct ClaimCache {
     store: std::sync::Weak<crate::db::Store>,
     last_id: i64,
     events: std::sync::Arc<ClaimEvents>,
+    /// `events` flattened per session and ordered by (ts, id), rebuilt only when new rows fold in,
+    /// so a request never sorts or replays markers for historical cards.
+    sorted: std::sync::Arc<SortedClaims>,
     refreshing: bool,
+}
+
+type SortedClaims = BTreeMap<String, Vec<TaskMarker>>;
+
+fn sort_claim_events(events: &ClaimEvents) -> SortedClaims {
+    events
+        .iter()
+        .map(|(session, markers)| {
+            let mut ordered: Vec<_> = markers.values().collect();
+            ordered.sort_by(|a, b| a.1.0.total_cmp(&b.1.0).then(a.0.cmp(&b.0)));
+            (session.clone(), ordered.into_iter().map(|(_, marker)| marker.clone()).collect())
+        })
+        .collect()
 }
 
 fn claim_cache() -> &'static std::sync::Mutex<ClaimCache> {
@@ -5321,7 +5337,7 @@ fn wait_for_claim_refresh(rx: &std::sync::mpsc::Receiver<()>, deadline: std::tim
 
 // A single detached reader owns each refresh. A stalled SQLite read never owns
 // the cache lock or the request thread, and cannot spawn unbounded readers.
-fn cached_claim_events(store: &crate::db::SharedStore) -> ClaimEvents {
+fn cached_claim_events(store: &crate::db::SharedStore) -> std::sync::Arc<SortedClaims> {
     let key = std::sync::Arc::downgrade(store);
     let mut cache = claim_cache().lock().unwrap_or_else(|e| e.into_inner());
     if !cache.store.ptr_eq(&key) {
@@ -5331,6 +5347,7 @@ fn cached_claim_events(store: &crate::db::SharedStore) -> ClaimEvents {
         cache.refreshing = true;
         let last_id = cache.last_id;
         let events = cache.events.clone();
+        let sorted = cache.sorted.clone();
         let worker_store = store.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
@@ -5343,19 +5360,21 @@ fn cached_claim_events(store: &crate::db::SharedStore) -> ClaimEvents {
             let result = result.map(|rows| {
                 let newest = rows.last().map(|row| row.0).unwrap_or(last_id);
                 if rows.is_empty() {
-                    (newest, events)
+                    (newest, events, sorted)
                 } else {
                     let mut updated = (*events).clone();
                     fold_claim_rows(&mut updated, rows);
-                    (newest, std::sync::Arc::new(updated))
+                    let ordered = std::sync::Arc::new(sort_claim_events(&updated));
+                    (newest, std::sync::Arc::new(updated), ordered)
                 }
             });
             let mut cache = claim_cache().lock().unwrap_or_else(|e| e.into_inner());
             if cache.store.ptr_eq(&key) {
                 match result {
-                    Ok((newest, events)) => {
+                    Ok((newest, events, sorted)) => {
                         cache.last_id = newest;
                         cache.events = events;
+                        cache.sorted = sorted;
                     }
                     Err(err) => tracing::warn!(target: "amux::sessions", %err, "claim refresh failed; serving stale claims"),
                 }
@@ -5372,7 +5391,7 @@ fn cached_claim_events(store: &crate::db::SharedStore) -> ClaimEvents {
     } else {
         tracing::warn!(target: "amux::sessions", "claim refresh still running; serving stale claims");
     }
-    if cache.store.ptr_eq(&std::sync::Arc::downgrade(store)) { (*cache.events).clone() } else { ClaimEvents::new() }
+    if cache.store.ptr_eq(&std::sync::Arc::downgrade(store)) { cache.sorted.clone() } else { std::sync::Arc::new(SortedClaims::new()) }
 }
 
 /// A cardless event must carry the semantic classification which licensed it.
@@ -7943,10 +7962,8 @@ fn build_array(conn: &rusqlite::Connection, store: &crate::db::SharedStore) -> r
                 }
             }
         }
-        for (session, events) in cached_claim_events(store) {
-            let mut events: Vec<_> = events.into_values().collect();
-            events.sort_by(|a, b| a.1.0.total_cmp(&b.1.0).then(a.0.cmp(&b.0)));
-            task_markers.entry(session).or_default().extend(events.into_iter().map(|(_, marker)| marker));
+        for (session, events) in cached_claim_events(store).iter() {
+            task_markers.entry(session.clone()).or_default().extend(events.iter().cloned());
         }
         let now = signals.now as i64;
         for v in out.iter_mut() {
@@ -8856,6 +8873,20 @@ pub(crate) mod tests {
         super::fold_claim_rows(&mut full, repeated);
         assert_eq!(full["lane"].len(), 3);
         assert!(full["lane"].values().any(|row| row.0 == 5));
+    }
+
+    #[test]
+    fn sorted_claims_follow_ts_then_id_per_session() {
+        let rows = vec![
+            (1, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"A"}"#.into()), 30.0),
+            (2, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"B"}"#.into()), 10.0),
+            (3, "lane".into(), "task.claimed".into(), Some(r#"{"issue":"C"}"#.into()), 10.0),
+        ];
+        let mut events = super::ClaimEvents::new();
+        super::fold_claim_rows(&mut events, rows);
+        let ids: Vec<_> = super::sort_claim_events(&events)["lane"]
+            .iter().map(|m| m.1.clone().unwrap()).collect();
+        assert_eq!(ids, ["B", "C", "A"]);
     }
 
     use super::*;
