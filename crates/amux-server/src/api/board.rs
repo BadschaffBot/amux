@@ -7180,6 +7180,12 @@ pub async fn get_item(
         let verified_gate = bs::effective_gate_trail(&conn, &row, TaskStatus::Verified, &groups);
         let verification = crate::db::verification_store::coverage(&conn, &row, &verified_gate.criteria)?;
         let attempts = crate::db::attempts::list_for_card(&conn, &row.id)?;
+        let pickup_outcome = match attempts.last() {
+            Some(attempt) => crate::db::attempts::consume_pickup_outcome(
+                &conn, &row.id, attempt.attempt, attempt.generation, row.version,
+            )?,
+            None => None,
+        };
         // gs12-model, GM-140, 2026-10-08: after `board doing --verify-cmd` the
         // card GET carried the command nowhere, so a lane could not read back
         // what froze. The frozen contract rides on the card it governs.
@@ -7187,7 +7193,7 @@ pub async fn get_item(
             "frozen": !c.is_uncontracted(), "state": c.state, "verify_cmd": c.command,
             "verify_kind": c.kind, "deploy_check": c.deploy_check, "amended": c.amended, "sha": c.sha,
         }));
-        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, (attempts, contract))))
+        Ok(Some((row, children, messages, artifacts, asset_links, gate_requirements, verification, (attempts, contract), pickup_outcome)))
     })
     .await;
     match joined {
@@ -7200,6 +7206,7 @@ pub async fn get_item(
             gate_requirements,
             verification,
             (attempts, contract),
+            pickup_outcome,
         )))) => {
             // Weak ETag for read-modify-write callers (AMUX-1711 parity).
             let mut headers = HeaderMap::new();
@@ -7257,6 +7264,10 @@ pub async fn get_item(
                 }
             }
             body["attempts"] = json!(attempts);
+            body["pickup_outcome"] = match pickup_outcome {
+                Some((receipt, route)) => json!({"receipt": receipt, "route": route}),
+                None => serde_json::Value::Null,
+            };
             (StatusCode::OK, headers, Json(body)).into_response()
         }
         Ok(Ok(None)) => not_found(&id),
