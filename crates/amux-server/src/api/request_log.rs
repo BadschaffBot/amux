@@ -45,6 +45,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Caps, all applied BEFORE a row enters the channel. Everything stored is
 /// bounded; nothing about a request can make its row large.
@@ -68,6 +70,10 @@ const ERROR_BODY_CHARS: usize = 2000;
 const QUEUE_CAP: usize = 10_000;
 /// Max rows folded into one write transaction.
 const BATCH_MAX: usize = 512;
+/// How long the flush task holds a batch open after its first row, so rows
+/// from requests that arrive close together share one write transaction.
+/// Log visibility lags by at most this much; the request path never waits.
+const LINGER: std::time::Duration = std::time::Duration::from_millis(10);
 /// Retention sweep cadence: once per this many inserted rows.
 const SWEEP_EVERY: u64 = 1000;
 const DEFAULT_RETAIN_DAYS: f64 = 14.0;
@@ -156,6 +162,10 @@ pub(crate) fn host_load1() -> Option<f64> {
 #[derive(Clone)]
 pub struct RequestLogger {
     tx: tokio::sync::mpsc::Sender<LogRow>,
+    /// Write transactions issued by the flush task (one per batch). Divided
+    /// by requests logged, it is the writes-per-request figure this module is
+    /// tuned against.
+    flushes: Arc<AtomicU64>,
 }
 
 impl RequestLogger {
@@ -167,21 +177,32 @@ impl RequestLogger {
     /// can be exercised without inserting 1000 rows.
     pub fn spawn_with(store: SharedStore, retain_days: f64, sweep_every: u64) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LogRow>(QUEUE_CAP);
+        let flushes = Arc::new(AtomicU64::new(0));
         // No runtime (a sync-context caller building a router for
         // inspection): rows will be dropped at send. Every production and
         // test caller runs inside tokio, so this is a guard, not a path.
         if tokio::runtime::Handle::try_current().is_err() {
             tracing::warn!("request log: no tokio runtime at spawn — rows will be dropped");
-            return Self { tx };
+            return Self { tx, flushes };
         }
+        let flush_counter = flushes.clone();
         tokio::spawn(async move {
             let mut since_sweep: u64 = 0;
             while let Some(first) = rx.recv().await {
                 let mut batch = vec![first];
+                let linger_until = tokio::time::Instant::now() + LINGER;
                 while batch.len() < BATCH_MAX {
                     match rx.try_recv() {
-                        Ok(r) => batch.push(r),
-                        Err(_) => break,
+                        Ok(r) => {
+                            batch.push(r);
+                            continue;
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    }
+                    match tokio::time::timeout_at(linger_until, rx.recv()).await {
+                        Ok(Some(r)) => batch.push(r),
+                        _ => break,
                     }
                 }
                 since_sweep += batch.len() as u64;
@@ -195,6 +216,7 @@ impl RequestLogger {
                 // AMUX-3646: what the HOST was doing. Once per batch, beside
                 // `boot` and for the same reason.
                 let load1 = host_load1();
+                flush_counter.fetch_add(1, Ordering::Relaxed);
                 let res = store
                     .write_async(move |conn| {
                         {
@@ -305,7 +327,12 @@ impl RequestLogger {
                 }
             }
         });
-        Self { tx }
+        Self { tx, flushes }
+    }
+
+    /// Write transactions this logger has issued (see `flushes`).
+    pub fn flush_count(&self) -> u64 {
+        self.flushes.load(Ordering::Relaxed)
     }
 
     fn send(&self, row: LogRow) {
@@ -6547,6 +6574,40 @@ mod tests {
             .query_row("SELECT path FROM _amux_request_log", [], |r| r.get(0))
             .unwrap();
         assert_eq!(path, "/api/board");
+    }
+
+    /// AMUX-434b evidence: write transactions per 100 logged requests, for a
+    /// single caller (sequential) and for a burst of concurrent callers.
+    #[tokio::test]
+    async fn writes_per_100_requests_measured() {
+        for mode in ["sequential", "burst"] {
+            let (store, _dir) = store();
+            let logger = RequestLogger::spawn_with(store.clone(), 14.0, 1_000_000);
+            let app = test_app(logger.clone());
+            let req = || {
+                HttpRequest::builder()
+                    .uri("/api/sessions/w1/peek?lines=5")
+                    .header("x-amux-session", "bench-lane")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            if mode == "sequential" {
+                for _ in 0..100 {
+                    assert_eq!(hit(&app, req()).await.0, StatusCode::OK);
+                }
+            } else {
+                let futs: Vec<_> = (0..100).map(|_| hit(&app, req())).collect();
+                for (st, _) in futures::future::join_all(futs).await {
+                    assert_eq!(st, StatusCode::OK);
+                }
+            }
+            assert_eq!(wait_rows(&store, 100).await, 100);
+            println!("MEASURE mode={mode} requests=100 rows=100 write_transactions={}", logger.flush_count());
+            if mode == "burst" {
+                // 100 concurrent requests must share a handful of writes, not one each.
+                assert!(logger.flush_count() <= 10, "burst not batched: {}", logger.flush_count());
+            }
+        }
     }
 
     #[tokio::test]
