@@ -2563,6 +2563,10 @@ struct TranscriptSig {
     mtime_ns: u128,
     len: u64,
     resolved_at: f64,
+    /// Identity the path was resolved under: the lane's claimed conversation id
+    /// and its project dir mtime. A change in either means the lane may have
+    /// moved to another conversation, so the path must be resolved again.
+    ident: (String, Option<u128>),
 }
 
 /// How long a signature may vouch for its path before the path is resolved
@@ -2575,9 +2579,38 @@ fn transcript_file_sig(path: &std::path::Path) -> Option<(u128, u64)> {
     Some((ns, m.len()))
 }
 
+/// Cheap (two small reads, no directory scan) identity a path resolution depends on.
+fn transcript_ident(name: &str) -> (String, Option<u128>) {
+    let wd = parse_env(name).get_or("CC_DIR", "").trim().to_string();
+    let conv = meta_str(&load_meta(name), "cc_conversation_id");
+    let dir_ns = if wd.is_empty() {
+        None
+    } else {
+        std::fs::metadata(claude_home().join("projects").join(project_name(&wd)))
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+    };
+    (conv, dir_ns)
+}
+
 /// Pure decision: may the cached entry stand without reading the file?
-fn transcript_sig_still_valid(sig: &TranscriptSig, now_stat: Option<(u128, u64)>, now: f64) -> bool {
-    now - sig.resolved_at < TRANSCRIPT_SIG_RESOLVE_S
+/// The file must be unchanged AND the lane's identity (claimed conversation,
+/// project dir mtime) the same, so a lane that switched conversations is never
+/// handed the old file's evidence. A claimed conversation is an explicit path
+/// (no periodic re-resolve needed); the scan-derived path is re-resolved
+/// every TRANSCRIPT_SIG_RESOLVE_S in case a title changed.
+fn transcript_sig_still_valid(
+    sig: &TranscriptSig,
+    now_stat: Option<(u128, u64)>,
+    now_ident: &(String, Option<u128>),
+    now: f64,
+) -> bool {
+    let explicit = !sig.ident.0.is_empty()
+        && sig.path.file_stem().and_then(|s| s.to_str()) == Some(sig.ident.0.as_str());
+    (explicit || now - sig.resolved_at < TRANSCRIPT_SIG_RESOLVE_S)
+        && sig.ident == *now_ident
         && now_stat.is_some_and(|(m, l)| m == sig.mtime_ns && l == sig.len)
 }
 
@@ -2676,7 +2709,7 @@ pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
             }
             // Expired, but the file has not moved: renew without any read.
             if let Some(sig) = sig {
-                if transcript_sig_still_valid(sig, transcript_file_sig(&sig.path), now) {
+                if transcript_sig_still_valid(sig, transcript_file_sig(&sig.path), &transcript_ident(name), now) {
                     let (m, t, sig) = (m.clone(), *t, sig.clone());
                     drop(g);
                     if let Ok(mut g) = cache.lock() {
@@ -2691,7 +2724,7 @@ pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
     let mut new_sig = None;
     if let Some(path) = session_jsonl_path(name) {
         if let Some((mtime_ns, len)) = transcript_file_sig(&path) {
-            new_sig = Some(TranscriptSig { path: path.clone(), mtime_ns, len, resolved_at: now });
+            new_sig = Some(TranscriptSig { path: path.clone(), mtime_ns, len, resolved_at: now, ident: transcript_ident(name) });
         }
         if let Ok(f) = std::fs::File::open(&path) {
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
@@ -28161,12 +28194,18 @@ CLAUDE-POSTFIX-COMPLETE
     #[test]
     fn an_unchanged_transcript_keeps_its_evidence_past_the_ttl() {
         // AMUX-729: expiry alone must not force a re-read of a file that has not moved.
-        let sig = TranscriptSig { path: PathBuf::from("/x.jsonl"), mtime_ns: 5, len: 10, resolved_at: 1000.0 };
-        assert!(transcript_sig_still_valid(&sig, Some((5, 10)), 1100.0));
-        assert!(!transcript_sig_still_valid(&sig, Some((6, 10)), 1100.0), "mtime moved");
-        assert!(!transcript_sig_still_valid(&sig, Some((5, 11)), 1100.0), "file grew");
-        assert!(!transcript_sig_still_valid(&sig, None, 1100.0), "file gone");
-        assert!(!transcript_sig_still_valid(&sig, Some((5, 10)), 1000.0 + TRANSCRIPT_SIG_RESOLVE_S), "path re-resolved periodically");
+        let id = |c: &str, d: u128| (c.to_string(), Some(d));
+        let sig = TranscriptSig { path: PathBuf::from("/x.jsonl"), mtime_ns: 5, len: 10, resolved_at: 1000.0, ident: id("", 1) };
+        assert!(transcript_sig_still_valid(&sig, Some((5, 10)), &id("", 1), 1100.0));
+        assert!(!transcript_sig_still_valid(&sig, Some((6, 10)), &id("", 1), 1100.0), "mtime moved");
+        assert!(!transcript_sig_still_valid(&sig, Some((5, 11)), &id("", 1), 1100.0), "file grew");
+        assert!(!transcript_sig_still_valid(&sig, None, &id("", 1), 1100.0), "file gone");
+        assert!(!transcript_sig_still_valid(&sig, Some((5, 10)), &id("", 2), 1100.0), "new transcript in project dir");
+        assert!(!transcript_sig_still_valid(&sig, Some((5, 10)), &id("c2", 1), 1100.0), "lane claimed another conversation");
+        assert!(!transcript_sig_still_valid(&sig, Some((5, 10)), &id("", 1), 1000.0 + TRANSCRIPT_SIG_RESOLVE_S), "scan path re-resolved periodically");
+        let ex = TranscriptSig { path: PathBuf::from("/p/abc.jsonl"), mtime_ns: 5, len: 10, resolved_at: 0.0, ident: id("abc", 1) };
+        assert!(transcript_sig_still_valid(&ex, Some((5, 10)), &id("abc", 1), 99999.0), "explicit claim needs no re-resolve");
+        assert!(!transcript_sig_still_valid(&ex, Some((5, 10)), &id("def", 1), 99999.0), "claim changed");
     }
 
     #[test]
