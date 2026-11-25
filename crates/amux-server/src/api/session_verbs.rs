@@ -2550,7 +2550,36 @@ pub(crate) fn conversation_owner(
 ///
 /// Tail-bounded and TTL-cached: /api/sessions is polled hard and there are ~47
 /// lanes, so an uncached full read would be a file scan per lane per poll.
-type TranscriptEvidenceCache = std::collections::HashMap<String, (f64, Option<String>, Option<u64>)>;
+type TranscriptEvidenceCache = std::collections::HashMap<String, (f64, Option<String>, Option<u64>, Option<TranscriptSig>)>;
+
+/// Which file an evidence entry was read from and what it looked like (AMUX-729).
+/// A TTL expiry on its own forced a path lookup plus a 512 KB tail parse per
+/// lane, and a lane whose transcript had not changed paid it again every 15 s;
+/// with ~50 lanes that spent the whole 1.5 s fallback budget of EVERY sessions
+/// build. An unchanged (path, mtime, len) means the answer cannot have changed.
+#[derive(Clone, Debug, PartialEq)]
+struct TranscriptSig {
+    path: PathBuf,
+    mtime_ns: u128,
+    len: u64,
+    resolved_at: f64,
+}
+
+/// How long a signature may vouch for its path before the path is resolved
+/// again (a lane that switched conversations leaves its old file idle).
+const TRANSCRIPT_SIG_RESOLVE_S: f64 = 300.0;
+
+fn transcript_file_sig(path: &std::path::Path) -> Option<(u128, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    let ns = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    Some((ns, m.len()))
+}
+
+/// Pure decision: may the cached entry stand without reading the file?
+fn transcript_sig_still_valid(sig: &TranscriptSig, now_stat: Option<(u128, u64)>, now: f64) -> bool {
+    now - sig.resolved_at < TRANSCRIPT_SIG_RESOLVE_S
+        && now_stat.is_some_and(|(m, l)| m == sig.mtime_ns && l == sig.len)
+}
 
 fn transcript_evidence_cache() -> &'static std::sync::Mutex<TranscriptEvidenceCache> {
     static EV: std::sync::OnceLock<std::sync::Mutex<TranscriptEvidenceCache>> = std::sync::OnceLock::new();
@@ -2567,7 +2596,7 @@ fn transcript_evidence_ttl() -> f64 {
 
 fn prune_transcript_evidence(cache: &mut TranscriptEvidenceCache, now: f64, ttl: f64) -> usize {
     let before = cache.len();
-    cache.retain(|_, (at, _, _)| now - *at <= ttl.max(300.0));
+    cache.retain(|_, (at, _, _, _)| now - *at <= ttl.max(300.0));
     let removed = before - cache.len();
     if removed > 0 {
         cache.shrink_to_fit();
@@ -2641,14 +2670,29 @@ pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
     let now = now_f64();
     let cache = transcript_evidence_cache();
     if let Ok(g) = cache.lock() {
-        if let Some((at, m, t)) = g.get(name) {
+        if let Some((at, m, t, sig)) = g.get(name) {
             if now - at < ttl {
                 return (m.clone(), *t);
+            }
+            // Expired, but the file has not moved: renew without any read.
+            if let Some(sig) = sig {
+                if transcript_sig_still_valid(sig, transcript_file_sig(&sig.path), now) {
+                    let (m, t, sig) = (m.clone(), *t, sig.clone());
+                    drop(g);
+                    if let Ok(mut g) = cache.lock() {
+                        g.insert(name.to_string(), (now, m.clone(), t, Some(sig)));
+                    }
+                    return (m, t);
+                }
             }
         }
     }
     let (mut model, mut tokens) = (None, None);
+    let mut new_sig = None;
     if let Some(path) = session_jsonl_path(name) {
+        if let Some((mtime_ns, len)) = transcript_file_sig(&path) {
+            new_sig = Some(TranscriptSig { path: path.clone(), mtime_ns, len, resolved_at: now });
+        }
         if let Ok(f) = std::fs::File::open(&path) {
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
             // Tail only. A long-running lane's transcript reaches hundreds of
@@ -2693,7 +2737,7 @@ pub(crate) fn transcript_evidence(name: &str) -> (Option<String>, Option<u64>) {
     }
     if let Ok(mut g) = cache.lock() {
         prune_transcript_evidence(&mut g, now, ttl);
-        g.insert(name.to_string(), (now, model.clone(), tokens));
+        g.insert(name.to_string(), (now, model.clone(), tokens, new_sig));
     }
     (model, tokens)
 }
@@ -28115,6 +28159,17 @@ CLAUDE-POSTFIX-COMPLETE
     /// `transcript_evidence` is what makes ONE cell here cover both consumers;
     /// gating at the two call sites would leave the third one somebody adds.
     #[test]
+    fn an_unchanged_transcript_keeps_its_evidence_past_the_ttl() {
+        // AMUX-729: expiry alone must not force a re-read of a file that has not moved.
+        let sig = TranscriptSig { path: PathBuf::from("/x.jsonl"), mtime_ns: 5, len: 10, resolved_at: 1000.0 };
+        assert!(transcript_sig_still_valid(&sig, Some((5, 10)), 1100.0));
+        assert!(!transcript_sig_still_valid(&sig, Some((6, 10)), 1100.0), "mtime moved");
+        assert!(!transcript_sig_still_valid(&sig, Some((5, 11)), 1100.0), "file grew");
+        assert!(!transcript_sig_still_valid(&sig, None, 1100.0), "file gone");
+        assert!(!transcript_sig_still_valid(&sig, Some((5, 10)), 1000.0 + TRANSCRIPT_SIG_RESOLVE_S), "path re-resolved periodically");
+    }
+
+    #[test]
     fn transcript_evidence_belongs_only_to_the_provider_that_wrote_it() {
         // The predicate is DERIVED from the launch binary, so these cells are
         // about the derivation, not a list. iterm2 is the one worth stating:
@@ -34740,10 +34795,10 @@ mod transcript_cache_retention_tests {
     fn inactive_worker_entries_expire_without_evicting_valid_long_ttl_entries() {
         let mut cache = TranscriptEvidenceCache::new();
         for i in 0..2048 {
-            cache.insert(format!("deleted-{i}"), (1.0, Some("model".into()), Some(42)));
+            cache.insert(format!("deleted-{i}"), (1.0, Some("model".into()), Some(42), None));
         }
-        cache.insert("active".into(), (999.0, Some("sonnet".into()), Some(123)));
-        cache.insert("long-ttl".into(), (600.0, None, None));
+        cache.insert("active".into(), (999.0, Some("sonnet".into()), Some(123), None));
+        cache.insert("long-ttl".into(), (600.0, None, None, None));
         let capacity = cache.capacity();
         assert_eq!(prune_transcript_evidence(&mut cache, 1000.0, 500.0), 2048);
         assert_eq!(cache.len(), 2);
