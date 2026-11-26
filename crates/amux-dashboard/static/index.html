@@ -756,6 +756,7 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
   <button id="tab-everything" title="Everything else: the full workspace" onclick="_homeShowEverything()"><span class="tab-ico">&#x22EF;</span><span class="tab-lbl">Everything else</span></button>
   <button id="tab-sessions" class="active" onclick="switchView('sessions')"><span class="tab-ico">▦</span><span class="tab-lbl">Workers</span></button>
   <button id="tab-board" onclick="switchView('board')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span></button>
+  <button id="tab-crm" title="CRM: people, companies, deals and follow-ups, for Mixpeek, amux and personal" onclick="switchView('crm')"><span class="tab-ico">&#x1F465;</span><span class="tab-lbl">CRM</span></button>
   <button id="tab-usage" title="Usage & Optimization: where the spend goes, what it produces, what to change" onclick="openUsage()"><span class="tab-ico">$</span><span class="tab-lbl">Usage</span></button>
   <button id="tab-tasks" onclick="switchView('tasks')"><span class="tab-ico">&#x2611;</span><span class="tab-lbl">Tasks</span></button>
   <button id="tab-groups" onclick="switchView('groups')"><span class="tab-ico">&#x2756;</span><span class="tab-lbl">Groups</span></button>
@@ -1506,6 +1507,17 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
 </div>
 <!-- Photos: a media library on the owner's own Mixpeek (photos.js, loaded on first open). -->
 <div id="photos-view" class="ph-host" style="display:none;"></div>
+<!-- CRM (docs/design/crm.md): people, companies, deals, follow-ups. One row of
+     controls on a phone: search, then the views and filters, scrolling sideways. -->
+<div id="crm-view" class="crm-view">
+  <div id="crm-bar" class="crm-bar" role="toolbar" aria-label="CRM views and filters">
+    <input id="crm-q" class="input crm-q" type="search" placeholder="Search" aria-label="Search the CRM" oninput="_crmSearch(this.value)">
+    <div id="crm-chips" class="crm-chips"></div>
+    <button class="btn primary crm-new" onclick="_crmNew()" aria-label="Add to the CRM">+ New</button>
+  </div>
+  <div id="crm-note" class="crm-note"></div>
+  <div id="crm-list" class="crm-list"></div>
+</div>
 <div id="calls-view" class="calls-view">
   <div id="calls-bar" class="calls-bar" role="toolbar" aria-label="Filter calls">
     <div id="calls-filters" class="calls-filters"></div>
@@ -3410,7 +3422,9 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
     <button class="peek-tab" id="peek-tab-shell" onclick="setPeekTab('shell')" title="This worker's shell schedules: what runs on this machine for it, live and past output"><span class="tab-ico">$</span><span class="tab-lbl">Shell</span></button>
     <button class="peek-tab" id="peek-tab-scope" onclick="setPeekTab('scope')" title="Edit this worker's configuration and see which layer supplies each value"><span class="tab-ico">&#9707;</span><span class="tab-lbl">Configurations</span></button>
     <button class="peek-tab" id="peek-tab-messages" onclick="setPeekTab('messages')" title="Every message sent to this worker"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span><span class="peek-tab-count" id="peek-tab-messages-count"></span></button>
+    <button class="peek-tab" id="peek-tab-intent" onclick="setPeekTab('intent')" title="Conversations from Intent routed to this worker" style="display:none;"><span class="tab-ico">&#x25CE;</span><span class="tab-lbl">Intent</span><span class="peek-tab-count" id="peek-tab-intent-count"></span></button>
     <button class="peek-tab" id="peek-tab-tasks" onclick="setPeekTab('tasks')" title="The task names this worker has worked on, newest first, as the model named them"><span class="tab-ico">&#x2611;</span><span class="tab-lbl">Tasks</span></button>
+    <button class="peek-tab" id="peek-tab-computer" onclick="setPeekTab('computer')" title="What this worker did in apps on this Mac, step by step, with what it saw"><span class="tab-ico">&#x1F5A5;</span><span class="tab-lbl">Computer</span><span class="peek-tab-count" id="peek-tab-computer-count"></span></button>
     <button class="peek-tab" id="peek-tab-dictation" onclick="setPeekTab('dictation')" title="Voice dictation — speak, get clean text"><span class="tab-ico">🎤</span><span class="tab-lbl">Dictation</span><span class="peek-tab-count" id="peek-tab-dictation-count"></span></button>
     <button class="peek-tab" id="peek-tab-readalouds" onclick="setPeekTab('readalouds')" title="Past read-alouds — replay any; auto-clears after 30 days"><span class="tab-ico">&#x1F50A;</span><span class="tab-lbl">Read alouds</span><span class="peek-tab-count" id="peek-tab-readalouds-count"></span></button>
     <button class="peek-tab" id="peek-tab-issues" onclick="setPeekTab('issues')"><span class="tab-ico">☷</span><span class="tab-lbl">Board</span><span class="peek-tab-count" id="peek-tab-issues-count"></span></button>
@@ -3664,6 +3678,14 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
   
   <!-- This worker's tasks, newest first and numbered: the Tasks view's list
        fixed to peekSession (app.js _tasksScopes.peek). -->
+  <div id="peek-computer-panel" class="peek-tasks-panel peek-computer-panel">
+    <div class="pcu-bar">
+      <strong>Computer use on this Mac</strong>
+      <span id="peek-computer-count" class="tasks-count" role="status" aria-live="polite"></span>
+      <span class="pcu-hint">Live while this tab is open. &#x2318;&#x21E7;Esc or the menu bar's Stop Computer Use stops every worker.</span>
+    </div>
+    <ol id="peek-computer-list" class="pcu-list" aria-label="This worker's computer-use steps, newest first"></ol>
+  </div>
   <div id="peek-tasks-panel" class="peek-tasks-panel tasks-scope row-note-host" style="padding:0;gap:0;flex-direction:column;">
     <div class="tasks-bar">
       <input id="peek-tasks-search" class="input tasks-search" type="search" placeholder="Search this worker's tasks, cards and messages" aria-label="Search this worker's tasks" oninput="_tasksSearchInput('peek')">
@@ -3725,7 +3747,6 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
       <div id="peek-ask-answer" style="font-size:var(--fs-lg);line-height:1.5;white-space:pre-wrap;word-break:break-word;margin-top:var(--space-1-5);"></div>
     </div>
     <div id="pm-selbar" style="display:none;"></div>
-    <div id="peek-msg-convs" class="peek-msg-convs"></div>
     <div id="peek-messages-list" style="flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:var(--space-2);padding:var(--space-2-5);"></div>
   </div>
   <!-- Dictation: speak → clean text. Audio goes to the amux server, which calls
@@ -3763,6 +3784,11 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
        Rendered by _vxRender in app.js; stored by api/converse.rs. -->
   <div id="peek-converse-panel" class="peek-tasks-panel vx-panel"></div>
   <!-- Past read-alouds: replay any clip; auto-flushes after 30 days (Ethan 2026-08-13). -->
+  <!-- Intent: the conversations from Intent routed to this worker (owner,
+       2026-11-19: "These should be in a separate intent tab"). -->
+  <div id="peek-intent-panel" class="peek-tasks-panel" style="padding:0;gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
+    <div id="peek-msg-convs" class="peek-msg-convs"></div>
+  </div>
   <div id="peek-readalouds-panel" class="peek-tasks-panel" style="padding:0;gap:0;overflow-y:auto;-webkit-overflow-scrolling:touch;">
     <div id="peek-readalouds-list" class="ra-list"></div>
   </div>
@@ -4121,6 +4147,11 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
         <div class="filter-section-title">Model type</div>
         <div id="filter-models" class="filter-chip-row"></div>
       </div>
+      <div class="filter-section">
+        <div class="filter-section-title">Default for new tabs</div>
+        <button class="btn" id="filter-default-btn" style="width:100%;" onclick="toggleListDefault()">Save as default</button>
+        <div class="filter-hint" id="filter-default-hint"></div>
+      </div>
     </div>
     <div class="filter-modal-actions">
       <button class="btn" onclick="clearAllFilters()">Clear all</button>
@@ -4256,6 +4287,7 @@ setTimeout(function(){document.documentElement.classList.remove('boot-home-pendi
     <div class="file-actions" id="file-actions" role="menu">
       <button class="file-view-tab" id="file-tab-newwin" onclick="_fileOpenNewWindow()" title="Open this file in a new window">&#x29C9; Open in new window</button>
       <button class="file-view-tab" id="file-tab-reveal" onclick="_fileShowInFolder()" title="Show this file in its folder">&#x1F4C2; Show in folder</button>
+      <button class="file-view-tab" id="file-tab-askall" onclick="_mdAskAll()" title="Ask every @worker in this file one question; each reply shows under its line" hidden>Ask every @worker&#x2026;</button>
       <button class="file-view-tab" id="file-tab-worker" onclick="_fileOpenInWorker()" title="Hand this file to a worker with instructions">Open in worker&#x2026;</button>
       <div class="file-actions-sep" role="separator"></div>
       <button class="file-view-tab" id="file-tab-print" onclick="_filePrint()" title="Print this file">&#x2399; Print&#x2026;</button>

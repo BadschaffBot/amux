@@ -46,6 +46,7 @@ pub mod branding;
 pub mod brex;
 pub mod browser;
 pub mod browser_import;
+pub mod browser_watch;
 pub mod audit;
 pub mod browser_routing;
 pub mod cdp_proxy;
@@ -58,6 +59,7 @@ pub mod chat_context;
 pub mod chat_worker;
 pub mod commit_mentions;
 pub mod computer;
+pub mod computer_mac;
 pub mod config_iac;
 pub mod move_bundle;
 pub mod connection;
@@ -65,6 +67,10 @@ pub mod gcal;
 pub mod connectors;
 pub mod criteria;
 pub mod crm;
+pub mod crm_accounts;
+pub mod crm_agent;
+pub mod crm_outbound;
+pub mod crm_signups;
 pub mod deleted_substrate;
 pub mod dependency_audit;
 pub mod dictation;
@@ -144,6 +150,7 @@ pub(crate) mod pane_prompts;
 pub mod pages;
 pub mod photos;
 pub mod palette;
+pub mod palette_history;
 pub mod pinned;
 pub mod planning;
 pub mod policy;
@@ -365,6 +372,7 @@ pub fn router_with_connector_transport(
         // The Photos tab's BYO Mixpeek connection (api/photos.rs).
         .merge(photos::routes())
         .merge(palette::routes())
+        .merge(palette_history::routes())
         .merge(session_verbs::routes())
         .merge(typing::routes())
         .merge(boundaries::routes())
@@ -440,7 +448,7 @@ pub fn router_with_connector_transport(
         // CRM: a PORT of the python contract, not a new feature — the schema and
         // 308 live contacts survived the cutover with no routes to reach them
         // (AMUX-2929).
-        .nest("/api/crm", crm::routes())
+        .nest("/api/crm", crm::routes().merge(crm_accounts::routes()).merge(crm_agent::routes()).merge(crm_outbound::routes()))
         .nest("/api/speedtest", speedtest::routes())
         .nest("/api/layout-presets", layout_presets::routes())
         // Social posting and results (AA-42): YouTube first, the rest report their gate.

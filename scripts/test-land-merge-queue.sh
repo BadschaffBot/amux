@@ -8,7 +8,11 @@
 #             mq ref is gone, and the base reaches the workflow input
 #   enforce   red alone: rc 6, main unchanged
 #   enforce   red batch: bisected, the culprit waiter ejected, the prefix that
-#             already passed lands, the waiters after the culprit keep tickets
+#             already passed lands, the waiters after the culprit keep tickets;
+#             a culprit in first place lands the holder alone
+#   enforce   red batch while main moves: the passing prefix is carried onto
+#             the new main and lands when nothing overlaps; re-tested when a
+#             file is shared
 #   enforce   red on the holder's own commit in a batch: rc 6, waiters keep
 #             their tickets
 #   enforce   lost runner: dispatched once more, lands
@@ -17,6 +21,8 @@
 #             beside it gets one; its check can still refuse
 #   enforce   main moves under a green candidate: carried when nothing overlaps or
 #             the new commit is no-code, re-composed when a file is shared
+#   enforce   carry check (amux.landMergeQueueCarryCheck): carried when it names
+#             no member, re-tested when it names one or fails, on both carry paths
 #   shadow    candidate dispatched, main pushed directly even when it is red
 #   misconfigured (no workflow): lands directly with a WARN
 set -uo pipefail
@@ -163,6 +169,76 @@ grep -q "bisected to w2's commit" "$H/.amux/logs/land.log" && ok "enforce red ba
 kill $PIDS 2>/dev/null; wait 2>/dev/null
 done_case
 
+# --- enforce, red batch whose culprit is the first waiter: the holder lands
+# alone (mxp-presales 2026-11-23: BSD head refused -n 0 and the land exited 1).
+setup; queue_on; commit_file h x
+key="$(printf '%s %s' "$(git remote get-url origin)" main | shasum | cut -c1-16)"
+q="$H/.amux/locks/land-$key.q"; mkdir -p "$q"; PIDS=""
+plant w1 bad; plant w2 w2
+land; rc=$?
+{ [ "$rc" = 0 ] && main_has h && ! main_has bad && ! main_has w2; } \
+  && ok "red batch, culprit is waiter 1: the holder's prefix of one lands" || bad "culprit-first rc=$rc; $(grep -a 'merge queue' "$H/.amux/logs/land.log" | tail -6); $(tail -3 "$H/out")"
+grep -q "this lane and 0 waiter(s), verdict=mq_prefix_landed" "$H/.amux/logs/land.log" && ok "red batch, culprit is waiter 1: land.log says the holder landed alone" || bad "no prefix-of-one line"
+ls "$q" | grep -q . && ok "red batch, culprit is waiter 1: the waiter after it keeps its ticket" || bad "w2's ticket is gone"
+kill $PIDS 2>/dev/null; wait 2>/dev/null
+done_case
+
+# --- a deep queue takes a bigger batch (Mixpeek 2026-11-23: 36 deep at 7 a batch).
+setup; queue_on; commit_file h x
+git config amux.landMergeQueueBatchMax 3; git config amux.landMergeQueueDeepQueue 2; git config amux.landMergeQueueBatchMaxDeep 6
+key="$(printf '%s %s' "$(git remote get-url origin)" main | shasum | cut -c1-16)"
+q="$H/.amux/locks/land-$key.q"; mkdir -p "$q"; PIDS=""
+plant w1 w1; plant w2 w2; plant w3 w3; plant w4 w4
+land; rc=$?
+{ [ "$rc" = 0 ] && main_has h && main_has w1 && main_has w4 && [ "$(dispatches)" = 1 ]; } \
+  && ok "deep queue: 4 waiters past a depth of 2 land in one candidate, not 2 at a time" || bad "deep rc=$rc dispatches=$(dispatches); $(grep -a 'merge queue' "$H/.amux/logs/land.log" | tail -4)"
+grep -q "verdict=mq_batch_deep" "$H/.amux/logs/land.log" && ok "deep queue: land.log says the batch grew" || bad "no mq_batch_deep line"
+kill $PIDS 2>/dev/null; wait 2>/dev/null
+done_case
+
+# --- a red batch's bisect lets the other machine's waiter land between steps
+setup; queue_on; commit_file h x
+key="$(printf '%s %s' "$(git remote get-url origin)" main | shasum | cut -c1-16)"
+q="$H/.amux/locks/land-$key.q"; mkdir -p "$q"; PIDS=""
+plant w1 w1; plant w2 bad; plant w3 w3
+wc="$(printf 'amux land wait\n\nholder=othermac:4242\nlane=other-machine\nexpires_at=%s\n' $(( $(date +%s) + 900 )) | git commit-tree "$(git mktree </dev/null)")"
+git push -q origin "$wc:refs/amux/land-wait/main/othermac-4242" 2>/dev/null
+AMUX_LAND_REMOTE_LEASE_POLL_S=1 land; rc=$?
+{ [ "$rc" = 0 ] && main_has h && main_has w1 && ! main_has bad; } \
+  && ok "bisect with a waiter on the other machine: the prefix still lands" || bad "bisect handover rc=$rc; $(grep -a 'merge queue\|lease' "$H/.amux/logs/land.log" | tail -6)"
+[ "$(grep -c 'verdict=land_remote_lease_handover' "$H/out" "$H/.amux/logs/land.log" 2>/dev/null | awk -F: '{s+=$2} END{print s}')" -ge 1 ] \
+  && ok "bisect: the lease is handed over between steps" || bad "no handover during the bisect: $(grep -a 'lease' "$H/out" | tail -4)"
+kill $PIDS 2>/dev/null; wait 2>/dev/null
+done_case
+
+# --- enforce, red batch while main moves (Mixpeek 2026-11-23: three commits
+# reached main during the bisect and the green prefix was re-composed instead).
+setup; queue_on; commit_file h x
+key="$(printf '%s %s' "$(git remote get-url origin)" main | shasum | cut -c1-16)"
+q="$H/.amux/locks/land-$key.q"; mkdir -p "$q"; PIDS=""
+plant w1 w1; plant w2 bad; plant w3 w3
+echo other.txt > "$H/move-main"
+land; rc=$?
+{ [ "$rc" = 0 ] && main_has h && main_has w1 && main_has other.txt && ! main_has bad && ! main_has w3; } \
+  && ok "red batch, main moved, no shared file: the passing prefix is carried onto the new main and lands" || bad "carried prefix rc=$rc; $(grep -a 'merge queue' "$H/.amux/logs/land.log" | tail -6)"
+[ "$(dispatches)" = 3 ] && ok "red batch, main moved: no run after the bisect" || bad "dispatches=$(dispatches)"
+grep -q "verdict=mq_prefix_carried" "$H/.amux/logs/land.log" && grep -q "verdict=mq_prefix_landed" "$H/.amux/logs/land.log" \
+  && ok "red batch, main moved: land.log says the prefix was carried and landed" || bad "no carried line: $(grep -a 'merge queue' "$H/.amux/logs/land.log" | tail -4)"
+ls "$q" | grep -q . && ok "red batch, main moved: the waiter after the culprit keeps its ticket" || bad "w3's ticket is gone"
+kill $PIDS 2>/dev/null; wait 2>/dev/null
+done_case
+
+setup; queue_on; commit_file h x
+key="$(printf '%s %s' "$(git remote get-url origin)" main | shasum | cut -c1-16)"
+q="$H/.amux/locks/land-$key.q"; mkdir -p "$q"; PIDS=""
+plant w1 w1; plant w2 bad; plant w3 w3
+echo w1 > "$H/move-main"
+land; rc=$?
+{ grep -q "verdict=mq_prefix_overlap" "$H/.amux/logs/land.log" && ! grep -q "verdict=mq_prefix_carried" "$H/.amux/logs/land.log"; } \
+  && ok "red batch, main moved on a file the prefix changes: not carried, tested again" || bad "overlap prefix rc=$rc; $(grep -a 'merge queue' "$H/.amux/logs/land.log" | tail -6)"
+kill $PIDS 2>/dev/null; wait 2>/dev/null
+done_case
+
 # --- enforce, the holder's own commit is the culprit of a batch
 setup; queue_on; base="$(git rev-parse origin/main)"; commit_file bad x
 key="$(printf '%s %s' "$(git remote get-url origin)" main | shasum | cut -c1-16)"
@@ -248,6 +324,45 @@ setup; queue_on; commit_file g1 x; echo g1 > "$H/move-main"
 land; rc=$?
 { grep -q "re-composing on the new tip" "$H/.amux/logs/land.log" && ! grep -q "replayed onto the new tip" "$H/.amux/logs/land.log"; } \
   && ok "moved main on the same file: not carried" || bad "overlap rc=$rc dispatches=$(dispatches)"
+done_case
+
+# --- the carry check (Mixpeek 2026-11-24: a carried prefix landed a tree no
+# candidate built). It prints the members whose tree the replay changes.
+setup; queue_on; commit_file g1 x; echo other.txt > "$H/move-main"
+git config amux.landMergeQueueCarryCheck 'env | grep ^AMUX_LAND_ | sort > "$FAKE_GH_HOME/carry-env"'
+land; rc=$?
+{ [ "$rc" = 0 ] && main_has g1 && [ "$(dispatches)" = 1 ]; } && ok "carry check prints nothing: carried with no second run" || bad "empty carry check rc=$rc dispatches=$(dispatches)"
+{ grep -q "^AMUX_LAND_REPLAY=$(git --git-dir="$H/origin.git" rev-parse main)$" "$H/carry-env" \
+  && grep -q '^AMUX_LAND_CANDIDATE=[0-9a-f]\{40\}$' "$H/carry-env" && grep -q '^AMUX_LAND_ONTO=[0-9a-f]\{40\}$' "$H/carry-env" && grep -q '^AMUX_LAND_BASE=[0-9a-f]\{40\}$' "$H/carry-env"; } \
+  && ok "carry check: given the base, the moved main, the candidate and the landed replay as full shas" || bad "carry env: $(cat "$H/carry-env" 2>/dev/null)"
+done_case
+
+setup; queue_on; commit_file g1 x; echo other.txt > "$H/move-main"
+git config amux.landMergeQueueCarryCheck 'echo engine; echo platform'
+land; rc=$?
+{ [ "$rc" = 0 ] && main_has g1 && [ "$(dispatches)" = 2 ] && grep -q "verdict=mq_carry_changes_members members=engine,platform" "$H/.amux/logs/land.log" \
+  && ! grep -q "replayed onto the new tip" "$H/.amux/logs/land.log"; } \
+  && ok "carry check names members: not carried, tested as a new candidate, then lands" || bad "member carry rc=$rc dispatches=$(dispatches); $(grep -a 'merge queue' "$H/.amux/logs/land.log" | tail -4)"
+done_case
+
+setup; queue_on; commit_file g1 x; echo other.txt > "$H/move-main"
+git config amux.landMergeQueueCarryCheck 'echo boom >&2; exit 3'
+land; rc=$?
+{ [ "$rc" = 0 ] && [ "$(dispatches)" = 2 ] && grep -q "verdict=mq_carry_unmeasured" "$H/.amux/logs/land.log"; } \
+  && ok "carry check fails: unjudged, so tested as a new candidate" || bad "failing carry check rc=$rc dispatches=$(dispatches); $(grep -a 'merge queue' "$H/.amux/logs/land.log" | tail -4)"
+done_case
+
+setup; queue_on; commit_file h x
+key="$(printf '%s %s' "$(git remote get-url origin)" main | shasum | cut -c1-16)"
+q="$H/.amux/locks/land-$key.q"; mkdir -p "$q"; PIDS=""
+plant w1 w1; plant w2 bad; plant w3 w3
+echo other.txt > "$H/move-main"
+git config amux.landMergeQueueCarryCheck 'echo engine'
+land; rc=$?
+{ grep -q "verdict=mq_carry_changes_members members=engine" "$H/.amux/logs/land.log" && ! grep -q "verdict=mq_prefix_carried" "$H/.amux/logs/land.log" \
+  && ! grep -q "verdict=mq_prefix_overlap" "$H/.amux/logs/land.log"; } \
+  && ok "red batch, main moved, carry check names a member: the prefix is not carried, tested again" || bad "member prefix rc=$rc; $(grep -a 'merge queue' "$H/.amux/logs/land.log" | tail -6)"
+kill $PIDS 2>/dev/null; wait 2>/dev/null
 done_case
 
 setup; queue_on; nocode; commit_file g1 x; echo research/notes.md > "$H/move-main"

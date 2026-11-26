@@ -113,6 +113,10 @@ struct Config: Codable {
     // Added 2026-10-19; optional so older desktop-config.json files still decode.
     var windows: [SavedWindow]?
     var menuBar: Bool?
+    // Computer use on this Mac (amux-computer.swift), off until the owner turns it on.
+    var computerUse: Bool?
+    // ⌥Space opens Quick Ask (amux-agentview.swift); on unless turned off.
+    var quickAsk: Bool?
     var notifications: Bool?
     var dockBadge: Bool?
     var layouts: [Layout]?
@@ -1044,12 +1048,16 @@ func registerHotKey() {
     var recRef: EventHotKeyRef?
     RegisterEventHotKey(UInt32(kVK_ANSI_R), UInt32(controlKey | optionKey), EventHotKeyID(signature: OSType(0x616D7578), id: 2),
                         GetApplicationEventTarget(), 0, &recRef)
+    // Command-Shift-Escape stops computer use from any app (amux-computer.swift).
+    var stopRef: EventHotKeyRef?
+    RegisterEventHotKey(UInt32(kVK_Escape), UInt32(cmdKey | shiftKey), EventHotKeyID(signature: OSType(0x616D7578), id: 3),
+                        GetApplicationEventTarget(), 0, &stopRef)
     var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
     InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
         var hk = EventHotKeyID()
         GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
                           MemoryLayout<EventHotKeyID>.size, nil, &hk)
-        DispatchQueue.main.async { if hk.id == 2 { recordHotKeyHandler?() } else { hotKeyHandler?() } }
+        DispatchQueue.main.async { if hk.id == 2 { recordHotKeyHandler?() } else if hk.id == 3 { stopComputerUseHotKey() } else if hk.id == 4 { QuickAsk.shared.toggle() } else { hotKeyHandler?() } }
         return noErr
     }, 1, &spec, nil, nil)
 }
@@ -1059,7 +1067,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     var config = loadConfig()
     var controllers: [DashboardWindowController] = []
     var overlays: [OverlayController] = []
-    var menuBar: MenuBarController?
+    var menuBar: AppStatusMenu?
     var pins: [[String: Any]] = []
     var pinsMenu = NSMenu(title: "Pins")
     var needsKeys: Set<String>? = nil
@@ -1067,6 +1075,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     var pinsTimer: Timer?
     var terminating = false
     var lastNeedsCount = 0
+    var lastNeedsItems: [[String: Any]] = []
     var settings: SettingsWindowController?
     let layoutsMenu = NSMenu(title: "Workspaces")
     // amux-workspace.swift
@@ -1155,7 +1164,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         hotKeyHandler = { [weak self] in self?.toggleVisible() }
         registerHotKey()
         setUpRecorder()
+        MicWatch.shared.start()
         startMenuBarItem()
+        startComputerUse()
+        AgentWatch.shared.start(self)
+        // A quiet test copy must not take ⌥Space from the owner's apps.
+        if !desktopTestQuiet { setQuickAskHotKey(config.quickAsk ?? true) }
+        MacPermissions.refreshNotifications()
         setUpNotifications()
         refreshPins()
         pinsTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refreshPins() }
@@ -1278,6 +1293,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             self.config = c
             saveConfig(c)
             NSLog("amux-desktop: verdict=windows_saved_on_quit n=%d", windows.count)
+            MacComputer.shared.stop(reason: "quit")
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -1756,29 +1772,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         openWindow(url: url(withHash: "#view=files"), frame: nil)
     }
 
-    // ── Menu bar readout (scripts/amux-menubar.swift) ──
+    // ── The amux icon in the menu bar (amux-statusmenu.swift) ──
+    /// Shown with or without a server: with none, it offers Connect to Server.
     func startMenuBarItem() {
         menuBar?.stop()
         menuBar = nil
-        guard config.menuBar ?? true, let s = serverURL else { return }
-        // The standalone readout (make menubar) already owns a status item.
-        if standaloneMenuBarRunning() { return }
-        menuBar = MenuBarController(apiBase: normalized(s.absoluteString))
-        menuBar?.authToken = { [weak self] go in
-            guard let self = self else { go(nil); return }
-            DispatchQueue.main.async { self.withAPIToken(go) }
-        }
+        guard config.menuBar ?? true else { dlog("verdict=status_menu_off"); return }
+        menuBar = AppStatusMenu(app: self)
+        menuBar?.setNeeds(count: lastNeedsCount, items: lastNeedsItems)
+        pollComputers()
     }
 
-    func standaloneMenuBarRunning() -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-x", "amux-menubar"]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return false }
-        p.waitUntilExit()
-        return p.terminationStatus == 0
+    func pollComputers() {
+        guard menuBar != nil else { return }
+        api("/api/computer/status") { [weak self] obj in self?.menuBar?.setComputers(obj as? [String: Any]) }
     }
 
     @objc func toggleMenuBarItem(_ sender: NSMenuItem) {
@@ -1809,13 +1816,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     func pollNeedsInput() {
         api("/api/needs-input") { [weak self] obj in
             guard let self = self else { return }
+            self.pollComputers()
             guard let d = obj as? [String: Any] else {
                 NSApp.dockTile.badgeLabel = nil
+                // Forget them too: a menu bar item made later must not show workers from before the outage.
+                self.lastNeedsCount = 0
+                self.lastNeedsItems = []
+                self.menuBar?.setNeeds(count: 0, items: [])
                 return
             }
             self.lastNeedsCount = (d["count"] as? Int) ?? 0
             self.applyBadge()
             let items = (d["items"] as? [[String: Any]]) ?? []
+            self.lastNeedsItems = items
+            self.menuBar?.setNeeds(count: self.lastNeedsCount, items: items)
             let keys = Set(items.compactMap { $0["key"] as? String })
             // The first poll only learns what is already waiting.
             if let before = self.needsKeys, self.config.notifications ?? true {

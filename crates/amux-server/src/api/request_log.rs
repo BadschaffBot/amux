@@ -45,6 +45,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Caps, all applied BEFORE a row enters the channel. Everything stored is
 /// bounded; nothing about a request can make its row large.
@@ -68,6 +70,10 @@ const ERROR_BODY_CHARS: usize = 2000;
 const QUEUE_CAP: usize = 10_000;
 /// Max rows folded into one write transaction.
 const BATCH_MAX: usize = 512;
+/// How long the flush task holds a batch open after its first row, so rows
+/// from requests that arrive close together share one write transaction.
+/// Log visibility lags by at most this much; the request path never waits.
+const LINGER: std::time::Duration = std::time::Duration::from_millis(10);
 /// Retention sweep cadence: once per this many inserted rows.
 const SWEEP_EVERY: u64 = 1000;
 const DEFAULT_RETAIN_DAYS: f64 = 14.0;
@@ -156,6 +162,10 @@ pub(crate) fn host_load1() -> Option<f64> {
 #[derive(Clone)]
 pub struct RequestLogger {
     tx: tokio::sync::mpsc::Sender<LogRow>,
+    /// Write transactions issued by the flush task (one per batch). Divided
+    /// by requests logged, it is the writes-per-request figure this module is
+    /// tuned against.
+    flushes: Arc<AtomicU64>,
 }
 
 impl RequestLogger {
@@ -167,21 +177,32 @@ impl RequestLogger {
     /// can be exercised without inserting 1000 rows.
     pub fn spawn_with(store: SharedStore, retain_days: f64, sweep_every: u64) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LogRow>(QUEUE_CAP);
+        let flushes = Arc::new(AtomicU64::new(0));
         // No runtime (a sync-context caller building a router for
         // inspection): rows will be dropped at send. Every production and
         // test caller runs inside tokio, so this is a guard, not a path.
         if tokio::runtime::Handle::try_current().is_err() {
             tracing::warn!("request log: no tokio runtime at spawn — rows will be dropped");
-            return Self { tx };
+            return Self { tx, flushes };
         }
+        let flush_counter = flushes.clone();
         tokio::spawn(async move {
             let mut since_sweep: u64 = 0;
             while let Some(first) = rx.recv().await {
                 let mut batch = vec![first];
+                let linger_until = tokio::time::Instant::now() + LINGER;
                 while batch.len() < BATCH_MAX {
                     match rx.try_recv() {
-                        Ok(r) => batch.push(r),
-                        Err(_) => break,
+                        Ok(r) => {
+                            batch.push(r);
+                            continue;
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    }
+                    match tokio::time::timeout_at(linger_until, rx.recv()).await {
+                        Ok(Some(r)) => batch.push(r),
+                        _ => break,
                     }
                 }
                 since_sweep += batch.len() as u64;
@@ -195,6 +216,7 @@ impl RequestLogger {
                 // AMUX-3646: what the HOST was doing. Once per batch, beside
                 // `boot` and for the same reason.
                 let load1 = host_load1();
+                flush_counter.fetch_add(1, Ordering::Relaxed);
                 let res = store
                     .write_async(move |conn| {
                         {
@@ -305,7 +327,12 @@ impl RequestLogger {
                 }
             }
         });
-        Self { tx }
+        Self { tx, flushes }
+    }
+
+    /// Write transactions this logger has issued (see `flushes`).
+    pub fn flush_count(&self) -> u64 {
+        self.flushes.load(Ordering::Relaxed)
     }
 
     fn send(&self, row: LogRow) {
@@ -1150,7 +1177,11 @@ pub(crate) fn count_within(
     let _ = timer.join();
     match got {
         Ok(n) => Ok(Some(n)),
-        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::OperationInterrupted => Ok(None),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::OperationInterrupted =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(e),
     }
 }
@@ -2065,6 +2096,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/palette/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/palette/visit",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/palette/history/import",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/pinned",
         methods: &["GET", "POST"],
     },
@@ -2708,6 +2751,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
+        path: "/api/browser/watch",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/watch/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/watch/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/computer/start",
         methods: &["POST"],
     },
@@ -2753,6 +2808,30 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/computer/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/tools",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/call",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/activity",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/broker/next",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/broker/result",
         methods: &["POST"],
     },
     // -- file viewer / files / fs
@@ -3149,10 +3228,22 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     // -- realtime rooms (api/rt.rs): WebSocket + SSE/POST fallback + debug
-    RouteEntry { path: "/api/rt", methods: &["GET"] },
-    RouteEntry { path: "/api/rt/events", methods: &["GET"] },
-    RouteEntry { path: "/api/rt/send", methods: &["POST"] },
-    RouteEntry { path: "/api/debug/rt", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/rt",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/rt/events",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/rt/send",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/debug/rt",
+        methods: &["GET"],
+    },
     // -- composer typing presence (api/typing.rs, AC-474)
     RouteEntry {
         path: "/api/sessions/{name}/typing",
@@ -3179,35 +3270,113 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     // -- the task each worker was on at given times (sessions_legacy::task_at_batch)
-    RouteEntry { path: "/api/task-history/at", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/task-history/at",
+        methods: &["GET"],
+    },
     // -- one task's commits, closed requests and handoff (sessions_legacy::task_links)
-    RouteEntry { path: "/api/task-history/links", methods: &["GET"] },
-    RouteEntry { path: "/api/task-history/requests", methods: &["GET"] },
+    RouteEntry {
+        path: "/api/task-history/links",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/task-history/requests",
+        methods: &["GET"],
+    },
     // -- Converse tab: voice conversations with a worker (api/converse.rs)
-    RouteEntry { path: "/api/converse/config", methods: &["GET"] },
-    RouteEntry { path: "/api/converse/sweep", methods: &["POST"] },
-    RouteEntry { path: "/api/converse/{worker}/realtime-session", methods: &["POST"] },
-    RouteEntry { path: "/api/converse/{worker}/conversations", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/converse/{worker}/conversations/{id}", methods: &["GET", "DELETE"] },
-    RouteEntry { path: "/api/converse/{worker}/conversations/{id}/audio", methods: &["GET", "PUT"] },
+    RouteEntry {
+        path: "/api/converse/config",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/converse/sweep",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/converse/{worker}/realtime-session",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/converse/{worker}/conversations",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/converse/{worker}/conversations/{id}",
+        methods: &["GET", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/converse/{worker}/conversations/{id}/audio",
+        methods: &["GET", "PUT"],
+    },
     // -- Messages: channels, direct messages, worker threads (api/conversations.rs)
-    RouteEntry { path: "/api/conversations", methods: &["GET"] },
-    RouteEntry { path: "/api/conversations/search", methods: &["GET"] },
-    RouteEntry { path: "/api/conversations/mentions", methods: &["GET"] },
-    RouteEntry { path: "/api/conversations/{conv}/posts", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/conversations/{conv}/read", methods: &["POST"] },
-    RouteEntry { path: "/api/conversations/{conv}/typing", methods: &["POST"] },
-    RouteEntry { path: "/api/conversations/posts/{id}", methods: &["PATCH", "DELETE"] },
-    RouteEntry { path: "/api/conversations/posts/{id}/reactions", methods: &["POST"] },
-    RouteEntry { path: "/api/conversations/posts/{id}/pin", methods: &["POST"] },
-    RouteEntry { path: "/api/conversations/unfurl", methods: &["GET"] },
-    RouteEntry { path: "/api/conversations/channels", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/conversations/channels/{name}", methods: &["PATCH"] },
-    RouteEntry { path: "/api/conversations/channels/{name}/members", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/conversations/channels/{name}/members/{email}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/profiles", methods: &["GET"] },
-    RouteEntry { path: "/api/profiles/avatar/{name}", methods: &["GET"] },
-    RouteEntry { path: "/api/profiles/{key}/avatar", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/conversations",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/conversations/search",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/conversations/mentions",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/conversations/{conv}/posts",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/conversations/{conv}/read",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/conversations/{conv}/typing",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/conversations/posts/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/conversations/posts/{id}/reactions",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/conversations/posts/{id}/pin",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/conversations/unfurl",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/conversations/channels",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/conversations/channels/{name}",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/conversations/channels/{name}/members",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/conversations/channels/{name}/members/{email}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/profiles",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/profiles/avatar/{name}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/profiles/{key}/avatar",
+        methods: &["POST"],
+    },
     // -- saved messages / habits / token-baseline reset (AMUX-2871)
     RouteEntry {
         path: "/api/saved-messages",
@@ -3252,20 +3421,59 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["DELETE"],
     },
     // The chat bridge (api/bridge.rs).
-    RouteEntry { path: "/api/bridge", methods: &["GET"] },
-    RouteEntry { path: "/api/bridge/links", methods: &["POST"] },
-    RouteEntry { path: "/api/bridge/links/{platform}/{conversation}", methods: &["DELETE"] },
-    RouteEntry { path: "/api/bridge/outbound/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/bridge/outbound/{id}/approve", methods: &["POST"] },
-    RouteEntry { path: "/api/bridge/hook/whatsapp", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/bridge/hook/slack", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/bridge",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/bridge/links",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/bridge/links/{platform}/{conversation}",
+        methods: &["DELETE"],
+    },
+    RouteEntry {
+        path: "/api/bridge/outbound/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/bridge/outbound/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/bridge/hook/whatsapp",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/bridge/hook/slack",
+        methods: &["POST"],
+    },
     // Outbound phone calls (api/calls.rs).
-    RouteEntry { path: "/api/calls", methods: &["GET", "POST"] },
-    RouteEntry { path: "/api/calls/{id}", methods: &["GET"] },
-    RouteEntry { path: "/api/calls/{id}/approve", methods: &["POST"] },
-    RouteEntry { path: "/api/calls/{id}/decline", methods: &["POST"] },
-    RouteEntry { path: "/api/calls/{id}/events", methods: &["POST"] },
-    RouteEntry { path: "/api/calls/{id}/result", methods: &["POST"] },
+    RouteEntry {
+        path: "/api/calls",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/calls/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/calls/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/calls/{id}/decline",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/calls/{id}/events",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/calls/{id}/result",
+        methods: &["POST"],
+    },
     // The owner's approval of an owner-gated change (scripts/land_gate.py).
     RouteEntry {
         path: "/api/land/approvals",
@@ -3357,6 +3565,82 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/crm/followups",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/accounts",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/accounts/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/deals",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/deals/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/lookalikes",
+        methods: &["POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/summary",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/due",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/{id}/observed",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}/done",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}/enroll",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/contacts/{id}/brief",
         methods: &["GET"],
     },
     // Speedtest (AMUX-2890): the Metrics tab's Run-speed-test button, unrouted
@@ -5990,16 +6274,29 @@ mod tests {
         let t0 = std::time::Instant::now();
         let got = count_within(&conn, endless, &[], std::time::Duration::from_millis(100)).unwrap();
         assert_eq!(got, None, "an interrupted count is not a number");
-        assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the budget bounds it: {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "the budget bounds it: {:?}",
+            t0.elapsed()
+        );
         let quick = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 1000) SELECT COUNT(*) FROM c";
-        assert_eq!(count_within(&conn, quick, &[], std::time::Duration::from_millis(300)).unwrap(), Some(1000));
+        assert_eq!(
+            count_within(&conn, quick, &[], std::time::Duration::from_millis(300)).unwrap(),
+            Some(1000)
+        );
         // The statement after runs longer than that 300ms budget. A timer left
         // running past the quick count would fire inside it and abort it.
         let long = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 20000000) SELECT COUNT(*) FROM c";
         let t1 = std::time::Instant::now();
-        let after: i64 = conn.query_row(long, [], |r| r.get(0)).expect("the next statement is not interrupted");
+        let after: i64 = conn
+            .query_row(long, [], |r| r.get(0))
+            .expect("the next statement is not interrupted");
         assert_eq!(after, 20_000_000);
-        assert!(t1.elapsed() > std::time::Duration::from_millis(300), "the after-statement must outlast the budget to test anything: {:?}", t1.elapsed());
+        assert!(
+            t1.elapsed() > std::time::Duration::from_millis(300),
+            "the after-statement must outlast the budget to test anything: {:?}",
+            t1.elapsed()
+        );
     }
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -6423,6 +6720,47 @@ mod tests {
             .query_row("SELECT path FROM _amux_request_log", [], |r| r.get(0))
             .unwrap();
         assert_eq!(path, "/api/board");
+    }
+
+    /// AMUX-434b evidence: write transactions per 100 logged requests, for a
+    /// single caller (sequential) and for a burst of concurrent callers.
+    #[tokio::test]
+    async fn writes_per_100_requests_measured() {
+        for mode in ["sequential", "burst"] {
+            let (store, _dir) = store();
+            let logger = RequestLogger::spawn_with(store.clone(), 14.0, 1_000_000);
+            let app = test_app(logger.clone());
+            let req = || {
+                HttpRequest::builder()
+                    .uri("/api/sessions/w1/peek?lines=5")
+                    .header("x-amux-session", "bench-lane")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            if mode == "sequential" {
+                for _ in 0..100 {
+                    assert_eq!(hit(&app, req()).await.0, StatusCode::OK);
+                }
+            } else {
+                let futs: Vec<_> = (0..100).map(|_| hit(&app, req())).collect();
+                for (st, _) in futures::future::join_all(futs).await {
+                    assert_eq!(st, StatusCode::OK);
+                }
+            }
+            assert_eq!(wait_rows(&store, 100).await, 100);
+            println!(
+                "MEASURE mode={mode} requests=100 rows=100 write_transactions={}",
+                logger.flush_count()
+            );
+            if mode == "burst" {
+                // 100 concurrent requests must share a handful of writes, not one each.
+                assert!(
+                    logger.flush_count() <= 10,
+                    "burst not batched: {}",
+                    logger.flush_count()
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -904,6 +904,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "0168_sso_mfa_scim",
         sql: include_str!("../../migrations/0168_sso_mfa_scim.sql"),
     },
+    Migration {
+        version: 169,
+        name: "0169_crm_accounts_deals",
+        sql: include_str!("../../migrations/0169_crm_accounts_deals.sql"),
+    },
+    Migration {
+        version: 170,
+        name: "0170_crm_channels_touches",
+        sql: include_str!("../../migrations/0170_crm_channels_touches.sql"),
+    },
+    Migration {
+        version: 171,
+        name: "0171_crm_sequences",
+        sql: include_str!("../../migrations/0171_crm_sequences.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
