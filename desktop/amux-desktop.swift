@@ -113,6 +113,10 @@ struct Config: Codable {
     // Added 2026-10-19; optional so older desktop-config.json files still decode.
     var windows: [SavedWindow]?
     var menuBar: Bool?
+    // Computer use on this Mac (amux-computer.swift), off until the owner turns it on.
+    var computerUse: Bool?
+    // ⌥Space opens Quick Ask (amux-agentview.swift); on unless turned off.
+    var quickAsk: Bool?
     var notifications: Bool?
     var dockBadge: Bool?
     var layouts: [Layout]?
@@ -423,11 +427,21 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     /// A restored tab that is not showing waits to load (launch speed, 2026-10-25):
     /// the shown tabs load first, then these one at a time, or at once when picked.
     var deferredURL: URL?
+    /// The page was unloaded to free memory after a long time out of sight
+    /// (AppDelegate.discardHiddenTabs); it comes back when it is shown, never
+    /// from the background queue.
+    var discarded = false
+    var discardedAt = Date.distantPast
 
     func loadDeferred(_ why: String) {
         guard let u = deferredURL else { return }
         deferredURL = nil
-        dlog("verdict=deferred_tab_loaded why=\(why) url=\(u.fragment ?? "")")
+        if discarded {
+            discarded = false
+            dlog("verdict=discarded_tab_restored why=\(why) away_s=\(Int(-discardedAt.timeIntervalSinceNow)) url=\(u.fragment ?? "")")
+        } else {
+            dlog("verdict=deferred_tab_loaded why=\(why) url=\(u.fragment ?? "")")
+        }
         load(u)
     }
 
@@ -529,6 +543,9 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         // Dictation on device (amux-dictation.swift, app.js _dictNativeStart).
         cfg.userContentController.removeScriptMessageHandler(forName: "amuxDictation")
         cfg.userContentController.add(WeakScriptHandler(self), name: "amuxDictation")
+        // Settings > This Mac (app.js _macSettings*, amux-settings.swift settingsAction).
+        cfg.userContentController.removeScriptMessageHandler(forName: "amuxSettings")
+        cfg.userContentController.add(WeakScriptHandler(self), name: "amuxSettings")
         webView.navigationDelegate = self
         webView.uiDelegate = self
         themeObservation = webView.observe(\.themeColor, options: [.initial, .new]) { [weak self] wv, _ in
@@ -552,6 +569,13 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             if webView.url.map({ app?.isServerURL($0) ?? false }) ?? false, let d = message.body as? [String: Any] {
                 NativeDictation.shared.message(d, from: self)
             }
+            return
+        }
+        if message.name == "amuxSettings" {
+            // Only a page on this tab's own server reads or changes this Mac's settings.
+            guard webView.url.map({ app?.isServerURL($0) ?? false }) ?? false, let app = app,
+                  let d = message.body as? [String: Any] else { return }
+            if (d["action"] as? String) == "state" { app.tellMacSettings(self) } else { app.settingsAction(d) }
             return
         }
         if message.name == "amuxZoom" {
@@ -806,6 +830,8 @@ class DashboardWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     // its saved view, and report it.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         if memoryKillPending { memoryKillPending = false; return }
+        // A discarded page's blank stand-in: it loads again when shown.
+        if discarded { return }
         dlog("verdict=webcontent_terminated view=\(viewHash) url=\(webView.url?.absoluteString ?? "-")")
         app?.beaconFrom(self, ["kind": "desktop-web-process-ended", "verdict": "webcontent_terminated", "measured": true,
                                "n_considered": 1, "view": viewHash])
@@ -1044,12 +1070,16 @@ func registerHotKey() {
     var recRef: EventHotKeyRef?
     RegisterEventHotKey(UInt32(kVK_ANSI_R), UInt32(controlKey | optionKey), EventHotKeyID(signature: OSType(0x616D7578), id: 2),
                         GetApplicationEventTarget(), 0, &recRef)
+    // Command-Shift-Escape stops computer use from any app (amux-computer.swift).
+    var stopRef: EventHotKeyRef?
+    RegisterEventHotKey(UInt32(kVK_Escape), UInt32(cmdKey | shiftKey), EventHotKeyID(signature: OSType(0x616D7578), id: 3),
+                        GetApplicationEventTarget(), 0, &stopRef)
     var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
     InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
         var hk = EventHotKeyID()
         GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
                           MemoryLayout<EventHotKeyID>.size, nil, &hk)
-        DispatchQueue.main.async { if hk.id == 2 { recordHotKeyHandler?() } else { hotKeyHandler?() } }
+        DispatchQueue.main.async { if hk.id == 2 { recordHotKeyHandler?() } else if hk.id == 3 { stopComputerUseHotKey() } else if hk.id == 4 { QuickAsk.shared.toggle() } else { hotKeyHandler?() } }
         return noErr
     }, 1, &spec, nil, nil)
 }
@@ -1059,7 +1089,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     var config = loadConfig()
     var controllers: [DashboardWindowController] = []
     var overlays: [OverlayController] = []
-    var menuBar: MenuBarController?
+    var menuBar: AppStatusMenu?
     var pins: [[String: Any]] = []
     var pinsMenu = NSMenu(title: "Pins")
     var needsKeys: Set<String>? = nil
@@ -1067,6 +1097,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     var pinsTimer: Timer?
     var terminating = false
     var lastNeedsCount = 0
+    var lastNeedsItems: [[String: Any]] = []
     var settings: SettingsWindowController?
     let layoutsMenu = NSMenu(title: "Workspaces")
     // amux-workspace.swift
@@ -1098,12 +1129,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         NSApp.dockTile.badgeLabel = show && lastNeedsCount > 0 ? String(lastNeedsCount) : nil
     }
 
-    @objc func toggleDockBadge(_ sender: Any?) {
-        config = loadConfig()
-        config.dockBadge = !(config.dockBadge ?? true)
-        saveConfig(config)
-        applyBadge()
-    }
 
     var serverURL: URL? {
         config.connections.isEmpty ? nil : URL(string: normalized(config.lastUrl))
@@ -1131,6 +1156,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // An update check (from either Settings surface, or on its own) redraws both.
+        Updater.shared.changed = { [weak self] in self?.settingsChanged() }
         routeStderrToLogFile()
         QuietTestCopy.start()
         registerTextCheckingDefaults()
@@ -1155,7 +1182,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         hotKeyHandler = { [weak self] in self?.toggleVisible() }
         registerHotKey()
         setUpRecorder()
+        MicWatch.shared.start()
         startMenuBarItem()
+        startComputerUse()
+        AgentWatch.shared.start(self)
+        // A quiet test copy must not take ⌥Space from the owner's apps.
+        if !desktopTestQuiet { setQuickAskHotKey(config.quickAsk ?? true) }
+        MacPermissions.refreshNotifications()
         setUpNotifications()
         refreshPins()
         pinsTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.refreshPins() }
@@ -1163,7 +1196,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         needsTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.pollNeedsInput() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in self?.reportResources() }
         resourcesTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in self?.reportResources() }
-        memoryGuardTimer = Timer.scheduledTimer(withTimeInterval: envSeconds("AMUX_DESKTOP_MEM_TICK_S", 60), repeats: true) { [weak self] _ in self?.guardTabMemory() }
+        memoryGuardTimer = Timer.scheduledTimer(withTimeInterval: envSeconds("AMUX_DESKTOP_MEM_TICK_S", 60), repeats: true) { [weak self] _ in
+            self?.guardTabMemory()
+            self?.discardHiddenTabs()
+        }
+        // A discarded page loads again the moment it is on screen: a tab picked
+        // in the tab bar, a window brought forward, a pane's tab selected.
+        for n in [NSWindow.didBecomeKeyNotification, NSWindow.didBecomeMainNotification, NSWindow.didChangeOcclusionStateNotification] {
+            NotificationCenter.default.addObserver(forName: n, object: nil, queue: .main) { [weak self] _ in self?.wakeShownDiscarded() }
+        }
+        // A tab chosen with no window becoming key (AppKit posts nothing for
+        // that) is caught within a second; only while a page is discarded.
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self = self, self.controllers.contains(where: { $0.discarded }) else { return }
+            self.wakeShownDiscarded()
+        }
         activateApp()
         // `amux amux://worker/x` on the command line, once the pins are known.
         let links = CommandLine.arguments.dropFirst().compactMap { URL(string: $0) }.filter { $0.scheme == "amux" }
@@ -1278,6 +1325,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             self.config = c
             saveConfig(c)
             NSLog("amux-desktop: verdict=windows_saved_on_quit n=%d", windows.count)
+            MacComputer.shared.stop(reason: "quit")
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -1500,6 +1548,71 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
             }
             c.webView.load(URLRequest(url: target))
         }
+    }
+
+    // ── Discard (owner, 2026-11-25: "make it faster to open, load, refresh") ──
+    // Every tab, and every tab inside a pane, is a whole dashboard in its own
+    // web process: 57 of them held 27 GB with 13 GB of swap in use, and the
+    // swapping slowed every window, the shown ones too. A page nobody has
+    // looked at for half an hour is unloaded while the tabs together are over
+    // a budget, oldest first. Its tab, title and place stay; it loads again,
+    // on the view it had, the moment it is shown (as a browser discards tabs).
+    // AMUX_DESKTOP_DISCARD_HIDDEN_S=0 turns it off.
+    func discardHiddenTabs() {
+        let minHidden = envSeconds("AMUX_DESKTOP_DISCARD_HIDDEN_S", 1800)
+        guard minHidden > 0 else { return }
+        let ramMB = Int(ProcessInfo.processInfo.physicalMemory / 1_048_576)
+        let budget = Int(envSeconds("AMUX_DESKTOP_WEB_BUDGET_MB", Double(max(4096, ramMB / 8))))
+        let pidKey = NSSelectorFromString("_webProcessIdentifier")
+        var pidOf: [ObjectIdentifier: pid_t] = [:], users: [pid_t: Int] = [:], mbOf: [pid_t: Int] = [:]
+        for c in controllers where c.webView.responds(to: pidKey) {
+            guard let pid = (c.webView.value(forKey: "_webProcessIdentifier") as? NSNumber)?.int32Value, pid > 0 else { continue }
+            pidOf[ObjectIdentifier(c)] = pid
+            users[pid, default: 0] += 1
+            if mbOf[pid] == nil { mbOf[pid] = footprintMB(pid) ?? 0 }
+        }
+        var total = mbOf.values.reduce(0, +)
+        guard total > budget else { return }
+        let now = Date()
+        let live = { (c: DashboardWindowController) -> Bool in
+            !c.discarded && c.deferredURL == nil && (c.webView.url?.scheme == "https" || c.webView.url?.scheme == "http")
+        }
+        let candidates = controllers.filter { c in
+            live(c) && !isShown(c) && now.timeIntervalSince(c.lastShown) >= minHidden && !c.memoryKillPending
+        }.sorted { $0.lastShown < $1.lastShown }
+        let maxPerTick = Int(envSeconds("AMUX_DESKTOP_DISCARD_PER_TICK", 6))
+        var n = 0
+        for c in candidates where total > budget && n < maxPerTick {
+            guard let pid = pidOf[ObjectIdentifier(c)], users[pid] == 1, let url = c.webView.url else { continue }
+            // Keep one live page per server: beacons, the Dock count and the
+            // workspaces sync go through a page.
+            let origin = c.serverOrigin
+            guard controllers.contains(where: { $0 !== c && live($0) && $0.serverOrigin == origin }) else { continue }
+            let mb = mbOf[pid] ?? 0
+            let target = c.savedURL().flatMap { URL(string: $0) } ?? url
+            if c.pageLabel.isEmpty { c.pageLabel = c.pageTitle }
+            c.lastServerURL = target
+            c.deferredURL = target
+            c.discarded = true
+            c.discardedAt = now
+            let kill = NSSelectorFromString("_killWebContentProcessAndResetState")
+            if c.webView.responds(to: kill) { c.memoryKillPending = true; c.webView.perform(kill) }
+            c.webView.load(URLRequest(url: URL(string: "about:blank")!))
+            total -= mb
+            n += 1
+            dlog("verdict=tab_discarded mb=\(mb) hidden_s=\(Int(now.timeIntervalSince(c.lastShown))) web_mb_total=\(total + mb) budget_mb=\(budget) view=\(c.viewHash)")
+        }
+        if n > 0 {
+            dlog("verdict=tabs_discarded n=\(n) candidates=\(candidates.count) web_mb_after=\(total) budget_mb=\(budget)")
+            beaconFrom(controllers.first { live($0) } ?? controllers[0],
+                       ["kind": "desktop-tabs-discarded", "verdict": "tabs_discarded", "measured": true, "n_considered": candidates.count,
+                        "discarded": n, "web_mb_after": total, "budget_mb": budget])
+        }
+    }
+
+    /// Load every discarded page that is on screen now.
+    func wakeShownDiscarded() {
+        for c in controllers where c.discarded && isShown(c) { c.loadDeferred("shown") }
     }
 
     /// Whether the person is working in this page now: its window is the key
@@ -1756,37 +1869,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         openWindow(url: url(withHash: "#view=files"), frame: nil)
     }
 
-    // ── Menu bar readout (scripts/amux-menubar.swift) ──
+    // ── The amux icon in the menu bar (amux-statusmenu.swift) ──
+    /// Shown with or without a server: with none, it offers Connect to Server.
     func startMenuBarItem() {
         menuBar?.stop()
         menuBar = nil
-        guard config.menuBar ?? true, let s = serverURL else { return }
-        // The standalone readout (make menubar) already owns a status item.
-        if standaloneMenuBarRunning() { return }
-        menuBar = MenuBarController(apiBase: normalized(s.absoluteString))
-        menuBar?.authToken = { [weak self] go in
-            guard let self = self else { go(nil); return }
-            DispatchQueue.main.async { self.withAPIToken(go) }
-        }
+        guard config.menuBar ?? true else { dlog("verdict=status_menu_off"); return }
+        menuBar = AppStatusMenu(app: self)
+        menuBar?.setNeeds(count: lastNeedsCount, items: lastNeedsItems)
+        pollComputers()
     }
 
-    func standaloneMenuBarRunning() -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-x", "amux-menubar"]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return false }
-        p.waitUntilExit()
-        return p.terminationStatus == 0
+    func pollComputers() {
+        guard menuBar != nil else { return }
+        api("/api/computer/status") { [weak self] obj in self?.menuBar?.setComputers(obj as? [String: Any]) }
     }
 
-    @objc func toggleMenuBarItem(_ sender: NSMenuItem) {
-        config = loadConfig()
-        config.menuBar = !(config.menuBar ?? true)
-        saveConfig(config)
-        startMenuBarItem()
-    }
 
     // ── Needs you: Dock badge and notifications ──
     /// Notifications need a real .app bundle: UNUserNotificationCenter throws
@@ -1809,13 +1907,20 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     func pollNeedsInput() {
         api("/api/needs-input") { [weak self] obj in
             guard let self = self else { return }
+            self.pollComputers()
             guard let d = obj as? [String: Any] else {
                 NSApp.dockTile.badgeLabel = nil
+                // Forget them too: a menu bar item made later must not show workers from before the outage.
+                self.lastNeedsCount = 0
+                self.lastNeedsItems = []
+                self.menuBar?.setNeeds(count: 0, items: [])
                 return
             }
             self.lastNeedsCount = (d["count"] as? Int) ?? 0
             self.applyBadge()
             let items = (d["items"] as? [[String: Any]]) ?? []
+            self.lastNeedsItems = items
+            self.menuBar?.setNeeds(count: self.lastNeedsCount, items: items)
             let keys = Set(items.compactMap { $0["key"] as? String })
             // The first poll only learns what is already waiting.
             if let before = self.needsKeys, self.config.notifications ?? true {
@@ -1988,9 +2093,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         }
     }
 
-    @objc func toggleNotifications(_ sender: NSMenuItem) {
-        setNotifications(!(loadConfig().notifications ?? true), source: "menu")
-    }
 
     /// The one switch for this Mac's notifications (needs-you and Messages).
     /// The menu, the app's Settings and any dashboard page set it; every page
@@ -2132,11 +2234,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
     @objc func zoomReset(_ sender: Any?) { zoom("resetZoom") { $0.pageZoom = 1 } }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        if item.action == #selector(toggleMenuBarItem(_:)) { item.state = (config.menuBar ?? true) ? .on : .off }
-        if item.action == #selector(toggleNotifications(_:)) { item.state = (config.notifications ?? true) ? .on : .off }
-        if item.action == #selector(toggleDockBadge(_:)) { item.state = (config.dockBadge ?? true) ? .on : .off }
         if item.action == #selector(toggleSnap(_:)) { item.state = snapEnabled ? .on : .off }
-        if item.action == #selector(toggleZoomAllWindows(_:)) { item.state = zoomAllWindows ? .on : .off }
         // Window > Panes acts on a window split into panes; elsewhere its keys
         // (⌘1-9 among them) go on to the page.
         let paneActions: [Selector] = [#selector(paneCloseTab(_:)), #selector(paneZoom(_:)), #selector(paneNextTab(_:)),
@@ -2155,10 +2253,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifi
         let m = NSMenu()
         m.addItem(withTitle: "New Window", action: #selector(newWindow(_:)), keyEquivalent: "").target = self
         m.addItem(withTitle: "New Tab", action: #selector(newTabAction(_:)), keyEquivalent: "").target = self
-        let badge = NSMenuItem(title: "Show Count on Dock Icon", action: #selector(toggleDockBadge(_:)), keyEquivalent: "")
-        badge.target = self
-        badge.state = (config.dockBadge ?? true) ? .on : .off
-        m.addItem(badge)
         let p = NSMenuItem(title: "Pins", action: nil, keyEquivalent: "")
         let copy = NSMenu(title: "Pins")
         for it in pinsMenu.items { copy.addItem(it.copy() as! NSMenuItem) }
@@ -2222,11 +2316,9 @@ func buildMenuBar(_ d: AppDelegate) {
     add(appMenu, "About amux", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), "")
     appMenu.addItem(.separator())
     add(appMenu, "Check for Updates…", #selector(AppDelegate.checkForUpdates(_:)), "", target: d)
+    // Every setting is in Settings (its This Mac tab for this app's own), so
+    // the menus carry no second copy of a switch (owner, 2026-11-25).
     add(appMenu, "Settings…", #selector(AppDelegate.showSettings(_:)), ",", target: d)
-    appMenu.addItem(.separator())
-    add(appMenu, "Show in Menu Bar", #selector(AppDelegate.toggleMenuBarItem(_:)), "", target: d)
-    add(appMenu, "Notify When amux Needs You", #selector(AppDelegate.toggleNotifications(_:)), "", target: d)
-    add(appMenu, "Show Count on Dock Icon", #selector(AppDelegate.toggleDockBadge(_:)), "", target: d)
     appMenu.addItem(.separator())
     add(appMenu, "Hide amux", #selector(NSApplication.hide(_:)), "h")
     add(appMenu, "Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option])
@@ -2291,7 +2383,6 @@ func buildMenuBar(_ d: AppDelegate) {
     add(view, "Zoom In", #selector(AppDelegate.zoomIn(_:)), "+", target: d)
     add(view, "Zoom Out", #selector(AppDelegate.zoomOut(_:)), "-", target: d)
     add(view, "Actual Size", #selector(AppDelegate.zoomReset(_:)), "0", target: d)
-    add(view, "Zoom All Windows", #selector(AppDelegate.toggleZoomAllWindows(_:)), "", target: d)
     view.addItem(.separator())
     add(view, "Show Tab Bar", #selector(NSWindow.toggleTabBar(_:)), "t", [.command, .shift])
     add(view, "Show All Tabs", #selector(NSWindow.toggleTabOverview(_:)), "\\", [.command, .shift])

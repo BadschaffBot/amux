@@ -225,6 +225,9 @@ fn wake_enabled(lane: &str) -> bool {
     wake_enabled_in(&crate::api::session_verbs::home(), lane, process.as_deref())
 }
 
+/// The emitter of an event whose caller showed no identity and no owner bearer.
+const UNATTRIBUTED_EMITTER: &str = "unattributed";
+
 fn actor_of(headers: &HeaderMap) -> String {
     super::org::local_member_actor(headers)
         .map(str::to_string)
@@ -1074,6 +1077,7 @@ struct EmitBody {
 /// its next tick.
 async fn emit_custom_signal(
     State(state): State<AppState>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     headers: HeaderMap,
     Json(body): Json<EmitBody>,
 ) -> Response {
@@ -1081,6 +1085,35 @@ async fn emit_custom_signal(
         return reply(StatusCode::BAD_REQUEST, json!({"error": "type is required"}));
     }
     let emitter = actor_of(&headers);
+    // Dropping the worker header does not make a caller the owner
+    // (amux-security, 2026-11-23): with no worker or member identity and no
+    // owner bearer it emits as UNATTRIBUTED_EMITTER, so the rules below keep it
+    // from naming a source or session and from firing anyone's subscriptions.
+    let emitter = if emitter.is_empty()
+        && state.auth_token.is_some()
+        && !super::auth::has_owner_token(&state, &headers, &uri)
+    {
+        UNATTRIBUTED_EMITTER.to_string()
+    } else {
+        emitter
+    };
+    // A worker or member emits as itself (amux-security, 2026-11-19): it may
+    // not name another source or session, so it cannot pass its text off as
+    // email.received, deploy.wake or another lane's event. The owner, with no
+    // worker header, keeps naming both freely.
+    if !emitter.is_empty() {
+        for (field, named) in [("source", &body.source), ("session", &body.session)] {
+            if !named.is_empty() && named != &emitter {
+                tracing::warn!(target: "amux::signals", emitter = %emitter, field, named = %named, event_type = %body.event_type,
+                    measured = true, n_considered = 1, verdict = "emit_impersonation_refused",
+                    "a worker tried to emit an event as someone else");
+                return reply(StatusCode::FORBIDDEN, json!({
+                    "error": format!("a worker emits as itself: {field} must be empty or {emitter}"),
+                    "code": "emit_as_self",
+                }));
+            }
+        }
+    }
     let source = if body.source.is_empty() {
         emitter.clone()
     } else {
@@ -1091,6 +1124,15 @@ async fn emit_custom_signal(
     } else {
         body.session.clone()
     };
+    // Who emitted it travels with the event, so dispatch can keep a worker's
+    // event to that worker's own subscriptions.
+    let mut data = body.data.clone();
+    if !emitter.is_empty() {
+        if !data.is_object() {
+            data = if data.is_null() { json!({}) } else { json!({ "value": data }) };
+        }
+        data[EMITTED_BY] = json!(emitter);
+    }
     static EMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let idem = format!("emit:{}:{}:{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
         EMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
@@ -1098,7 +1140,7 @@ async fn emit_custom_signal(
         &state.store,
         &session,
         &body.event_type,
-        Some(body.data.clone()),
+        Some(data),
         Some(idem.clone()),
         &source,
     )
@@ -1353,6 +1395,17 @@ fn default_text(sub: &LiveSub, event_type: &str, ev: &Value) -> String {
 /// One event through every live subscription. `subs` is the batch's list and
 /// is updated in place (last fire time, thread root), so a burst inside one
 /// batch dedupes the same as one spread over several.
+/// The data key naming the worker that emitted an event through
+/// POST /api/subscriptions/emit. Harness-emitted events never carry it.
+pub(crate) const EMITTED_BY: &str = "_emitted_by";
+
+/// Whether a worker-emitted event may fire `sub`: only a subscription that
+/// worker made, or one that sends to that worker. The owner's subscriptions
+/// and other lanes' never take a worker's event as theirs.
+pub(crate) fn worker_event_reaches(sub: &LiveSub, emitted_by: &str) -> bool {
+    sub.owner == emitted_by || (sub.action == "send" && sub.action_target == emitted_by)
+}
+
 pub(crate) async fn dispatch_one(
     state: &AppState,
     subs: &mut [LiveSub],
@@ -1365,8 +1418,15 @@ pub(crate) async fn dispatch_one(
     let ev = super::event_subs::event_view(event_type, session, source, data);
     let now = chrono::Utc::now().timestamp();
     let mut fired = Vec::new();
+    let emitted_by = data.get(EMITTED_BY).and_then(Value::as_str).unwrap_or("");
     for sub in subs.iter_mut() {
         if !sub_matches(sub, event_type, session, source, &ev) {
+            continue;
+        }
+        if !emitted_by.is_empty() && !worker_event_reaches(sub, emitted_by) {
+            tracing::info!(target: "amux::signals", subscription = %sub.name, emitted_by, event_type,
+                measured = true, n_considered = 1, verdict = "worker_event_held_to_emitter",
+                "a worker-emitted event did not fire a subscription that is not that worker's");
             continue;
         }
         let key = super::event_subs::fill(&sub.dedupe_key, &ev);

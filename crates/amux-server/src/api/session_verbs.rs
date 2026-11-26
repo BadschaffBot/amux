@@ -935,30 +935,56 @@ impl EnvFile {
     /// same lock and reload under it, so concurrent UI saves cannot resurrect
     /// a stale copy of another setting merely because their serialization
     /// formats differ.
+    /// The file's text with `updates` applied IN PLACE: the line that sets a
+    /// key is replaced (or removed for `None`), a new key is appended, and
+    /// every other line, comments and order included, is kept byte for byte.
+    /// It used to rebuild the file from a sorted map, so one Scope-tab change
+    /// re-sorted the owner's global env and deleted his comments (2026-11-18:
+    /// the note explaining the numeric thread caps after a CPU RCA).
+    pub(crate) fn merge_plain_text(old: &str, updates: &[(String, Option<String>)]) -> String {
+        let key_of = |line: &str| -> Option<String> {
+            let t = line.trim_start();
+            let t = t.strip_prefix("export ").unwrap_or(t);
+            if t.starts_with('#') { return None; }
+            let (k, _) = t.split_once('=')?;
+            let k = k.trim();
+            (!k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then(|| k.to_string())
+        };
+        let mut lines: Vec<String> = old.lines().map(str::to_string).collect();
+        for (key, value) in updates {
+            let mut placed = false;
+            let mut i = 0;
+            while i < lines.len() {
+                if key_of(&lines[i]).as_deref() == Some(key.as_str()) {
+                    match value {
+                        Some(v) if !placed => {
+                            // An `export KEY=` line stays an export (land review F1).
+                            let export = if lines[i].trim_start().starts_with("export ") { "export " } else { "" };
+                            lines[i] = format!("{export}{key}={}", Self::plain_quote(v));
+                            placed = true;
+                            i += 1;
+                        }
+                        _ => { lines.remove(i); }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if let (Some(v), false) = (value, placed) {
+                lines.push(format!("{key}={}", Self::plain_quote(v)));
+            }
+        }
+        let mut text = lines.join("\n");
+        if !text.is_empty() { text.push('\n'); }
+        text
+    }
+
     pub(crate) fn merge_plain(
         path: &Path,
         updates: &[(String, Option<String>)],
     ) -> std::io::Result<()> {
         let _guard = env_write_lock().lock().unwrap_or_else(|e| e.into_inner());
-        // Read with the worker-file parser: it un-escapes the double-quoted
-        // values Self::write produces, which crate::config::parse_env_file
-        // does not, so a round trip here cannot grow backslashes.
-        let mut current: std::collections::BTreeMap<String, String> =
-            Self::load(path).pairs.into_iter().collect();
-        for (key, value) in updates {
-            match value {
-                Some(value) => {
-                    current.insert(key.clone(), value.clone());
-                }
-                None => {
-                    current.remove(key);
-                }
-            }
-        }
-        let text: String = current
-            .iter()
-            .map(|(key, value)| format!("{key}={}\n", Self::plain_quote(value)))
-            .collect();
+        let text = Self::merge_plain_text(&std::fs::read_to_string(path).unwrap_or_default(), updates);
         use std::io::Write as _;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -979,7 +1005,46 @@ impl EnvFile {
 }
 
 pub(crate) fn parse_env(name: &str) -> EnvFile {
-    EnvFile::load(&env_path(name))
+    if let Some(hit) = ENV_MEMO.with(|m| m.borrow().as_ref().and_then(|m| m.get(name).cloned())) {
+        return hit;
+    }
+    let env = EnvFile::load(&env_path(name));
+    ENV_MEMO.with(|m| {
+        if let Some(m) = m.borrow_mut().as_mut() {
+            m.insert(name.to_string(), env.clone());
+        }
+    });
+    env
+}
+
+thread_local! {
+    static ENV_MEMO: std::cell::RefCell<Option<std::collections::HashMap<String, EnvFile>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with each worker's env file read from disk at most once. A roster
+/// asks the send check about every pair of workers, and each check re-read
+/// several env files: at every server start (every deploy) composing all 65
+/// workers' rosters read about 25,000 files and held amux-server-rs over 300%
+/// CPU on two cleanup ticks in a row (Mac RCA 20261118-153034). Nested calls
+/// share the outer memo; it is dropped when the outermost call returns.
+pub(crate) fn with_env_memo<T>(f: impl FnOnce() -> T) -> T {
+    // Dropped on return AND on unwind: a panic inside `f` must not leave this
+    // thread reading stale env files for the rest of its life (land review F2).
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            let read = ENV_MEMO.with(|m| m.borrow_mut().take().map(|m| m.len()).unwrap_or(0));
+            tracing::debug!(env_files_read = read, measured = true, n_considered = read, verdict = "env_memo_scope",
+                "a listing read each worker env file once");
+        }
+    }
+    if ENV_MEMO.with(|m| m.borrow().is_some()) {
+        return f();
+    }
+    ENV_MEMO.with(|m| *m.borrow_mut() = Some(std::collections::HashMap::new()));
+    let _clear = Clear;
+    f()
 }
 
 /// One setting for a lane, resolved WORKER > GROUP > GLOBAL (AMUX-2930).
@@ -5692,18 +5757,26 @@ fn last_codex_assistant_text(events: Vec<crate::opencode::events::TranscriptEven
 }
 
 pub(crate) fn last_assistant_message(name: &str, max_chars: usize) -> String {
+    last_assistant_message_at(name, max_chars).0
+}
+
+/// [`last_assistant_message`] and when it was written (the transcript row's
+/// RFC 3339 `timestamp`), so a reader can tell a current reply from an old
+/// one. `None` when the transcript does not say (a Codex rollout).
+pub(crate) fn last_assistant_message_at(name: &str, max_chars: usize) -> (String, Option<String>) {
     if matches!(provider_of(&parse_env(name)).as_str(), "codex" | "ollama") {
         let text = last_codex_assistant_text(codex_transcript_events(name, 400).unwrap_or_default(), max_chars);
         if text.is_empty() {
             tracing::debug!(session = name, measured = true, n_considered = 1,
                 verdict = "codex_last_message_empty", "no assistant text in the resolved Codex rollout");
         }
-        return text;
+        return (text, None);
     }
     let Some(path) = session_jsonl_path(name) else {
-        return String::new();
+        return (String::new(), None);
     };
     let mut last = String::new();
+    let mut at = None;
     for o in iter_jsonl_tail(&path, 5_000_000) {
         if o["type"].as_str() != Some("assistant") {
             continue;
@@ -5731,9 +5804,10 @@ pub(crate) fn last_assistant_message(name: &str, max_chars: usize) -> String {
         // (no text block) is skipped rather than blanking the result.
         if !parts.is_empty() {
             last = parts.join("\n\n");
+            at = o["timestamp"].as_str().map(str::to_string);
         }
     }
-    last.chars().take(max_chars).collect()
+    (last.chars().take(max_chars).collect(), at)
 }
 
 fn render_session_transcript(name: &str, max_chars: usize) -> String {
@@ -11234,6 +11308,53 @@ pub(crate) async fn reconcile_stuck_on_submit(state: &AppState, session: &str, p
     }
 }
 
+/// Acknowledge or release a reservation wherever it is now. A rename moves
+/// send_dedup rows to the new name in its own transaction, so a send in flight
+/// across it finishes under the old name and matched nothing: the reservation
+/// stayed, and every retry of that message ID under the new name answered
+/// "still pending" (503) until it aged into "uncertain"
+/// (worker-rename-follows.spec.ts, red on main 2026-11-20). The rename journal
+/// cannot say where it went in time, because it is written after that
+/// transaction. So when the name has no worker any more, the one unsettled
+/// reservation with this message ID under a worker that does exist is this
+/// one. `sql` takes ?1 session, ?2 msg_id, ?3 `extra`.
+fn send_dedup_at_reservation(
+    conn: &rusqlite::Connection,
+    session: &str,
+    msg_id: &str,
+    sql: &str,
+    extra: Option<&str>,
+) -> rusqlite::Result<usize> {
+    let run = |name: &str| match extra {
+        Some(x) => conn.execute(sql, rusqlite::params![name, msg_id, x]),
+        None => conn.execute(sql, rusqlite::params![name, msg_id]),
+    };
+    let changed = run(session)?;
+    if changed > 0 || env_path(session).exists() {
+        return Ok(changed);
+    }
+    let moved: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT session FROM send_dedup WHERE msg_id=?1 AND session<>?2 AND receipt_id IS NULL",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![msg_id, session], |r| r.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).filter(|n| env_path(n).exists()).collect()
+    };
+    let [to] = moved.as_slice() else {
+        if !moved.is_empty() {
+            tracing::warn!(target:"amux::message_acceptance", session, candidates=moved.len(),
+                measured=true, n_considered=moved.len(), verdict="send_dedup_rename_ambiguous",
+                "a send's worker is gone and its message ID is unsettled under several workers; settled none");
+        }
+        return Ok(0);
+    };
+    let changed = run(to)?;
+    tracing::info!(target:"amux::message_acceptance", session, renamed_to=%to, changed,
+        measured=true, n_considered=1, verdict="send_dedup_followed_rename",
+        "the worker was renamed while this send was in flight; its reservation was settled under the new name");
+    Ok(changed)
+}
+
 async fn send_dedup_accept(state: &AppState, name: &str, msg_id: &str, receipt_id: &str) {
     if msg_id.is_empty() {
         return;
@@ -11243,9 +11364,12 @@ async fn send_dedup_accept(state: &AppState, name: &str, msg_id: &str, receipt_i
     let result = state
         .store
         .write_async(move |conn| {
-            let changed = conn.execute(
-                "UPDATE send_dedup SET receipt_id=? WHERE session=? AND msg_id=?",
-                rusqlite::params![receipt, session, identity],
+            let changed = send_dedup_at_reservation(
+                conn,
+                &session,
+                &identity,
+                "UPDATE send_dedup SET receipt_id=?3 WHERE session=?1 AND msg_id=?2",
+                Some(&receipt),
             )?;
             if changed != 1 {
                 return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -11265,15 +11389,21 @@ async fn send_dedup_accept(state: &AppState, name: &str, msg_id: &str, receipt_i
 }
 
 async fn send_dedup_forget(state: &AppState, name: &str, msg_id: &str) {
+    if msg_id.is_empty() {
+        return;
+    }
     let session = name.to_string();
     let msg_id = msg_id.to_string();
     let _ = state
         .store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
-            conn.execute(
-                "DELETE FROM send_dedup WHERE session=? AND msg_id=?",
-                rusqlite::params![session, msg_id],
+            send_dedup_at_reservation(
+                conn,
+                &session,
+                &msg_id,
+                "DELETE FROM send_dedup WHERE session=?1 AND msg_id=?2",
+                None,
             )?;
             Ok(crate::db::WriteOutcome {
                 applied: true,
@@ -18521,6 +18651,13 @@ pub(crate) async fn start_session(
         meta.insert("pending_structured_resume_context".into(), json!(context));
         meta.insert("pending_structured_resume_token".into(), token.clone());
     }
+    // `meta` was loaded before the launch watch. The worker-resources job may
+    // have recorded the new Claude's config folder since; saving this copy
+    // without it sent every transcript reader to ~/.claude (2026-11-24,
+    // feature-orchestrator: "Load earlier output" answered 404).
+    if let Some(folder) = load_meta(name).get(super::claude_config::META_KEY) {
+        meta.insert(super::claude_config::META_KEY.into(), folder.clone());
+    }
     if let Err(error) = save_resume_meta(name, &meta) {
         tracing::warn!(session = name, %error, verdict = "swap_context_persist_failed",
             "started worker retains recovery requirement; metadata commit failed");
@@ -19635,6 +19772,90 @@ async fn sync_worker_row_archived(state: &AppState, name: &str, archived: bool) 
             tracing::info!(session = name, to, verdict = "worker_row_lifecycle_synced", measured = true, n_considered = 1,
                 "the worker row's lifecycle followed the lane's archive flag");
         }
+    }
+}
+
+/// Archiving the worker Intent sends unmatched requests to needs a second yes
+/// (`{"confirm_helper": true}`). On 2026-11-17 `personal` was archived; Intent
+/// then had nowhere to send what no worker fits, dropped 9 goal check-ins
+/// ("nothing was sent"), and 45 of its schedules were paused, all unseen for a
+/// day. The refusal names what breaks, so the dashboard can ask.
+fn intent_helper_archive_refusal(name: &str, body: &Value) -> Option<Value> {
+    let helper = crate::api::intent_store::intent_helper();
+    if name != helper || body.get("confirm_helper").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    tracing::warn!(session = name, measured = true, n_considered = 1, verdict = "intent_helper_archive_refused",
+        "refused archiving the Intent standing helper without confirm_helper");
+    Some(json!({
+        "error": format!("{name} is where Intent sends requests no other worker fits. Archived, those requests are not delivered and its schedules pause. Archive it anyway, or point AMUX_INTENT_HELPER at another worker first."),
+        "code": "intent_helper",
+    }))
+}
+
+#[cfg(test)]
+mod env_memo_tests {
+    use super::{parse_env, with_env_memo};
+
+    #[test]
+    fn a_listing_reads_each_env_file_once_and_only_inside_the_scope() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _g = crate::api::settings::test_env::set_home(home.path());
+        let name = "memo-probe".to_string();
+        let path = super::env_path(&name);
+        std::fs::write(&path, "CC_TAGS=ops\n").unwrap();
+        with_env_memo(|| {
+            assert_eq!(parse_env(&name).get("CC_TAGS"), Some("ops"));
+            std::fs::write(&path, "CC_TAGS=admin\n").unwrap();
+            assert_eq!(parse_env(&name).get("CC_TAGS"), Some("ops"), "the second read is the memo, not the disk");
+            with_env_memo(|| assert_eq!(parse_env(&name).get("CC_TAGS"), Some("ops"), "a nested scope shares it"));
+        });
+        assert_eq!(parse_env(&name).get("CC_TAGS"), Some("admin"), "outside the scope every read is fresh");
+        // A panic inside the scope still clears the memo for this thread.
+        let caught = std::panic::catch_unwind(|| with_env_memo(|| { let _ = parse_env(&name); panic!("inside the scope") }));
+        assert!(caught.is_err());
+        std::fs::write(&path, "CC_TAGS=gtm\n").unwrap();
+        assert_eq!(parse_env(&name).get("CC_TAGS"), Some("gtm"), "no memo survives the panic");
+    }
+}
+
+#[cfg(test)]
+mod env_merge_keeps_text_tests {
+    use super::EnvFile;
+
+    #[test]
+    fn a_merge_changes_its_keys_and_keeps_every_other_line() {
+        let old = "A=1\n# Why the caps: an RCA.\nOMP_NUM_THREADS=4\nexport B=2\nB=3\n\nZ=9\n";
+        let set = |k: &str, v: Option<&str>| (k.to_string(), v.map(str::to_string));
+        assert_eq!(
+            EnvFile::merge_plain_text(old, &[set("OMP_NUM_THREADS", Some("8")), set("NEW", Some("x"))]),
+            "A=1\n# Why the caps: an RCA.\nOMP_NUM_THREADS=8\nexport B=2\nB=3\n\nZ=9\nNEW=x\n",
+            "the value changes where it stands, the comment and order stay, a new key goes last"
+        );
+        assert_eq!(EnvFile::merge_plain_text(old, &[set("B", None)]),
+            "A=1\n# Why the caps: an RCA.\nOMP_NUM_THREADS=4\n\nZ=9\n", "a delete removes every line that sets it");
+        assert_eq!(EnvFile::merge_plain_text(old, &[set("B", Some("5"))]),
+            "A=1\n# Why the caps: an RCA.\nOMP_NUM_THREADS=4\nexport B=5\n\nZ=9\n", "a duplicate key ends as one line, where the first one stood");
+        assert_eq!(EnvFile::merge_plain_text("", &[set("K", Some("v"))]), "K=v\n");
+        assert_eq!(EnvFile::merge_plain_text("# n\nexport K=1\n", &[set("K", Some("2"))]), "# n\nexport K=2\n",
+            "an export line stays an export");
+    }
+}
+
+#[cfg(test)]
+mod intent_helper_archive_tests {
+    use super::intent_helper_archive_refusal;
+    use serde_json::json;
+
+    #[test]
+    fn the_standing_helper_needs_a_second_yes_to_archive() {
+        let helper = crate::api::intent_store::intent_helper();
+        let r = intent_helper_archive_refusal(&helper, &json!({})).expect("a bare archive of the helper is refused");
+        assert_eq!(r["code"], json!("intent_helper"));
+        assert!(r["error"].as_str().unwrap().contains("not delivered"), "{r}");
+        assert!(intent_helper_archive_refusal(&helper, &json!({"confirm_helper": true})).is_none(), "confirmed goes ahead");
+        assert!(intent_helper_archive_refusal("some-other-worker", &json!({})).is_none(), "other workers archive as before");
     }
 }
 
@@ -21675,9 +21896,9 @@ fn reachable_lanes(
     me: &str,
     lanes: &[(String, std::collections::HashMap<String, String>)],
 ) -> Vec<(String, std::collections::HashMap<String, String>)> {
-    super::worker_messaging::without_refusal_logs(|| {
+    super::worker_messaging::without_refusal_logs(|| with_env_memo(|| {
         lanes.iter().filter(|(n, _)| n == me || peer_input_refusal(me, n).is_none()).cloned().collect()
-    })
+    }))
 }
 
 /// The longest description the roster prints. Descriptions are meant to be one
@@ -22439,15 +22660,14 @@ fn not_found() -> Response {
 
 /// py:801 _UI_TOKEN — sha256("amux-ui-guard:" + AUTH_TOKEN)[:40].
 fn ui_token(state: &AppState) -> String {
+    ui_token_of(state.auth_token.as_deref())
+}
+
+/// The dashboard's UI token for a server whose API token is `auth`.
+pub(crate) fn ui_token_of(auth: Option<&str>) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
-    h.update(
-        format!(
-            "amux-ui-guard:{}",
-            state.auth_token.clone().unwrap_or_default()
-        )
-        .as_bytes(),
-    );
+    h.update(format!("amux-ui-guard:{}", auth.unwrap_or_default()).as_bytes());
     hex::encode(h.finalize()).chars().take(40).collect()
 }
 
@@ -22477,7 +22697,7 @@ fn session_destructive_allowed(state: &AppState, headers: &HeaderMap) -> bool {
 /// The request is the owner's own dashboard: a verified invited member, or
 /// the UI token the dashboard page carries. Unlike
 /// `session_destructive_allowed`, no environment switch widens it.
-fn owner_ui_proof(state: &AppState, headers: &HeaderMap) -> bool {
+pub(crate) fn owner_ui_proof(state: &AppState, headers: &HeaderMap) -> bool {
     if super::org::is_verified_local_member(headers) {
         return true;
     }
@@ -27871,10 +28091,11 @@ async fn get_dispatch(
         // "read latest message" ellipsis action speaks (AMUX-3021).
         "last-message" => {
             let mx: usize = qs_first(qs, "max", "8000").parse().unwrap_or(8000);
-            let txt = last_assistant_message(name, mx);
+            let (txt, at) = last_assistant_message_at(name, mx);
             j200(json!({
                 "name": name,
                 "text": txt,
+                "at": at,
                 "chars": txt.chars().count(),
                 "empty": txt.is_empty(),
             }))
@@ -29176,6 +29397,14 @@ pub(crate) async fn steer_mutate(
             }
         };
         send_dedup_accept(state, name, &dedup_id, &msg_id).await;
+        // The sessions list carries each worker's queue and is cached for 2s,
+        // as for the edit in steer_edit_response: the dashboard refetches once
+        // on message.queued, and without this it got the list from before the
+        // message and had no reason to ask again (steering-edit red on main,
+        // runs 44856032789 and 44866191571, 2026-11-21).
+        crate::api::sessions_legacy::invalidate_sessions_cache();
+        tracing::info!(session = name, id = %msg_id, measured = true, n_considered = 1,
+            sessions_cache_invalidated = true, verdict = "steering_queued", "a steering message was queued");
         let deliver_at = steer_deliver_at_from(body, now_f64()).unwrap_or(0.0);
         if deliver_at > 0.0 {
             let id2 = msg_id.clone();
@@ -29607,15 +29836,25 @@ async fn post_dispatch(
                     json!({"error": "cannot archive pinned session — unpin first"}),
                 );
             }
-            let (ok, msg) = archive_session(state, name).await;
-            if ok {
-                sync_lifecycle_to_rust_worker(
-                    state,
-                    name,
-                    amux_core::worker::WorkerLifecycle::Archived,
-                )
-                .await;
+            if let Some(refusal) = intent_helper_archive_refusal(name, body) {
+                return jresp(StatusCode::CONFLICT, refusal);
             }
+            // Archive stops the worker, then records the lifecycle; a dropped
+            // request must not end between the two (run_to_completion).
+            let (st2, n) = (state.clone(), name.to_string());
+            let (ok, msg) = crate::db::interactions::run_to_completion("archive", name, async move {
+                let (ok, msg) = archive_session(&st2, &n).await;
+                if ok {
+                    sync_lifecycle_to_rust_worker(
+                        &st2,
+                        &n,
+                        amux_core::worker::WorkerLifecycle::Archived,
+                    )
+                    .await;
+                }
+                (ok, msg)
+            })
+            .await;
             verb_resp(ok, msg)
         }
         "wake" => wake_verb(state, name).await,
@@ -30786,7 +31025,9 @@ pub(crate) fn send_origin_for(origin: &str, name: &str) -> SendOrigin {
 pub(crate) fn speaks_for_owner(origin: &str) -> bool {
     if chat_speaks_for_owner(origin) { return true; }
     let admin = is_admin_worker(origin);
-    if admin {
+    // A roster asking who a worker may reach passes no gate; logging it wrote
+    // 2,250 INFO lines per server start (Mac RCA 20261118-153034).
+    if admin && !super::worker_messaging::quiet() {
         tracing::info!(origin, verdict = "admin_group_owner_reach", measured = true, n_considered = 1,
             "an admin-group worker passed an owner-only gate");
     }
@@ -31081,6 +31322,17 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
         crate::db::interactions::spawn_blocking(move || backup_session_jsonl(&n, "pre_compact"));
     }
     let record_history = body.get("record_history").map(py_truthy).unwrap_or(false);
+    // A send amux itself makes for a person's thread (a goal's change check
+    // waking its worker) is recorded as amux's, never as the owner's: stored
+    // as "user" it read sender=owner, kind=human, and `amux requests` listed
+    // 40 goal checks as open owner requests (AF-1346). Only amux's own types
+    // are accepted, so a caller can mark its send as machine-made but can
+    // never make one read as a person's.
+    let history_type = body
+        .get("history_type")
+        .and_then(Value::as_str)
+        .filter(|t| crate::api::history::AMUX_TYPES.contains(t))
+        .unwrap_or("user");
     // The context the sender composed in (AMUX-4693). Serialised back to a
     // string here rather than threaded as a `&Value` so the recorder's
     // validation has exactly one input shape to defend, and so a caller that
@@ -31105,6 +31357,11 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
     }
     let orig_text = text.clone();
     let mut origin = String::new();
+    // The Chat-tab companion that relayed the owner's words, when it did. The
+    // send is delivered as the owner's (origin cleared below), but its row
+    // must still say it came through Chat (owner, 2026-11-19: "these messages
+    // came from chat but theyre labeled as human which is incorrect").
+    let mut relayed_by: Option<String> = None;
     // A directive types now, like deliver_now, and still carries its sender.
     if defer_busy || super::directive::delivering(&send_origin, name) {
         origin = if member_actor.is_some() {
@@ -31135,7 +31392,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 "[amux-origin: the owner, relayed by {origin} (this worker's Chat tab) from the owner's message \"{quote}\". \
                  Server-verified: the owner started the companion turn that sent this.]\n\n{text}"
             );
-            origin = String::new();
+            relayed_by = Some(std::mem::take(&mut origin));
         } else if let Some(stamped) = origin_stamped(&origin, name, &text) {
             text = stamped;
         } else if !origin.is_empty() && origin != name {
@@ -31258,7 +31515,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
             state,
             name,
             &orig_text,
-            "user",
+            history_type,
             actor,
             skip_board,
             DeliveryMeta {
@@ -31440,7 +31697,7 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 ..meta
             };
             let row_id =
-                cmd_hist_record_with_id(state, name, &orig_text, "user", author, skip_board, meta)
+                cmd_hist_record_with_id(state, name, &orig_text, history_type, author, skip_board, meta)
                     .await;
             if let Some(id) = queue_id.as_deref() {
                 link_queued_message(state, name, row_id, id).await;
@@ -31476,6 +31733,16 @@ pub(crate) async fn send_post(state: &AppState, name: &str, headers: &HeaderMap,
                 state, name, &orig_text, "session", &origin, skip_board, meta,
             )
             .await;
+            if let Some(id) = queue_id.as_deref() {
+                link_queued_message(state, name, row_id, id).await;
+            }
+        } else if let Some(by) = relayed_by.as_deref() {
+            // The owner's words through this worker's Chat tab: a Chat row,
+            // from the companion that relayed them (history_author reads it as
+            // the owner). Without this arm the cleared origin fell through to
+            // "api (no worker identity)" and the row read Human.
+            let row_id =
+                cmd_hist_record_with_id(state, name, &orig_text, "chat", by, skip_board, meta).await;
             if let Some(id) = queue_id.as_deref() {
                 link_queued_message(state, name, row_id, id).await;
             }
@@ -31697,7 +31964,12 @@ fn transient_send_refusal(message: &str) -> bool {
 /// route and the legacy `/api/sessions/{name}/reset` spelling run ONE
 /// implementation instead of a route alias and a re-implementation (AF-288).
 pub(crate) async fn reset_verb(state: &AppState, name: &str) -> Response {
-    let (ok, msg) = reset_session(state, name).await;
+    // Reset stops the worker first; a dropped request must not end mid-stop.
+    let (state, name_owned) = (state.clone(), name.to_string());
+    let (ok, msg) = crate::db::interactions::run_to_completion("reset", name, async move {
+        reset_session(&state, &name_owned).await
+    })
+    .await;
     verb_resp(ok, msg)
 }
 
@@ -33660,7 +33932,19 @@ fn find_latest_session_id(work_dir: &str) -> String {
     String::new()
 }
 
+/// Delete stops the worker (typing `/exit`, then waiting for the shell) before
+/// it unregisters it, so a dropped request must not end between the two
+/// (`run_to_completion`). Both spellings, POST .../delete and DELETE on the
+/// resource, come through here.
 async fn delete_post(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
+    let (state, name_owned, headers) = (state.clone(), name.to_string(), headers.clone());
+    crate::db::interactions::run_to_completion("delete", name, async move {
+        delete_post_inner(&state, &name_owned, &headers).await
+    })
+    .await
+}
+
+async fn delete_post_inner(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
     if !session_destructive_allowed(state, headers) {
         return jresp(
             StatusCode::FORBIDDEN,
@@ -36346,7 +36630,17 @@ pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> 
     out
 }
 
+/// A provider, worker-type or model change can stop and restart the worker,
+/// and a rename moves its files; none may end halfway because the client left.
 async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Response {
+    let (state, name_owned, body) = (state.clone(), name.to_string(), body.clone());
+    crate::db::interactions::run_to_completion("config", name, async move {
+        config_patch_live(&state, &name_owned, &body).await
+    })
+    .await
+}
+
+async fn config_patch_live(state: &AppState, name: &str, body: &Value) -> Response {
     let changes_runtime = [
         "provider",
         "worker_type",
@@ -39765,6 +40059,38 @@ mod tests {
             "an approval was recorded without the owner's note: {seen:?}");
     }
 
+    /// AF-1346: a goal's change check posted into an outcome thread as the
+    /// owner, and each one was recorded as an owner request (40 open on
+    /// 2026-11-22). amux's own send says so with history_type and is stored as
+    /// amux's; a type that is not amux's falls back to "user", so the field can
+    /// mark a send machine-made but never make one read as a person's.
+    #[tokio::test]
+    async fn a_send_amux_marks_as_its_own_is_not_recorded_as_the_owners() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/goal-lane.env"), "CC_PAUSED=1\n").unwrap();
+        for (i, (asked, want)) in [(Some("system"), "system"), (Some("direct"), "user"), (None, "user")].into_iter().enumerate() {
+            let text = format!("Something changed in the owner's email, check {i}");
+            let mut body = json!({"text": text, "record_history": true, "msg_id": format!("goal-{i}")});
+            if let Some(t) = asked {
+                body["history_type"] = json!(t);
+            }
+            let _ = send_post(&state, "goal-lane", &HeaderMap::new(), &body).await;
+            let conn = state.store.read().unwrap();
+            let types: Vec<String> = conn
+                .prepare("SELECT type FROM cmd_history WHERE session='goal-lane' AND text=?1")
+                .unwrap()
+                .query_map([&text], |r| r.get(0))
+                .unwrap()
+                .flatten()
+                .collect();
+            assert_eq!(types, vec![want.to_string()], "history_type {asked:?} must record as {want}");
+            let kind = crate::api::history::msg_kind(&types[0]);
+            assert_eq!(kind == "human", want == "user", "history_type {asked:?} read as kind {kind}");
+        }
+    }
+
     /// A send with no worker identity and no record_history (`amux send` from
     /// the owner's Codex app) left no cmd_history row, so the peek showed it
     /// "Unclassified" (2026-10-23, tubescience-parity). It is recorded as owner
@@ -39792,6 +40118,41 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "an unidentified send must leave exactly one row: {rows:?} (send answered {status} {body})");
         assert_eq!(rows[0], ("user".to_string(), UNIDENTIFIED_SEND_ORIGIN.to_string()));
+    }
+
+    /// The owner's words relayed by the worker's own Chat tab are delivered as
+    /// the owner's, and recorded as Chat from that companion, not as an
+    /// unidentified API send (owner, 2026-11-19: "these messages came from
+    /// chat but theyre labeled as human which is incorrect"; ten such rows on
+    /// one worker read Human).
+    #[tokio::test]
+    async fn an_owner_relay_from_the_chat_tab_is_recorded_as_chat_from_the_companion() {
+        let (state, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("relay-lane.env"), "CC_PAUSED=1\n").unwrap();
+        let companions = dir.path().join("chat").join("companions");
+        std::fs::create_dir_all(&companions).unwrap();
+        std::fs::write(companions.join("relay-lane.meta.json"), json!({
+            "chat_inflight_turn": "T1", "chat_inflight_origin": "owner", "chat_inflight_text": "you have my approval"
+        }).to_string()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-worker", "relay-lane@chat".parse().unwrap());
+        let resp = send_post(&state, "relay-lane", &headers,
+            &json!({"text": "APPROVED (owner, Chat tab): ship it", "msg_id": "relay-1"})).await;
+        let status = resp.status();
+        let conn = state.store.read().unwrap();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT type, COALESCE(origin,'') FROM cmd_history WHERE session='relay-lane' AND text LIKE '%ship it%'")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(rows, vec![("chat".to_string(), "relay-lane@chat".to_string())],
+            "a Chat-tab relay must be one Chat row from its companion (send answered {status})");
+        assert_eq!(crate::api::history::msg_kind(&rows[0].0), "chat");
     }
 
     /// AMUX-4661: STOPPED is a third state AMUX-4566's own check cannot see —
@@ -42104,10 +42465,12 @@ mod tests {
         // the computed `skip_board`, which is the property below.
         // 11 -> 12 at fb9e44cb3: a send with no worker identity is recorded
         // under UNIDENTIFIED_SEND_ORIGIN, also passing the computed `skip_board`.
+        // 12 -> 13: the owner's words relayed by a Chat tab are recorded as
+        // Chat from the companion (relayed_by), also passing `skip_board`.
         assert_eq!(
             sites.len(),
-            12,
-            "the scan must see all 12 production call sites. A LOWER number means the detector \
+            13,
+            "the scan must see all 13 production call sites. A LOWER number means the detector \
              stopped matching rather than that the call sites went away, which is exactly how \
              the first two versions of this test passed a broken tree: one scanned a window \
              that excluded the send handlers, the other missed the multi-line spelling and left \
@@ -48446,6 +48809,111 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
         );
     }
 
+    /// 2026-11-21, queue-launch: the dashboard reloaded six seconds into a
+    /// confirmed Delete. Hyper dropped the handler while stop waited for the
+    /// shell after `/exit`, so the worker was stopped but never unregistered
+    /// (env, meta and log left behind, interaction stuck at `sending`). The
+    /// stand-in acts on `/exit` slowly, like Claude running its exit hooks; the
+    /// caller is dropped once `/exit` has been typed, and the delete must still
+    /// finish. The stand-in clears its screen as it exits, as Claude's own UI
+    /// leaves the pane: with its `❯` still on screen stop never saw the shell,
+    /// took its 15 s hard-kill path every run, and the test finished at about
+    /// 31 s against a 25 s deadline after the abort (failed 1 in 3, AF-1346 land).
+    #[tokio::test]
+    async fn delete_finishes_when_the_client_disconnects_mid_stop() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let name = format!("delete-drop-{}-{}", std::process::id(), ulid::Ulid::new());
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(env_path(&name), "CC_PROVIDER=claude\n").unwrap();
+        std::fs::write(meta_path(&name), "{}").unwrap();
+        struct Pane(String);
+        impl Drop for Pane {
+            fn drop(&mut self) {
+                let st = session_target(&self.0);
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &st])
+                    .output();
+            }
+        }
+        let keys = home.path().join("keys.bin");
+        let pane = Pane(tmux_name(&name));
+        let agent = r#"import os,select,sys,time,tty
+tty.setraw(sys.stdin.fileno())
+sys.stdout.write('❯ '); sys.stdout.flush()
+buf=b''; end=time.monotonic()+60
+with open(sys.argv[1],'ab',buffering=0) as log:
+    while time.monotonic()<end:
+        if not select.select([sys.stdin],[],[],0.2)[0]: continue
+        key=os.read(sys.stdin.fileno(),1); log.write(key)
+        if key==b'\x15': buf=b''
+        elif key in (b'\r',b'\n'):
+            if buf.strip()==b'/exit': time.sleep(1.5); sys.stdout.write('\x1b[2J\x1b[H'); sys.stdout.flush(); sys.exit(0)
+            buf=b''
+        else: buf+=key
+"#;
+        let created = tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            &pane.0,
+            "-x",
+            "200",
+            "-y",
+            "24",
+            "sh",
+            "-c",
+            r#"python3 -c "$1" "$2"; PS1='$ ' exec sh -i"#,
+            "sh",
+            agent,
+            keys.to_str().unwrap(),
+        ])
+        .await
+        .expect("tmux required for the delete-drop proof");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let ready = std::time::Instant::now() + Duration::from_secs(10);
+        while !is_running(&name).await {
+            assert!(std::time::Instant::now() < ready, "stand-in agent never ran");
+            sleep_ms(50).await;
+        }
+        let state = AppState {
+            store: Arc::new(crate::db::Store::open(&home.path().join("delete.db")).unwrap()),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amux-ui-token", ui_token(&state).parse().unwrap());
+        let (st2, n2) = (state.clone(), name.clone());
+        let client = tokio::spawn(async move { delete_post(&st2, &n2, &headers).await });
+
+        // The client goes away once stop has typed /exit, while it waits for the shell.
+        let typed = std::time::Instant::now() + Duration::from_secs(15);
+        while !String::from_utf8_lossy(&std::fs::read(&keys).unwrap_or_default()).contains("/exit") {
+            assert!(std::time::Instant::now() < typed, "delete never typed /exit");
+            sleep_ms(20).await;
+        }
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled(), "the client was dropped mid-stop");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        while env_path(&name).exists() || meta_path(&name).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a delete whose client disconnected mid-stop left the worker registered \
+                 (env exists: {}, meta exists: {})",
+                env_path(&name).exists(),
+                meta_path(&name).exists()
+            );
+            sleep_ms(100).await;
+        }
+    }
+
     #[tokio::test]
     async fn stop_route_interrupts_busy_tools_without_waiting_for_composer_commands() {
         let home = tempfile::tempdir().unwrap();
@@ -49753,6 +50221,48 @@ Enter to select \u{00b7} \u{2191}/\u{2193} to navigate \u{00b7} Esc to cancel\n\
             Some(json!({"desc": "fresh lane"}))).await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert!(parse_env("fo-new").get("CC_DESC") != Some("fresh lane"));
+    }
+
+    #[tokio::test]
+    async fn a_send_in_flight_across_a_rename_settles_its_reservation_under_the_new_name() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+        std::fs::write(env_path("rf-old"), "CC_DESC=\"lane\"\n").unwrap();
+        // Three sends reserve their IDs, then the worker is renamed under them:
+        // the env file and the rows have moved, and the rename journal is not
+        // written yet (rename_session emits it after its transaction).
+        for id in ["refused", "accepted", "elsewhere"] {
+            assert!(send_dedup_gate(&state, "rf-old", id).await.is_none());
+        }
+        std::fs::rename(env_path("rf-old"), env_path("rf-new")).unwrap();
+        state.store.write_async(|conn| {
+            conn.execute("UPDATE send_dedup SET session='rf-new' WHERE session='rf-old'", [])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        // A worker that still holds its name is never redirected.
+        std::fs::write(env_path("rf-live"), "CC_DESC=\"lane\"\n").unwrap();
+        send_dedup_forget(&state, "rf-live", "elsewhere").await;
+        assert!(send_dedup_gate(&state, "rf-new", "elsewhere").await.is_some(),
+            "a release under a live name must not settle another worker's reservation");
+        // Nor is a reservation moved to a name no worker holds.
+        assert!(send_dedup_gate(&state, "rf-ghost", "orphan").await.is_none());
+        send_dedup_forget(&state, "rf-gone", "orphan").await;
+        assert!(send_dedup_gate(&state, "rf-ghost", "orphan").await.is_some(),
+            "only a reservation under a worker that exists is this send's");
+        // Each finishes under the name it arrived with.
+        send_dedup_forget(&state, "rf-old", "refused").await;
+        send_dedup_accept(&state, "rf-old", "accepted", "receipt-1").await;
+        // The refused one is sendable again to the new name, not "still pending".
+        assert!(send_dedup_gate(&state, "rf-new", "refused").await.is_none(),
+            "a released reservation must not block the retry under the new name");
+        let body = |r: Response| async move {
+            serde_json::from_slice::<Value>(&axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap()).unwrap()
+        };
+        let accepted = body(send_receipt(&state, "rf-new", "accepted")).await;
+        assert_eq!(accepted["accepted"], true, "{accepted}");
+        assert_eq!(accepted["id"], "receipt-1", "{accepted}");
     }
 
     /// The owner-addendum rename matrix: noop, happy-path cascade with
@@ -57942,7 +58452,7 @@ mod amux4770_worktree_isolation_tests {
     fn reaping_a_worker_releases_its_board_leases() {
         let src = include_str!("session_verbs.rs");
         let body = src
-            .split_once("async fn delete_post(")
+            .split_once("async fn delete_post_inner(")
             .expect("the delete handler exists")
             .1;
         let body = body.split_once("\n    j200(").expect("its end marker").0;
@@ -57964,7 +58474,7 @@ mod amux4770_worktree_isolation_tests {
     fn reaping_a_worker_reclaims_its_worktree_and_says_so_when_it_cannot() {
         let src = include_str!("session_verbs.rs");
         let body = src
-            .split_once("async fn delete_post(")
+            .split_once("async fn delete_post_inner(")
             .expect("the delete handler exists")
             .1;
         let body = body.split_once("\n    j200(").expect("its end marker").0;
@@ -58015,7 +58525,7 @@ mod amux4770_worktree_isolation_tests {
     #[test]
     fn deleting_a_dashboard_worktree_worker_reclaims_the_conventional_path() {
         let src = include_str!("session_verbs.rs");
-        let body = src.split_once("async fn delete_post(").unwrap().1;
+        let body = src.split_once("async fn delete_post_inner(").unwrap().1;
         let body = body.split_once("\n    j200(").unwrap().0;
         let code: String = body
             .lines()

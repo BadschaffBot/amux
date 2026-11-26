@@ -464,6 +464,21 @@ fn when_on_shell_refusal() -> Response {
     )
 }
 
+/// `critical` skips the host guard, so it is for a shell command, or a prompt
+/// schedule whose `when` check gates the turn. On a prompt schedule with no
+/// check it would carry a model turn past the guard on every fire.
+fn critical_not_shell_refusal() -> Response {
+    tracing::info!(verdict = "schedule_critical_refused", reason = "not_shell", measured = true, n_considered = 1,
+        "critical was set on a prompt schedule with no when check");
+    err(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "error": "critical applies to kind 'shell' schedules, or a prompt schedule with a when check: it fires through a critical host, and a prompt schedule with no check would carry a model turn past the host guard on every fire",
+            "code": "critical_not_shell",
+        }),
+    )
+}
+
 /// The note a create/PATCH response carries for a schedule with `when`.
 fn when_note(o: &serde_json::Map<String, Value>) -> Option<Value> {
     let check = o.get("when_check").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty())?;
@@ -945,7 +960,9 @@ pub struct ScheduleBody {
     pub pass_fail: Option<i64>,
     /// Wake condition (runtime_jobs/schedule_wake.rs, stored as `when_check`):
     /// a shell command run before each scheduled fire of a tmux schedule.
-    /// Exit 0 delivers the prompt; anything else skips the fire. `null` or ""
+    /// Exit 0 delivers the prompt; exit 1 skips the fire. Any other exit or a
+    /// timeout skips it too and counts as a broken check (the owner is told
+    /// after six in a row). `null` or ""
     /// clears it.
     #[serde(default, deserialize_with = "de_present")]
     pub when: Option<Option<String>>,
@@ -954,6 +971,11 @@ pub struct ScheduleBody {
     /// time the check passes.
     #[serde(default, deserialize_with = "de_flag")]
     pub when_once: Option<i64>,
+    /// Fire on time while the host guard reads critical: a shell schedule, or a
+    /// prompt schedule with `when` (its check runs on time; the prompt goes
+    /// only when it passes). Refused on a prompt schedule with no check.
+    #[serde(default, deserialize_with = "de_flag")]
+    pub critical: Option<i64>,
     /// When set, the scheduler creates an ephemeral worktree session for each
     /// firing instead of sending the command to the named session directly.
     /// The worktree is torn down after the command completes and pushes.
@@ -1187,6 +1209,9 @@ pub async fn create(
     if matches!(when_in, Some(Some(_))) && body.kind.as_deref() == Some("shell") {
         return when_on_shell_refusal();
     }
+    if body.critical.unwrap_or(0) != 0 && body.kind.as_deref() != Some("shell") && !matches!(when_in, Some(Some(_))) {
+        return critical_not_shell_refusal();
+    }
     let by = mutation_by(&headers, body.by.as_deref());
     // Governance PR 13: the creator the server PROVED, kept on the row so every
     // firing can re-check that this principal still has authority (the audit's
@@ -1340,6 +1365,7 @@ pub async fn create(
         m.insert("when_check".into(), json!(check));
     }
     m.insert("when_once".into(), json!(body.when_once.unwrap_or(1)));
+    m.insert("critical".into(), json!(body.critical.unwrap_or(0)));
     m.insert("created".into(), json!(now_ts));
     m.insert("updated".into(), json!(now_ts));
     m.insert("deleted".into(), Value::Null);
@@ -1550,6 +1576,7 @@ pub async fn patch(
         },
         Locked(DurableSchedule),
         WhenOnShell,
+        CriticalNotShell,
         Applied(Value, Option<(DurableSchedule, String)>),
     }
     let slot: Arc<Mutex<Option<Outcome>>> = Arc::new(Mutex::new(None));
@@ -1687,6 +1714,16 @@ pub async fn patch(
             }
             if s.str_field("kind") == "shell" && !s.str_field("when_check").trim().is_empty() {
                 return finish(&slot_w, Outcome::WhenOnShell, no_write());
+            }
+            if let Some(v) = body.critical {
+                s.set("critical", json!(v));
+            }
+            // Also refuses a kind change away from shell, or clearing `when`,
+            // on a critical row.
+            if s.str_field("kind") != "shell" && s.raw().get("critical").and_then(Value::as_i64).unwrap_or(0) != 0
+                && s.str_field("when_check").trim().is_empty()
+            {
+                return finish(&slot_w, Outcome::CriticalNotShell, no_write());
             }
             apply_bounds(&mut s, &bounds_in);
 
@@ -1865,6 +1902,7 @@ pub async fn patch(
             Some(Outcome::NotFound) => not_found(),
             Some(Outcome::Locked(s)) => owner_lock_refusal(&id, "re-enable", &by_outer, &s),
             Some(Outcome::WhenOnShell) => when_on_shell_refusal(),
+            Some(Outcome::CriticalNotShell) => critical_not_shell_refusal(),
             Some(Outcome::Tombstone {
                 deleted_at,
                 deleted_by,
@@ -2810,6 +2848,44 @@ mod tests {
         // On again without a check is refused on PATCH too.
         let (st, _) = send(&app, "PATCH", "/api/schedules/SCHED-1", Some(json!({ "pass_fail": 1 })), &SES).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    /// `critical` (0173) is accepted on a shell schedule and published, and
+    /// refused on a prompt schedule with no when check, on create, on PATCH,
+    /// on a PATCH that moves a critical shell schedule to tmux, and on one that
+    /// clears the check. A prompt schedule with a check may carry it.
+    #[tokio::test]
+    async fn critical_is_for_shell_schedules_only() {
+        let (app, _dir) = app();
+        let prompt = json!({ "title": "watch", "command": "is it done?", "schedule_expr": "every 2m", "session": "lane", "critical": true });
+        let (st, r) = send(&app, "POST", "/api/schedules", Some(prompt), &SES).await;
+        assert_eq!((st, r["code"].clone()), (StatusCode::BAD_REQUEST, json!("critical_not_shell")), "{r}");
+
+        let shell = json!({ "title": "watch", "kind": "shell", "command": "true", "schedule_expr": "every 2m", "session": "lane", "critical": true });
+        let (st, c) = send(&app, "POST", "/api/schedules", Some(shell), &SES).await;
+        assert_eq!((st, c["critical"].clone()), (StatusCode::CREATED, json!(1)), "{c}");
+        let id = c["id"].as_str().unwrap().to_string();
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "kind": "tmux" })), &SES).await;
+        assert_eq!((st, p["code"].clone()), (StatusCode::BAD_REQUEST, json!("critical_not_shell")), "{p}");
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "critical": false })), &SES).await;
+        assert_eq!((st, p["critical"].clone()), (StatusCode::OK, json!(0)), "{p}");
+
+        let plain = json!({ "title": "plain", "command": "go", "schedule_expr": "every 2m", "session": "lane" });
+        let (st, c) = send(&app, "POST", "/api/schedules", Some(plain), &SES).await;
+        assert_eq!((st, c["critical"].clone()), (StatusCode::CREATED, json!(0)), "{c}");
+        let id = c["id"].as_str().unwrap().to_string();
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "critical": 1 })), &SES).await;
+        assert_eq!((st, p["code"].clone()), (StatusCode::BAD_REQUEST, json!("critical_not_shell")), "{p}");
+
+        // A prompt schedule with a when check may carry it: the check gates the turn.
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "when": "test -e /tmp/x", "critical": 1 })), &SES).await;
+        assert_eq!((st, p["critical"].clone()), (StatusCode::OK, json!(1)), "{p}");
+        // Clearing the check on a critical row is refused.
+        let (st, p) = send(&app, "PATCH", &format!("/api/schedules/{id}"), Some(json!({ "when": null })), &SES).await;
+        assert_eq!((st, p["code"].clone()), (StatusCode::BAD_REQUEST, json!("critical_not_shell")), "{p}");
+        let gated = json!({ "title": "rare", "command": "look", "schedule_expr": "every 2m", "session": "lane", "when": "true", "critical": true });
+        let (st, c) = send(&app, "POST", "/api/schedules", Some(gated), &SES).await;
+        assert_eq!((st, c["critical"].clone()), (StatusCode::CREATED, json!(1)), "{c}");
     }
 
     /// `when` (0141): validated like a pass check, refused on a shell
