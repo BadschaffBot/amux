@@ -68,6 +68,32 @@ class Approvals(http.server.BaseHTTPRequestHandler):
         self._send(200, {"ok": True, "card": "AMUX-T1", "link": "/#land-approve=" + body.get("patch_id", "")})
 
 
+def deleted_scratch_checkout(tmp):
+    """The gate's scratch checkout deleted from disk (a cleanup) while git still
+    lists it: the gate re-creates it instead of erroring."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import land_gate
+    repo = os.path.join(tmp, "wt-repo")
+    os.makedirs(repo)
+    g = lambda *a: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.hooksPath=/dev/null", *a],
+                                  capture_output=True, text=True)
+    g("init", "-q")
+    with open(os.path.join(repo, "a.txt"), "w") as f:
+        f.write("a\n")
+    g("add", ".")
+    g("commit", "-qm", "a")
+    tree = os.path.join(tmp, "wt-scratch")
+    land_gate.checkout(repo, tree, "HEAD")
+    shutil.rmtree(tree)
+    try:
+        land_gate.checkout(repo, tree, "HEAD")
+        ok = os.path.isfile(os.path.join(tree, "a.txt"))
+    except Exception as e:  # the old behaviour: "missing but already registered worktree"
+        ok = False
+        print("   ", e)
+    check("a deleted scratch checkout git still lists is re-created, not an error", ok, True)
+
+
 def main():
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Approvals)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -200,8 +226,14 @@ def main():
         n = len(Approvals.requests)
         r = run(work, "push", "origin", "main", env=agent)
         check("a push cannot drop its own tier", r.returncode != 0, True)
-        check("and the ask lists both owner files", len(Approvals.requests) > n and
-              sorted(Approvals.requests[-1]["files"]) == ["boundaries.toml", "scripts/review-tiers.txt"], True)
+        # The pushed hook reads the account's real global scope, which this
+        # test cannot redirect by design. With the owner's approval off there,
+        # review-tiers.txt is waived and only the boundary registry is asked.
+        real_off = (land_gate._env_value(os.path.join(land_gate.SCOPE_HOME, "amux.env"),
+                                         land_gate.OWNER_APPROVAL_KEY) or "").lower() in land_gate._OFF
+        want = ["boundaries.toml"] if real_off else ["boundaries.toml", "scripts/review-tiers.txt"]
+        check("and the ask lists the owner files still gated", len(Approvals.requests) > n and
+              sorted(Approvals.requests[-1]["files"]) == want, True)
 
         # AMUX_LAND_OWNER_APPROVAL: the owner turns his approval off at global
         # or group scope (Ethan, 2026-11-13: "I dont want to approve PRs").
@@ -261,10 +293,46 @@ def main():
     finally:
         srv.shutdown()
 
+    static_readers(tmp)
     review_convergence(tmp)
+    deleted_scratch_checkout(tmp)
     shutil.rmtree(tmp, ignore_errors=True)
     print("\nland gate: %d passed, %d failed" % (passed, failed))
     return 1 if failed else 0
+
+
+def static_readers(tmp):
+    """A change to one crate's static files selects the tests in other crates
+    that read them. 2eb8f94ce changed amux-dashboard/static/app.js, the gate
+    ran only amux-dashboard's tests, and amux-server's dashboard_assets.rs
+    turned main red for 15h51m (velocity audit 2026-11-14)."""
+    sys.path.insert(0, os.path.join(ROOT, "scripts"))
+    import land_gate
+    tree = os.path.join(tmp, "readers")
+    files = {
+        "crates/dash/Cargo.toml": 'name = "dash"\n',
+        "crates/dash/static/app.js": "x\n",
+        "crates/srv/Cargo.toml": 'name = "srv"\n',
+        "crates/srv/tests/assets.rs": 'const P: &str = "../dash/static";\n',
+        "crates/srv/tests/unrelated.rs": "fn t() {}\n",
+        "crates/srv/src/api/files.rs": '// serves dash/static\n',
+        "crates/srv/src/api/other.rs": "fn f() {}\n",
+        "crates/srv/src/lib.rs": '// embeds dash/static\n',
+    }
+    for rel, text in files.items():
+        os.makedirs(os.path.dirname(os.path.join(tree, rel)), exist_ok=True)
+        open(os.path.join(tree, rel), "w").write(text)
+    pkgs = land_gate.crate_pkgs(tree)
+    expr, _ = land_gate.rust_filter(["crates/dash/static/app.js"], pkgs, tree)
+    check("a static change runs the other crate's test binary that reads it",
+          "(package(=srv) & binary(=assets))" in expr, True, expr)
+    check("and the unit tests of the module that reads it",
+          "(package(=srv) & kind(lib) & test(/^api::files::/))" in expr, True, expr)
+    check("a crate root that reads it runs its own tests",
+          "(package(=srv) & kind(lib) & test(/^tests::/))" in expr, True, expr)
+    check("a test that does not read it stays out", "unrelated" in expr or "api::other" in expr, False, expr)
+    expr, _ = land_gate.rust_filter(["crates/dash/src/lib.rs"], pkgs, tree)
+    check("a Rust change in that crate does not pull the readers in", "package(=srv)" in expr, False, expr)
 
 
 FAKE_CLAUDE = r'''#!/usr/bin/env python3

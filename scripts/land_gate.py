@@ -289,7 +289,14 @@ def gate_tree(name, suffix=""):
 def checkout(repo, tree, ref):
     if not os.path.isdir(os.path.join(tree, ".git")) and not os.path.isfile(os.path.join(tree, ".git")):
         os.makedirs(os.path.dirname(tree), exist_ok=True)
-        git(repo, "worktree", "add", "-q", "--detach", tree, ref, timeout=600)
+        # -f: a cleanup that deleted this folder left git's registration of it
+        # behind, and a plain add refused ("missing but already registered
+        # worktree"), so the gate errored before checking anything
+        # (2026-10-28). -f overrides only for this path.
+        listed = sh(["git", "-C", repo, "worktree", "list", "--porcelain"]).stdout
+        if ("worktree " + os.path.realpath(tree)) in listed or ("worktree " + tree) in listed:
+            print("land gate: its scratch checkout %s had been deleted; re-created it" % tree, file=sys.stderr)
+        git(repo, "worktree", "add", "-f", "-q", "--detach", tree, ref, timeout=600)
     git(tree, "reset", "-q", "--hard", ref, timeout=600)
     git(tree, "clean", "-fdq", "-e", "node_modules", "-e", "target", timeout=600)
 
@@ -342,12 +349,41 @@ SLOW_BINARIES = [b for b in os.environ.get(
     "diagnostic_contract,restart_persistence,dead_pub_api,move_bundle,public_links,board_api").split(",") if b]
 
 
-def rust_filter(files, pkgs):
+def readers(tree, pkgs, crate_dir, sub):
+    """Test binaries and modules in OTHER crates whose source names
+    `<crate_dir>/<sub>`, as nextest clauses. dashboard_assets.rs lives in
+    amux-server and reads amux-dashboard/static, so a static/ change has to
+    select it: 2eb8f94ce changed app.js, the gate ran amux-dashboard's tests
+    only, and main's rust was red for 15h51m (velocity audit 2026-11-14)."""
+    needle, out = "%s/%s" % (crate_dir, sub), set()
+    for d, pkg in pkgs.items():
+        if d == crate_dir:
+            continue
+        for path in glob.glob(os.path.join(tree, "crates", d, "tests", "*.rs")):
+            if needle in open(path, errors="replace").read():
+                out.add("(package(=%s) & binary(=%s))" % (pkg, os.path.basename(path)[:-3]))
+        src = os.path.join(tree, "crates", d, "src")
+        for path in glob.glob(os.path.join(src, "**", "*.rs"), recursive=True):
+            if needle in open(path, errors="replace").read():
+                parts = os.path.relpath(path, src)[:-3].split(os.sep)
+                if parts[0] == "bin":
+                    out.add("(package(=%s) & kind(bin))" % pkg)
+                    continue
+                if parts[-1] in ("mod", "lib", "main"):
+                    # A module root's own tests, as rust_filter selects them.
+                    parts = parts[:-1] + ["tests"]
+                out.add("(package(=%s) & kind(lib) & test(/^%s::/))" % (pkg, "::".join(parts)))
+    return out
+
+
+def rust_filter(files, pkgs, tree=None):
     """Unit tests of each changed module, and the integration test binaries of
     each changed crate (the tree-walking contract tests that redden main live
     there and take under a second each), except SLOW_BINARIES. A changed test
     file always runs. A change to Cargo files or a build script runs the
-    crate's whole unit suite. Returns (filterset, skipped binary names)."""
+    crate's whole unit suite. A change to a crate's non-Rust files (static/,
+    templates) also runs the tests in other crates that read that directory,
+    found by scanning `tree`. Returns (filterset, skipped binary names)."""
     clauses, crates, edited = set(), set(), set()
     for f in files:
         m = re.match(r"^crates/([^/]+)/(.*)$", f)
@@ -374,6 +410,8 @@ def rust_filter(files, pkgs):
             clauses.add("(package(=%s) & binary(=%s))" % (pkg, tm.group(1)))
         elif not rest.endswith(".md"):
             clauses.add("(package(=%s) & kind(lib))" % pkg)
+            if tree and "/" in rest and not rest.startswith("src/"):
+                clauses |= readers(tree, pkgs, m.group(1), rest.split("/", 1)[0])
     skipped = sorted(b for b in SLOW_BINARIES if b not in edited)
     not_slow = "".join(" & !binary(=%s)" % b for b in skipped)
     for pkg in crates:
@@ -384,10 +422,14 @@ def rust_filter(files, pkgs):
 NEXTEST_FAIL = re.compile(r"^\s+(?:FAIL|SIGSEGV|SIGABRT|TIMEOUT) \[[^\]]*\] (?:\([^)]*\) )?(\S+) (\S+)\s*$", re.M)
 
 
+SAFE_CARGO = os.path.join(HERE, "safe-cargo.sh")
+
+
 def nextest(tree, expr, extra=(), timeout=RUST_TIMEOUT_S):
     env = dict(os.environ, CARGO_TARGET_DIR=os.path.expanduser(
         os.environ.get("AMUX_LAND_GATE_TARGET", "~/.amux/rust-build-target")))
-    cmd = ["cargo", "nextest", "run", "--workspace", "--no-fail-fast", "--no-tests=pass", "-E", expr, *extra]
+    cargo = [SAFE_CARGO] if os.path.isfile(SAFE_CARGO) else ["cargo"]
+    cmd = [*cargo, "nextest", "run", "--workspace", "--no-fail-fast", "--no-tests=pass", "-E", expr, *extra]
     t0 = time.time()
     try:
         r = sh(cmd, cwd=tree, env=env, timeout=timeout)
@@ -409,7 +451,7 @@ def by_test_expr(names):
 
 def rust_leg(repo, tree, files, base_tree_fn):
     pkgs = crate_pkgs(tree)
-    expr, skipped = rust_filter(files, pkgs)
+    expr, skipped = rust_filter(files, pkgs, tree)
     if not expr:
         return {"verdict": "rust_not_affected"}
     fails, detail, secs = nextest(tree, expr)
@@ -485,7 +527,14 @@ def playwright(tree, specs, timeout=E2E_TIMEOUT_S):
         walk(s, [])
     stats = data.get("stats", {})
     if not res["expected"] and not res["unexpected"] and not res["flaky"]:
-        return None, "playwright ran no tests: %s" % json.dumps(stats), time.time() - t0
+        # Say WHY: a run of zero tests is usually a web server that never came
+        # up or a config error, and the stats alone ("expected": 0) said
+        # neither (2026-10-28: 358 s, no tests, no reason).
+        errs = [((e.get("message") or "") + " " + (e.get("location", {}) or {}).get("file", "")).strip()
+                for e in data.get("errors", [])][:3]
+        tail = (r.stderr or r.stdout or "")[-800:]
+        return None, "playwright ran no tests: %s%s%s" % (json.dumps(stats), (" errors: " + " | ".join(errs)) if errs else "",
+                                                          (" output: " + tail) if not errs and tail.strip() else ""), time.time() - t0
     return res, stats, time.time() - t0
 
 

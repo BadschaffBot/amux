@@ -232,7 +232,7 @@ extension AppDelegate {
     /// so tabs behind others load one at a time instead of all at launch. A
     /// fallback timer keeps the queue moving if a page never finishes.
     func loadNextDeferred(after c: DashboardWindowController?) {
-        guard let next = controllers.first(where: { $0.deferredURL != nil }) else { return }
+        guard let next = controllers.first(where: { $0.deferredURL != nil && !$0.discarded }) else { return }
         deferredTimer?.invalidate()
         deferredTimer = Timer.scheduledTimer(withTimeInterval: envSeconds("AMUX_DESKTOP_DEFER_STEP_S", 4), repeats: false) { [weak self] _ in
             self?.loadNextDeferred(after: nil)
@@ -333,7 +333,7 @@ extension AppDelegate {
         if let front = placed.reversed().first(where: { $0.0.window?.isOnActiveSpace == true && $0.1.minimized != true && $0.1.selected != false })?.0 {
             front.window?.makeKeyAndOrderFront(nil)
         }
-        if controllers.contains(where: { $0.deferredURL != nil }) {
+        if controllers.contains(where: { $0.deferredURL != nil && !$0.discarded }) {
             // The queue also starts on its own if no shown page ever finishes.
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 if self?.deferredTimer == nil { self?.loadNextDeferred(after: nil) }
@@ -1075,6 +1075,19 @@ extension AppDelegate {
         case "/recorder": recorderTestHook(q)
         // 🌐 pressed (?down=1) or let go (?down=0), as the keyboard does it;
         // ?tap=N taps it N times at once (two hook calls are too far apart).
+        // Pretend microphones come and go: ?add=Name, ?remove=Name, ?default=Name.
+        case "/mics":
+            let w = MicWatch.shared
+            for it in q {
+                guard let v = it.value else { continue }
+                switch it.name {
+                case "add": if !w.testExtra.contains(v) { w.testExtra.append(v) }
+                case "remove": w.testExtra.removeAll { $0 == v }
+                case "default": w.testDefault = v
+                default: break
+                }
+            }
+            w.changed()
         case "/globe":
             if let n = Int(q.first { $0.name == "tap" }?.value ?? "") {
                 for _ in 0..<n { globeChanged(down: true); globeChanged(down: false) }
@@ -1203,11 +1216,27 @@ extension AppDelegate {
         // Through Window > Arrange > Snap to Grid While Dragging, as a person turns it off.
         case "/snap": if snapEnabled != (q.first { $0.name == "on" }?.value != "0") { toggleSnap(nil) }
         // Click a button in Settings by id, as a person does (desktop/test/update-e2e.py).
+        // One Settings action, as Settings > This Mac sends it (?action=toggle&name=menuBar&value=0).
+        case "/settings-action":
+            var m: [String: Any] = ["action": q.first { $0.name == "action" }?.value ?? "", "name": q.first { $0.name == "name" }?.value ?? ""]
+            if let v = q.first(where: { $0.name == "value" })?.value { m["value"] = v == "1" ? true : v == "0" ? false : v as Any }
+            settingsAction(m)
+        // in=page clicks it in the dashboard's Settings > This Mac instead.
         case "/settings-click":
-            showSettings(nil)
             let id = q.first { $0.name == "id" }?.value ?? ""
             // JSON-quoted for JavaScript (jsString also escapes for HTML attributes).
             let lit = String(data: (try? JSONSerialization.data(withJSONObject: [id])) ?? Data("[\"\"]".utf8), encoding: .utf8)?.dropFirst().dropLast() ?? "\"\""
+            let click = "(function(){const b=document.getElementById(\(lit));if(!b)return 'missing';if(b.disabled)return 'disabled';b.click();return 'clicked'})()"
+            if q.first(where: { $0.name == "in" })?.value == "page" {
+                showSettings(nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    (self?.keyPage ?? self?.controllers.first)?.webView.evaluateJavaScript(click) { r, e in
+                        dlog("verdict=test_settings_click in=page id=\(id) result=\(r ?? "-") error=\(e.map { "\($0)" } ?? "-")")
+                    }
+                }
+                break
+            }
+            showNativeSettings(nil)
             settings?.afterLoad.append { [weak self] in
                 self?.settings?.webView.evaluateJavaScript("(function(){const b=document.getElementById(\(lit));if(!b)return 'missing';if(b.disabled)return 'disabled';b.click();return 'clicked'})()") { r, e in
                     dlog("verdict=test_settings_click id=\(id) result=\(r ?? "-") error=\(e.map { "\($0)" } ?? "-")")
@@ -1240,6 +1269,33 @@ extension AppDelegate {
                 c.webView.evaluateJavaScript(code) { _, err in if let err = err { dlog("verdict=test_js_failed error=\(err.localizedDescription)") } }
             }
         // Choose a menu item by title (?title=Copy), as a click on it does.
+        // The amux menu bar item: ?title= chooses one of its items; ?needs=N
+        // stands in N waiting workers (test-w1…) for the needs-you section.
+        // Quick Ask: ?show=1 opens it; ?text=&worker= fill it; ?selection= stands
+        // in for selected text; ?window_self=1 attaches this copy's own window;
+        // ?attach_window=1 / ?attach_selection=1 tick the boxes; ?send=1 sends.
+        case "/quickask":
+            let qa = QuickAsk.shared
+            let val = { (k: String) in q.first { $0.name == k }?.value }
+            if val("show") == "1" { qa.show() }
+            if val("window_self") == "1" { qa.testWindowPID = getpid() }
+            if let t = val("text") { qa.field.stringValue = t }
+            if let s = val("selection") { qa.testSelection(s) }
+            if let w = val("worker") {
+                if qa.workers.itemTitles.contains(w) { qa.workers.selectItem(withTitle: w) } else { qa.workers.addItem(withTitle: w); qa.workers.selectItem(withTitle: w) }
+            }
+            if val("attach_window") == "1" { qa.attachWindow.state = .on }
+            if val("attach_selection") == "1" { qa.attachSelection.state = .on }
+            if val("send") == "1" { qa.send(nil) }
+        case "/status-menu":
+            if let n = Int(q.first { $0.name == "needs" }?.value ?? "") {
+                let items = (0..<n).map { ["worker": "test-w\($0 + 1)", "key": "k\($0)", "question": "Approve step \($0 + 1)?"] }
+                lastNeedsCount = n; lastNeedsItems = items
+                menuBar?.setNeeds(count: n, items: items)
+            }
+            if let t = q.first(where: { $0.name == "title" })?.value {
+                dlog("verdict=test_status_menu_chosen title=\(t) found=\(menuBar?.choose(t) == true ? 1 : 0)")
+            }
         case "/menu":
             let title = q.first { $0.name == "title" }?.value ?? ""
             func pick(_ m: NSMenu) -> Bool {
@@ -1345,7 +1401,9 @@ extension AppDelegate {
                                         "view": c.viewHash, "selected": (w.tabGroup?.selectedWindow ?? w) === w, "tooltip": w.tab.toolTip ?? "",
                                         "connection": w.tab.accessoryView?.toolTip ?? "",
                                         "server": c.serverOrigin?.absoluteString ?? "", "saved": c.savedURL() ?? "",
-                                        "subtitle": w.subtitle]
+                                        "subtitle": w.subtitle,
+                                        // The same window as the window server reports it (AgentWatch's outline source).
+                                        "cg_frame": NSStringFromRect(AgentWatch.shared.windowFrame(pid: Int(getpid()), windowID: w.windowNumber) ?? .zero)]
                 if let g = c.grid {
                     d["grid"] = g.readingOrder
                     d["panes"] = g.tree.leaves.compactMap { g.members[$0]?.pageTitle }
@@ -1390,10 +1448,17 @@ extension AppDelegate {
                                      "visible_frame": NSStringFromRect(arrangeTarget?.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? .zero),
                                      "screen_frame": NSStringFromRect(arrangeTarget?.screen?.frame ?? NSScreen.main?.frame ?? .zero),
                                      "windows": ws,
+                                     "status_menu": menuBar?.snapshot() ?? NSNull(),
+                                     "agent_view": AgentWatch.shared.state,
+                                     "quick_ask": QuickAsk.made ? QuickAsk.shared.state : ["visible": false, "workers": [String](), "last_sent": [String: Any]()],
+                                     "permissions": MacPermissions.all(),
+                                     "settings_permission_rows": settingsHTML(self).components(separatedBy: "data-permission=").count - 1,
+                                     "mac_settings": macSettingsState(),
                                      // Every page, shown or not: its web process and what it costs.
                                      "pages": controllers.map { c -> [String: Any] in
                                          let pid = webPID(c)
                                          return ["view": c.viewHash, "shown": isShown(c), "pid": pid ?? 0,
+                                                 "url": c.webView.url?.absoluteString ?? "", "saved": c.savedURL() ?? "", "discarded": c.discarded,
                                                  "mb": pid.flatMap { footprintMB($0) } ?? -1, "cpu_s": pid.flatMap { cpuSeconds($0) } ?? -1]
                                      },
                                      "app_mb": footprintMB(getpid()) ?? -1, "app_cpu_s": cpuSeconds(getpid()) ?? -1,

@@ -310,6 +310,11 @@ pub(crate) fn history_author(mtype: &str, origin: &str, names: &HashMap<String, 
             if o.is_empty() || (t == "chat" && o == "chat-companion") || o == "owner" {
                 return HistoryAuthor { key: "person:owner".into(), name: "owner".into(), verdict: "person" };
             }
+            // The owner's words relayed by this worker's Chat tab companion
+            // (session_verbs::send_post, owner_relay_quote).
+            if t == "chat" && super::chat_worker::companion_parent(o).is_some() {
+                return HistoryAuthor { key: "person:owner".into(), name: "owner (Chat tab)".into(), verdict: "person" };
+            }
             // A cloud gateway user is stamped with their email.
             if looks_like_email(o) {
                 return person(o);
@@ -1291,6 +1296,17 @@ fn delivery_retryable(status: u16, attempt: usize) -> bool {
     status >= 500 && attempt < DELIVERY_BACKOFF_S.len()
 }
 
+/// The send a Messages delivery makes. amux's own post carries
+/// `history_type: system`, so the worker's history says amux sent it and
+/// `amux requests` does not count it as the owner's (AF-1346).
+fn delivery_body(text: &str, by_amux: bool) -> Value {
+    if by_amux {
+        json!({"text": text, "record_history": true, "history_type": "system"})
+    } else {
+        json!({"text": text, "record_history": true})
+    }
+}
+
 /// The text a worker receives. It names where it came from and how to answer
 /// there, since the worker cannot see the Messages tab.
 fn delivery_text(conv: &Conv, author: &str, body: &str) -> String {
@@ -1328,6 +1344,23 @@ fn delivery_text(conv: &Conv, author: &str, body: &str) -> String {
             "this outcome's thread".to_string(),
         ),
     };
+    // amux's own follow-up into an outcome (a goal's change check, AF-1346):
+    // say that amux sent it and that the owner reads the thread. It used to
+    // arrive as "owner asked for this" with "Something changed in my email",
+    // words the owner never wrote.
+    if author == AMUX_AUTHOR_NAME && matches!(conv, Conv::Outcome(..)) {
+        let opening = opening
+            .replacen(&format!("{author} asked for this in amux (amux Messages, an outcome they follow by itself)."),
+                "amux is following up, for the owner, on an outcome they follow by itself (amux Messages).", 1)
+            .replacen("What they asked:", "What amux noticed:", 1);
+        return format!(
+            "{opening}\n\n{body}\n\nNobody pasted this. amux sent it because this outcome's goal check found something new; \
+             the owner did not write it. Do the work within your rules. Your answer must be posted to {place}, because that \
+             is where the owner is reading (this pane is not). Post it with:\n\
+             amux post '{}' <<'EOF'\n<your answer>\nEOF",
+            conv.key()
+        );
+    }
     // WHO SENT THIS, said outright. Twice on 2026-10-28 a worker read a
     // delivery as "text you pasted with nothing from you asking me to act" and
     // posted a refusal in the thread instead of doing the task (mtp-demo from
@@ -1651,6 +1684,9 @@ pub(crate) async fn post_inner(
     // each outcome is written back onto it.
     if !targets.is_empty() {
         let (st, conv2, author, text_body) = (state.clone(), conv.clone(), author_name.clone(), body.clone());
+        // amux's own post (author `amux:*`, e.g. a goal's change check) is
+        // recorded in the worker's history as amux's, not as the owner's.
+        let by_amux = author_key.starts_with("amux:");
         tokio::spawn(super::instruction_provenance::carry(async move {
             let mut outcomes = Vec::new();
             for w in targets {
@@ -1679,7 +1715,7 @@ pub(crate) async fn post_inner(
                 // (a refusal, 4xx, is not). Bounded: four tries over ~17s.
                 let mut attempt = 0usize;
                 let (status, v) = loop {
-                    let resp = super::session_verbs::send_post(&st, &w, &hdrs, &json!({"text": text, "record_history": true})).await;
+                    let resp = super::session_verbs::send_post(&st, &w, &hdrs, &delivery_body(&text, by_amux)).await;
                     let status = resp.status();
                     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap_or_default();
                     let v: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
@@ -1972,6 +2008,22 @@ pub(crate) async fn amux_post_to_outcome(state: &AppState, id: &str, body: &str)
     let body: String = body.replace('@', "").chars().take(MAX_BODY).collect();
     post_inner(state, conv, &me, "amux:intent".into(), "amux".into(), body, HeaderMap::new(), None, None, json!([]), None, None).await
         .map_err(|_| format!("the post into outcome {id} was refused"))
+}
+
+/// The name amux's own posts carry (`amux_post_to_outcome`, `record_post`).
+const AMUX_AUTHOR_NAME: &str = "amux";
+
+/// amux's own follow-up into an outcome that DOES reach its worker: a goal's
+/// change check (intent_items.rs). Author `amux:goal`, so the worker is told
+/// amux sent it and its history records it as amux's (type `system`), never
+/// as an owner request (AF-1346: 29 goal checks in a day, 40 open as the
+/// owner's requests). Mentions are stripped like amux_post_to_outcome's.
+pub(crate) async fn amux_wake_outcome(state: &AppState, id: &str, body: &str) -> Result<Value, String> {
+    let conv = Conv::parse(&format!("o:{id}")).ok_or_else(|| format!("not an outcome: {id}"))?;
+    let me = Who::Person { email: "owner".into(), scope: MemberScope::Global };
+    let body: String = body.replace('@', "").chars().take(MAX_BODY).collect();
+    post_inner(state, conv, &me, "amux:goal".into(), AMUX_AUTHOR_NAME.into(), body, HeaderMap::new(), None, None, json!([]), None, None).await
+        .map_err(|_| format!("the goal follow-up into outcome {id} was refused"))
 }
 
 /// A record post (`intent_record.rs`): an outcome's routing, an idea or a
@@ -3260,6 +3312,57 @@ mod tests {
         assert!(org::local_member_actor(&h).is_none(), "no member identity is minted for a cloud user");
     }
 
+    /// AF-1346: amux's goal follow-up tells the worker amux sent it and the
+    /// owner reads the thread; it no longer says the owner asked, and it is
+    /// sent as amux's own type so the owner's request ledger skips it.
+    #[test]
+    fn amux_s_goal_follow_up_says_amux_sent_it() {
+        let o = Conv::Outcome("o01goal".into(), "sec".into());
+        let t = delivery_text(&o, AMUX_AUTHOR_NAME, "Something changed in the owner's email");
+        assert!(t.starts_with("amux is following up, for the owner, on an outcome they follow by itself"), "{t}");
+        assert!(t.contains("What amux noticed:") && !t.contains("What they asked:"), "{t}");
+        assert!(t.contains("the owner did not write it") && t.contains("amux post 'o:o01goal'"), "{t}");
+        assert!(!t.contains("amux asked for this") && !t.contains("Treat it as amux's own request"), "{t}");
+        let owner = delivery_text(&o, "owner", "book the camp");
+        assert!(owner.starts_with("owner asked for this in amux") && owner.contains("Treat it as owner's own request"), "{owner}");
+        assert_eq!(delivery_body("x", true)["history_type"], json!("system"));
+        assert!(delivery_body("x", false).get("history_type").is_none());
+    }
+
+    /// AF-1346 end to end: the goal follow-up goes through post_inner to the
+    /// outcome's worker and lands in its history as amux's (type `system`,
+    /// kind `amux`), so `amux requests` (sender=owner, kind=human) skips it.
+    #[tokio::test]
+    async fn a_goal_follow_up_reaches_the_worker_and_is_not_an_owner_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/goal-wake-w.env"), "CC_PAUSED=1\n").unwrap();
+        crate::api::intent_store::test_route("ogoalwake1", "goal-wake-w");
+        let state = AppState {
+            store: std::sync::Arc::new(crate::db::Store::open(&dir.path().join("g.db")).unwrap()),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        amux_wake_outcome(&state, "ogoalwake1", "Something changed for this goal").await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let rows = loop {
+            let rows: Vec<(String, String)> = state.store.read().unwrap()
+                .prepare("SELECT type, text FROM cmd_history WHERE session='goal-wake-w'").unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
+            if !rows.is_empty() || std::time::Instant::now() > deadline {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(rows.len(), 1, "the worker got the follow-up once: {rows:?}");
+        assert_eq!(rows[0].0, "system", "recorded as amux's, not the owner's: {rows:?}");
+        assert_eq!(crate::api::history::msg_kind(&rows[0].0), "amux");
+        assert!(rows[0].1.contains("the owner did not write it"), "{rows:?}");
+    }
+
     #[test]
     fn a_worker_only_chain_stops_delivering() {
         let w = |n: &str| format!("worker:{n}");
@@ -3281,6 +3384,9 @@ mod tests {
         assert_eq!((d.key.as_str(), d.name.as_str()), ("person:dorongreenspan@gmail.com", "dorongreenspan"));
         assert_eq!(history_author("user", "", &names).key, "person:owner");
         assert_eq!(history_author("chat", "chat-companion", &names).key, "person:owner");
+        // The owner's words relayed by a worker's own Chat tab companion.
+        let relay = history_author("chat", "relay-lane@chat", &names);
+        assert_eq!((relay.key.as_str(), relay.name.as_str()), ("person:owner", "owner (Chat tab)"));
         assert_eq!(history_author("user", "hello@amux.io", &names).key, "person:hello@amux.io");
         assert_eq!(history_author("session", "mxp-gs12@chat", &names).key, "worker:mxp-gs12");
         assert_eq!(history_author("schedule", "[SCHED-1] x", &names).verdict, "schedule");

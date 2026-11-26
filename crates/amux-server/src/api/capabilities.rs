@@ -352,8 +352,23 @@ pub fn grant_hint(capability: &str, lane: &str, detail: &str) -> String {
         "publish" => format!("set {PUBLISH_KEY}=public (or internal) on worker {lane}"),
         "message" => format!("set {MESSAGE_KEY}={detail} on worker {lane}, or put both workers in one group"),
         "connectors" => format!("enable {detail} for worker {lane} in its Connectors scope"),
+        "mac_apps" => format!(
+            "add {detail} to {} for worker {lane} (Scope tab), so it may use that app on this Mac",
+            crate::integrations::computer_mac::APPS_KEY
+        ),
+        "mac_outside" => format!(
+            "let worker {lane} act in Mac apps for 30 minutes although it read outside content (sets {})",
+            crate::integrations::computer_mac::OUTSIDE_UNTIL_KEY
+        ),
         _ => format!("grant {capability} to {lane}"),
     }
+}
+
+/// The open ask of `capability` for `lane`, if one is waiting on the owner:
+/// `{worker, capability, resource, asked_at}`.
+pub fn open_ask(home: &Path, lane: &str, capability: &str) -> Option<Value> {
+    let all: Map<String, Value> = serde_json::from_str(&std::fs::read_to_string(asks_file(home)).ok()?).ok()?;
+    all.get(&ask_key(lane, capability)).cloned()
 }
 
 fn asks_file(home: &Path) -> PathBuf {
@@ -409,19 +424,39 @@ pub fn existing_refusal(home: &Path, lane: &str, capability: &str, resource: &st
     file_card(home, lane, capability, resource, &hint, grant_write(home, lane, capability, detail));
 }
 
+/// A boundary that always refuses, whatever AMUX_CAPABILITIES says (computer
+/// use on the owner's Mac): ask the owner, once per worker and capability.
+pub fn ask(home: &Path, lane: &str, capability: &str, resource: &str, detail: &str) {
+    counters::bump(&format!("{capability}.refused"));
+    let hint = grant_hint(capability, lane, detail);
+    receipt(lane, capability, resource, "deny", &hint);
+    file_card(home, lane, capability, resource, &hint, grant_write(home, lane, capability, detail));
+}
+
 /// The worker crossed nothing this time: a later crossing may ask again once
 /// an earlier card was answered.
-pub fn clear_ask(home: &Path, lane: &str, capability: &str) {
+/// Returns the ask that was open, if one was.
+pub fn clear_ask(home: &Path, lane: &str, capability: &str) -> Option<Value> {
     let f = asks_file(home);
     let mut all: Map<String, Value> = std::fs::read_to_string(&f)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    if all.remove(&ask_key(lane, capability)).is_some() {
-        if let Err(e) = crate::integrations::secure_store::write(&f, Value::Object(all).to_string().as_bytes()) {
-            tracing::warn!(error = %e, verdict = "capability_ask_unsaved", "clearing the capability ask was not saved; the worker may not be asked again");
-        }
+    let was = all.remove(&ask_key(lane, capability))?;
+    if let Err(e) = crate::integrations::secure_store::write(&f, Value::Object(all).to_string().as_bytes()) {
+        tracing::warn!(error = %e, verdict = "capability_ask_unsaved", "clearing the capability ask was not saved; the worker may not be asked again");
     }
+    Some(was)
+}
+
+/// What a worker is told when the owner grants a capability it was refused.
+/// Without it the worker ends its turn on "approve and I will retry" and sits
+/// there until the owner also types "try again" (mxp-presales, 2026-11-25).
+pub fn granted_text(capability: &str, resource: &str) -> String {
+    let what = if resource.trim().is_empty() { String::new() } else { format!(" for {resource}") };
+    format!(
+        "[amux] The owner granted you '{capability}'{what}. The call that was refused for it will work now: retry it and carry on with the task it was for."
+    )
 }
 
 /// The capabilities a scope write touches: the `connectors` layer, or an env
@@ -443,7 +478,13 @@ pub fn caps_written(key: &str, value: &Value) -> Vec<&'static str> {
         _ => vec![],
     };
     let mut out = Vec::new();
-    for (k, cap) in [(FOLDERS_KEY, "folders"), (PUBLISH_KEY, "publish"), (MESSAGE_KEY, "message")] {
+    for (k, cap) in [
+        (FOLDERS_KEY, "folders"),
+        (PUBLISH_KEY, "publish"),
+        (MESSAGE_KEY, "message"),
+        (crate::integrations::computer_mac::APPS_KEY, "mac_apps"),
+        (crate::integrations::computer_mac::OUTSIDE_UNTIL_KEY, "mac_outside"),
+    ] {
         if keys.iter().any(|x| x == k) && !out.contains(&cap) {
             out.push(cap);
         }
@@ -455,13 +496,37 @@ pub fn caps_written(key: &str, value: &Value) -> Vec<&'static str> {
 pub fn clear_asks(home: &Path, workers: &[String], caps: &[&str]) {
     for w in workers {
         for c in caps {
-            clear_ask(home, w, c);
+            let was = clear_ask(home, w, c);
             // A grant answers the ask's card too, however it was written
             // (governance PR 12): the card and the env never disagree.
             let item = format!("{w}:{c}");
+            // Only a grant that answers an open ask tells the worker: an
+            // ordinary scope edit with nothing waiting on it stays quiet.
+            let tell = was.map(|a| {
+                let resource = a.get("resource").and_then(Value::as_str).unwrap_or("").to_string();
+                (w.clone(), granted_text(c, &resource))
+            });
             if let Ok(h) = tokio::runtime::Handle::try_current() {
                 h.spawn(super::trace::carry(async move {
                     super::approval_cards::resolved("capability", &item, "approved", "a scope grant", None).await;
+                    let Some((lane, text)) = tell else { return };
+                    let Some(store) = STORE.get().cloned() else {
+                        tracing::warn!(worker = %lane, measured = false, verdict = "capability_grant_untold",
+                            "a capability was granted but the worker was not told: no store");
+                        return;
+                    };
+                    match crate::api::session_verbs::steer_enqueue_store(&store, &lane, &text, "capability-grant", "").await {
+                        Ok(id) => {
+                            counters::bump("grant_told");
+                            tracing::info!(worker = %lane, id = %id, verdict = "capability_grant_told",
+                                "told the worker its refused capability was granted")
+                        }
+                        Err(why) => {
+                            counters::bump("grant_untold");
+                            tracing::warn!(worker = %lane, why, verdict = "capability_grant_untold",
+                                "a capability was granted but the worker could not be told")
+                        }
+                    }
                 }));
             }
         }
@@ -539,6 +604,15 @@ pub fn grant_write(home: &Path, lane: &str, capability: &str, detail: &str) -> O
         "folders" if !detail.trim().is_empty() => Some(json!({ FOLDERS_KEY: merged(FOLDERS_KEY) })),
         "message" if !detail.trim().is_empty() => Some(json!({ MESSAGE_KEY: merged(MESSAGE_KEY) })),
         "publish" => Some(json!({ PUBLISH_KEY: if detail == "internal" { "internal" } else { "public" } })),
+        "mac_apps" if !detail.trim().is_empty() => {
+            Some(json!({ crate::integrations::computer_mac::APPS_KEY: merged(crate::integrations::computer_mac::APPS_KEY) }))
+        }
+        // approval_cards.rs computes this again when the owner approves, so the
+        // 30 minutes start then.
+        "mac_outside" => Some(json!({
+            crate::integrations::computer_mac::OUTSIDE_UNTIL_KEY:
+                (chrono::Utc::now().timestamp() + crate::integrations::computer_mac::OUTSIDE_WINDOW_S).to_string()
+        })),
         _ => None,
     }
 }
@@ -909,6 +983,17 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(asks_file(home.path())).unwrap()).unwrap();
         assert_eq!(all.len(), 1, "the folders ask is cleared, the publish ask stays");
         assert!(all.contains_key(&ask_key("w", "publish")));
+    }
+
+    #[test]
+    fn a_grant_tells_the_worker_only_when_it_answers_an_open_ask() {
+        let home = tempfile::tempdir().unwrap();
+        file_card(home.path(), "w", "mac_apps", "Slack (com.tinyspeck.slackmacgap)", "h", None);
+        let was = clear_ask(home.path(), "w", "mac_apps").expect("the open ask is returned");
+        assert_eq!(was["resource"], "Slack (com.tinyspeck.slackmacgap)");
+        assert!(clear_ask(home.path(), "w", "mac_apps").is_none(), "nothing open, nothing to tell");
+        let t = granted_text("mac_apps", "Slack (com.tinyspeck.slackmacgap)");
+        assert!(t.contains("'mac_apps' for Slack") && t.contains("retry"), "{t}");
     }
 
     #[test]

@@ -2065,6 +2065,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["GET"],
     },
     RouteEntry {
+        path: "/api/palette/history",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/palette/visit",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/palette/history/import",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/pinned",
         methods: &["GET", "POST"],
     },
@@ -2708,6 +2720,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
         methods: &["POST"],
     },
     RouteEntry {
+        path: "/api/browser/watch",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/browser/watch/start",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/browser/watch/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
         path: "/api/computer/start",
         methods: &["POST"],
     },
@@ -2753,6 +2777,30 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/computer/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/status",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/tools",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/call",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/activity",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/broker/next",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/computer/mac/broker/result",
         methods: &["POST"],
     },
     // -- file viewer / files / fs
@@ -3020,6 +3068,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/social/queue/{id}/cancel",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/social/queue/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/social/queue/{id}/reject",
         methods: &["POST"],
     },
     RouteEntry {
@@ -3358,6 +3414,98 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry {
         path: "/api/crm/followups",
         methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/accounts",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/accounts/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/accounts/{id}/interactions",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/deals",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/deals/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/lookalikes",
+        methods: &["POST", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/summary",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/due",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/{id}",
+        methods: &["PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/channels/{id}/observed",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}",
+        methods: &["PATCH"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/touches/{id}/done",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}",
+        methods: &["GET", "PATCH", "DELETE"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}/enroll",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/sequences/{id}/stop",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/contacts/{id}/brief",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/crm/voices",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/crm/voices/{id}",
+        methods: &["GET", "PATCH"],
+    },
+    RouteEntry {
+        path: "/api/crm/voices/{id}/check",
+        methods: &["POST"],
     },
     // Speedtest (AMUX-2890): the Metrics tab's Run-speed-test button, unrouted
     // since the python retirement — clicks errored against the SPA catch-all.
@@ -4371,6 +4519,30 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     },
     RouteEntry {
         path: "/api/approvals/decide",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound",
+        methods: &["GET", "POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound/{id}",
+        methods: &["GET"],
+    },
+    RouteEntry {
+        path: "/api/outbound/check",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound/{id}/approve",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound/{id}/reject",
+        methods: &["POST"],
+    },
+    RouteEntry {
+        path: "/api/outbound/{id}/done",
         methods: &["POST"],
     },
     RouteEntry {

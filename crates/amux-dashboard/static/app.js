@@ -1222,23 +1222,112 @@ const _LIST_VIEW_KEY = 'amux_list_view_v1';
 // the first is an iframe on this origin, so the shared localStorage record is
 // the page's, not the tab's: a tab starts clean and keeps its own copy in
 // sessionStorage under its tab id, beside the bar's per-tab address
-// (_CHROME_TAB_VIEW_KEY). The page itself, and the app reopened, still restore
-// the shared record. The tab id is read here rather than through _isInTab,
+// (_CHROME_TAB_VIEW_KEY). The page itself keeps its own too (below). The tab id is read here rather than through _isInTab,
 // which is declared further down and not yet initialised when this runs.
 const _LIST_VIEW_TAB_KEY = 'amux_list_view_v1:tab:';
+// The default a new tab starts from (Save as default, in the filters panel), and
+// the storage key of the tab you were in before the one you are opening: a new
+// tab with no default copies it. Both hold filters only, never search text.
+const _LIST_DEFAULT_KEY = 'amux_list_default_v1';
+const _LIST_LAST_TAB_KEY = 'amux_list_last_tab_key';
 const _listViewTabId = (() => { try { return new URLSearchParams(location.search).get('_tab'); } catch (e) { return null; } })();
-function _listViewStore() { return _listViewTabId !== null ? sessionStorage : localStorage; }
-function _listViewKey() { return _listViewTabId !== null ? _LIST_VIEW_TAB_KEY + _listViewTabId : _LIST_VIEW_KEY; }
+// EVERY PAGE IS A TAB, NOT ONLY THE IN-PAGE BAR'S IFRAMES (owner, 2026-11-21:
+// "a tab should be a representation of a current work stream ... the fact that
+// filters change across tabs can make you very distraught when you pull out").
+// A Mac app tab (Cmd-T), a native pane and a browser tab are each their own
+// page, and all of them read and wrote the one localStorage record: a new tab
+// opened on the last tab's pills, and a tab WebKit reloaded in the background
+// came back, behind the worker it had open, on whatever filter another tab set
+// last, so backing out of that worker showed someone else's list. The DOWNSIDE
+// of a shared record, kept here so nobody restores it as a convenience: a
+// filter is part of one work stream, and sharing it silently rewrites the view
+// of every other stream the next time it loads.
+// So a page keeps its own view in sessionStorage (per browser tab or webview,
+// survives a reload), and the localStorage record is only the last view used,
+// read by a page that has none of its own AND finds no other amux page open:
+// the app reopened, or a phone PWA the OS evicted (Ethan, 2026-09-24: views
+// "saved for that client"). With another page open, a new page starts clean.
+const _LIST_VIEW_PAGE_KEY = 'amux_list_view_v1:page';
+const _LIST_VIEW_ALIVE_PREFIX = 'amux_page_alive:';
+// Hidden pages run timers about once a minute, so a beat this old is still a
+// live page; a closed one removes its beat on pagehide.
+const _LIST_VIEW_ALIVE_MS = 3 * 60 * 1000;
+const _listViewPageId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+function _listViewOtherPageOpen() {
+  const now = Date.now();
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(_LIST_VIEW_ALIVE_PREFIX) || k === _LIST_VIEW_ALIVE_PREFIX + _listViewPageId) continue;
+      const ts = parseInt(localStorage.getItem(k) || '0', 10);
+      if (now - ts < _LIST_VIEW_ALIVE_MS) return true;
+      localStorage.removeItem(k);   // a page that died without pagehide
+      i--;
+    }
+  } catch (e) { console.warn('[list-view] could not read which amux pages are open; this page starts clean', e); return true; }
+  return false;
+}
+function _listViewBeat() {
+  try { localStorage.setItem(_LIST_VIEW_ALIVE_PREFIX + _listViewPageId, String(Date.now())); } catch (e) { console.warn('[list-view] page heartbeat not written', e); }
+}
+function _listViewStore() { return sessionStorage; }
+function _listViewKey() { return _listViewTabId !== null ? _LIST_VIEW_TAB_KEY + _listViewTabId : _LIST_VIEW_PAGE_KEY; }
 let _listViewSaved = '';
 function _listViewSnapshot() {
   return JSON.stringify({ tag: activeTag || '', hidden: [...hiddenTags].sort(),
     providers: [...filterProviders].sort(), models: [...filterModels].sort(),
     statuses: [...filterStatuses].sort(), q: searchQuery || '', logs: !!logSearchMode });
 }
+// The filters a new tab inherits: tag, hidden tags, providers, models, statuses.
+// Search text and logs mode stay with the tab that set them.
+function _listFiltersOf(v) {
+  const arr = x => Array.isArray(x) ? x.filter(y => typeof y === 'string') : [];
+  return { tag: typeof v.tag === 'string' ? v.tag : '', hidden: arr(v.hidden), providers: arr(v.providers),
+    models: arr(v.models), statuses: arr(v.statuses) };
+}
+function _listDefaultRead() {
+  try { const v = JSON.parse(localStorage.getItem(_LIST_DEFAULT_KEY) || 'null'); return v && typeof v === 'object' ? v : null; }
+  catch (e) { console.warn('[list-view] saved default unreadable; new tabs start from the tab you came from', e); return null; }
+}
+// A new tab's starting filters: the saved default, else the tab you were in
+// before it (this browser tab's record), else nothing.
+function _listSeed() {
+  const d = _listDefaultRead();
+  if (d) return { from: 'default', v: d };
+  let last = null;
+  try { last = sessionStorage.getItem(_LIST_LAST_TAB_KEY); } catch (e) { last = null; }
+  if (!last) return null;
+  try { const v = JSON.parse(sessionStorage.getItem(last) || 'null'); if (v && typeof v === 'object') return { from: 'last_tab', v }; }
+  catch (e) { console.warn('[list-view] last tab\'s view unreadable; new tab starts clean', e); }
+  return null;
+}
+// The record a tab's view lives under: the page's own, or the tab's iframe copy.
+function _listKeyOfTab(id) {
+  return id === _chromePageId ? _LIST_VIEW_PAGE_KEY : _LIST_VIEW_TAB_KEY + id;
+}
 function _restoreListView() {
-  let v = null;
+  let v = null, verdict = 'own_view';
   try { v = JSON.parse(_listViewStore().getItem(_listViewKey()) || 'null'); } catch (e) { v = null; }
+  if (!v && _listViewTabId === null && !_listViewOtherPageOpen()) {
+    try { v = JSON.parse(localStorage.getItem(_LIST_VIEW_KEY) || 'null'); } catch (e) { console.warn('[list-view] last view unreadable', e); v = null; }
+    verdict = v ? 'reopened_last_view' : 'none_saved';
+  } else if (!v) {
+    const seed = _listSeed();
+    if (seed) { v = _listFiltersOf(seed.v); verdict = 'seeded_' + seed.from; }
+    else verdict = 'new_tab_clean';
+  }
   _applyListView(v);
+  // A seeded tab writes its copy now, so a reload keeps the filters it started with.
+  if (verdict.startsWith('seeded_')) { try { _listViewStore().setItem(_listViewKey(), _listViewSnapshot()); } catch (e) { console.warn('[list-view] seeded filters not kept; a reload starts from the default again', e); } }
+  // The page's own copy now holds whatever it started on, so a reload keeps it.
+  if (v && _listViewTabId === null) _listViewSaved = '';
+  if (_listViewTabId === null) {
+    _listViewBeat();
+    setInterval(_listViewBeat, 30000);
+    window.addEventListener('pagehide', () => { try { localStorage.removeItem(_LIST_VIEW_ALIVE_PREFIX + _listViewPageId); } catch (e) { console.warn('[list-view] page heartbeat not removed', e); } });
+    window.addEventListener('pageshow', _listViewBeat);
+  }
+  try { amuxTrack('list_view_restored', {verdict, in_tab_bar: _listViewTabId !== null, measured: true, n_considered: 1}); } catch (e) { console.warn('[list-view] restore beacon failed', e); }
 }
 function _applyListView(v) {
   if (!v || typeof v !== 'object') return;
@@ -1257,6 +1346,8 @@ function _saveListView() {
   if (snap === _listViewSaved) return;
   _listViewSaved = snap;
   try { _listViewStore().setItem(_listViewKey(), snap); } catch (e) {}
+  // The last view used, for the app reopened; no open page reads it.
+  if (_listViewTabId === null) { try { localStorage.setItem(_LIST_VIEW_KEY, snap); } catch (e) { console.warn('[list-view] last view not saved for the app reopened', e); } }
 }
 // Closing the first tab of the in-page tab bar moves this page to the next
 // tab's place (_chromeCloseTab): its list view comes too, or the page would
@@ -2254,7 +2345,7 @@ function showConnHistory() {
         + '</div>'
         + '<span class="conn-clip-age">' + (age < 1 ? 'just now' : age + 'm ago') + '</span>'
         // An unreadable clip has nothing to send again; it can only be deleted.
-        + (c.state === 'unreadable' ? '' : ' <button type="button" class="btn conn-op-retry" onclick="_dictRetry(\'' + escJs(c.id) + '\');document.getElementById(\'conn-hist-modal\')?.remove();" title="Send this recording again">Send again</button>')
+        + (_dictNoResend(c) ? '' : ' <button type="button" class="btn conn-op-retry" onclick="_dictRetry(\'' + escJs(c.id) + '\');document.getElementById(\'conn-hist-modal\')?.remove();" title="Send this recording again">Send again</button>')
         + '</div>';
     }).join('');
     pendingHtml = '<div style="margin-top:var(--space-2-5);padding-top:var(--space-2);border-top:1px solid var(--border);">'
@@ -2442,18 +2533,24 @@ function _cloudOfferCheckLongJob() {
 }
 
 async function _cloudOfferTry(trigger, worker) {
+  // Each refusal is recorded on the verdict by name, so a missing offer says
+  // which gate held it rather than reading the same as "never tried".
+  const skip = why => { if (window._cloudOfferVerdict) window._cloudOfferVerdict.skipped = trigger + ':' + why; };
   if (!_cloudOfferOwner || document.getElementById('cloud-offer')) return;
   const st = await _cloudOfferLoad();
-  if (!st || st.dismissed || st[trigger] || document.getElementById('cloud-offer')) return;
+  if (!st) return skip('pref_unreadable');
+  if (st.dismissed || st[trigger]) return skip(st.dismissed ? 'dismissed' : 'already_offered');
+  if (document.getElementById('cloud-offer')) return;
   const setup = document.getElementById('apikey-setup-modal');
-  if (setup && setup.style.display === 'flex') return;   // first run comes first
+  if (setup && setup.style.display === 'flex') return skip('setup_open');   // first run comes first
   // Not over an open file or worker: it covered the markdown editor's text on a phone
   // (2026-10-31). Left unmarked, so it is offered again on the next trigger.
-  if (document.querySelector('#file-overlay.active, #peek-overlay.active')) return;
+  if (document.querySelector('#file-overlay.active, #peek-overlay.active')) return skip('overlay_open');
   // Not over Home either: it is a pitch about running workers on servers, made
   // to someone who came to say what they want (docs/design/intent-first.md).
   // Unmarked, so the fleet view can still offer it later.
-  if (document.body.classList.contains('intent-simple') || !window._homeChoiceSettled || _HOME_VIEWS[activeView]) return;
+  if (document.body.classList.contains('intent-simple') || !window._homeChoiceSettled || _HOME_VIEWS[activeView]) return skip('home');
+  if (window._cloudOfferVerdict) delete window._cloudOfferVerdict.skipped;
   _cloudOfferMark(trigger);
   _cloudOfferShow(trigger, worker);
 }
@@ -3991,6 +4088,7 @@ let _modalResolve = null;
 function _modalBgClick(e) { if (e.target === document.getElementById('modal-backdrop')) _modalClose(false); }
 function _modalClose(val) {
   document.getElementById('modal-backdrop').classList.remove('open');
+  document.querySelector('#modal-backdrop .modal-box')?.classList.remove('modal-form');
   if (_modalResolve) { _modalResolve(val); _modalResolve = null; }
 }
 function showConfirm(msg, confirmLabel = 'Confirm', danger = false) {
@@ -4033,6 +4131,10 @@ function showFormModal(title, innerHTML, confirmLabel = 'Save') {
     document.getElementById('modal-btns').innerHTML =
       `<button class="btn primary" onclick="_modalClose(true)">${esc(confirmLabel)}</button>` +
       `<button class="btn" onclick="_modalClose(false)">Cancel</button>`;
+    // A form scrolls as one page, its buttons after the last field, so a
+    // phone keeps the whole height for the form (owner, 2026-11-22). A
+    // confirm or alert keeps its buttons pinned below a scrolling message.
+    document.querySelector('#modal-backdrop .modal-box').classList.add('modal-form');
     document.getElementById('modal-backdrop').classList.add('open');
   });
 }
@@ -6112,7 +6214,12 @@ const _origFetch = window.fetch.bind(window);
 // four days, none in the request log, each press held 30 s at "accepted"
 // (press_busy_released_unsettled), and the workers stayed. A delete now goes
 // to the server or says it did not.
-const _OUTBOX_SKIP = /\/api\/(sessions\/[^/?#]+\/delete(?:[?#]|$)|email\/(?:approve|reject)\/|connectors\/[^/]+\/(?:auth|token|test)(?:[?#]|$)|connection\/|client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/(?:run|chat)(?:[?#]|$)|history\/ask|config\/cross-group|gateway\/switch-org)/;
+// `palette/visit` and `palette/history/import` joined 2026-11-24: a Cmd-K
+// visit is a ranking hint that is also counted locally (_NAV.usage), so offline
+// it is dropped, not queued. Queued, three visits sat in the outbox beside a
+// person's real edits and sends, and LC-OFFLINE-ROUNDTRIP counted 8 held
+// operations where it made 5 (AF-1392, red on every scheduled run since 278d16114).
+const _OUTBOX_SKIP = /\/api\/(palette\/(?:visit|history\/import)(?:[?#]|$)|sessions\/[^/?#]+\/delete(?:[?#]|$)|email\/(?:approve|reject)\/|connectors\/[^/]+\/(?:auth|token|test)(?:[?#]|$)|connection\/|client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/(?:run|chat)(?:[?#]|$)|history\/ask|config\/cross-group|gateway\/switch-org)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -7375,6 +7482,14 @@ function _refreshOpenPeekOnSessions() {
     if (typeof peekSession !== 'undefined' && peekSession && pov && pov.classList.contains('active')) {
       if (typeof updatePeekStatus === 'function') updatePeekStatus();
       if (!document.hidden) _peekPollNow();
+      // The Board switch renders only once the worker is in `sessions`. A peek
+      // opened on a worker the list did not have yet kept it hidden until the
+      // tab's board fetch came back, however long that took. Every list
+      // refresh re-syncs it now.
+      const pbc = document.getElementById('peek-board-config');
+      const hidden = !!pbc && pbc.style.display === 'none';
+      _peekBoardPolicySync();
+      if (hidden && pbc.style.display !== 'none') console.info('[peek] board switch shown once the worker reached the list', { verdict: 'board_switch_late', session: peekSession });
     }
   } catch (e) {}
 }
@@ -7769,7 +7884,8 @@ function _niRender() {
     + (it.unblocks ? '<div class="ni-unblocks"><span class="ni-label">Unblocks</span> ' + esc(it.unblocks) + '</div>' : '')
     + (it.email ? '<div class="ni-email"><div><span class="ni-label">To</span> ' + esc(it.email.to || '') + (it.email.cc ? ' <span class="ni-label">cc</span> ' + esc(it.email.cc) : '') + '</div>'
         + '<div><span class="ni-label">Subject</span> ' + esc(it.email.subject || '') + '</div></div>' : '')
-    + (it.context ? '<details class="ni-context" open><summary>Context</summary><pre>' + esc(it.context) + '</pre></details>' : '')
+    + (it.outbound ? _niOutboundHtml(it.outbound)
+        : it.context ? '<details class="ni-context" open><summary>Context</summary><pre>' + esc(it.context) + '</pre></details>' : '')
     + _niPanelHtml(it);
   const hasTarget = !!(it.worker || it.kind === 'email' || it.card);
   if (_niAllArmed) { foot.innerHTML = _niApproveAllConfirmHtml(); return; }
@@ -7794,6 +7910,26 @@ function _niRender() {
     + '</div>';
   foot.querySelectorAll('button').forEach(b => { if (_niBusy) b.disabled = true; });
 }
+// A held outbound message, whole: where it goes, why, what it answers, the
+// recent conversation, and the full text (api/outbound.rs context).
+function _niOutboundHtml(o) {
+  const row = (label, v) => v ? '<div><span class="ni-label">' + label + '</span> ' + _linkifyUrls(esc(String(v))) + '</div>' : '';
+  const what = [o.channel, o.action].filter(Boolean).join(' ') + (o.account ? ', as ' + o.account : '');
+  const p = o.parent && typeof o.parent === 'object' ? o.parent : null;
+  const thread = Array.isArray(o.thread) ? o.thread : [];
+  return '<div class="ni-email ni-outbound">'
+    + row('What', what) + row('To', o.to) + row('Where', o.target_url) + row('Subject', o.subject) + row('Contact', o.contact)
+    + row('Why', o.reason || 'the worker gave no reason')
+    + '</div>'
+    + (p ? '<details class="ni-context" open><summary>Replying to' + (p.author ? ' ' + esc(p.author) : '') + (p.ts ? ' · ' + esc(p.ts) : '') + '</summary>'
+        + (p.url ? '<div>' + _linkifyUrls(esc(p.url)) + '</div>' : '')
+        + '<pre>' + esc(p.text || ('not shown: ' + (p.why_unmeasured || 'no text was given'))) + '</pre></details>' : '')
+    + (thread.length ? '<details class="ni-context"><summary>Recent conversation (' + thread.length + ')</summary><pre>'
+        + esc(thread.map(m => (m.author || '?') + ': ' + (m.text || '')).join('\n\n')) + '</pre></details>' : '')
+    + (o.notes ? row('Notes', o.notes) : '')
+    + '<details class="ni-context" open><summary>Full text</summary><pre>' + esc(o.text || '') + '</pre></details>';
+}
+
 function _niPanelHtml(it) {
   if (_niPanel === 'reply') {
     return '<div class="ni-panel ni-reply-panel">'
@@ -9562,8 +9698,524 @@ document.addEventListener('mouseout', (e) => {
 });
 ['scroll', 'mousedown', 'keydown'].forEach(t => document.addEventListener(t, () => { if (_wkHoverLink) _wkHoverHide(); }, true));
 
+// A TASK LINE'S WORKER, FROM INSIDE MARKDOWN (owner, 2026-11-22: "In markdown I
+// want a way to highlight text/worker and be able to send a command to chat /
+// terminal selectively. Basically a simple way to check the status of a task
+// from within md"). Each @worker carries a dot in its status colour, repainted
+// on every render. A click opens a small card: status, what it is on, its
+// latest reply, and a box pre-filled with the line's task to ask about it. The
+// reply to that ask shows in the card. Chat and Terminal open the worker on
+// that view; ⌘/Ctrl-click opens it straight away, as the link used to.
+function _mdWorkerDotStatus(name) {
+  const s = (typeof sessions !== 'undefined' ? sessions : []).find(x => x.name === name);
+  if (!s) return 'none';
+  const st = _workerStatus(s);
+  return st.key === 'needs_input' ? 'needs_input' : st.group;
+}
+function _mdWorkerStatusText(name) {
+  const k = _mdWorkerDotStatus(name);
+  if (k === 'none') return 'Not running here';
+  if (k === 'needs_input') return 'Waiting on you';
+  return _STATUS_LABELS[k] || k;
+}
+function _mdWorkerDotsPaint() {
+  const dots = document.querySelectorAll('.md-worker-dot');
+  for (const d of dots) {
+    const a = d.closest('[data-worker]');
+    if (!a) continue;
+    const st = _mdWorkerDotStatus(a.dataset.worker);
+    if (d.dataset.status !== st) d.dataset.status = st;
+  }
+  if (_mdTask.name) _mdTaskPaint();
+}
+// The task a mention sits in: its list item or paragraph, without the mention.
+function _mdTaskLine(a) {
+  const block = a.closest('li, p, td, th, h1, h2, h3, h4, h5, h6, blockquote') || a.parentElement;
+  if (!block) return '';
+  const c = block.cloneNode(true);
+  c.querySelectorAll('ul, ol').forEach(n => n.remove());   // a nested list is other lines
+  c.querySelectorAll('.md-worker-link, .md-ask-reply').forEach(n => n.remove());   // a drawn reply is not the line
+  return c.textContent.replace(/\s+/g, ' ').replace(/^[\s:—–-]+/, '').trim().slice(0, 300);
+}
+const _mdTask = { name: '', task: '', last: '', lastAt: '', waiting: false, sentAt: 0, pollAt: 0, anchor: null, timer: 0 };
+// While the card is open it reads the reply on its own clock: a worker's reply
+// sends no session event, so render alone may not come round. Every 5 s while
+// an ask waits, every 10 s otherwise (owner, 2026-11-23: a card opened before
+// the worker's newest reply kept showing the one before it).
+function _mdTaskWait(on) {
+  clearInterval(_mdTask.timer);
+  _mdTask.timer = on ? setInterval(_mdTaskPaint, 5000) : 0;
+}
+// "Latest reply · 1:08 PM, 3m ago": when the reply was written, so an old one reads as old.
+function _mdReplyLabel(base, at) {
+  const t = at ? Date.parse(at) : NaN;
+  if (!isFinite(t)) return base;
+  const clock = new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  return base + ' · ' + clock + ', ' + timeAgo(Math.floor(t / 1000));
+}
+function _mdTaskEl() {
+  let el = document.getElementById('md-task-card');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'md-task-card';
+    el.className = 'md-task-card';
+    el.setAttribute('role', 'dialog');
+    el.hidden = true;
+    el.innerHTML = '<div class="mtc-head"><span class="md-worker-dot"></span><b class="mtc-name"></b>'
+      + '<span class="mtc-status"></span><button class="btn mtc-close" type="button" aria-label="Close">×</button></div>'
+      + '<div class="mtc-doing"></div>'
+      + '<div class="mtc-reply-label"></div><div class="mtc-reply md-body"></div>'
+      + '<textarea class="input mtc-ask" rows="2" aria-label="Ask the worker"></textarea>'
+      + '<div class="mtc-row"><button class="btn primary mtc-send" type="button">Ask</button>'
+      + '<span class="mtc-note"></span><span class="mtc-open">Open'
+      + '<button class="btn mtc-chat" type="button">Chat</button><button class="btn mtc-term" type="button">Terminal</button></span></div>';
+    document.body.appendChild(el);
+    el.querySelector('.mtc-close').onclick = () => _mdTaskClose();
+    el.querySelector('.mtc-send').onclick = () => _mdTaskSend();
+    el.querySelector('.mtc-chat').onclick = () => _mdTaskOpenWorker('chat');
+    el.querySelector('.mtc-term').onclick = () => _mdTaskOpenWorker('terminal');
+    el.querySelector('.mtc-ask').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); _mdTaskSend(); }
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _mdTaskClose(); }
+    });
+    document.addEventListener('mousedown', e => {
+      if (!el.hidden && !el.contains(e.target) && !(e.target.closest && e.target.closest('.md-worker-link'))) _mdTaskClose();
+    }, true);
+  }
+  return el;
+}
+function _mdTaskPlace(el, a) {
+  if (window.matchMedia('(max-width: 600px)').matches) { el.style.top = el.style.left = ''; return; }   // a bottom sheet on a phone (CSS)
+  const r = a.getBoundingClientRect(), pr = el.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight, gap = 6;
+  let top = r.bottom + gap;
+  if (top + pr.height > vh - 8 && r.top - gap - pr.height >= 8) top = r.top - gap - pr.height;
+  el.style.top = Math.max(8, Math.min(top, vh - pr.height - 8)) + 'px';
+  el.style.left = Math.max(8, Math.min(r.left, vw - pr.width - 8)) + 'px';
+}
+function _mdTaskOpen(a) {
+  _wkHoverHide();
+  const name = a.dataset.worker;
+  const task = _mdTaskLine(a);
+  _mdTaskWait(false);
+  Object.assign(_mdTask, { name, task, last: '', lastAt: '', waiting: false, sentAt: 0, pollAt: Date.now(), anchor: a });
+  const el = _mdTaskEl();
+  el.setAttribute('aria-label', name + ': status and ask');
+  el.querySelector('.mtc-name').textContent = '@' + name;
+  el.querySelector('.mtc-ask').value = task ? 'Where are you on: ' + task + '?' : 'What is your status?';
+  el.querySelector('.mtc-note').textContent = '';
+  el.querySelector('.mtc-reply-label').textContent = 'Latest reply';
+  el.querySelector('.mtc-reply').textContent = 'Reading…';
+  el.hidden = false;
+  _mdTaskPaint();
+  _mdTaskPlace(el, a);
+  _mdBeacon('md_task_card_opened', { known: _mdWorkerKnown(name) ? 1 : 0, task_chars: task.length });
+  _mdTaskWait(true);
+  _mdTaskReadReply(name, false);
+}
+function _mdTaskClose() {
+  const el = document.getElementById('md-task-card');
+  if (el) el.hidden = true;
+  _mdTask.name = ''; _mdTask.waiting = false; _mdTask.anchor = null;
+  _mdTaskWait(false);
+}
+function _mdTaskPaint() {
+  const el = document.getElementById('md-task-card');
+  if (!el || el.hidden || !_mdTask.name) return;
+  const name = _mdTask.name;
+  const s = sessions.find(x => x.name === name);
+  el.querySelector('.mtc-head .md-worker-dot').dataset.status = _mdWorkerDotStatus(name);
+  el.querySelector('.mtc-status').textContent = _mdWorkerStatusText(name);
+  el.querySelector('.mtc-doing').textContent = s ? (s.task_name || s.desc || '') : '';
+  el.querySelector('.mtc-send').disabled = !s;
+  // An ask in flight: read the latest reply every 5 s until it changes (10 min at most).
+  // Otherwise every 10 s, so a reply the worker writes while the card is open shows.
+  const now = Date.now();
+  if (_mdTask.waiting) {
+    if (now - _mdTask.sentAt > 600000) { _mdTask.waiting = false; el.querySelector('.mtc-note').textContent = 'No reply yet; open the worker to see it.'; }
+    else if (now - _mdTask.pollAt > 4500) { _mdTask.pollAt = now; _mdTaskReadReply(name, true); }
+  } else if (now - _mdTask.pollAt > 9500) { _mdTask.pollAt = now; _mdTaskReadReply(name, false); }
+}
+async function _mdTaskReadReply(name, afterAsk) {
+  let text = '', at = '', read = false;
+  try {
+    const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/last-message', { headers: _authHeaders(), signal: AbortSignal.timeout(8000) });
+    const d = (await r.json()) || {};
+    text = String(d.text || '').trim();
+    at = String(d.at || '');
+    read = r.ok;
+  } catch (e) { console.warn('md task card: latest reply not read', e); }
+  if (_mdTask.name !== name) return;
+  const el = _mdTaskEl();
+  const label = el.querySelector('.mtc-reply-label');
+  if (afterAsk) {
+    if (!text || text === _mdTask.last) return;   // still the reply from before the ask
+    _mdTask.waiting = false;
+    Object.assign(_mdTask, { last: text, lastAt: at });   // a second ask waits for a reply newer than this one
+    el.querySelector('.mtc-note').textContent = '';
+    label.textContent = _mdReplyLabel('Reply', at);
+    _mdBeacon('md_task_reply_shown', { wait_ms: Date.now() - _mdTask.sentAt, chars: text.length });
+  } else {
+    // An unchanged reply keeps its place (and the reader's scroll); only its age moves on.
+    const same = text === _mdTask.last && at === _mdTask.lastAt && el.querySelector('.mtc-reply').textContent !== 'Reading…';
+    if (same || (!read && _mdTask.last)) {
+      if (!label.textContent.startsWith('Reply')) label.textContent = _mdReplyLabel('Latest reply', _mdTask.lastAt);
+      return;
+    }
+    if (_mdTask.last && text !== _mdTask.last) _mdBeacon('md_task_reply_refreshed', { chars: text.length });
+    Object.assign(_mdTask, { last: text, lastAt: at });
+    label.textContent = _mdReplyLabel('Latest reply', at);
+  }
+  const box = el.querySelector('.mtc-reply');
+  if (text) box.innerHTML = renderMarkdown(text, '', { workers: true });
+  else box.textContent = 'No reply from ' + name + ' yet.';
+  _bindMdFileLinks(box);
+  if (_mdTask.anchor && _mdTask.anchor.isConnected) _mdTaskPlace(el, _mdTask.anchor);
+}
+async function _mdTaskSend() {
+  const name = _mdTask.name;
+  const el = _mdTaskEl();
+  const text = el.querySelector('.mtc-ask').value.trim();
+  if (!name || !text) return;
+  const btn = el.querySelector('.mtc-send'), note = el.querySelector('.mtc-note');
+  btn.disabled = true;
+  note.textContent = 'Sending…';
+  try {
+    // The composer's own send: a busy worker gets it queued for its next pause.
+    const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(name) + '/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(30000) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.error || d.message || ('HTTP ' + r.status));
+    const queued = String(d.message || '').startsWith('queued');
+    if (_mdTask.name !== name) return;
+    Object.assign(_mdTask, { waiting: true, sentAt: Date.now(), pollAt: Date.now() });
+    _mdTaskWait(true);
+    note.textContent = queued ? 'Queued for its next pause. The reply shows here.' : 'Sent. The reply shows here.';
+    _mdBeacon('md_task_asked', { queued: queued ? 1 : 0, chars: text.length });
+  } catch (e) {
+    note.textContent = 'Not sent: ' + ((e && e.message) || e);
+    _mdBeacon('md_task_ask_failed', { error: String((e && e.message) || e).slice(0, 120) });
+  } finally {
+    btn.disabled = !sessions.find(x => x.name === name);
+  }
+}
+function _mdTaskOpenWorker(tab) {
+  const name = _mdTask.name;
+  const a = _mdTask.anchor;
+  _mdTaskClose();
+  if (!name) return;
+  _mdBeacon('md_task_open_worker', { tab });
+  const fo = document.getElementById('file-overlay');
+  if (fo && fo.classList.contains('active') && a && a.closest('#file-overlay')) {
+    if (typeof _navNote === 'function') { clearTimeout(_nav.timer); _navNote(); }
+    closeFilePreview();
+    if (fo.classList.contains('active')) return;   // unsaved edits keep the file open
+  }
+  if (typeof openPeek === 'function') openPeek(name);
+  if (typeof setPeekTab === 'function') setPeekTab(tab);
+  if (typeof _navSoon === 'function') _navSoon();
+}
+
+// ASK SEVERAL WORKERS FROM A FILE (owner, 2026-11-24: "highlight and all
+// highlighted @ workers I can send a mass message ... But then I also want to
+// see all the results at once"). Select lines in a markdown preview and an
+// "Ask N workers" button appears; the file menu's "Ask every @worker…" does
+// the same for the whole file. Each worker gets the question plus its own line
+// from the file, through the same send the single-worker card uses (a busy
+// worker gets it queued, a stopped one is woken). Its reply shows under its
+// line, drawn by the viewer only (the file is never written), and a bar at the
+// top counts replies. The state lives per file, so closing and reopening it
+// keeps the answers; a re-render (Split typing, a reload) redraws them.
+const _mdAsk = { path: '', question: '', sentAt: 0, rows: new Map(), timer: 0 };
+const _MD_ASK_WAIT_MS = 15 * 60 * 1000;
+function _mdAskBody() {
+  const b = document.getElementById('file-body');
+  return b && b.classList.contains('markdown') ? b : null;
+}
+function _mdAskNamesIn(body, range) {
+  const names = [];
+  body.querySelectorAll('.md-worker-link[data-worker]').forEach(a => {
+    if (range && !range.intersectsNode(a)) return;
+    if (!names.includes(a.dataset.worker)) names.push(a.dataset.worker);
+  });
+  return names;
+}
+function _mdAskSelBtn() {
+  let b = document.getElementById('md-ask-sel');
+  if (!b) {
+    b = document.createElement('button');
+    b.id = 'md-ask-sel';
+    b.type = 'button';
+    b.className = 'btn primary md-ask-sel';
+    b.hidden = true;
+    // mousedown, so the click does not first collapse the selection it acts on
+    b.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); });
+    b.addEventListener('click', e => {
+      e.preventDefault(); e.stopPropagation();
+      const names = (b.dataset.names || '').split('\n').filter(Boolean);
+      b.hidden = true;
+      _mdAskStart(names, 'selection');
+    });
+    document.body.appendChild(b);
+  }
+  return b;
+}
+function _mdAskSelSync() {
+  const btn = _mdAskSelBtn(), body = _mdAskBody();
+  const sel = window.getSelection();
+  if (!body || !sel || sel.isCollapsed || !sel.rangeCount || !body.isConnected
+      || !document.getElementById('file-overlay').classList.contains('active')) { btn.hidden = true; return; }
+  const range = sel.getRangeAt(0);
+  if (!body.contains(range.commonAncestorContainer)) { btn.hidden = true; return; }
+  const names = _mdAskNamesIn(body, range);
+  if (!names.length) { btn.hidden = true; return; }
+  btn.dataset.names = names.join('\n');
+  btn.textContent = 'Ask ' + names.length + (names.length === 1 ? ' worker' : ' workers');
+  btn.hidden = false;
+  const r = range.getBoundingClientRect(), bw = btn.offsetWidth || 120, bh = btn.offsetHeight || 32;
+  let top = r.bottom + 6;
+  if (top + bh > window.innerHeight - 8) top = Math.max(8, r.top - bh - 6);
+  btn.style.top = top + 'px';
+  btn.style.left = Math.max(8, Math.min(r.right - bw, window.innerWidth - bw - 8)) + 'px';
+}
+let _mdAskSelT = 0;
+document.addEventListener('selectionchange', () => { clearTimeout(_mdAskSelT); _mdAskSelT = setTimeout(_mdAskSelSync, 120); });
+function _mdAskAll() {
+  const m = document.getElementById('file-actions'); if (m) m.classList.remove('open');
+  const body = _mdAskBody();
+  _mdAskStart(body ? _mdAskNamesIn(body, null) : [], 'file');
+}
+async function _mdAskReadLast(name) {
+  const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/last-message', { headers: _authHeaders(), signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = (await r.json()) || {};
+  return { text: String(d.text || '').trim(), at: String(d.at || '') };
+}
+async function _mdAskStart(names, from) {
+  const body = _mdAskBody(), path = _fileData && _fileData.path;
+  if (!body || !path) return;
+  names = names.filter(n => _mdWorkerKnown(n));
+  if (!names.length) { showToast('No @workers here to ask'); return; }
+  const off = names.filter(n => { const s = sessions.find(x => x.name === n); return !s || !s.running; }).length;
+  const title = 'Ask ' + names.length + (names.length === 1 ? ' worker' : ' workers')
+    + (off ? ' (' + off + ' off: the message starts ' + (off === 1 ? 'it' : 'them') + ')' : '')
+    + '. Each also gets its line from this file.';
+  const q = ((await showPrompt(title, 'Your question', 'What is your status?')) || '').trim();
+  if (!q) return;
+  const file = path.split('/').pop();
+  clearInterval(_mdAsk.timer);
+  Object.assign(_mdAsk, { path, question: q, sentAt: Date.now(), rows: new Map(), timer: 0 });
+  for (const n of names) _mdAsk.rows.set(n, { state: 'sending', before: null, text: '', at: '', error: '', queued: false });
+  _mdAskPaint();
+  await Promise.all(names.map(async n => {
+    const row = _mdAsk.rows.get(n);
+    const a = body.querySelector('.md-worker-link[data-worker="' + CSS.escape(n) + '"]');
+    const line = a ? _mdTaskLine(a) : '';
+    const text = q + (line ? '\n\n(Your line in ' + file + ': "' + line + '")' : '');
+    try {
+      // null when unread: the poll then never takes the message from before the ask as its answer
+      row.before = await _mdAskReadLast(n).catch(() => null);
+      const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(n) + '/send', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(30000) });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || d.ok === false) throw new Error(d.error || d.message || ('HTTP ' + r.status));
+      row.queued = String(d.message || '').startsWith('queued');
+      row.state = 'waiting';
+    } catch (e) {
+      row.state = 'failed';
+      row.error = String((e && e.message) || e).slice(0, 160);
+    }
+    if (_mdAsk.path === path) _mdAskPaint();
+  }));
+  const failed = [..._mdAsk.rows.values()].filter(r => r.state === 'failed').length;
+  _mdBeacon('md_ask_sent', { n_considered: names.length, from, off, failed, chars: q.length });
+  if (failed) _mdBeacon('md_ask_failed', { failed, first_error: [..._mdAsk.rows.values()].find(r => r.error).error });
+  _mdAsk.timer = setInterval(_mdAskPoll, 5000);
+}
+async function _mdAskPoll() {
+  const waiting = [..._mdAsk.rows.entries()].filter(([, r]) => r.state === 'waiting');
+  if (!waiting.length) { clearInterval(_mdAsk.timer); _mdAsk.timer = 0; return; }
+  if (Date.now() - _mdAsk.sentAt > _MD_ASK_WAIT_MS) {
+    waiting.forEach(([, r]) => { r.state = 'silent'; });
+    _mdBeacon('md_ask_unanswered', { n_considered: _mdAsk.rows.size, silent: waiting.length });
+    clearInterval(_mdAsk.timer); _mdAsk.timer = 0;
+    _mdAskPaint();
+    return;
+  }
+  let changed = false;
+  await Promise.all(waiting.map(async ([n, r]) => {
+    let now;
+    try { now = await _mdAskReadLast(n); } catch (e) { return; }
+    if (!now.text) return;
+    if (!r.before) {
+      // The read before the ask failed. A message stamped after the ask is the
+      // answer; anything else becomes the baseline a later reply must differ from.
+      const t = Date.parse(now.at);
+      if (!(isFinite(t) && t >= _mdAsk.sentAt - 2000)) { r.before = now; return; }
+    } else if (now.text === r.before.text && now.at === r.before.at) return;
+    Object.assign(r, { state: 'replied', text: now.text, at: now.at });
+    _mdBeacon('md_ask_replied', { wait_ms: Date.now() - _mdAsk.sentAt, chars: now.text.length });
+    changed = true;
+  }));
+  if (changed) _mdAskPaint();
+}
+function _mdAskClear() {
+  clearInterval(_mdAsk.timer);
+  Object.assign(_mdAsk, { path: '', question: '', sentAt: 0, rows: new Map(), timer: 0 });
+  const body = _mdAskBody();
+  if (body) body.querySelectorAll('.md-ask-reply, .md-ask-bar').forEach(n => n.remove());
+}
+// Draws the answers into the preview showing this file; safe to call after any render.
+function _mdAskPaint() {
+  const body = _mdAskBody();
+  if (!body) return;
+  body.querySelectorAll('.md-ask-reply, .md-ask-bar').forEach(n => n.remove());
+  if (!_mdAsk.rows.size || !_fileData || _fileData.path !== _mdAsk.path) return;
+  const rows = [..._mdAsk.rows.values()];
+  const n = { replied: 0, waiting: 0, failed: 0, silent: 0, sending: 0 };
+  rows.forEach(r => { n[r.state] = (n[r.state] || 0) + 1; });
+  const bar = document.createElement('div');
+  bar.className = 'md-ask-bar';
+  bar.setAttribute('role', 'status');
+  const parts = [n.replied + ' of ' + rows.length + ' replied'];
+  if (n.sending) parts.push(n.sending + ' sending');
+  if (n.waiting) parts.push(n.waiting + ' waiting');
+  if (n.silent) parts.push(n.silent + ' no reply in 15 min');
+  if (n.failed) parts.push(n.failed + ' not sent');
+  bar.innerHTML = '<span class="md-ask-q">Asked: “' + esc(_mdAsk.question.slice(0, 80)) + '”</span>'
+    + '<span class="md-ask-count">' + esc(parts.join(' · ')) + '</span>'
+    + '<button class="btn md-ask-clear" type="button">Clear</button>';
+  bar.querySelector('.md-ask-clear').onclick = () => { _mdBeacon('md_ask_cleared', { n_considered: rows.length }); _mdAskClear(); };
+  body.prepend(bar);
+  for (const [name, r] of _mdAsk.rows) {
+    const a = body.querySelector('.md-worker-link[data-worker="' + CSS.escape(name) + '"]');
+    if (!a) continue;
+    const block = a.closest('li, p, td, th, h1, h2, h3, h4, h5, h6, blockquote') || a.parentElement;
+    const btn = document.createElement('button');   // a control: keyboard and the shared press layer reach it
+    btn.type = 'button';
+    btn.className = 'md-ask-reply';
+    btn.dataset.worker = name;
+    btn.dataset.state = r.state;
+    let txt;
+    if (r.state === 'replied') {   // one line of plain text; the card shows it formatted
+      const t = document.createElement('div');
+      t.innerHTML = renderMarkdown(r.text, '');
+      txt = t.textContent.replace(/\s+/g, ' ').trim();
+    }
+    else if (r.state === 'failed') txt = 'Not sent: ' + r.error;
+    else if (r.state === 'silent') txt = 'No reply in 15 minutes; open the worker to see it.';
+    else if (r.state === 'sending') txt = 'Sending…';
+    else txt = r.queued ? 'Queued for its next pause; waiting…' : 'Waiting…';
+    btn.innerHTML = '<span class="md-ask-arrow" aria-hidden="true">↳</span>'
+      + (r.state === 'replied' && r.at ? '<span class="md-ask-when">' + esc(timeAgo(Math.floor(Date.parse(r.at) / 1000))) + '</span>' : '')
+      + '<span class="md-ask-text"></span>';
+    btn.querySelector('.md-ask-text').textContent = txt;
+    btn.title = r.state === 'replied' ? 'Open @' + name + "'s card to read the whole reply and ask more" : '';
+    btn.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); _mdBeacon('md_ask_reply_opened', { state: r.state }); _mdTaskOpen(a); });
+    const nested = [...block.children].find(c => c.tagName === 'UL' || c.tagName === 'OL');
+    if (nested) block.insertBefore(btn, nested); else block.appendChild(btn);
+  }
+}
+
+// HOVER PREVIEW OF A LINKED FILE (owner, 2026-11-18: "file path is clickable
+// and on mouseover shows a preview"). Any .md-file-link to a file: the head of
+// the file, rendered as markdown for .md and as text otherwise, in the same
+// inert card as an @worker preview. A click still opens the file. Pointers
+// that hover only. Reads are cached for 30 s so moving across a list of paths
+// does not refetch.
+let _fhTimer = null, _fhLink = null;
+const _fhCache = new Map();
+async function _fhRead(path) {
+  const hit = _fhCache.get(path);
+  if (hit && Date.now() - hit.at < 30000) return hit;
+  let res;
+  try {
+    const r = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(path), { headers: _authHeaders(), signal: AbortSignal.timeout(6000) });
+    if (!r.ok) res = { error: r.status === 404 ? 'No file at this path' : 'Could not read it (' + r.status + ')' };
+    else {
+      const type = r.headers.get('content-type') || '';
+      if (!/^text\/|json|xml|javascript|markdown/i.test(type) && !/\.(md|txt|json|ya?ml|toml|csv|rs|js|ts|py|sh)$/i.test(path)) res = { error: 'No preview for this kind of file' };
+      else { const t = await r.text(); res = { text: t.slice(0, 6000), cut: t.length > 6000 }; }
+    }
+  } catch (e) { res = { error: 'Could not read it' }; }
+  res.at = Date.now();
+  _fhCache.set(path, res);
+  return res;
+}
+// Every file link: a markdown link carries the full path; a path in worker
+// output (Messages, Chat, a peek) is relative to the worker, so it is resolved
+// the way its context menu resolves it.
+const _FH_LINKS = '.md-file-link[data-file]:not([data-dir]), .file-link[data-path], .md-link[data-path]';
+async function _fhPath(a) {
+  if (a.classList.contains('md-file-link')) return a.dataset.file || '';
+  const raw = (a.dataset.path || '').replace(/(?::\d+){1,2}$/, '');
+  try { return (await _resolveLinkedPath(raw)) || raw; }
+  catch (e) { console.warn('[hover] could not resolve a linked path', e); return raw; }
+}
+async function _fhShow(a) {
+  const pop = _wkHoverCard();
+  const path = await _fhPath(a);
+  if (_fhLink !== a || !path) return;
+  pop.innerHTML = '<div class="worker-hovercard-none">Loading ' + esc(path.split('/').pop()) + '…</div>';
+  pop.hidden = false;
+  const res = await _fhRead(path);
+  if (_fhLink !== a) return;
+  const head = '<div class="file-hovercard-path">' + esc(path) + '</div>';
+  let body;
+  if (res.error) body = '<div class="worker-hovercard-none">' + esc(res.error) + '</div>';
+  else if (/\.md$/i.test(path)) body = '<div class="file-hovercard-body md-body">' + renderMarkdown(res.text, path) + '</div>';
+  else body = '<pre class="file-hovercard-body">' + esc(res.text) + '</pre>';
+  pop.innerHTML = head + body + (res.cut ? '<div class="worker-hovercard-none">…</div>' : '');
+  const r = a.getBoundingClientRect(), pr = pop.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight, gap = 6;
+  let top = r.bottom + gap;
+  if (top + pr.height > vh - 8 && r.top - gap - pr.height >= 8) top = r.top - gap - pr.height;
+  pop.style.top = Math.max(8, Math.min(top, vh - pr.height - 8)) + 'px';
+  pop.style.left = Math.max(8, Math.min(r.left, vw - pr.width - 8)) + 'px';
+}
+function _fhHide() {
+  clearTimeout(_fhTimer); _fhTimer = null; _fhLink = null;
+  const pop = document.getElementById('worker-hovercard');
+  if (pop) pop.hidden = true;
+}
+document.addEventListener('mouseover', (e) => {
+  if (!window.matchMedia('(hover: hover)').matches) return;
+  const a = e.target.closest && e.target.closest(_FH_LINKS);
+  if (!a || a === _fhLink) return;
+  _fhHide();
+  _fhLink = a;
+  _fhTimer = setTimeout(() => { if (_fhLink === a && a.isConnected) _fhShow(a); }, 350);
+});
+document.addEventListener('mouseout', (e) => {
+  if (!_fhLink) return;
+  const to = e.relatedTarget;
+  if (to && _fhLink.contains(to)) return;
+  if (e.target.closest && e.target.closest(_FH_LINKS) === _fhLink) _fhHide();
+});
+['mousedown', 'keydown'].forEach(t => document.addEventListener(t, () => { if (_fhLink) _fhHide(); }, true));
+// Only a scroll that moves the link hides its card (owner, 2026-11-19: "file
+// preview mouseover not working"): any scroll anywhere used to, and a live
+// terminal or list scrolls all the time, so the card closed as it opened.
+document.addEventListener('scroll', (e) => {
+  if (!_fhLink) return;
+  const t = e.target;
+  if (t === document || t === document.documentElement || (t && t.contains && t.contains(_fhLink))) _fhHide();
+}, true);
+
 // One worker's card, as the worker list draws it. Top level so a hover
 // preview of an @worker mention draws the same card (owner, 2026-11-09).
+// A NEW WORKER OPENS FROM ITS CARD AT ONCE (owner, 2026-11-22: "it doesn't
+// open unless you click the terminal block, and the terminal block doesn't
+// always get started immediately when the worker is created"). Only the
+// preview block opened a worker; it appears once the pane has printed, the
+// server's preview cache has refreshed and the list has been fetched again,
+// and until then a click anywhere folded the card. The name is now a link to
+// the worker (a plain click opens it through the own-link handler, which
+// stops the click before the card folds; a middle click opens a new tab),
+// and a running worker with no output yet shows the block, saying so.
+function _workerCardHref(name) {
+  return '/#peek=' + encodeURIComponent(String(name || ''));
+}
 function _renderSessionCard(s) {
   const isExp = expanded.has(s.name);
   const flags = s.flags || '';
@@ -9606,7 +10258,7 @@ function _renderSessionCard(s) {
     <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
       <div class="card-header-top">
         <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
-        <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config or behavioral hooks. Passive lifecycle hooks report status only. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
+        <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config or behavioral hooks. Passive lifecycle hooks report status only. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}<a class="card-name-link" href="${esc(_workerCardHref(s.name))}" title="Open ${esc(s.name)}">${esc(s.name)}</a>${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
         <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
         <div class="card-menu" id="menu-${s.name}">
         ${_renderWorkerActionMenu(s, 'card')}
@@ -9726,7 +10378,8 @@ function _renderSessionCard(s) {
         ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
         ${s.last_activity ? `<div class="timing-item"><span class="timing-label">Last interaction</span><span class="timing-value">${timeAgo(s.last_activity)}</span></div>` : ''}
       </div>` : ''}
-      ${s.preview_lines && s.preview_lines.length ? `<div class="card-preview-lines" onclick="event.stopPropagation();openPeek('${s.name}')" style="cursor:pointer;">${rewriteLocalhostUrls(s.preview_lines.map(l => esc(l)).join('\n'))}</div>` : ''}
+      ${s.preview_lines && s.preview_lines.length ? `<div class="card-preview-lines" onclick="event.stopPropagation();openPeek('${s.name}')" style="cursor:pointer;">${rewriteLocalhostUrls(s.preview_lines.map(l => esc(l)).join('\n'))}</div>`
+        : s.running ? `<div class="card-preview-lines card-preview-pending" onclick="event.stopPropagation();openPeek('${s.name}')" title="Open ${esc(s.name)}">No output yet · open</div>` : ''}
       <div class="card-stats" id="stats-${s.name}"></div>
       ${s.running ? `
       <div class="chips" id="card-chips-${s.name}"></div>
@@ -9749,6 +10402,8 @@ function _renderSessionCard(s) {
 function render() {
   // The Send/Queue label reads the target's status, so it follows each render.
   try { _syncComposerPending(); } catch (_) {}
+  // @worker dots and an open task card in markdown follow the same data.
+  try { _mdWorkerDotsPaint(); } catch (e) { console.warn('md worker dots: repaint failed', e); }
   // THE PEEK HEADER UPDATES FIRST, ahead of the card-clobbering guard below.
   //
   // It used to sit AFTER that guard, so an open card menu / edit overlay froze
@@ -10927,6 +11582,49 @@ function _renderTabCustomizerMenu() {
   });
 }
 
+// ONE LIVE SORTABLE DRAG OWNS THE PAGE. Sortable keeps the drag in progress in
+// module globals shared by every instance, and destroy() on ANY instance runs
+// its drop with no event: the globals are cleared and the drag in progress
+// hangs with its floating copy under the pointer, and the drop never lands.
+// Measured 2026-11-23: renderBoard, reached from _ensureArchivedCount with the
+// Board not even shown, destroyed the board's Sortables while a tab of the
+// in-page strip was held, and that drag never ended. So a render that destroys
+// Sortables waits while any drag is live (Sortable.dragged is set from the
+// press to the drop) and runs once, after the pointer is let go. Each wait is
+// beaconed as kind=sortable-drag-deferred with what waited.
+function _sortableDragLive() { return !!(window.Sortable && window.Sortable.dragged); }
+const _afterSortableDrag = new Map();
+// A drag Sortable never closed (its globals left set) must not hold renders
+// for ever: past this, a render runs anyway and says so (sortable-drag-stuck).
+const _SORTABLE_HOLD_MAX_MS = 30000;
+let _sortableHoldSince = 0;
+function _deferForSortableDrag(fn, what) {
+  if (!_sortableDragLive()) { _sortableHoldSince = 0; return false; }
+  if (!_sortableHoldSince) _sortableHoldSince = Date.now();
+  if (Date.now() - _sortableHoldSince > _SORTABLE_HOLD_MAX_MS) {
+    console.warn('[sortable] a drag has been live for over 30s; rendering anyway', what);
+    try { window._clientDebug && window._clientDebug('sortable-drag-stuck', { what, held_ms: Date.now() - _sortableHoldSince, measured: true, n_considered: 1 }); } catch (e) { console.warn('[sortable] stuck-drag beacon not sent', e); }
+    return false;
+  }
+  if (!_afterSortableDrag.has(fn)) {
+    _afterSortableDrag.set(fn, what);
+    try { window._clientDebug && window._clientDebug('sortable-drag-deferred', { what, measured: true, n_considered: 1 }); } catch (e) { console.warn('[sortable] deferred-render beacon not sent', e); }
+  }
+  return true;
+}
+function _runAfterSortableDrag() {
+  if (!_afterSortableDrag.size) return;
+  // Sortable's own drop runs after this listener in the same event, so wait a turn.
+  setTimeout(function flush() {
+    if (_sortableDragLive()) { setTimeout(flush, 200); return; }
+    _sortableHoldSince = 0;
+    const waiting = [..._afterSortableDrag.keys()];
+    _afterSortableDrag.clear();
+    waiting.forEach(fn => { try { fn(); } catch (e) { console.warn('[sortable] a render held for a drag failed', e); } });
+  }, 0);
+}
+['pointerup', 'mouseup', 'touchend', 'pointercancel'].forEach(t => document.addEventListener(t, () => setTimeout(_runAfterSortableDrag, 0), true));
+
 // ONE DRAG FOR BOTH TAB MENUS, driven by the pointer (Ethan, 2026-10-25, the
 // Mac app's worker-view menu: "drag & tab not working or draggable"). Sortable's
 // default is the browser's native drag and drop, and in the Mac app that is an
@@ -10969,7 +11667,7 @@ function _tabMenuSortableCreate(menu, which, draggable, onReorder) {
   }
   return Sortable.create(menu, {
     draggable, animation: 120,
-    filter: 'input, .tab-cust-search-wrap', preventOnFilter: false,
+    filter: 'input, .tab-cust-search-wrap, .chrome-tab-close', preventOnFilter: false,
     forceFallback: true, fallbackTolerance: 4,
     delay: 160, delayOnTouchOnly: true, touchStartThreshold: 6,
     scroll: true, scrollSensitivity: 56, scrollSpeed: 14, bubbleScroll: true,
@@ -11137,12 +11835,17 @@ function _applyPeekTabVisibility() {
       // worker's cards, it adds nothing to the raw CLI (Ethan, 2026-09-24).
       const alwaysShown = PEEK_REQUIRED_TABS.has(t.id);
       // A type with no worktree has no Worktree tab to show.
-      const typeHides = t.id === 'git' && _peekType.worktree === 'unsupported';
+      // A chat worker's first tab is already its chat, so the companion Chat tab
+      // would be a second "Chat" beside it (owner screenshot, 2026-11-20).
+      const typeHides = (t.id === 'git' && _peekType.worktree === 'unsupported')
+        || (t.id === 'chat' && _primaryRenderer === 'chat')
+        || (t.id === 'intent' && !(peekSession && _peekIntentList().length));
       // Schedules are shown for isolated workers too: a schedule is owner
       // configuration and delivers into them (Ethan, 2026-09-26).
       el.style.display = !alwaysShown && (peekHiddenTabs.has(t.id) || typeHides) ? 'none' : '';
     }
   });
+  _peekIntentTabPaint();
 }
 _loadPeekTabPrefs();
 // Tab-customizer geometry beacon (AF-45). Ethan reported three times that the
@@ -12249,7 +12952,11 @@ function closeAddMenu() {
 // ── Describe what you want (Ethan, 2026-10-18) ──
 // One box: describe the outcome, and attach a recording or files if the
 // outcome lives in them. Everything else is a default under a closed
-// "Defaults and constraints" section, remembered in prefs (outcome_defaults).
+// "Defaults and constraints" section. Saved setups are presets (prefs key
+// outcome_presets): a preset holds every field of that section, picked from
+// the Preset selector (None = the built-in defaults) and saved only when
+// "Save as a preset" is ticked (owner, 2026-11-21, replacing "Remember these
+// as my defaults", which rewrote the defaults on every start).
 // The server (POST /api/outcome/plan) names the worker and picks the
 // directory and groups the fleet already uses for this work, reading the
 // text and the attachments (a recording is transcribed and the transcript
@@ -12284,29 +12991,517 @@ function _outcomePrompt(text, constraints, goal) {
     + ' Done when this outcome is achieved and verified.';
   return (goal ? '/goal ' : '') + body.slice(0, 4000);
 }
-async function _outcomeDefaults() {
-  let d = {};
-  try { d = JSON.parse(localStorage.getItem('amux_outcome_defaults') || '{}'); } catch (_) {}
-  try {
-    const r = await fetch(API + '/api/prefs?key=outcome_defaults', { headers: _authHeaders() });
-    if (r.ok) { const v = (await r.json()).value; if (v) d = JSON.parse(v); }
-  } catch (_) { /* offline: the cached copy stands */ }
+// The built-in defaults the "None" preset stands for.
+function _outcomeBaseDefaults() {
   return {
-    group: d.group ?? ((typeof activeTag === 'string' && activeTag) ? activeTag : ''),
-    dir: d.dir || '',
-    provider: d.provider || 'claude',
-    model: d.model || '',
+    group: (typeof activeTag === 'string' && activeTag) ? activeTag : '',
+    dir: '',
+    provider: 'claude',
+    model: '',
     // Decided 2026-11-12 (docs/design/intent-first.md): routed and created
     // workers are not isolated by default; isolation stays an explicit choice.
-    isolated: d.isolated === true,
-    constraints: d.constraints ?? _OUTCOME_DEFAULT_CONSTRAINTS,
+    isolated: false,
+    constraints: _OUTCOME_DEFAULT_CONSTRAINTS,
   };
 }
+// Paths that start a worker without this dialog (Open in worker -> New
+// worker) use the preset the dialog opens on: the one last started with
+// (outcome_history.last_preset), or the built-in defaults.
+async function _outcomeDefaults() {
+  const last = (await _ocHistLoad()).last_preset;
+  if (!last) return _outcomeBaseDefaults();
+  const p = (await _outcomePresets()).find(x => x.name === last);
+  if (!p) { console.info('[outcome] last-used preset "' + last + '" is gone; using the built-in defaults'); return _outcomeBaseDefaults(); }
+  const { name: _n, ...cfg } = p;
+  return cfg;
+}
+const _OUTCOME_PRESET_FIELDS = ['group', 'dir', 'provider', 'model', 'isolated', 'constraints'];
+function _outcomePresetClean(p) {
+  const base = _outcomeBaseDefaults();
+  const out = { name: String(p.name || '').trim() };
+  for (const k of _OUTCOME_PRESET_FIELDS) out[k] = k === 'isolated' ? p[k] === true : (p[k] == null ? base[k] : String(p[k]));
+  return out;
+}
+async function _prefGet(key) {
+  const r = await fetch(API + '/api/prefs?key=' + encodeURIComponent(key), { headers: _authHeaders() });
+  if (!r.ok) throw new Error('prefs ' + r.status);
+  return (await r.json()).value || '';
+}
+// Presets live in prefs so every device sees them; localStorage is the
+// offline copy. The first load after this change carries the old remembered
+// defaults (outcome_defaults) over as a preset named "My defaults", so a
+// setup saved the old way is still one pick away. The old pref is not deleted.
+async function _outcomePresets() {
+  let list = null;
+  try { list = JSON.parse(localStorage.getItem('amux_outcome_presets') || 'null'); } catch (e) { console.warn('[outcome] cached presets unreadable', e); }
+  try {
+    const v = await _prefGet('outcome_presets');
+    if (v) list = JSON.parse(v);
+    else if (!list) {
+      let legacy = null;
+      try { const lv = await _prefGet('outcome_defaults'); legacy = lv ? JSON.parse(lv) : null; } catch (e) { console.warn('[outcome] old defaults unreadable on the server', e); }
+      if (!legacy) { try { legacy = JSON.parse(localStorage.getItem('amux_outcome_defaults') || 'null'); } catch (e) { console.warn('[outcome] cached old defaults unreadable', e); } }
+      const base = _outcomeBaseDefaults();
+      const differs = legacy && typeof legacy === 'object'
+        && _OUTCOME_PRESET_FIELDS.some(k => legacy[k] != null && legacy[k] !== '' && legacy[k] !== base[k] && !(k === 'isolated' && !legacy[k]));
+      list = differs ? [_outcomePresetClean({ ...legacy, name: 'My defaults' })] : [];
+      if (differs) {
+        console.info('[outcome] carried the remembered defaults over as preset "My defaults"');
+        await _outcomeSavePresets(list);
+        // They were what every start used, so the dialog opens on them.
+        await _ocHistEdit(h => { if (!h.last_preset) h.last_preset = 'My defaults'; });
+      }
+    }
+  } catch (e) { console.warn('[outcome] presets not read from the server; the cached copy stands', e); }
+  return Array.isArray(list) ? list.filter(p => p && p.name).map(_outcomePresetClean) : [];
+}
+// A save or delete is applied to the server's current list, so a preset another
+// device saved while this dialog was open is kept (and one it deleted stays gone).
+async function _outcomePresetsEdit(fn) {
+  let base = _outcomePresetList;
+  try {
+    const v = await _prefGet('outcome_presets');
+    if (v) base = JSON.parse(v).filter(p => p && p.name).map(_outcomePresetClean);
+  } catch (e) { console.warn('[outcome] presets not re-read before an edit; editing the cached copy', e); }
+  _outcomePresetList = fn(base);
+  return _outcomeSavePresets(_outcomePresetList);
+}
+async function _outcomeSavePresets(list) {
+  const val = JSON.stringify(list);
+  localStorage.setItem('amux_outcome_presets', val);
+  try {
+    const r = await fetch(API + '/api/prefs', { method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
+      body: JSON.stringify({ key: 'outcome_presets', value: val }) });
+    return r.ok || _isLocallyQueued(r);
+  } catch (_) { return false; }
+}
+// A preset saved without a name is named for what it holds: the folder's
+// last part and the group, made unique so it never replaces another preset.
+function _outcomePresetAutoName(cfg, taken) {
+  const parts = [(cfg.dir || '').replace(/\/+$/, '').split('/').pop(), cfg.group].filter(Boolean);
+  const base = parts.join(' · ') || 'Preset';
+  let name = base, n = 2;
+  while (taken.has(name)) name = base + ' ' + n++;
+  return name;
+}
+let _outcomePresetList = [];
+
+// ── Describe what you want: shared history (owner, 2026-11-21) ──
+// The working directories, groups and models used here, kept in prefs
+// (outcome_history) so every device sees one list, and x on an entry removes
+// it everywhere. The fleet's own directories and groups are offered too; x on
+// one of those hides it until it is used again. last_preset is the preset the
+// dialog opens on.
+const _OC_HIST_CAP = 25;
+function _ocHistEmpty() { return { dirs: [], groups: [], models: {}, hidden: { dirs: [], groups: [] }, last_preset: '' }; }
+function _ocHistClean(h) {
+  const out = _ocHistEmpty();
+  h = (h && typeof h === 'object') ? h : {};
+  const list = (a, cap) => Array.isArray(a)
+    ? [...new Set(a.filter(x => typeof x === 'string').map(x => x.trim()).filter(Boolean))].slice(0, cap) : [];
+  out.dirs = list(h.dirs, _OC_HIST_CAP);
+  out.groups = list(h.groups, _OC_HIST_CAP);
+  if (h.models && typeof h.models === 'object') {
+    for (const [p, l] of Object.entries(h.models)) { const v = list(l, _OC_HIST_CAP); if (v.length) out.models[p] = v; }
+  }
+  out.hidden.dirs = list(h.hidden && h.hidden.dirs, _OC_HIDDEN_CAP);
+  out.hidden.groups = list(h.hidden && h.hidden.groups, _OC_HIDDEN_CAP);
+  out.last_preset = typeof h.last_preset === 'string' ? h.last_preset : '';
+  return out;
+}
+let _ocHist = _ocHistEmpty();
+async function _ocHistRead() {
+  const v = await _prefGet('outcome_history');
+  return v ? _ocHistClean(JSON.parse(v)) : null;
+}
+async function _ocHistLoad() {
+  let h = null;
+  try { h = JSON.parse(localStorage.getItem('amux_outcome_history') || 'null'); } catch (e) { console.warn('[outcome] cached history unreadable', e); }
+  try { const s = await _ocHistRead(); if (s) h = s; } catch (e) { console.warn('[outcome] history not read from the server; the cached copy stands', e); }
+  _ocHist = _ocHistClean(h);
+  return _ocHist;
+}
+// One edit at a time (queued here), each applied to the server's current copy,
+// so neither two quick edits nor two devices undo each other's entries.
+let _ocHistQueue = Promise.resolve();
+function _ocHistEdit(fn) {
+  const run = _ocHistQueue.then(() => _ocHistEditNow(fn));
+  _ocHistQueue = run.catch(() => false);
+  return run;
+}
+async function _ocHistEditNow(fn) {
+  let base = _ocHistClean(_ocHist);
+  try { const s = await _ocHistRead(); if (s) base = s; } catch (e) { console.warn('[outcome] history not re-read before an edit; editing the cached copy', e); }
+  fn(base);
+  _ocHist = _ocHistClean(base);
+  const val = JSON.stringify(_ocHist);
+  localStorage.setItem('amux_outcome_history', val);
+  try {
+    const r = await fetch(API + '/api/prefs', { method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
+      body: JSON.stringify({ key: 'outcome_history', value: val }) });
+    return r.ok || _isLocallyQueued(r);
+  } catch (e) { console.warn('[outcome] history not saved on the server', e); return false; }
+}
+const _ocFront = (list, v, cap) => [v, ...list.filter(x => x !== v)].slice(0, cap || _OC_HIST_CAP);
+const _OC_HIDDEN_CAP = 500;
+// What a start teaches the lists: its directory, groups and model go to the
+// top (and are unhidden), and its preset is the one the dialog opens on next.
+function _ocHistRecord(cfg, preset) {
+  return _ocHistEdit(h => {
+    if (cfg.dir) { h.dirs = _ocFront(h.dirs, cfg.dir); h.hidden.dirs = h.hidden.dirs.filter(x => x !== cfg.dir); }
+    for (const g of _createGroupsFrom(cfg.group || '').reverse()) {
+      h.groups = _ocFront(h.groups, g); h.hidden.groups = h.hidden.groups.filter(x => x !== g);
+    }
+    if (cfg.model) h.models[cfg.provider || 'claude'] = _ocFront(h.models[cfg.provider || 'claude'] || [], cfg.model);
+    h.last_preset = preset || '';
+  });
+}
+function _ocFleet(field) {
+  const out = [];
+  for (const s of (sessions || [])) {
+    if (field === 'dirs' && s.dir) out.push(s.dir);
+    if (field === 'groups') out.push(...(s.tags || []));
+  }
+  return [...new Set(out)].sort();
+}
+// History first (most recent first), then the fleet's, minus what was removed.
+function _ocKnown(field) {
+  const hidden = new Set(_ocHist.hidden[field] || []);
+  const hist = _ocHist[field] || [];
+  return [...hist, ..._ocFleet(field).filter(x => !hist.includes(x) && !hidden.has(x))];
+}
+async function _ocForget(kind, value) {
+  const field = kind === 'dir' ? 'dirs' : kind === 'group' ? 'groups' : 'models';
+  const prov = document.getElementById('outcome-provider')?.value || 'claude';
+  const saved = await _ocHistEdit(h => {
+    if (field === 'models') { h.models[prov] = (h.models[prov] || []).filter(x => x !== value); return; }
+    h[field] = h[field].filter(x => x !== value);
+    if (_ocFleet(field).includes(value)) h.hidden[field] = _ocFront(h.hidden[field], value, _OC_HIDDEN_CAP);
+  });
+  if (kind === 'group') _ocGroupsRender(); else _ocComboShow(kind, true);
+  if (!saved) showToast('Removed here; the server did not save it');
+}
+
+// ── One combobox for the working directory and the model ──
+// Type freely, or pick from the list under the field: Recent (x removes it on
+// every device), then suggestions for what is typed (folders on the amux
+// host, or the provider's models from /api/models).
+const _ocCombo = { dir: { items: [], active: -1, seq: 0, timer: null }, model: { items: [], active: -1, seq: 0, timer: null } };
+let _ocModels = { provider: '', list: [], error: '' };
+function _ocComboHtml(kind, id, value, placeholder, extra) {
+  return `<div class="oc-combo" data-kind="${kind}"><div class="oc-combo-row">`
+    + `<input id="${id}" class="input" value="${esc(value)}" placeholder="${esc(placeholder)}" autocomplete="off" spellcheck="false"`
+    + ` role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="${id}-list"`
+    + ` onfocus="_ocComboShow('${kind}')" oninput="_ocComboShow('${kind}')" onkeydown="_ocComboKey(event,'${kind}')" onblur="_ocComboBlur('${kind}')">`
+    + (extra || '') + `</div><div class="oc-combo-list" id="${id}-list" role="listbox" hidden></div></div>`;
+}
+const _ocComboInput = kind => document.getElementById(kind === 'dir' ? 'outcome-dir' : 'outcome-model');
+function _ocComboRender(kind, sections) {
+  const inp = _ocComboInput(kind);
+  const list = document.getElementById(inp.id + '-list');
+  const st = _ocCombo[kind];
+  st.items = [];
+  let html = '';
+  for (const sec of sections) {
+    if (!sec.items.length) continue;
+    html += '<div class="oc-combo-head">' + esc(sec.title) + '</div>';
+    for (const it of sec.items) {
+      const i = st.items.push(it.value) - 1;
+      html += '<div class="oc-opt" role="option" id="' + inp.id + '-opt-' + i + '" data-i="' + i + '">'
+        + '<span class="oc-opt-label">' + esc(it.label || it.value) + '</span>'
+        + (it.note ? '<span class="oc-opt-note">' + esc(it.note) + '</span>' : '')
+        + (sec.removable ? '<button type="button" class="oc-x" data-forget="' + i + '" tabindex="-1" aria-label="Remove ' + esc(it.value) + ' from the list">&times;</button>' : '')
+        + '</div>';
+    }
+  }
+  if (!html && sections.note) html = '<div class="oc-combo-head">' + esc(sections.note) + '</div>';
+  st.active = -1;
+  list.innerHTML = html;
+  const was = !list.hidden;
+  const open = !!html && document.activeElement === inp;
+  list.hidden = !open;
+  inp.setAttribute('aria-expanded', open ? 'true' : 'false');
+  inp.removeAttribute('aria-activedescendant');
+  if (!open) return;
+  // On a phone the list opens in the dialog's flow, as tall as the screen
+  // allows: the field moves to the dialog's top once, when the list opens, so
+  // the list has the room below it (owner, 2026-11-22). Elsewhere, and on
+  // later renders while typing, only make sure the list shows.
+  if (!was && matchMedia('(max-width: 600px)').matches) inp.closest('.outcome-field').scrollIntoView({ block: 'start' });
+  else list.scrollIntoView({ block: 'nearest' });
+}
+function _ocComboShow(kind, keep) {
+  const inp = _ocComboInput(kind);
+  if (!inp) return;
+  if (keep && document.activeElement !== inp) return;
+  const q = inp.value.trim(), ql = q.toLowerCase();
+  const match = v => !ql || v.toLowerCase().includes(ql);
+  const st = _ocCombo[kind];
+  if (kind === 'dir') {
+    const recent = _ocKnown('dirs').filter(v => v !== q && match(v)).slice(0, 12).map(value => ({ value }));
+    _ocComboRender(kind, [{ title: 'Recent', items: recent, removable: true }]);
+    clearTimeout(st.timer);
+    if (q.length < 2 || !/^[~/]/.test(q)) return;
+    const seq = ++st.seq;
+    st.timer = setTimeout(async () => {
+      let found = [];
+      try {
+        const r = await fetch(API + '/api/autocomplete/dir?q=' + encodeURIComponent(q), { headers: _authHeaders() });
+        if (r.ok) found = await r.json();
+      } catch (e) { console.warn('[outcome] folder suggestions unavailable', e); }
+      if (seq !== st.seq || !inp.isConnected || inp.value.trim() !== q) return;
+      const seen = new Set(recent.map(x => x.value));
+      const folders = (Array.isArray(found) ? found : []).map(f => String(f).replace(/\/+$/, '') || '/')
+        .filter(f => !seen.has(f) && f !== q).slice(0, 12).map(value => ({ value }));
+      _ocComboRender(kind, [{ title: 'Recent', items: recent, removable: true }, { title: 'Folders', items: folders }]);
+    }, 150);
+    return;
+  }
+  const prov = document.getElementById('outcome-provider')?.value || 'claude';
+  const recentIds = (_ocHist.models[prov] || []).filter(v => v !== q && match(v));
+  const seen = new Set(recentIds);
+  const catalog = _ocModels.provider === prov ? _ocModels.list : [];
+  const models = catalog.filter(m => !seen.has(m.id) && m.id !== q && (match(m.id) || match(m.model_type || '')))
+    .map(m => ({ value: m.id, note: _modelTypeLabel(m.model_type) }));
+  const secs = [{ title: 'Recent', items: recentIds.map(value => ({ value })), removable: true },
+    { title: 'Models', items: models }];
+  secs.note = _ocModels.provider !== prov ? 'Loading models…' : (_ocModels.error ? 'Model list unavailable: type a model id' : '');
+  _ocComboRender(kind, secs);
+}
+function _ocComboPick(kind, value) {
+  const inp = _ocComboInput(kind);
+  inp.value = value;
+  const list = document.getElementById(inp.id + '-list');
+  list.hidden = true;
+  inp.setAttribute('aria-expanded', 'false');
+  if (kind === 'dir') _ocBrowseClose();
+}
+function _ocComboKey(e, kind) {
+  const inp = _ocComboInput(kind), st = _ocCombo[kind];
+  const list = document.getElementById(inp.id + '-list');
+  if (list.hidden || !st.items.length) return;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    st.active = (st.active + (e.key === 'ArrowDown' ? 1 : -1) + st.items.length) % st.items.length;
+    list.querySelectorAll('.oc-opt').forEach((o, i) => o.classList.toggle('active', i === st.active));
+    const id = inp.id + '-opt-' + st.active;
+    inp.setAttribute('aria-activedescendant', id);
+    document.getElementById(id)?.scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter' && st.active >= 0 && !(e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    _ocComboPick(kind, st.items[st.active]);
+  } else if (e.key === 'Escape') {
+    e.preventDefault(); e.stopPropagation();
+    list.hidden = true; inp.setAttribute('aria-expanded', 'false');
+  }
+}
+function _ocComboBlur(kind) {
+  setTimeout(() => {
+    const inp = _ocComboInput(kind);
+    if (!inp || document.activeElement === inp) return;
+    const list = document.getElementById(inp.id + '-list');
+    if (list) list.hidden = true;
+    inp.setAttribute('aria-expanded', 'false');
+  }, 150);
+}
+// mousedown, not click: picking must land before the input's blur hides the list.
+function _ocComboMouse(e) {
+  const list = e.target.closest('.oc-combo-list');
+  if (!list) return;
+  e.preventDefault();
+  const kind = list.closest('.oc-combo').dataset.kind;
+  const st = _ocCombo[kind];
+  const x = e.target.closest('[data-forget]');
+  if (x) { _ocForget(kind, st.items[+x.dataset.forget]); return; }
+  const opt = e.target.closest('.oc-opt');
+  if (opt) _ocComboPick(kind, st.items[+opt.dataset.i]);
+}
+async function _ocLoadModels(prov) {
+  _ocModels = { provider: '', list: [], error: '' };
+  try {
+    const list = await _workerModelsFor(prov);
+    if ((document.getElementById('outcome-provider')?.value || 'claude') !== prov) return;
+    _ocModels = { provider: prov, list, error: '' };
+  } catch (e) {
+    console.warn('[outcome] model list unavailable for ' + prov, e);
+    if ((document.getElementById('outcome-provider')?.value || 'claude') !== prov) return;
+    _ocModels = { provider: prov, list: [], error: String(e) };
+  }
+  _ocComboShow('model', true);
+}
+function _ocProviderChanged() {
+  const prov = document.getElementById('outcome-provider').value;
+  const m = document.getElementById('outcome-model');
+  // A model id belongs to one provider: it does not carry over.
+  if (m) { m.value = ''; m.placeholder = prov === 'claude' ? (window._AMUX_DEFAULT_MODEL || 'Default') : 'Provider default'; }
+  _ocLoadModels(prov);
+}
+// Providers a worker can run on, from the catalog; the three CLIs amux
+// launches are always offered, so a catalog outage cannot hide them.
+async function _ocProviders() {
+  const base = ['claude', 'codex', 'gemini'];
+  try {
+    const all = await _loadModelCatalog();
+    const extra = [...new Set(all.filter(m => m.worker_selectable && m.provider !== 'muse').map(m => m.provider))].filter(p => !base.includes(p));
+    return base.concat(extra);
+  } catch (e) { console.warn('[outcome] provider list from the built-in three; the catalog is unavailable', e); return base; }
+}
+
+// ── Groups: pills, with the known groups in one row to tap ──
+let _ocGroupsSel = [];
+function _ocGroupsSet(str) { _ocGroupsSel = _createGroupsFrom(str || ''); _ocGroupsRender(); }
+// Text still in the box when the dialog closes counts, as if committed.
+function _ocGroupsValue() { _ocGroupsCommit(); return _ocGroupsSel.join(','); }
+function _ocGroupsRender() {
+  const box = document.getElementById('outcome-groups');
+  const row = document.getElementById('outcome-group-known');
+  if (!box || !row) return;
+  box.querySelectorAll('.oc-pill').forEach(p => p.remove());
+  const input = document.getElementById('outcome-group');
+  for (const g of _ocGroupsSel) {
+    const pill = document.createElement('span');
+    pill.className = 'oc-pill';
+    pill.dataset.group = g;
+    pill.innerHTML = '<span>' + esc(g) + '</span><button type="button" class="oc-x" data-unpick="' + esc(g) + '" aria-label="Remove group ' + esc(g) + '">&times;</button>';
+    box.insertBefore(pill, input);
+  }
+  if (input) input.placeholder = _ocGroupsSel.length ? 'Add more' : 'Add groups, comma-separated';
+  const known = _ocKnown('groups').filter(g => !_ocGroupsSel.includes(g));
+  row.innerHTML = known.map(g => '<span class="oc-chip" data-group="' + esc(g) + '">'
+    + '<button type="button" class="oc-chip-add" data-pick="' + esc(g) + '">+ ' + esc(g) + '</button>'
+    + '<button type="button" class="oc-x" data-forget-group="' + esc(g) + '" aria-label="Remove ' + esc(g) + ' from the list">&times;</button></span>').join('');
+  row.hidden = !known.length;
+}
+function _ocGroupsCommit() {
+  const input = document.getElementById('outcome-group');
+  if (!input || !input.value.trim()) return;
+  const add = _createGroupsFrom(input.value);
+  input.value = '';
+  _ocGroupsSel = [...new Set([..._ocGroupsSel, ...add])];
+  _ocGroupsRender();
+}
+function _ocGroupKey(e) {
+  if (e.key === ',' || (e.key === 'Enter' && !(e.metaKey || e.ctrlKey))) {
+    if (!e.target.value.trim()) { if (e.key === ',') e.preventDefault(); return; }
+    e.preventDefault(); _ocGroupsCommit();
+  } else if (e.key === 'Backspace' && !e.target.value && _ocGroupsSel.length) {
+    _ocGroupsSel.pop(); _ocGroupsRender();
+  }
+}
+// Pressing a pill's or chip's button must not blur the group box first: the
+// blur commits typed text and redraws the row, removing the button before its
+// click lands.
+function _ocGroupsPress(e) { if (e.target.closest('button')) e.preventDefault(); }
+function _ocGroupsClick(e) {
+  const t = e.target.closest('[data-unpick],[data-pick],[data-forget-group]');
+  if (!t) { if (e.currentTarget.id === 'outcome-groups') document.getElementById('outcome-group')?.focus(); return; }
+  if (t.dataset.unpick != null) { _ocGroupsSel = _ocGroupsSel.filter(g => g !== t.dataset.unpick); _ocGroupsRender(); }
+  else if (t.dataset.pick != null) { _ocGroupsSel = [...new Set([..._ocGroupsSel, t.dataset.pick])]; _ocGroupsRender(); }
+  else _ocForget('group', t.dataset.forgetGroup);
+}
+
+// ── Browse: the amux host's folders, on any device ──
+// The worker runs on the amux host, so its folders are what to pick from,
+// whether this page is on that Mac or on a phone. The rows are the Files
+// view's (_feBuildRow); only folders are listed.
+let _ocBrowsePath = '', _ocBrowseSeq = 0;
+async function _ocBrowseOpen(path) {
+  const box = document.getElementById('outcome-browse');
+  if (!box) return;
+  const seq = ++_ocBrowseSeq;   // a slower earlier listing must not replace a later one
+  box.hidden = false;
+  document.getElementById('outcome-browse-btn')?.setAttribute('aria-expanded', 'true');
+  const want = path || document.getElementById('outcome-dir')?.value.trim() || '~';
+  const crumbs = box.querySelector('.oc-browse-crumbs'), rows = box.querySelector('.oc-browse-rows');
+  rows.innerHTML = '';
+  rows.appendChild(_feEmptyRow('Loading…'));
+  let d = null;
+  try {
+    const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(want), { headers: _authHeaders() });
+    d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || ('HTTP ' + r.status));
+  } catch (e) {
+    if (seq !== _ocBrowseSeq) return;
+    console.warn('[outcome] cannot list ' + want, e);
+    rows.innerHTML = '';
+    rows.appendChild(_feEmptyRow('Cannot open ' + want + ': ' + (e.message || e)));
+    if (want !== '~' && !path) return _ocBrowseOpen('~');
+    return;
+  }
+  if (seq !== _ocBrowseSeq) return;
+  _ocBrowsePath = d.path;
+  crumbs.innerHTML = _feCrumbsHtml(d.path, '_ocBrowseOpen');
+  rows.innerHTML = '';
+  if (d.parent && d.parent !== d.path) rows.appendChild(_feParentRow(() => _ocBrowseOpen(d.parent)));
+  const dirs = (d.entries || []).filter(e => e.type === 'dir' && !e.name.startsWith('.'));
+  for (const e of dirs) rows.appendChild(_feBuildRow(e, d.path, 0, '', { openDir: _ocBrowseOpen, openFile: () => {} }));
+  if (!dirs.length) rows.appendChild(_feEmptyRow('No folders here'));
+  box.querySelector('.oc-browse-use').textContent = 'Use ' + (d.path.split('/').pop() || d.path);
+}
+function _ocBrowseToggle() {
+  const box = document.getElementById('outcome-browse');
+  if (box && !box.hidden) { _ocBrowseClose(); return; }
+  _ocBrowseOpen();
+}
+function _ocBrowseClose() {
+  const box = document.getElementById('outcome-browse');
+  if (box) box.hidden = true;
+  document.getElementById('outcome-browse-btn')?.setAttribute('aria-expanded', 'false');
+}
+function _ocBrowseUse() {
+  if (!_ocBrowsePath) return;
+  document.getElementById('outcome-dir').value = _ocBrowsePath;
+  _ocBrowseClose();
+}
+
+function _outcomePresetPick(name) {
+  const p = _outcomePresetList.find(x => x.name === name) || _outcomeBaseDefaults();
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+  const provSel = document.getElementById('outcome-provider');
+  const prov = p.provider || 'claude';
+  if (provSel && ![...provSel.options].some(o => o.value === prov)) provSel.add(new Option(prov, prov));
+  const provChanged = provSel && provSel.value !== prov;
+  set('outcome-provider', prov);
+  if (provChanged || _ocModels.provider !== prov) _ocLoadModels(prov);
+  set('outcome-dir', p.dir); set('outcome-model', p.model); set('outcome-constraints', p.constraints);
+  const m = document.getElementById('outcome-model');
+  if (m) m.placeholder = prov === 'claude' ? (window._AMUX_DEFAULT_MODEL || 'Default') : 'Provider default';
+  set('outcome-group', '');
+  _ocGroupsSet(p.group);
+  const iso = document.getElementById('outcome-isolated'); if (iso) iso.checked = !!p.isolated;
+  set('outcome-preset-name', name || '');
+  const del = document.getElementById('outcome-preset-delete');
+  if (del) { del.hidden = !name; del.textContent = 'Delete'; delete del.dataset.armed; }
+}
+function _outcomePresetSaveToggle() {
+  const on = !!document.getElementById('outcome-save-preset')?.checked;
+  const f = document.getElementById('outcome-preset-name-field');
+  if (f) f.hidden = !on;
+  if (on) document.getElementById('outcome-preset-name')?.focus();
+}
+// Delete asks twice on the same button (a second dialog would close this one).
+async function _outcomePresetDelete(btn) {
+  const sel = document.getElementById('outcome-preset');
+  const name = sel?.value;
+  if (!name) return;
+  if (!btn.dataset.armed) { btn.dataset.armed = '1'; btn.textContent = 'Delete "' + name + '"?'; return; }
+  const saved = await _outcomePresetsEdit(list => list.filter(p => p.name !== name));
+  sel.querySelector('option[value="' + CSS.escape(name) + '"]')?.remove();
+  sel.value = '';
+  _outcomePresetPick('');
+  showToast(saved ? 'Preset "' + name + '" deleted' : 'Preset "' + name + '" deleted here; the server did not save it');
+}
 async function openOutcome() {
-  const d = await _outcomeDefaults();
+  // Presets first: carrying old defaults over also sets the preset to open on.
+  const providersLoad = _ocProviders();
+  _outcomePresetList = await _outcomePresets();
+  const [, providers] = await Promise.all([_ocHistLoad(), providersLoad]);
+  // Opens on the preset last started with (shared across devices); None when
+  // that was None or the preset is gone.
+  const last = _outcomePresetList.some(p => p.name === _ocHist.last_preset) ? _ocHist.last_preset : '';
+  const d = _outcomeBaseDefaults();
   const draft = localStorage.getItem('amux_outcome_draft') || '';
-  const groups = [...new Set((sessions || []).flatMap(s => s.tags || []))].sort();
-  const chk = (id, on, label) => `<label class="outcome-check"><input type="checkbox" id="${id}"${on ? ' checked' : ''}> ${label}</label>`;
+  const chk = (id, on, label, extra) => `<label class="outcome-check"><input type="checkbox" id="${id}"${on ? ' checked' : ''}${extra || ''}> ${label}</label>`;
   const html = `<div class="outcome-form">
     <textarea id="outcome-text" class="input outcome-text" rows="4"
       placeholder="e.g. Add a dark mode toggle to settings and ship it"
@@ -12317,39 +13512,74 @@ async function openOutcome() {
       <div id="outcome-file-list" class="ui-help" aria-live="polite"></div>
     </div>
     <details class="outcome-settings">
-      <summary>Defaults and constraints</summary>
-      <label class="outcome-field">Group<input id="outcome-group" class="input" list="outcome-group-list" value="${esc(d.group)}" placeholder="none"></label>
-      <datalist id="outcome-group-list">${groups.map(g => '<option value="' + esc(g) + '"></option>').join('')}</datalist>
-      <label class="outcome-field">Working directory<input id="outcome-dir" class="input" value="${esc(d.dir)}" placeholder="Chosen from your description"></label>
-      <label class="outcome-field">Provider<select id="outcome-provider" class="input">
-        ${['claude', 'codex', 'gemini'].map(p => `<option value="${p}"${p === d.provider ? ' selected' : ''}>${p}</option>`).join('')}
-      </select></label>
-      <label class="outcome-field">Model<input id="outcome-model" class="input" value="${esc(d.model)}" placeholder="${esc(window._AMUX_DEFAULT_MODEL || 'default')}"></label>
+      <summary>Defaults and constraints${last ? '<span class="oc-summary-preset">· ' + esc(last) + '</span>' : ''}</summary>
+      <label class="outcome-field">Preset<span class="outcome-preset-row">
+        <select id="outcome-preset" class="input" onchange="_outcomePresetPick(this.value)">
+          <option value="">None</option>
+          ${_outcomePresetList.map(p => '<option value="' + esc(p.name) + '">' + esc(p.name) + '</option>').join('')}
+        </select>
+        <button type="button" class="btn" id="outcome-preset-delete" hidden onclick="_outcomePresetDelete(this)">Delete</button>
+      </span></label>
+      <div class="outcome-field"><label for="outcome-group">Groups</label>
+        <div class="oc-pills" id="outcome-groups" onclick="_ocGroupsClick(event)" onmousedown="_ocGroupsPress(event)">
+          <input id="outcome-group" class="oc-pill-input" autocomplete="off" placeholder="Add groups, comma-separated" onkeydown="_ocGroupKey(event)" onblur="_ocGroupsCommit()">
+        </div>
+        <div class="oc-chip-row" id="outcome-group-known" aria-label="Known groups" onclick="_ocGroupsClick(event)" onmousedown="_ocGroupsPress(event)" hidden></div>
+      </div>
+      <div class="outcome-field"><label for="outcome-dir">Working directory</label>
+        ${_ocComboHtml('dir', 'outcome-dir', d.dir, 'Chosen from your description',
+          '<button type="button" class="btn" id="outcome-browse-btn" aria-expanded="false" aria-controls="outcome-browse" onclick="_ocBrowseToggle()">Browse</button>')}
+        <div class="oc-browse" id="outcome-browse" hidden>
+          <div class="oc-browse-crumbs"></div>
+          <div class="oc-browse-rows"></div>
+          <div class="oc-browse-btns"><button type="button" class="btn primary oc-browse-use" onclick="_ocBrowseUse()">Use this folder</button>
+            <button type="button" class="btn" onclick="_ocBrowseClose()">Close</button></div>
+        </div>
+      </div>
+      <div class="outcome-row2">
+        <label class="outcome-field">Provider<select id="outcome-provider" class="input" onchange="_ocProviderChanged()">
+          ${providers.map(p => `<option value="${esc(p)}"${p === d.provider ? ' selected' : ''}>${esc(p)}</option>`).join('')}
+        </select></label>
+        <div class="outcome-field"><label for="outcome-model">Model</label>
+          ${_ocComboHtml('model', 'outcome-model', d.model, window._AMUX_DEFAULT_MODEL || 'Default')}
+        </div>
+      </div>
       <label class="outcome-field">Constraints<textarea id="outcome-constraints" class="input" rows="3">${esc(d.constraints)}</textarea></label>
       ${chk('outcome-isolated', d.isolated, 'Isolated (no board or harness prompts)')}
-      ${chk('outcome-remember', true, 'Remember these as my defaults')}
+      ${chk('outcome-save-preset', false, 'Save as a preset', ' onchange="_outcomePresetSaveToggle()"')}
+      <label class="outcome-field" id="outcome-preset-name-field" hidden>Preset name (optional)<input id="outcome-preset-name" class="input" placeholder="Named from the folder and group"></label>
     </details>
   </div>`;
   _outcomeFiles = [];
   const shown = showFormModal('Describe what you want', html, 'Start');
+  document.querySelectorAll('#modal-msg .oc-combo-list').forEach(l => l.addEventListener('mousedown', _ocComboMouse));
+  document.getElementById('outcome-preset').value = last;
+  _outcomePresetPick(last);
   setTimeout(() => document.getElementById('outcome-text')?.focus(), 30);
   const ok = await shown;
   const v = (id) => (document.getElementById(id)?.value || '').trim();
   const on = (id) => !!document.getElementById(id)?.checked;
   const text = v('outcome-text');
   if (text) localStorage.setItem('amux_outcome_draft', text);   // kept until a worker exists
-  if (!ok || !text) return;
-  const cfg = { group: v('outcome-group'), dir: v('outcome-dir'), provider: v('outcome-provider') || 'claude',
+  const cfg = { group: _ocGroupsValue(), dir: v('outcome-dir'), provider: v('outcome-provider') || 'claude',
     model: v('outcome-model'), isolated: on('outcome-isolated'),
     constraints: document.getElementById('outcome-constraints')?.value ?? d.constraints };
+  let picked = v('outcome-preset');
+  // Saving a preset does not need a description: Start with an empty box
+  // saves the preset and starts nothing.
+  if (ok && on('outcome-save-preset')) {
+    const typed = v('outcome-preset-name');
+    const name = typed || _outcomePresetAutoName({ ...cfg, group: _createGroupsFrom(cfg.group).join(', ') }, new Set(_outcomePresetList.map(p => p.name)));
+    const replaced = _outcomePresetList.some(p => p.name === name);
+    const saved = await _outcomePresetsEdit(list => list.filter(p => p.name !== name).concat([_outcomePresetClean({ ...cfg, name })]));
+    showToast((saved ? '' : 'Saved on this device only: ') + 'Preset "' + name + '" ' + (replaced ? 'updated' : 'saved'));
+    picked = name;
+  }
+  if (!ok) return;
+  if (!text) { if (on('outcome-save-preset')) _ocHistRecord(cfg, picked); return; }
   const files = await _outcomeFilesReady();
   if (files === null) { showToast('Not started: an attachment did not upload. Your description is kept.'); return; }
-  if (on('outcome-remember')) {
-    const val = JSON.stringify(cfg);
-    localStorage.setItem('amux_outcome_defaults', val);
-    fetch(API + '/api/prefs', { method: 'POST', headers: _authHeaders({'Content-Type': 'application/json'}),
-      body: JSON.stringify({ key: 'outcome_defaults', value: val }) }).catch(() => {});
-  }
+  _ocHistRecord(cfg, picked);
   await _outcomeStart(text, cfg, files);
 }
 // Attachments upload as soon as they are picked (the same upload API voice
@@ -13137,6 +14367,8 @@ function _homeOutcomeIndexLoad(force) {
     const changed = JSON.stringify(Object.keys(by).map(k => [k, by[k].length])) !== JSON.stringify(Object.keys(_homeOutcomeIndex.by).map(k => [k, _homeOutcomeIndex.by[k].length]));
     _homeOutcomeIndex = { at: Date.now(), by, loading: false };
     if (changed && activeView === 'sessions') { try { render(); } catch (e) { console.warn('[home] card re-render failed', e); } }
+    // The worker view's Intent tab shows only when this worker has some.
+    if (peekSession) { try { _applyPeekTabVisibility(); } catch (e) { console.warn('[home] Intent tab repaint failed', e); } }
   }).catch(() => { _homeOutcomeIndex.loading = false; });
 }
 function _homeCardOutcomes(name) {
@@ -13146,9 +14378,20 @@ function _homeCardOutcomes(name) {
   const names = list.slice(0, 3).map(o => o.title).join(' · ');
   return '<div class="card-outcomes" title="Conversations from Intent routed to this worker">From Intent: ' + esc(names) + (list.length > 3 ? ' +' + (list.length - 3) : '') + '</div>';
 }
-// The conversations from Chat routed to this worker, at the top of its
-// Messages tab: conversations are organized by conversation, and a worker
-// shows the ones it owns where its messages already are. Empty shows nothing.
+// The conversations from Intent routed to this worker, in its own Intent tab
+// (owner, 2026-11-19: "These should be in a separate intent tab in the worker
+// details page"). They used to sit above the Messages list, where on a phone
+// they took the top third of the screen. The tab shows only for a worker that
+// has some (_peekIntentList), with their count.
+function _peekIntentList(name) {
+  _homeOutcomeIndexLoad(false);
+  return (_homeOutcomeIndex.by[name || peekSession] || []);
+}
+function _peekIntentTabPaint() {
+  const n = peekSession ? _peekIntentList().length : 0;
+  const c = document.getElementById('peek-tab-intent-count');
+  if (c) { c.textContent = n ? String(n) : ''; c.classList.toggle('has-count', n > 0); }
+}
 async function _peekConvsLoad() {
   const el = document.getElementById('peek-msg-convs');
   if (!el || !peekSession) return;
@@ -13157,7 +14400,7 @@ async function _peekConvsLoad() {
   try { const r = await fetch(API + '/api/intent/outcomes', { headers: _authHeaders() }); v = r.ok ? await r.json() : null; } catch (e) { console.warn('[home] conversations for the worker view did not load', e); }
   if (peekSession !== who) return;
   const mine = ((v && v.outcomes) || []).filter(o => o.worker === who);
-  el.innerHTML = !mine.length ? '' : '<div class="peek-msg-convs-head">Conversations from Intent</div><div class="home-list">'
+  el.innerHTML = !mine.length ? '<div class="dict-empty">No conversations from Intent for this worker.</div>' : '<div class="home-list">'
     + mine.slice(0, 8).map(o => '<button type="button" class="home-row" onclick="_homeOpenFromPeek(\'' + esc(o.id) + '\')">'
       + '<span class="home-row-top"><span class="home-row-title">' + esc(o.title) + '</span><span class="home-pill ' + (o.status === 'ready' ? 'ready' : 'working') + '">' + _homeStatusLabel(o.status) + '</span></span>'
       + '<span class="home-row-when">' + esc(_homeAgo(o.updated_ms)) + (o.overridden ? ' · moved here by Change' : '') + '</span></button>').join('') + '</div>';
@@ -13728,6 +14971,15 @@ async function deleteSession(session) {
   done();
   if (r) showToast('Worker "' + session + '" deleted');
   expanded.delete(session);
+  // The open peek is on a worker that no longer exists. Leave it for the
+  // workers overview; the list filters live in localStorage, so they stay.
+  if (r && peekSession === session) {
+    closePeek();
+    if (!peekSession) {
+      switchView('sessions');
+      amuxTrack('worker_deleted_from_peek', { verdict: 'returned_to_overview', measured: true, n_considered: 1 });
+    }
+  }
   await fetchSessions();
 }
 
@@ -13795,7 +15047,22 @@ async function _changeWorkerPaused(session, paused) {
 async function archiveSession(session) {
   closeAllMenus();
   const done = _cardBusy(session, 'Archiving');
-  const r = await apiCall(API + '/api/sessions/' + session + '/archive', { method: 'POST', headers: { 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') } });
+  const url = API + '/api/sessions/' + session + '/archive';
+  const post = body => fetch(url, { method: 'POST', body: JSON.stringify(body),
+    headers: _authHeaders({ 'Content-Type': 'application/json', 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') }) });
+  let r = null;
+  try {
+    let res = await post({});
+    let d = await res.json().catch(() => ({}));
+    // The worker Intent sends unmatched requests to: the server says what breaks, and asks.
+    if (res.status === 409 && d.code === 'intent_helper') {
+      if (!(await showConfirm(d.error, 'Archive anyway', true))) { done(); return; }
+      res = await post({ confirm_helper: true });
+      d = await res.json().catch(() => ({}));
+    }
+    if (res.ok && d.ok !== false) r = d;
+    else showToast((d && d.error) || ('Could not archive ' + session));
+  } catch (e) { showToast('Could not archive ' + session + ': ' + ((e && e.message) || e)); }
   done();
   if (r) {
     _expiredWorkerInventory.delete(session);
@@ -15975,6 +17242,12 @@ function _peekChatMenuItem(s) {
 }
 
 function setPeekTab(tab) {
+  // A chat worker has no companion Chat tab (_applyPeekTabVisibility): a remembered or
+  // linked 'chat' opens its own chat, the first tab.
+  if (tab === 'chat' && peekSession && _workerRenderer(peekSession) === 'chat') {
+    console.info('[peek] verdict=chat_tab_folded_into_primary worker=' + peekSession);
+    tab = 'terminal';
+  }
   _peekTab = tab;
   // CSS reads this to drop chrome a tab does not use (phone real estate).
   const _po = document.getElementById('peek-overlay'); if (_po) _po.dataset.peekTab = tab;
@@ -16059,6 +17332,12 @@ function setPeekTab(tab) {
   const steering = document.getElementById('peek-steering-panel');
   if (tab === 'steering') { steering.classList.add('active'); _steerHistLoadedFor = null; _steeringRender(); loadPeekInstructions(); }
   else { steering.classList.remove('active'); }
+  document.getElementById('peek-tab-computer')?.classList.toggle('active', tab === 'computer');
+  const cuP = document.getElementById('peek-computer-panel');
+  if (cuP) {
+    if (tab === 'computer') { cuP.classList.add('active'); _peekComputerStart(); }
+    else { cuP.classList.remove('active'); _peekComputerStop(); }
+  }
   document.getElementById('peek-tab-tasks')?.classList.toggle('active', tab === 'tasks');
   const tasksP = document.getElementById('peek-tasks-panel');
   if (tasksP) {
@@ -16066,8 +17345,14 @@ function setPeekTab(tab) {
     else tasksP.classList.remove('active');
   }
   const messages = document.getElementById('peek-messages-panel');
-  if (tab === 'messages') { messages.classList.add('active'); _peekMessagesLoad(); _peekConvsLoad(); }
+  if (tab === 'messages') { messages.classList.add('active'); _peekMessagesLoad(); }
   else { messages.classList.remove('active'); }
+  document.getElementById('peek-tab-intent')?.classList.toggle('active', tab === 'intent');
+  const intentP = document.getElementById('peek-intent-panel');
+  if (intentP) {
+    if (tab === 'intent') { intentP.classList.add('active'); _peekConvsLoad(); }
+    else intentP.classList.remove('active');
+  }
   const costPanel = document.getElementById('peek-cost-panel');
   if (tab === 'cost') { costPanel.classList.add('active'); _peekCostLoad(); }
   else { costPanel.classList.remove('active'); }
@@ -17249,6 +18534,7 @@ async function togglePeekBoardPolicy(field, on) {
 function _renderPeekIssuesBody() {
   // Don't rebuild mid-drag — a board SSE refresh would destroy the active Sortable.
   if (document.body.classList.contains('board-dragging')) return;
+  if (_deferForSortableDrag(_renderPeekIssuesBody, 'peek-board')) return;
   // NOT LOADED IS NOT EMPTY (Ethan, 2026-08-06 — screenshot of the amux worker's
   // Board tab reading "No issues for this worker yet." while that worker owned 29
   // cards). This panel renders from the global boardItems and never fetched: open
@@ -18410,7 +19696,8 @@ function _workerRenderer(name) {
 // re-parsed (settled markdown blocks are frozen DOM). The finished message is
 // rendered from its full text, so it is what a full re-render produces.
 const _chat = { name: null, es: null, messages: [], streaming: null, loadedAt: 0, busy: false, queued: 0, gen: 0,
-  cursor: '', stick: true, unseen: false, raf: 0, onScroll: null, live: null, offlineNote: '' };
+  cursor: '', stick: true, unseen: false, raf: 0, onScroll: null, live: null, offlineNote: '',
+  holdUntil: 0, holdCap: 0, held: 0, onRelease: null };
 
 // OFFLINE PARITY WITH CODING WORKERS (Ethan 2026-09-26: "make sure amux chat
 // has all the same offline capabilities as coding too"). A coding worker's
@@ -18458,6 +19745,8 @@ function _chatUnmount() {
   clearInterval(_chatWatchdog); _chatWatchdog = 0;
   const body = document.getElementById('peek-body');
   if (body && _chat.onScroll) body.removeEventListener('scroll', _chat.onScroll);
+  if (body && _chat.onRelease) for (const ev of ['touchstart', 'keydown', 'pointerdown']) body.removeEventListener(ev, _chat.onRelease);
+  _chat.onRelease = null; _chat.holdUntil = 0;
   _chat.es = null; _chat.name = null; _chat.messages = []; _chat.streaming = null; _chat.gen++;
   _chat.cursor = ''; _chat.stick = true; _chat.unseen = false; _chat.raf = 0; _chat.onScroll = null; _chat.live = null;
   _chat.loadedAt = 0; _chat.offlineNote = ''; _chat.pendingShown = 0;
@@ -18639,10 +19928,26 @@ function _chatMount(name) {
     // to read earlier output pins the view until they come back down.
     _chat.onScroll = () => {
       const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+      // A JUMP HOLDS THE BOTTOM BRIEFLY (owner, 2026-11-23: "when I click jump
+      // to bottom it still doesnt do it"). A reply streaming in grows the page
+      // between the jump and the scroll events it causes, and a trackpad's
+      // momentum keeps scrolling after the click, so the first scroll event
+      // read "not at the bottom" and turned following off: the view fell
+      // further behind each second. While scroll events keep coming (a
+      // momentum tail of any length, up to 3 s after the jump) it stays at the
+      // bottom, until the reader touches, presses a key or grabs the scrollbar.
+      if (!atBottom && Date.now() < _chat.holdUntil) {
+        body.scrollTop = body.scrollHeight;
+        _chat.held++;
+        _chat.holdUntil = Math.min(_chat.holdCap, Date.now() + 400);
+        return;
+      }
       _chat.stick = atBottom;
       if (atBottom && _chat.unseen) { _chat.unseen = false; _chatJumpPill(); }
     };
     body.addEventListener('scroll', _chat.onScroll, { passive: true });
+    _chat.onRelease = () => { _chat.holdUntil = 0; };
+    for (const ev of ['touchstart', 'keydown', 'pointerdown']) body.addEventListener(ev, _chat.onRelease, { passive: true });
   }
   // Same as a coding worker's open-time cache paint: show the saved
   // conversation at once; the live snapshot replaces it when it arrives.
@@ -18986,12 +20291,26 @@ async function _chatInterrupt(target) {
   }
 }
 
+// Every jump to the bottom of a chat comes here: the chat's own Latest pill and
+// the peek's Jump to bottom. It used to scroll smoothly, and during a streaming
+// reply each frame of that animation read "not at the bottom", so following
+// switched off and the view never arrived (2,400 px behind after 2 s, measured).
+// Now it lands at once and holds there while the scrolling settles (see _chat.onScroll).
 function _chatJumpToLatest() {
   const body = document.getElementById('peek-body');
   if (!body) return;
+  const gap = Math.round(body.scrollHeight - body.scrollTop - body.clientHeight);
   _chat.stick = true; _chat.unseen = false;
-  body.scrollTo({ top: body.scrollHeight, behavior: 'smooth' });
+  _chat.holdUntil = Date.now() + 1000; _chat.holdCap = Date.now() + 3000; _chat.held = 0;
+  body.scrollTop = body.scrollHeight;
   _chatJumpPill();
+  setTimeout(() => {
+    if (!document.contains(body)) return;
+    const left = Math.round(body.scrollHeight - body.scrollTop - body.clientHeight);
+    if (typeof _peekPollBeacon === 'function') _peekPollBeacon('chat-jump-to-latest', _chat.name || peekSession, {
+      gap_px: gap, left_px: left, held: _chat.held, streaming: !!_chat.live,
+      verdict: left < 80 ? 'chat_jump_landed' : 'chat_jump_fell_short', measured: true, n_considered: 1 });
+  }, 1100);
 }
 function _chatJumpPill() {
   const b = document.querySelector('#peek-body .chat-jump');
@@ -19169,7 +20488,18 @@ function _frozenWorker(next) {
   return true;
 }
 
+// A page opened on a #peek= address keeps the fleet hidden until the worker
+// opens (index.html adds boot-peek-pending): a tab returned to from a link
+// showed the Workers list first, then entered the worker (owner, 2026-11-23).
+function _peekBootReveal(verdict, name) {
+  const h = document.documentElement;
+  if (!h.classList.contains('boot-peek-pending')) return;
+  h.classList.remove('boot-peek-pending');
+  amuxTrack('peek_boot_reveal', { verdict, session: name || '', ms: Math.round(performance.now()), measured: true, n_considered: 1 });
+  if (verdict !== 'worker_opened') console.warn('[amux] peek_boot_reveal: ' + verdict + ', the Workers list shows instead of ' + (name || 'the worker'));
+}
 function openPeek(name, opts) {
+  _peekBootReveal('worker_opened', name);
   if (_frozenWorker(name)) return;
   _peekAgentsReset();
   _vxOnPeekOpen(name);   // switching worker ends another worker's live conversation
@@ -19194,6 +20524,7 @@ function openPeek(name, opts) {
     if (peekSession) _peekFilesStash(peekSession);
     _peekFilesRestore(name);
   }
+  _navVisit('worker', name, name);
   peekSession = name;
   _applyPeekTabVisibility();
   _syncComposerPending();
@@ -19954,6 +21285,202 @@ function _peekFileBrowser() {
   if (_splitPaneOpen('#path=' + encodeURIComponent(peekSessionDir || '/'), 'files')) return;
   openExplore(peekSessionDir, peekSession);
 }
+// ── Computer tab: what a worker did in this Mac's apps (Athena sends each
+// step's screenshot into the chat; amux shows them on the worker). The rows
+// come from GET /api/computer/mac/activity, which the server writes on every
+// call, refused or not. Polled every 2s while the tab is shown, never otherwise.
+let _peekComputerTimer = null;
+let _peekComputerSig = null;   // null: nothing rendered yet (an empty feed's signature is '')
+let _peekComputerTicks = 0;
+let _peekComputerStatus = null;   // GET /api/computer/mac/status?session= for peekSession
+function _peekComputerStart() {
+  _peekComputerStop();
+  _peekComputerSig = null;
+  _peekComputerTicks = 0;
+  _peekComputerHeadLoad();
+  _peekComputerLoad();
+  _peekComputerTimer = setInterval(() => {
+    if (document.hidden || _peekTab !== 'computer') return;
+    _peekComputerLoad();
+    // The status asks the driver for its permissions: every 16s is enough.
+    if (++_peekComputerTicks % 8 === 0) _peekComputerHeadLoad();
+  }, 2000);
+}
+
+// ── The Computer tab's head: is computer use on, what macOS granted, which
+// apps this worker may use, and what it is waiting on you for, with the
+// buttons to answer it right here (owner, 2026-11-25: "the stuff is in the
+// computer use tab, this needs to be richer"). Allow goes through the same
+// approval the Needs-you card does; an app added by hand is a scope write.
+async function _peekComputerHeadLoad() {
+  const w = peekSession;
+  const host = document.getElementById('peek-computer-head');
+  if (!host || !w) return;
+  let d = null;
+  try {
+    const r = await fetch(API + '/api/computer/mac/status?session=' + encodeURIComponent(w), { headers: _authHeaders(), signal: AbortSignal.timeout(8000) });
+    d = await r.json().catch(() => null);
+    if (!r.ok) d = { error: (d && d.error) || ('HTTP ' + r.status) };
+  } catch (e) { d = { error: 'amux is unreachable' }; }
+  if (w !== peekSession) return;
+  _peekComputerStatus = d;
+  _peekComputerHeadRender();
+  // Refused rows offer Allow only while the app is still not allowed.
+  _peekComputerSig = null;
+  _peekComputerLoad();
+}
+function _pcuApps() {
+  const sw = (_peekComputerStatus && _peekComputerStatus.switches) || {};
+  return Array.isArray(sw.apps) ? sw.apps.filter(Boolean) : [];
+}
+function _pcuAllowed(app) {
+  const sw = (_peekComputerStatus && _peekComputerStatus.switches) || {};
+  if (sw.any_app) return true;
+  const want = String(app || '').toLowerCase();
+  return _pcuApps().some(a => a === '*' || want.includes('(' + a.toLowerCase() + ')') || want.split(' (')[0] === a.toLowerCase());
+}
+// "Slack (com.tinyspeck.slackmacgap)" -> "com.tinyspeck.slackmacgap"; a bare name stays a name.
+function _pcuAppId(label) {
+  const m = String(label || '').match(/\(([^)]+)\)\s*$/);
+  return m ? m[1] : String(label || '').trim();
+}
+function _pcuAppName(label) { return String(label || '').split(' (')[0] || label; }
+function _peekComputerHeadRender() {
+  const host = document.getElementById('peek-computer-head');
+  if (!host) return;
+  const d = _peekComputerStatus;
+  const w = peekSession;
+  if (!d) { host.innerHTML = '<p class="ui-help">Reading computer use…</p>'; return; }
+  if (d.error && !('up' in d)) { host.innerHTML = '<p class="ui-error" role="alert">Computer use status: ' + esc(d.error) + '</p>'; return; }
+  const perms = d.permissions || {};
+  const perm = (on, name) => '<span class="pcu-perm" data-on="' + (on ? '1' : '0') + '">' + (on ? '✓ ' : '✗ ') + esc(name) + '</span>';
+  const inApp = typeof _macSettingsBridge === 'function' && _macSettingsBridge();
+  const state = d.up
+    ? '<span class="pcu-state" data-up="1">On</span>' + perm(perms.accessibility, 'Accessibility') + perm(perms.screen_recording, 'Screen Recording')
+    : '<span class="pcu-state" data-up="0">Off</span><span class="ui-help">' + esc(d.why || 'the amux Mac app is not running computer use') + '</span>'
+      + (inApp ? '<button type="button" class="btn" id="pcu-turn-on" onclick="_macSettingsOpen()">Open This Mac settings</button>'
+               : '<span class="ui-help">Turn it on in the amux Mac app: Settings, This Mac, Computer use.</span>');
+  const sw = d.switches || {};
+  const apps = _pcuApps();
+  const chips = sw.any_app
+    ? '<span class="pcu-chip">Any app that is not blocked</span>'
+    : apps.length ? apps.map(a => '<span class="pcu-chip">' + esc(a)
+        + '<button type="button" class="pcu-chip-x" aria-label="Stop ' + esc(w) + ' using ' + esc(a) + '" title="Stop this worker using ' + esc(a) + '" onclick="_pcuRemoveApp(\'' + escJs(a) + '\')">×</button></span>').join('')
+    : '<span class="ui-help">None yet</span>';
+  const ask = d.ask;
+  const askRow = ask ? '<div class="pcu-ask" role="group" aria-label="Waiting on you"><span class="pcu-ask-what"><b>Waiting on you:</b> ' + esc(w) + ' asked to use '
+      + esc(ask.resource || 'an app') + (ask.asked_at ? ' · ' + esc(timeAgo(ask.asked_at)) : '') + '</span>'
+      + '<span class="pcu-ask-btns"><button type="button" class="btn primary" id="pcu-ask-allow" onclick="_pcuDecide(\'approve\')">Allow</button>'
+      + '<button type="button" class="btn" id="pcu-ask-keep" onclick="_pcuDecide(\'reject\')">Keep refused</button></span></div>' : '';
+  host.innerHTML = '<div class="pcu-status">' + state + '</div>'
+    + '<div class="pcu-apps"><span class="pcu-apps-label">Apps ' + esc(w) + ' may use:</span>' + chips
+    + (sw.any_app ? '' : '<button type="button" class="btn" id="pcu-add-app" onclick="_pcuAddApp()">Add an app…</button>') + '</div>'
+    + askRow;
+}
+// The worker's own apps, written at its worker scope (the owner's dashboard may; a worker may not).
+async function _pcuWriteApps(list, why) {
+  const w = peekSession;
+  const r = await fetch(API + '/api/scope', { method: 'PUT', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ level: 'worker', name: w, capability: 'env', value: { AMUX_MAC_APPS: list.join(',') } }), _skipOutbox: true });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { showToast('Not saved: ' + (d.error || ('HTTP ' + r.status))); return false; }
+  showToast(why);
+  await _peekComputerHeadLoad();
+  return true;
+}
+async function _pcuAllowApp(label) {
+  const id = _pcuAppId(label);
+  const d = _peekComputerStatus || {};
+  // The open ask for this same app: answer it, so its card closes and the worker is told.
+  if (d.ask && _pcuAppId(d.ask.resource) === id) return _pcuDecide('approve');
+  const apps = _pcuApps();
+  if (!apps.includes(id)) apps.push(id);
+  return _pcuWriteApps(apps, _pcuAppName(label) + ' allowed for ' + peekSession);
+}
+async function _pcuRemoveApp(app) {
+  return _pcuWriteApps(_pcuApps().filter(a => a !== app), peekSession + ' may no longer use ' + app);
+}
+async function _pcuAddApp() {
+  const v = await showPrompt('Let ' + peekSession + ' use an app (its name or bundle id). Terminals, password managers and System Settings stay off limits whatever you list.',
+    'e.g. Slack or com.tinyspeck.slackmacgap');
+  const id = (v || '').trim();
+  if (!id) return;
+  const apps = _pcuApps();
+  if (apps.includes(id)) { showToast(peekSession + ' may already use ' + id); return; }
+  apps.push(id);
+  return _pcuWriteApps(apps, id + ' allowed for ' + peekSession);
+}
+async function _pcuDecide(decision) {
+  const d = _peekComputerStatus || {};
+  if (!d.ask) return;
+  const w = peekSession;
+  const btns = document.querySelectorAll('#peek-computer-head .pcu-ask button');
+  btns.forEach(b => b.disabled = true);
+  try {
+    const r = await fetch(API + '/api/approvals/decide', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ approval_ref: d.ask.approval_ref, decision }), _skipOutbox: true, signal: AbortSignal.timeout(15000) });
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast('Not saved: ' + (out.error || ('HTTP ' + r.status))); return; }
+    showToast(decision === 'approve' ? _pcuAppName(d.ask.resource) + ' allowed for ' + w + '; it was told to retry' : 'Kept refused: ' + w + ' still may not use ' + _pcuAppName(d.ask.resource));
+  } catch (e) {
+    showToast('Not saved: ' + (e && e.name === 'TimeoutError' ? 'amux did not answer in 15s' : 'amux is unreachable'));
+  } finally {
+    btns.forEach(b => b.disabled = false);
+    await _peekComputerHeadLoad();
+  }
+}
+function _peekComputerStop() {
+  if (_peekComputerTimer) { clearInterval(_peekComputerTimer); _peekComputerTimer = null; }
+}
+async function _peekComputerLoad() {
+  const list = document.getElementById('peek-computer-list');
+  const count = document.getElementById('peek-computer-count');
+  const w = peekSession;
+  if (!list || !w) return;
+  let d;
+  try {
+    const r = await fetch(API + '/api/computer/mac/activity?limit=40&session=' + encodeURIComponent(w), { headers: _authHeaders(), signal: AbortSignal.timeout(6000) });
+    d = r.ok ? await r.json() : null;
+  } catch (e) { d = null; }
+  if (w !== peekSession) return;
+  if (!d || !d.measured) {
+    if (!list.children.length) list.innerHTML = '<li class="pcu-empty">Could not read the activity feed.</li>';
+    return;
+  }
+  const rows = d.rows || [];
+  const sig = rows.map(x => x.ts + x.verdict).join('|') + '#' + _pcuApps().join(',') + (_peekComputerStatus ? '' : '?');
+  if (sig === _peekComputerSig) return;
+  _peekComputerSig = sig;
+  count.textContent = rows.length ? rows.length + (rows.length >= 40 ? '+' : '') + ' steps' : '';
+  const badge = document.getElementById('peek-tab-computer-count');
+  if (badge) badge.textContent = rows.length ? String(rows.length) : '';
+  if (!rows.length) {
+    list.innerHTML = '<li class="pcu-empty">No computer use yet. When this worker reads or acts in an app on this Mac (amux computer mac), each step shows here with what it saw.</li>';
+    return;
+  }
+  // The newest screenshot is what the worker sees now: large, above the steps.
+  const latest = rows.find(x => x.screenshot);
+  list.innerHTML = (latest ? '<li class="pcu-now"><span class="pcu-now-label">Latest view · ' + esc(latest.apps || '') + ' · '
+      + esc(timeAgo(latest.ts / 1000)) + '</span><button type="button" class="pcu-shot pcu-shot-big" data-path="' + esc(latest.screenshot) + '" title="Open this screenshot"><img alt="What the worker saw last" src="'
+      + esc(_authUrl(API + '/api/file/raw?path=' + encodeURIComponent(latest.screenshot))) + '"></button></li>' : '')
+    + rows.map(x => {
+    const t = new Date(x.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const ok = x.verdict === 'called';
+    const what = ok ? 'done' : (x.code || x.verdict || 'refused').replace(/_/g, ' ');
+    const allow = x.code === 'app_not_allowed' && x.apps && _peekComputerStatus && !_pcuAllowed(x.apps)
+      ? '<button type="button" class="btn primary pcu-allow" onclick="_pcuAllowApp(\'' + escJs(x.apps) + '\')">Allow ' + esc(_pcuAppName(x.apps)) + '</button>' : '';
+    const detail = x.detail ? '<span class="pcu-detail">' + esc(x.detail) + '</span>' : '';
+    const ms = ok && x.ms ? '<span class="pcu-ms">' + (x.ms >= 1000 ? (x.ms / 1000).toFixed(1) + 's' : x.ms + 'ms') + '</span>' : '';
+    const shot = x.screenshot
+      ? '<button type="button" class="pcu-shot" data-path="' + esc(x.screenshot) + '" title="Open this screenshot"><img loading="lazy" alt="What the worker saw" src="' + esc(_authUrl(API + '/api/file/raw?path=' + encodeURIComponent(x.screenshot))) + '"></button>'
+      : '';
+    return '<li class="pcu-row' + (ok ? '' : ' pcu-refused') + '" data-verdict="' + esc(x.verdict || '') + '">'
+      + '<div class="pcu-line"><span class="pcu-time">' + esc(t) + '</span><code class="pcu-tool">' + esc(x.tool || '') + '</code>'
+      + '<span class="pcu-app">' + esc(x.apps || '') + '</span>' + detail + ms + '<span class="pcu-verdict">' + esc(what) + '</span>' + allow + '</div>' + shot + '</li>';
+  }).join('');
+  list.querySelectorAll('.pcu-shot').forEach(b => { b.onclick = () => openFilePreview(b.dataset.path); });
+}
+
 function togglePeekSplit() {
   if (_nativeSplit()) { _splitBeacon('split_pane_opened', { what: 'page' }); return; }
   _peekFileBrowser();
@@ -20831,13 +22358,68 @@ function _linkWrap(L, htmlText) {
   }
   const cls = /\.md(?::\d+)*$/i.test(L.value) ? 'md-link' : 'file-link';
   const title = typeof _resolveOutputPath === 'function' ? ' title="Open: ' + ea(_resolveOutputPath(L.value.replace(/(?::\d+){1,2}$/, ''))) + '"' : '';
-  return '<span class="' + cls + '" data-path="' + ea(L.value) + '"' + title + ' onclick="_openLinkedPath(this,event)">' + htmlText + '</span>';
+  return _outputFileLink(cls, L.value, title, htmlText);
 }
+// A PATH IN WORKER OUTPUT IS A REAL LINK (owner, 2026-11-21: "if there's a
+// relative path that is being sent back in a response, I can't
+// middle-mouse-button-click it to open a new tab"). It was a <span> with an
+// onclick, so a middle, ⌘ or ctrl click and "Open Link in New Tab" had no
+// address to open. It is an <a> whose href is this dashboard's #path= deep
+// link to the file. A plain click still opens it here (_openLinkedPath); any
+// other way of opening it is the browser's.
+//
+// A relative path names a file only against the worker's cwd, and the blind
+// join is wrong when the worker wrote it from an ancestor (AMUX-3511). So the
+// href starts as the blind join and is replaced with the server's answer
+// (/api/fs/resolve) when the pointer reaches the link, before any click can
+// land. Answers are kept per cwd, so a re-rendered link starts resolved.
+const _outputHrefCache = new Map();
+function _outputFileHref(p) {
+  // Guarded like _linkWrap's title: the render code is also loaded alone,
+  // without the resolver defined further down (e2e/peek-links.test.mjs).
+  if (typeof _resolveOutputPath !== 'function' || typeof _encodeHashPath !== 'function') return '';
+  const raw = String(p || '').replace(/(?::\d+){1,2}$/, '');
+  const cwd = (typeof peekSessionDir === 'string' && peekSessionDir) || '';
+  const full = _outputHrefCache.get(cwd + '\n' + raw) || _resolveOutputPath(raw);
+  if (!full.startsWith('/') && !full.startsWith('~/')) return '';
+  return location.origin + location.pathname + (typeof _linkViewerQuery === 'function' ? _linkViewerQuery() : '') + '#path=' + _encodeHashPath(full);
+}
+// labelHtml is already-escaped HTML (the visible path, possibly coloured).
+function _outputFileLink(cls, path, attrs, labelHtml) {
+  const ea = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const href = _outputFileHref(path);
+  return '<a class="' + cls + '"' + (href ? ' href="' + ea(href) + '"' : '') + ' data-path="' + ea(path) + '"'
+    + (attrs || '') + ' onclick="_openLinkedPath(this,event)">' + labelHtml + '</a>';
+}
+function _outputLinkResolve(e) {
+  const a = e.target && e.target.closest && e.target.closest('a.file-link[data-path], a.md-link[data-path]');
+  if (!a || a.dataset.resolved) return;
+  const raw = (a.dataset.path || '').replace(/(?::\d+){1,2}$/, '');
+  const cwd = (typeof peekSessionDir === 'string' && peekSessionDir) || '';
+  a.dataset.resolved = '1';
+  if (!raw || raw.startsWith('/') || raw.startsWith('~/') || !cwd) return;
+  const key = cwd + '\n' + raw;
+  if (_outputHrefCache.has(key)) { a.setAttribute('href', _outputFileHref(raw)); return; }
+  _resolveLinkedPath(raw).then(full => {
+    if (!full || (!full.startsWith('/') && !full.startsWith('~/'))) return;
+    const blind = _resolveOutputPath(raw);
+    if (_outputHrefCache.size > 2000) _outputHrefCache.clear();
+    _outputHrefCache.set(key, full);
+    a.setAttribute('href', _outputFileHref(raw));
+    if (full !== blind) console.info('[amux] output_link_href_resolved', { from: blind, to: full });
+  });
+}
+if (typeof document !== 'undefined') ['pointerover', 'pointerdown', 'focusin', 'contextmenu'].forEach(ev => document.addEventListener(ev, _outputLinkResolve, true));
 // Open a path from worker output through the one resolver every output link
 // uses (_openPathFromOutput: server-side resolve against the worker's cwd).
+// Only a plain primary click: a modifier click is the browser's new tab, and
+// the click must not reach a header or card toggle behind the link either.
 function _openLinkedPath(el, ev) {
-  if (window.getSelection && String(window.getSelection()) !== '') return;
+  if (ev.button || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) { ev.stopPropagation(); return; }
+  // A plain click never follows the href, even when it only ends a drag or
+  // double-click select (then it opens nothing): the link is an <a> now.
   ev.preventDefault(); ev.stopPropagation();
+  if (window.getSelection && String(window.getSelection()) !== '') return;
   const p = (el.dataset.path || '').replace(/(?::\d+){1,2}$/, '');
   if (p) _openPathFromOutput(p);
 }
@@ -21136,7 +22718,7 @@ async function _fileCtxRun(act) {
   if (act === 'window') {
     // Synchronous on purpose: after an await the browser no longer treats this
     // as the user's click and blocks the window.
-    window.open(location.origin + location.pathname + '#path=' + _encodeHashPath(c.full), '_blank');
+    window.open(location.origin + location.pathname + (c.output ? _linkViewerQuery() : '') + '#path=' + _encodeHashPath(c.full), '_blank');
     return;
   }
   if (c.ready) await c.ready;
@@ -21276,9 +22858,8 @@ function _linkifyPaths(safeHtml) {
       const cls = /\.md$/i.test(p) ? 'md-link' : 'file-link';
       const shown = p + (line || '');
       // data-path is what the right-click menu reads (_fileCtxMenu).
-      return pre + at + '<span class="' + cls + '" data-path="' + esc(p) + '" title="Open in the file browser: '
-        + esc(_resolveOutputPath(p)) + '" onclick="event.preventDefault();event.stopPropagation();'
-        + "_openPathFromOutput('" + escJs(p) + "')" + '">' + esc(shown) + '</span>'
+      // A real link (_outputFileLink): a middle or ⌘ click opens a tab.
+      return pre + at + _outputFileLink(cls, p, ' title="Open in the file browser: ' + esc(_resolveOutputPath(p)) + '"', esc(shown))
         + (dot ? '.' : '');
     });
   } catch (e) { return safeHtml; }
@@ -21490,8 +23071,21 @@ const _peekToolCollapsed = {};
 // does, and a single click toggles after a beat so a second click can cancel
 // it instead of collapsing the block under the selection.
 let _ptcClickTimer = 0;
+// A LINK IN THE HEADER IS A LINK, NOT A TOGGLE (owner, 2026-11-21: "if I
+// click a response that has a link in it, it collapses the response text").
+// A reply's first line is its header, so a URL, file path or card id on that
+// line bubbled its click here and folded the reply 250 ms after the link
+// opened. A click on a link or control inside the header does its own job.
+const _PTC_HEAD_OWN_CLICK = 'a[href], button, input, select, textarea, [role="link"], [onclick]';
 function _peekToggleTool(id, ev) {
-  const onCaret = !!(ev && ev.target && ev.target.closest && ev.target.closest('.ptc-caret'));
+  const t = ev && ev.target && ev.target.closest ? ev.target : null;
+  const own = t && t.closest(_PTC_HEAD_OWN_CLICK);
+  if (own && !own.classList.contains('ptc-head') && own.closest('.ptc-head')) {
+    clearTimeout(_ptcClickTimer);
+    console.info('[amux] ptc_toggle_skipped', { id, on: own.tagName.toLowerCase() });
+    return;
+  }
+  const onCaret = !!(t && t.closest('.ptc-caret'));
   if (ev && !onCaret) {
     clearTimeout(_ptcClickTimer);
     if (ev.detail > 1) return;
@@ -21519,8 +23113,25 @@ function _htmlPreviewUrl(filePath) {
   if (!p.startsWith('/')) return null;
   return '/api/file/raw-path' + p.split('/').map(encodeURIComponent).join('/');
 }
+// THE BLINKING DOT IS STILL A BLOCK (owner, 2026-11-22: "that circle icon
+// that shows at the start of the message flickers in and out as an agent is
+// currently working. It causes the terminal to do a layout shift"). While a
+// tool runs, Claude Code blinks its ⏺ by drawing a coloured space in the same
+// cell, about twice a second. The terminal does not move, but a block head is
+// found by its ⏺, so on the blank frames the running line ("  Updating the
+// README…") read as a continuation of the block above: the running block
+// vanished into the previous one (hidden with it when that one was folded) and
+// came back on the next frame, shifting everything below. A coloured lone
+// space at column 0 followed by text is that blank frame; a real continuation
+// line starts with plain spaces. It is drawn as a steady ⏺.
+const _PTC_BLINK_OFF_HEAD = /^(<span\b[^>]*>) (<\/span> (?! ))/;
+let _ptcBlinkSeen = 0;
 function _wrapToolCalls(html) {
-  const lines = html.split('\n');
+  const lines = html.split('\n').map(l => {
+    if (!_PTC_BLINK_OFF_HEAD.test(l)) return l;
+    if (!_ptcBlinkSeen++) console.info('[amux] ptc_blink_head', { verdict: 'blank_frame_kept_as_block', worker: peekSession || null });
+    return l.replace(_PTC_BLINK_OFF_HEAD, '$1⏺$2');
+  });
   const strip = s => s.replace(/<[^>]*>/g, '');
   const out = [];
   _peekToolSeq = 0;
@@ -22273,6 +23884,13 @@ function _peekScrollAffordance() {
   if (!overlay || !overlay.classList.contains('active')) return;
   if (_isScrolledToBottom(body)) { _hideScrollLockBadge(body); return; }
   _showScrollLockBadge(body, () => {
+    // A chat owns this body: its own follow state decides what happens next,
+    // so the jump has to go through it (a terminal-only jump left the chat
+    // not following, and the next streamed line left the view behind).
+    if (body.classList.contains('peek-chat') && typeof _chatJumpToLatest === 'function') {
+      _peekFollowBottom = true; _peekBufferedOutput = false; _peekScrollLocked = false;
+      _chatJumpToLatest(); _hideScrollLockBadge(body); return;
+    }
     _peekScrollLocked = false;
     _peekFollowBottom = true;
     _peekBufferedOutput = false;
@@ -23366,11 +24984,15 @@ function _peekHasBoardRef(text) {
 }
 // Both navigation and Find select message blocks with the same predicate.
 // Content filters inspect actual references, never guesses about task intent.
+// A web link that is not a file link. A file link's href is this page's own
+// https URL (`_outputFileHref`: origin + '#path='), so an https selector alone
+// counted every file path as a link once paths became real links (27807a7ef).
+const _PEEK_WEB_LINK = ['https://', 'http://'].map(p => `a[href^="${p}"]:not(.file-link):not(.md-link):not(.md-file-link)`).join(', ');
 function _peekPromptMatchesFilters(el) {
   if (!el || (_peekMsgNavKind !== 'all' && el.dataset.msgKind !== _peekMsgNavKind)) return false;
   if (_peekMsgNavContent === 'board') return _peekHasBoardRef(el.textContent);
   if (_peekMsgNavContent === 'files') return !!el.querySelector('.file-link, .md-link');
-  if (_peekMsgNavContent === 'links') return !!el.querySelector('a[href^="https://"], a[href^="http://"]');
+  if (_peekMsgNavContent === 'links') return !!el.querySelector(_PEEK_WEB_LINK);
   return true;
 }
 function _peekFilterSync() {
@@ -23725,11 +25347,11 @@ function peekMsgPrev(event) { _peekMsgMove(-1, event); }
 // are highlighted and up/down steps between them.
 const _PEEK_TAB_ITEMS = {
   chat: '.chat-msg', schedules: '.sx-row, .sx-fleet-run', messages: '.pm-row', logs: '.wlog-row',
-  commits: '.commits-item', shell: '.peek-shell-card', issues: '.peek-issue-item', dictation: '.dict-row',
+  commits: '.commits-item', shell: '.peek-shell-card', issues: '.peek-issue-item', dictation: '.dict-row', intent: '.home-row',
   scope: '.worker-config-row', cost: '.cost-row, .cost-day', tasks: '.board-card, .peek-issue-item',
 };
 const _PEEK_TAB_LABELS = { chat: 'chat', schedules: 'schedules and runs', messages: 'messages', logs: 'logs',
-  commits: 'commits', shell: 'shell runs', issues: 'board', dictation: 'dictation', scope: 'settings', tasks: 'tasks' };
+  commits: 'commits', shell: 'shell runs', issues: 'board', dictation: 'dictation', scope: 'settings', tasks: 'tasks', intent: 'conversations', computer: 'computer use' };
 let _peekTabIdx = -1, _peekTabObs = null, _peekTabObsRoot = null, _peekTabApplying = false, _peekTabTimer = 0;
 function _peekTabName() { return document.getElementById('peek-overlay')?.dataset.peekTab || 'terminal'; }
 function _peekTabRoot(tab = _peekTabName()) {
@@ -23750,7 +25372,7 @@ function _peekTabItemKeeps(el, q) {
   if (_peekMsgNavKind !== 'all' && el.dataset.msgKind && el.dataset.msgKind !== _peekMsgNavKind) return false;
   if (_peekMsgNavContent === 'board') return _peekHasBoardRef(el.textContent);
   if (_peekMsgNavContent === 'files') return !!el.querySelector('.file-link, .md-link, .md-file-link');
-  if (_peekMsgNavContent === 'links') return !!el.querySelector('a[href^="https://"], a[href^="http://"]');
+  if (_peekMsgNavContent === 'links') return !!el.querySelector(_PEEK_WEB_LINK);
   return true;
 }
 function _peekTabHighlight(root, q) {
@@ -26286,6 +27908,8 @@ async function _approvalsRefresh() {
         + 'border-radius:var(--radius-md);padding:var(--space-2) var(--space-2-5);margin:var(--space-1-5) 0;font-size:var(--fs-md);max-height:320px;overflow:auto;">'
         + esc(_bodyText) + '</div>'
         + _apprAttachHtml(p)
+        + _apprLinksHtml(pv)
+        + _apprVoiceHtml(pv)
         + '<div id="appr-sched-' + esc(p.id) + '" class="appr-sched-row" data-send-at="' + (_sched ? _sched.send_at : '') + '" hidden></div>'
         + (p.schedule_failed ? '<div class="appr-sched-failed">'
           + 'It was scheduled for ' + esc(_apprWhenText(p.schedule_failed.send_at)) + ' and did not send. It is waiting for you again.</div>' : '')
@@ -26299,6 +27923,34 @@ async function _approvalsRefresh() {
     el.innerHTML = html;
     el.style.display = 'block';
   } catch (e) {}
+}
+// THE LINKS WERE CHECKED (Ethan, 2026-11-24: "make sure links are always
+// checked"). The server fetched every URL in the draft when it was held
+// (api/email_links.rs) and refused it on a dead one; this line says what it
+// found, so a bot-walled or slow link is seen before Approve.
+// The owner's voice and the /slop pass (Ethan, 2026-11-24: "everything should
+// use my founder voice and be run thru anti slop skill"): what the voice check
+// found when the draft was held, the worker's reason if it broke a rule, and
+// whether the drafter attested the /slop pass.
+function _apprVoiceHtml(pv) {
+  const v = pv.voice;
+  if (!v) return '';
+  let text;
+  if (v.measured !== true) text = 'Voice not checked (' + (v.why_unmeasured || 'unknown') + ')';
+  else if (!v.voice) text = 'Voice: none set';
+  else text = v.ok ? 'Voice: fits ' + v.voice : 'Voice: ' + (v.problems || []).join('; ');
+  if (v.override) text += ' (sent as written because: ' + v.override + ')';
+  text += v.slop === true ? ' · slop pass attested' : ' · slop pass NOT attested';
+  const bad = v.measured !== true || v.ok === false || v.slop !== true;
+  return '<div class="appr-links' + (bad ? ' appr-links-warn' : '') + '">' + esc(text) + '</div>';
+}
+function _apprLinksHtml(pv) {
+  const l = pv.links;
+  if (!l) return '';
+  const warn = l.measured === true && (l.warn || []).length;
+  const text = l.measured === true ? 'Links: ' + (l.summary || (l.checked + ' checked'))
+    : 'Links not checked (' + (l.why_unmeasured || 'unknown') + ')';
+  return '<div class="appr-links' + (warn || l.measured !== true ? ' appr-links-warn' : '') + '">' + esc(text) + '</div>';
 }
 // THE FILES GO OUT TOO (Ethan, 2026-11-09: "make sure amux supports
 // attachments too in the approval flow"). Each held attachment is a chip with
@@ -29739,17 +31391,75 @@ async function _dictMicReveal() {
   } catch (e) { showToast('The microphone was not allowed, so its name cannot be shown.'); return; }
   _dictRenderSettings();
 }
-// getUserMedia's audio constraint for the chosen microphone, matched by name. Not
-// connected here: the default microphone, said once rather than silently.
-async function _dictMicConstraint() {
-  const want = ((_dictSettings || {}).mic || '').trim();
-  if (!want || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return {};
+// The microphone is this device's own choice (owner, 2026-11-20: "dictation mic
+// settings should be client specific not server saved"): a phone, a laptop and
+// the Mac app each keep theirs in localStorage. A device that never chose one
+// starts from the server's old shared value, so nobody's pick is lost.
+const _DICT_MIC_KEY = 'amux_dict_mic';
+function _dictMic() {
   try {
-    const dev = (await navigator.mediaDevices.enumerateDevices()).find(d => d.kind === 'audioinput' && d.label === want);
-    if (dev) return { deviceId: { exact: dev.deviceId } };
-  } catch (e) { console.warn('dictation: could not list microphones', e); }
-  _dictMicMissing(want);
-  return {};
+    const own = localStorage.getItem(_DICT_MIC_KEY);
+    if (own !== null) return own;
+  } catch (e) { console.warn('dictation: could not read this device\'s microphone', e); }
+  return ((_dictSettings || {}).mic || '');
+}
+function _dictSetMic(name) {
+  const was = _dictMic();
+  try { localStorage.setItem(_DICT_MIC_KEY, name || ''); }
+  catch (e) { showToast('This browser would not save the microphone'); return; }
+  // A warm stream is the old microphone: the next take opens the new one.
+  if (was !== (name || '') && _dictStream) {
+    try { _dictStream.getTracks().forEach(t => t.stop()); } catch (e) { console.warn('dictation: could not release the previous microphone', e); }
+    _dictStream = null;
+  }
+  _dictMicWarned = '';
+  showToast(name ? 'This device dictates with ' + name : 'This device dictates with its default microphone');
+}
+// One microphone under two spellings: the Mac app's input name, Chrome's label
+// with its "(0909:001a)" USB id, or the "Default - " entry.
+function _dictMicSame(label, want) {
+  const n = s => String(s || '').toLowerCase().replace(/^default\s*-\s*/, '').replace(/\s*\([0-9a-f]{4}:[0-9a-f]{4}\)\s*$/, '').trim();
+  return !!n(label) && n(label) === n(want);
+}
+async function _dictMicFind(want) {
+  try {
+    return (await navigator.mediaDevices.enumerateDevices()).find(d => d.kind === 'audioinput'
+      && d.deviceId !== 'default' && d.deviceId !== 'communications' && _dictMicSame(d.label, want)) || null;
+  } catch (e) { console.warn('dictation: could not list microphones', e); return null; }
+}
+// getUserMedia's audio constraint for the chosen microphone, matched by name. No
+// match yet is not "not connected": a page that has not opened the microphone
+// sees no names at all (the Mac app, 2026-11-25: the owner's connected
+// ATR2500x-USB was reported missing every take). _dictMicSettle decides once the
+// stream is open and the names can be read.
+async function _dictMicConstraint() {
+  const want = _dictMic().trim();
+  if (!want || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return {};
+  const dev = await _dictMicFind(want);
+  return dev ? { deviceId: { exact: dev.deviceId } } : {};
+}
+// After the default microphone opened: it may BE the chosen one; else the names
+// are readable now, so open the chosen one if it is here, and only when it is
+// not, say so once.
+async function _dictMicSettle(stream, audio) {
+  const want = _dictMic().trim();
+  if (!want || !stream || audio.deviceId) return stream;
+  const track = stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
+  if (track && _dictMicSame(track.label, want)) return stream;
+  const dev = await _dictMicFind(want);
+  if (!dev) { _dictMicMissing(want); return stream; }
+  const on = track && track.getSettings ? track.getSettings().deviceId : '';
+  if (on && on === dev.deviceId) return stream;
+  try {
+    const chosen = await navigator.mediaDevices.getUserMedia({ audio: Object.assign({}, audio, { deviceId: { exact: dev.deviceId } }) });
+    stream.getTracks().forEach(t => t.stop());
+    _dictBeacon('dict_mic_reopened', { native: false });
+    return chosen;
+  } catch (e) {
+    console.warn('dictation: could not open the chosen microphone', e);
+    _dictMicMissing(want);
+    return stream;
+  }
 }
 function _dictMicMissing(name) {
   _dictBeacon('dict_mic_missing', { native: false });
@@ -29772,12 +31482,13 @@ function _dictRenderGlobal() {
 // The Dictation tab opened: the dictionary, key source and settings, fresh.
 async function _dictGlobalLoad() {
   try {
-    const [d, c] = await Promise.all([
+    const [d, c, tx] = await Promise.all([
       fetch(API + '/api/dictation/dict', { headers: _authHeaders() }).then(r => r.json()),
       fetch(API + '/api/dictation/config', { headers: _authHeaders() }).then(r => r.json()),
+      fetch(API + '/api/transcription', { headers: _authHeaders() }).then(r => r.json()).catch(() => null),
       _dictSettingsLoad(),
     ]);
-    _dictWords = Array.isArray(d) ? d : []; _dictCfg = c || {};
+    _dictWords = Array.isArray(d) ? d : []; _dictCfg = c || {}; _dictTx = tx;
   } catch (e) { console.warn('dictation: the dictionary did not load', e); }
   _dictRenderDict();
   _dictRenderSettings();
@@ -29848,7 +31559,10 @@ async function _dictStartRec() {
   if (_dictRecording) return;
   try { _dictBus?.postMessage({ op: 'start', tab: _dictTabId }); } catch (e) { console.warn('dictation: could not tell other tabs', e); }
   const nat = _dictNativeBridge();
-  if (nat && !_dictSettings) await _dictSettingsEnsure();
+  // Never wait on the settings read here: a take that started late let a quick
+  // hold-and-release of the Globe key land before its start, so the take ran on.
+  // They load at boot (below); a first take before that uses the default mic.
+  if (nat && !_dictSettings) _dictSettingsEnsure();
   if (nat) { _dictNativeStart(nat); return; }
   if (!navigator.mediaDevices || !window.MediaRecorder) { showToast('Recording not supported in this browser'); return; }
   _dictCancelled = false;
@@ -29870,8 +31584,8 @@ async function _dictStartRec() {
     try {
       await _dictSettingsEnsure();
       const mic = await _dictMicConstraint();
-      _dictStream = await navigator.mediaDevices.getUserMedia({
-        audio: Object.assign({ echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: { ideal: 16000 } }, mic) });
+      const audio = Object.assign({ echoCancellation: true, noiseSuppression: true, channelCount: 1, sampleRate: { ideal: 16000 } }, mic);
+      _dictStream = await _dictMicSettle(await navigator.mediaDevices.getUserMedia({ audio }), audio);
     } catch(e) {
       showToast(mac ? 'The microphone is off for amux. Turn it on in System Settings → Privacy & Security → Microphone.' : 'Microphone access denied');
       _dictBeacon('mic_permission_refused', { mac, error: String(e && e.name || e).slice(0, 80) });
@@ -29895,7 +31609,8 @@ async function _dictStartRec() {
   // 2026-11-03). Storage runs its writes in order, so this clear still lands
   // before the first second is saved.
   _dictLiveClear();
-  _dictRecorder.ondataavailable = e => { if (e.data && e.data.size) { _dictChunks.push(e.data); _dictLiveSave(e.data); } };
+  const take = ++_dictTake;
+  _dictRecorder.ondataavailable = e => { if (e.data && e.data.size) { const first = !_dictChunks.length; _dictChunks.push(e.data); _dictLiveSave(e.data, take, first); } };
   _dictRecorder.onstop = () => { _dictStopMeter(); if (_dictCancelled) { _dictChunks = []; _dictLiveClear(); _dictStatus('Cancelled'); } else _dictUpload(); };
   // 1 s slices: each second reaches IndexedDB as it is spoken (see _dictLiveSave).
   _dictRecorder.start(1000);
@@ -30006,7 +31721,7 @@ function _dictNativeStart(bridge) {
   _dictRecording = true; _dictStartedAt = Date.now();
   document.getElementById('dict-rec-btn')?.classList.add('recording');
   _dictTick();
-  bridge.postMessage({ op: 'start', hints: _dictNativeHints(), input: ((_dictSettings || {}).mic || '') });
+  bridge.postMessage({ op: 'start', hints: _dictNativeHints(), input: _dictMic() });
   if (_dictSettings && _dictSettings.mic) _dictSettingsEnsure();
 }
 function _dictNativeStop() {
@@ -30057,6 +31772,27 @@ window._dictNativeEvent = function (ev) {
   }
   _dictBeacon('dict_native_error', { error: String(ev.why || '').slice(0, 160) });
   _dictPillSays(ev.why || 'Dictation failed');
+};
+// A microphone was plugged in or unplugged (the Mac app tells the page you are in:
+// MicWatch in desktop/amux-dictation.swift). The toast says whether dictation uses it:
+// the one chosen in Dictation settings when it is connected, else the system default.
+window._dictMicsChanged = function (ev) {
+  if (!ev) return;
+  const chosen = _dictMic(), inputs = ev.inputs || [], def = ev.default || 'the default microphone';
+  const using = chosen && inputs.includes(chosen) ? chosen : def;
+  const lines = [];
+  for (const m of ev.added || []) {
+    if (m === using) lines.push(m + ' connected. Dictation uses it.');
+    else lines.push(m + ' connected. Dictation keeps using ' + using + '.');
+  }
+  for (const m of ev.removed || []) {
+    if (m === chosen) lines.push(m + ' disconnected. Dictation uses ' + def + ' until it is back.');
+    else if (!chosen && m === ev.was_default) lines.push(m + ' disconnected. Dictation now uses ' + def + '.');
+    else lines.push(m + ' disconnected. Dictation did not use it.');
+  }
+  if (!lines.length) return;
+  _dictBeacon('dict_mic_changed', { added: (ev.added || []).length, removed: (ev.removed || []).length, uses_new: (ev.added || []).includes(using) });
+  showToast(lines.join(' '));
 };
 async function _dictNativeDone(ev, take) {
   _dictRecording = false;
@@ -30140,11 +31876,23 @@ function _dictStoreHung(why) {
   _dictBeacon('dict_storage_hung', { why });
 }
 const _dictStoreDown = () => Date.now() < _dictStoreDownUntil;
-async function _dictLiveSave(chunk) {
+// The live copy belongs to ONE take. A chunk that finds no record of its take
+// starts one only if it is the take's first chunk: a later chunk alone has no
+// header, so a record made from it can never be decoded. And `last` dates the
+// final chunk, so a take recovered a day later says how long it really was
+// (AF-1361: 6.6 KB clips recovered as 24.8 h long, each refused as corrupt).
+let _dictTake = 0;
+async function _dictLiveSave(chunk, take, first) {
   if (_dictStoreDown()) return;
   try {
-    const live = (await _idb.get('dict_live')) || {started: _dictStartedAt, mime: chunk.type || 'audio/webm', session: peekSession || '', chunks: []};
+    const stored = await _idb.get('dict_live');
+    let live = stored && stored.take === take ? stored : null;
+    if (!live) {
+      if (!first || take !== _dictTake) { _dictBeacon('dict_live_orphan_chunk_dropped', { bytes: chunk.size || 0 }); return; }
+      live = {take, started: _dictStartedAt, mime: chunk.type || 'audio/webm', session: peekSession || '', chunks: []};
+    }
     live.chunks.push(chunk);
+    live.last = Date.now();
     await _idb.set('dict_live', live);
   } catch(e) {}
 }
@@ -30166,8 +31914,35 @@ async function _dictRecoverLive() {
   const blob = new Blob(live.chunks, {type: live.mime || 'audio/webm'});
   await _dictLiveClear();
   if (blob.size < 1200) return;
-  const id = await _dictOutboxAdd(blob, (live.mime || 'audio/webm').split(';')[0], Date.now() - (live.started || Date.now()));
-  await _dictOutboxPatch(id, {recovered: true, session: live.session || ''});
+  // RECOVERED ONCE, NOT ONCE PER WINDOW OR PER LOAD (AF-1361). Every window of
+  // the Mac app ran this on load, and a clear that timed out left the take to
+  // be recovered again on the next one: one take became clips in ten workers,
+  // each stamped with the time since it began (24.8 h). The take's start is
+  // its key, checked in this device's shared storage and in the outbox's own
+  // transaction; the length is the take's, from its last chunk.
+  const started = live.started || 0;
+  const key = 'amux_dict_recovered';
+  let seen = [];
+  try { seen = JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) { seen = []; }
+  if (started && seen.includes(started)) { _dictBeacon('dict_live_recovered_again', { age_ms: Date.now() - started, where: 'device' }); return; }
+  try { localStorage.setItem(key, JSON.stringify(seen.concat([started]).slice(-20))); } catch (e) { console.warn('dictation: could not note the recovered take', e); }
+  const ms = Math.max(0, (live.last || (started + live.chunks.length * 1000)) - started);
+  const id = 'd' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  let dup = false;
+  try {
+    const bytes = await blob.arrayBuffer();
+    await _dictUpdate(q => {
+      dup = !!started && q.some(x => x.live_started === started);
+      return dup ? q : q.concat([{ id, bytes, mime: (live.mime || 'audio/webm').split(';')[0], ms, ts: Date.now(),
+        session: live.session || '', live_started: started, recovered: true,
+        state: 'pending', attempts: 0, last: 0, error: '', text: '' }]);
+    });
+  } catch (e) {
+    if (e && e.message === 'dict_write_timeout') _dictStoreHung('dict_write_timeout');
+    _dictBeacon('dict_live_recover_failed', { error: String((e && e.message) || e).slice(0, 120), bytes: blob.size });
+    return;
+  }
+  if (dup) { _dictBeacon('dict_live_recovered_again', { age_ms: Date.now() - started, where: 'outbox' }); return; }
   showToast('A dictation interrupted by a reload was saved; it will be transcribed');
   setTimeout(_dictFlushOffline, 1500);
 }
@@ -30261,6 +32036,11 @@ async function _dictSendDirect(blob, mime, ms) {
     const r = await fetch(url, { method: 'POST', headers: _authHeaders({ 'Content-Type': mime || 'audio/webm' }),
       body: blob, signal: AbortSignal.timeout(120000) });
     const d = await r.json();
+    if (d.code === 'audio_unreadable') {
+      _dictStatus('The transcriber found no audio it could read in this recording.');
+      _dictBeacon('dict_clip_refused', { bytes: blob.size || 0, ms: ms || 0, unsaved: true });
+      return null;
+    }
     if (d.error) throw new Error(d.error);
     _dictStatus('Added to the composer — review, then send');
     _dictInsert(d.text);
@@ -30274,7 +32054,23 @@ async function _dictSendDirect(blob, mime, ms) {
 // One attempt against a stored clip. Never discards audio: a failure of ANY kind
 // leaves the item in the outbox with its error, so Retry re-sends the same
 // recording instead of asking you to say it again.
-async function _dictTrySend(id, interactive) {
+// One send per clip at a time. The background pass, the sync banner and a
+// Retry can each reach the same clip; a second caller joins the send already
+// in flight, so a clip is uploaded and transcribed once (AF-1289: the stored
+// clip went out twice, [3000, 3000]). dictation_send_joined counts the joins.
+const _dictInflight = new Map();
+function _dictTrySend(id, interactive) {
+  const running = _dictInflight.get(id);
+  if (running) {
+    try { amuxTrack('dictation_send_joined', {id, interactive: !!interactive, measured: true, n_considered: 1}); }
+    catch (e) { console.warn('dictation_send_joined not tracked', e); }
+    return running;
+  }
+  const p = _dictTrySendOnce(id, interactive).finally(() => _dictInflight.delete(id));
+  _dictInflight.set(id, p);
+  return p;
+}
+async function _dictTrySendOnce(id, interactive) {
   const q = await _dictOutbox();
   const it = q.find(x => x.id === id);
   if (!it || !it.blob) return null;
@@ -30302,7 +32098,26 @@ async function _dictTrySend(id, interactive) {
     if (_peekTab === 'dictation') _dictRender();
     return null;
   } finally { clearTimeout(readTimer); }
-  await _dictOutboxPatch(id, { state: 'sending', sending_at: Date.now() });
+  // One window sends a clip. Each window of the Mac app runs its own send
+  // pass, and both sent the same clip in the same second (AF-1361: every
+  // refused clip on 2026-11-23 reached the server twice). The claim is made in
+  // the outbox's own transaction; a window that finds a fresh claim leaves it.
+  // A store that cannot record the claim sends anyway, as before.
+  let claimed = true;
+  try {
+    await _dictUpdate(q => { claimed = true; return q.map(x => {
+      if (x.id !== id) return x;
+      if (x.state === 'sending' && !_dictSendingStale(x)) { claimed = false; return x; }
+      return Object.assign({}, x, { state: 'sending', sending_at: Date.now() });
+    }); });
+  } catch (e) {
+    if (e && e.message === 'dict_write_timeout') _dictStoreHung('dict_write_timeout');
+  }
+  if (!claimed) {
+    _dictBeacon('dict_send_claimed_elsewhere', { id });
+    if (interactive) _dictStatus('Another window is sending this recording');
+    return null;
+  }
   if (interactive) _dictStatus('Transcribing… (' + _dictKB(it.blob.size) + ')');
   if (_peekTab === 'dictation') _dictRender();
   const url = API + '/api/dictate?session=' + encodeURIComponent(it.session || peekSession || '')
@@ -30314,6 +32129,17 @@ async function _dictTrySend(id, interactive) {
                                  body, signal: ctl.signal });
     clearTimeout(timer);
     const d = await r.json();
+    // The transcriber refused the audio itself; a retry sends the same bytes
+    // and is refused again (AF-1361: 24 refusals in 4 h from two clips). The
+    // clip is kept to play or delete, and nothing sends it again on its own.
+    if (d.code === 'audio_unreadable') {
+      await _dictOutboxPatch(id, { state: 'refused', last: Date.now(),
+        error: 'The transcriber found no audio it could read in this recording' });
+      _dictBeacon('dict_clip_refused', { id, bytes: it.blob.size || 0, ms: it.ms || 0, recovered: !!it.recovered });
+      if (interactive) _dictStatus('The transcriber found no audio it could read in this recording. Play it, or delete it.');
+      if (_peekTab === 'dictation') _dictRender();
+      return null;
+    }
     if (d.error) throw new Error(d.error);
     await _dictOutboxPatch(id, { state: 'done', text: d.text || '', error: '', last: Date.now() });
     await _dictPruneDone();
@@ -30394,6 +32220,32 @@ async function _dictRetry(id) {
   await _dictPendingBadge();
 }
 
+// Try every clip that can still be sent, now, ignoring its backoff.
+async function _dictRetryAll() {
+  await _dictPendingBadge();
+  const ids = new Set(_dictPendingRows.filter(x => !_dictNoResend(x)).map(x => x.id));
+  if (!ids.size) return;
+  try { await _dictUpdate(q => q.map(x => ids.has(x.id) ? Object.assign({}, x, { attempts: 0, last: 0 }) : x)); }
+  catch (e) { showToast('This device could not update the recordings yet; try again'); return; }
+  _dictBeacon('dict_retry_all', { n: ids.size });
+  if (_dictFlushing) { showToast('Already sending queued recordings; these go next'); return; }
+  showToast('Sending ' + ids.size + ' recording' + (ids.size === 1 ? '' : 's') + '…');
+  await _dictFlushOffline();
+  if (_peekTab === 'dictation') _dictRender();
+}
+// Delete every clip that has not been transcribed, after one confirm.
+async function _dictClearAll() {
+  await _dictPendingBadge();
+  const n = _dictPendingRows.length;
+  if (!n) return;
+  const ok = await showConfirm('Delete the ' + n + ' recording' + (n === 1 ? '' : 's') + ' that ' + (n === 1 ? 'was' : 'were')
+    + ' not transcribed? The audio is removed from this device.', 'Delete ' + n, true);
+  if (!ok) return;
+  try { await _dictUpdate(q => q.filter(x => x.state === 'done')); _dictBeacon('dict_clear_all', { n }); }
+  catch (e) { showToast('This device could not delete the recordings yet; try again'); }
+  if (_peekTab === 'dictation') _dictRender();
+}
+
 // Play the stored audio back. You asked for it to feel like a recording — so the
 // clip is a thing you can hear before deciding to retry or bin it.
 async function _dictPlay(id) {
@@ -30410,6 +32262,9 @@ async function _dictPlay(id) {
 // synchronously by the connection pill and its modal. `var`, because the pill
 // can render before this part of the file has run.
 var _dictPendingN = 0, _dictAttentionN = 0, _dictSyncPending = false, _dictPendingRows = [];
+// A clip nothing can send again: its stored copy is unreadable, or the
+// transcriber refused the audio itself, which a retry would send unchanged.
+const _dictNoResend = c => c.state === 'unreadable' || c.state === 'refused';
 function _dictClipLabel(c) {
   const secs = Math.round((c.ms || 0) / 1000);
   return 'Transcribe recording (' + secs + 's' + (c.session ? ', ' + c.session : '') + ')';
@@ -30419,7 +32274,7 @@ function _dictClipLabel(c) {
 async function _dictSyncClips(forced) {
   const out = [];
   for (const it of (await _dictOutbox())) {
-    if (it.state === 'done' || it.state === 'unreadable' || !it.blob) continue;
+    if (it.state === 'done' || _dictNoResend(it) || !it.blob) continue;
     if (it.state === 'sending' && !_dictSendingStale(it)) continue;
     if (!forced && !_dictReady(it)) continue;
     if (it.state === 'sending') {
@@ -30434,7 +32289,8 @@ async function _dictPendingBadge() {
   let q = [];
   try { q = (await _idb.get('dict_pending')) || []; } catch(e) {}
   const n = q.filter(x => x.state !== 'done').length;
-  _dictPendingRows = q.filter(x => x.state !== 'done').map(({blob, bytes, ...rest}) => rest);
+  _dictPendingRows = q.filter(x => x.state !== 'done')
+    .map(({blob, bytes, ...rest}) => Object.assign(rest, { size: (bytes && bytes.byteLength) || (blob && blob.size) || 0 }));
   _dictPendingN = n;
   _dictSyncPending = n > 0;
   _dictAttentionN = _dictPendingRows.filter(x => x.error || (x.attempts || 0) >= _DICT_MAX_AUTO || _dictSendingStale(x)).length;
@@ -30469,21 +32325,26 @@ function _dictTabBadge(pending) {
 function _dictOutboxHTML(q) {
   const live = q.filter(x => x.state !== 'done');
   if (!live.length) return '';
-  let h = '<div class="dict-day">PENDING</div>';
+  // Every clip at once (owner, 2026-11-19: "I should have a way to clear, try
+  // again or whatever these"), on the heading's own row so a phone gets no new row.
+  const resend = live.filter(x => !_dictNoResend(x)).length;
+  let h = '<div class="dict-day dict-pending-head"><span>PENDING</span><span class="dict-pending-acts">'
+    + (resend ? '<button class="btn small" onclick="_dictRetryAll()">Try all again</button>' : '')
+    + '<button class="btn small" onclick="_dictClearAll()">Clear all</button></span></div>';
   for (const it of live.slice().reverse()) {
     const secs = Math.round((it.ms || 0) / 1000);
     const label = { sending: 'Sending…', offline: 'Waiting for connection', failed: 'Failed', pending: 'Queued',
-      unreadable: 'Can no longer be read' }[it.state] || it.state;
+      unreadable: 'Can no longer be read', refused: 'No audio the transcriber can read' }[it.state] || it.state;
     const gone = it.state === 'unreadable';   // nothing to play or re-send; only Delete helps
     const err = it.error ? '<div class="dict-err">' + esc(it.error) + '</div>' : '';
     const attempts = (it.attempts || 0) > 1 ? ' · ' + it.attempts + ' tries' : '';
     h += '<div class="dict-item dict-item-pending">'
       +  '<div class="dict-item-head"><span class="dict-state dict-state-' + esc(it.state) + '">' + label + '</span>'
-      +  '<span class="dict-meta">' + secs + 's · ' + _dictKB((it.blob && it.blob.size) || 0) + attempts + '</span></div>'
+      +  '<span class="dict-meta">' + secs + 's · ' + _dictKB(it.size || (it.blob && it.blob.size) || 0) + attempts + '</span></div>'
       +  err
       +  '<div class="dict-actions">'
       +    (gone ? '' : '<button class="btn small" onclick="_dictPlay(\'' + it.id + '\')">▶ Play</button>'
-      +      '<button class="btn small primary" onclick="_dictRetry(\'' + it.id + '\')">Retry</button>')
+      +      (_dictNoResend(it) ? '' : '<button class="btn small primary" onclick="_dictRetry(\'' + it.id + '\')">Retry</button>'))
       +    '<button class="btn small" onclick="_dictOutboxDel(\'' + it.id + '\')">Delete</button>'
       +  '</div></div>';
   }
@@ -30494,6 +32355,9 @@ function _dictOutboxHTML(q) {
 // runs on reconnect and on its backoff timer; this tick only wakes it for clips.
 window.addEventListener('online', () => { setTimeout(() => { if (_dictPendingN) runSyncBanner(true); }, 1500); });
 setInterval(() => { if ((typeof online === 'undefined' || online) && _dictPendingN) runSyncBanner(true); }, 45000);
+// The Mac app is told the saved microphone on each take's start; read it now so
+// the first take has it without waiting.
+if (typeof _dictNativeBridge === 'function' && _dictNativeBridge()) setTimeout(() => { _dictSettingsLoad(); }, 0);
 // A clip queued before this page loaded counts from the start, not from the first Dictation open.
 setTimeout(() => { _dictPendingBadge().then(() => { if (_dictPendingN && (typeof online === 'undefined' || online)) runSyncBanner(true); }); }, 2000);
 
@@ -30613,10 +32477,13 @@ function _dictRenderHistory() {
   if (!body) return;
   // Pending clips render first and out-of-band: they are the ones needing a
   // decision (retry / play / bin), and they must show even when history is empty.
-  _dictOutbox().then(ob => {
-    const strip = _dictOutboxHTML(ob);
+  // From the rows the pending count read, not a second read: on the Mac app a
+  // slow store let the count answer "4 pending" while _dictOutbox() gave up
+  // after 5 s and the list showed none (owner, 2026-11-19, with
+  // dict_storage_hung beacons from that device).
+  _dictPendingBadge().then(() => {
     const host = document.getElementById('dict-outbox-strip');
-    if (host) host.innerHTML = strip;
+    if (host) host.innerHTML = _dictOutboxHTML(_dictPendingRows);
   });
   const q = (document.getElementById('dict-search')?.value || '').trim().toLowerCase();
   const items = q ? _dictItems.filter(i => (i.text||'').toLowerCase().includes(q)) : _dictItems;
@@ -30746,12 +32613,42 @@ async function _dictDelWord(id) {
 }
 
 // ── Settings (BYO key) ──
+// What actually transcribes, from GET /api/transcription (the same status the
+// server's engine choice reads), so the page cannot claim an engine that is
+// not the one running (owner, 2026-11-18: "make sure the dictation tab ... is
+// accurate").
+var _dictTx = null;
+function _dictEngineLabel(engine, model) {
+  const m = String(model || '').replace(/^mlx-community\//, '').replace(/ \(MLX\)$/, '');
+  if (engine === 'mlx-whisper') return 'Whisper ' + m.replace(/^whisper-/, '') + ' on this Mac (MLX, GPU)';
+  if (engine === 'whisper') return 'Whisper ' + m + ' on this Mac (CPU)';
+  if (engine === 'gemini') return 'Gemini (' + (_dictTx?.gemini?.model || 'cloud') + ')';
+  return '';
+}
+function _dictEngineRows() {
+  const tx = _dictTx;
+  if (!tx || !tx.dictate) return '<div class="dict-set-row"><b>Engine</b><span>Could not read the engine status</span></div>';
+  const uses = tx.dictate.uses || {}, local = tx.dictate.local || {}, gem = tx.gemini || {};
+  const keyFrom = gem.source === 'byo' ? 'your own key' : gem.source === 'server' ? "this server's key" : '';
+  const now = uses.available
+    ? (uses.engine === 'gemini' ? 'Gemini (' + esc(gem.model || '') + ', ' + keyFrom + ')' : esc(_dictEngineLabel(uses.engine, local.model)))
+    : 'Nothing can transcribe: ' + esc(uses.why_unavailable || 'no engine');
+  let fallback = '';
+  if (uses.engine !== 'gemini' && uses.available) {
+    fallback = tx.engine === 'local' ? 'None: the setting is Local only'
+      : gem.configured ? 'Gemini (' + esc(gem.model || '') + ', ' + keyFrom + ') when the local engine cannot answer'
+      : 'None: no Gemini key is set';
+  } else if (!local.available && local.why) {
+    fallback = 'Local engine unavailable: ' + esc(local.why);
+  }
+  return '<div class="dict-set-row dict-set-gap"><b>Browser and phone</b><span id="dict-engine-now">' + now + '</span></div>'
+    + (fallback ? '<div class="dict-set-row"><b>' + (uses.engine === 'gemini' ? 'Local' : 'Fallback') + '</b><span id="dict-engine-fallback">' + fallback + '</span></div>' : '')
+    + '<div class="dict-set-row"><b>Mac app</b><span>Apple on-device speech, then the same name and dictionary pass</span></div>';
+}
 function _dictRenderSettings() {
   const body = document.getElementById('dict-set-body');
   if (!body) return;
   const c = _dictCfg || {};
-  const using = c.source === 'byo' ? 'your own Gemini key'
-    : c.source === 'server' ? "this amux server's Gemini key" : 'nothing configured';
   const ds = _dictSettings || { mic: '', context: '', workers: true, contacts: false };
   const src = _dictSources || {};
   // A repaint (the tab's background reload) keeps context typed but not saved yet.
@@ -30761,7 +32658,7 @@ function _dictRenderSettings() {
   body.innerHTML =
     '<div class="dict-settings">'
     + '<div class="dict-set-row"><b>Microphone</b><span id="dict-mic-host"><select id="dict-mic" class="input" disabled><option>Loading…</option></select></span></div>'
-    + '<div class="dict-sethint" id="dict-mic-note">Saved on the server: every device that has this microphone dictates with it, and the others use their default.</div>'
+    + '<div class="dict-sethint" id="dict-mic-note">Saved on this device only: each phone, laptop and Mac app keeps its own microphone.</div>'
     + '<div class="dict-set-row"><b>What dictation knows</b><span></span></div>'
     + '<label class="dict-set-row"><span><input type="checkbox" id="dict-src-workers"' + (ds.workers !== false ? ' checked' : '') + ' onchange="_dictSettingsSave({workers:this.checked})"> Worker names' + count(src.workers, 'worker', 'workers') + '</span></label>'
     + '<label class="dict-set-row"><span><input type="checkbox" id="dict-src-contacts"' + (ds.contacts ? ' checked' : '') + ' onchange="_dictSettingsSave({contacts:this.checked})"> CRM contact names' + count(src.contacts, 'contact', 'contacts') + '</span></label>'
@@ -30770,11 +32667,10 @@ function _dictRenderSettings() {
     + '<div class="dict-sethint">About you and what you talk about: names, products, jargon. Dictation uses it to settle unclear words.</div>'
     + '<textarea id="dict-context" class="input dict-context" rows="4" maxlength="4000" placeholder="e.g. I run Mixpeek; I talk about amux workers, Rust, GKE and our customers TubeScience and Wexus.">' + esc(ds.context || '') + '</textarea>'
     + '<div class="dict-set-actions"><button class="btn primary" id="dict-context-save" onclick="_dictSettingsSave({context:(document.getElementById(\'dict-context\')||{}).value||\'\'})">Save context</button></div>'
-    + '<div class="dict-set-row dict-set-gap"><b>Transcription</b><span>' + esc(c.model || '') + '</span></div>'
-    + '<div class="dict-set-row"><b>Currently using</b><span>' + using + '</span></div>'
+    + _dictEngineRows()
     + '<div class="dict-sethint">Which engine Dictate and Recordings use is one setting: '
     + '<button type="button" class="btn" onclick="_transcriptionOpenSettings()">Transcription settings</button></div>'
-    + '<div class="dict-sethint">Bring your own Gemini API key (optional). If set, amux uses it instead of the '
+    + '<div class="dict-sethint">Bring your own Gemini API key for the Gemini engine (optional). If set, amux uses it instead of the '
     + 'server\'s key. It is stored on the amux server and is <b>never sent back to any browser</b>. '
     + 'Get one at <span style="color:var(--accent)">aistudio.google.com/apikey</span>.</div>'
     + '<div style="display:flex;gap:var(--space-2);margin-top:var(--space-2);">'
@@ -30784,7 +32680,7 @@ function _dictRenderSettings() {
     + (c.source === 'byo' ? '<button class="btn" onclick="_dictClearKey()">Remove</button>' : '')
     + '</div>'
     + '<div class="dict-sethint" style="margin-top:var(--space-3-5);">Audio never touches this page’s JavaScript beyond the '
-    + 'recording itself — it is uploaded to your amux server, which calls Gemini and returns only text.</div>'
+    + 'recording itself: it is uploaded to your amux server, which transcribes it on this Mac (Gemini only when the engine above says so) and returns only text.</div>'
     + '</div>';
   if (typed !== null) { const ta = document.getElementById('dict-context'); if (ta) ta.value = typed; }
   _dictRenderMicPicker();
@@ -30792,11 +32688,11 @@ function _dictRenderSettings() {
 async function _dictRenderMicPicker() {
   const host = document.getElementById('dict-mic-host');
   if (!host) return;
-  const want = ((_dictSettings || {}).mic || '');
+  const want = _dictMic();
   const { names, hidden } = await _dictMicNames();
   const opts = [''].concat(names);
   if (want && !names.includes(want)) opts.push(want);
-  host.innerHTML = '<select id="dict-mic" class="input" onchange="_dictSettingsSave({mic:this.value})">'
+  host.innerHTML = '<select id="dict-mic" class="input" onchange="_dictSetMic(this.value)">'
     + opts.map(n => '<option value="' + esc(n) + '"' + (n === want ? ' selected' : '') + '>'
       + esc(n ? (names.includes(n) ? n : n + ' (not connected here)') : 'Default microphone') + '</option>').join('')
     + '</select>'
@@ -30839,7 +32735,9 @@ function _peekCostLoad() {
 // adds. Strip it when INSERTING back into a composer — resending would
 // otherwise stack a second timestamp onto the old one.
 function _msgStripPrefix(text) {
-  return String(text || '').replace(/^\[\d{1,2}:\d{2}\s?[AP]M[^\]]*\]\s*/i, '');
+  // 12- and 24-hour stamps, with or without seconds: the server's
+  // with_send_author keeps whichever form the sender's stamp used.
+  return String(text || '').replace(/^\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]\.?M\.?)?[^\]]*\]\s*/i, '');
 }
 // After inserting, GO TO the input: expand the send bar if collapsed, scroll the
 // composer into view, focus with the caret at the end — ready to edit/send.
@@ -30905,7 +32803,12 @@ function _cmdRecallBuild(session) {
     // sometimes lands in history alongside the same text without it, which made
     // recall show the identical prompt twice in a row. Only that glyph is
     // removed, never a leading '>' a person may have typed as a quote.
-    const t = (e.text || '').replace(/^\u276F\s*/, '').trim();
+    // Then the "[time author] " stamp the send path writes into the stored
+    // text (server with_send_author; the same shape _msgStripPrefix removes on
+    // edit). Without this, recall handed the stamp back to the composer, so a
+    // resend went out with the old timestamp still on it.
+    const t = (e.text || '').replace(/^\u276F\s*/, '')
+      .replace(/^\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]\.?M\.?)?[^\]]*\]\s*/i, '').trim();
     if (!t) continue;
     if (out.length && out[out.length - 1] === t) continue;   // collapse repeats
     out.push(t);
@@ -31097,6 +33000,7 @@ function resetGroupView() {
 function toggleTagFilter(tag) {
   const next = _nextTagState(tag, activeTag, hiddenTags);
   activeTag = next.active; hiddenTags = next.hidden;
+  if (activeTag === tag) _navVisit('group', tag, tag);
   render();
 }
 
@@ -31193,6 +33097,7 @@ function renderFilterOptions() {
     const n = live.filter(s => _modelClass(sessionConfiguredModel(s)) === m).length;
     return `<button class="filter-chip${on?' on':''}" onclick="toggleModelFilter('${escJs(m)}')">${esc(_mLabel(m))}<span class="filter-chip-n">${n}</span></button>`;
   }).join('') : '<span class="filter-hint">No workers.</span>';
+  renderListDefault();
 }
 function toggleProviderFilter(p) {
   if (filterProviders.has(p)) filterProviders.delete(p); else filterProviders.add(p);
@@ -31205,6 +33110,32 @@ function toggleStatusFilter(k) {
 function toggleModelFilter(m) {
   if (filterModels.has(m)) filterModels.delete(m); else filterModels.add(m);
   renderFilterOptions(); render(); renderActiveFilters();
+}
+// Save as default: this tab's filters become what new tabs start with. Pressed
+// again while they match the saved default, it clears the default. Clear all
+// empties this tab only, and never changes the default.
+function _listDefaultMatchesNow() {
+  const d = _listDefaultRead();
+  if (!d) return false;
+  return JSON.stringify(_listFiltersOf(d)) === JSON.stringify(_listFiltersOf(JSON.parse(_listViewSnapshot())));
+}
+function toggleListDefault() {
+  if (_listDefaultMatchesNow()) localStorage.removeItem(_LIST_DEFAULT_KEY);
+  else localStorage.setItem(_LIST_DEFAULT_KEY, JSON.stringify(_listFiltersOf(JSON.parse(_listViewSnapshot()))));
+  renderListDefault();
+}
+function renderListDefault() {
+  const btn = document.getElementById('filter-default-btn');
+  const hint = document.getElementById('filter-default-hint');
+  const has = !!_listDefaultRead();
+  const same = has && _listDefaultMatchesNow();
+  if (btn) {
+    btn.textContent = same ? 'Default ✓ (tap to clear)' : 'Save as default';
+    btn.classList.toggle('primary', !same);
+  }
+  if (hint) hint.textContent = same ? 'New tabs start with these filters.'
+    : has ? 'Another default is saved. Save as default replaces it.'
+    : 'No default. New tabs start with the filters of the tab you came from.';
 }
 function clearAllFilters() {
   filterProviders.clear(); filterModels.clear(); filterStatuses.clear();
@@ -31659,6 +33590,8 @@ function _fileMenuSync() {
   }
   const share = document.getElementById('file-tab-share');
   if (share) share.style.display = navigator.share ? '' : 'none';
+  const ask = document.getElementById('file-tab-askall'), mb = _mdAskBody();
+  if (ask) ask.hidden = !(mb && mb.querySelector('.md-worker-link'));
 }
 async function _fileRenameOpen() {
   const path = _fvNeedPath(); if (!path) return;
@@ -32936,6 +34869,7 @@ function _renderFileBody(data, mode) {
     _bindMdFileLinks(body);
     _fileBindAnchors(body);
     _bindReadPosDiv(body, data.path);
+    _mdAskPaint();
   } else if (data.is_html) {
     body.className = 'file-overlay-body file-html-preview';
     const iframe = document.createElement('iframe');
@@ -33062,6 +34996,7 @@ function _mdxShow(data, mode) {
     ta.value = data.content || '';
     // A file opens at its top, caret and scroll both.
     ta.setSelectionRange(0, 0);
+    _mdxHistReset(ta);
     ta.scrollTop = 0;
     _mdx.base = ta.value;
     _mdx.opened = ta.value;
@@ -33155,6 +35090,7 @@ function _mdxRenderPreview() {
   _bindMdFileLinks(body);
   _fileBindAnchors(body);
   _mdxDecoratePreview(body);
+  _mdAskPaint();
   body.scrollTop = top;
   if (_mdSearchHits && _mdSearchHits.length) { const q = document.getElementById('md-search-input'); if (q && q.value) _mdSearchApply(q.value); }
 }
@@ -33365,6 +35301,7 @@ async function _mdxFollow() {
   const at = ta.selectionStart;
   ta.value = text;
   try { ta.setSelectionRange(Math.min(at, text.length), Math.min(at, text.length)); } catch (e) {}
+  _mdxHistReset(ta);   // another writer's text: history starts again from it
   _fileData.content = text;
   _mdx.opened = text;
   if (etag) _fileData.etag = etag;
@@ -33380,10 +35317,58 @@ document.addEventListener('visibilitychange', () => { if (document.hidden && _md
 // ── Editing commands ──
 function _mdxIndent() { return parseInt(localStorage.getItem('amux_mdx_indent') || '2', 10) === 4 ? 4 : 2; }
 // Replace [start, end) with `text` through the browser's own editing, so ⌘Z undoes it.
+// THE EDITOR'S OWN UNDO HISTORY (owner, 2026-11-19: "Undo / redo doesnt work
+// in the markdown editor - fix it. The button should works and the
+// shortcuts"). The browser's stack undid one typed character per press in
+// Chromium and is emptied by any direct ta.value write (a file reload, the /
+// menu fallback), and the Mac app's Edit menu bypassed the page. So the editor
+// keeps the states itself: typing groups into one step until a pause or a word
+// ends, each tool is one step, and the buttons, the keys and the Edit menu
+// (beforeinput historyUndo/historyRedo) all step through it.
+const _MDX_UNDO_GAP_MS = 800, _MDX_UNDO_MAX = 300;
+function _mdxHistReset(ta) {
+  _mdx.undo = [{ v: ta.value, s: ta.selectionStart, e: ta.selectionEnd }];
+  _mdx.undoAt = 0; _mdx.undoOpen = false; _mdx.undoLast = 0;
+}
+function _mdxHistRecord(ta, e) {
+  if (!_mdx.undo) { _mdxHistReset(ta); return; }
+  const top = _mdx.undo[_mdx.undoAt];
+  if (top && top.v === ta.value) return;
+  const now = Date.now();
+  const typing = !_mdx.undoTool && e && /^(insertText|deleteContentBackward|deleteContentForward)$/.test(e.inputType || '');
+  const state = { v: ta.value, s: ta.selectionStart, e: ta.selectionEnd };
+  if (typing && _mdx.undoOpen && _mdx.undoAt > 0 && now - _mdx.undoLast < _MDX_UNDO_GAP_MS) {
+    _mdx.undo[_mdx.undoAt] = state;   // the same typing step, grown
+  } else {
+    _mdx.undo.length = _mdx.undoAt + 1;
+    _mdx.undo.push(state);
+    if (_mdx.undo.length > _MDX_UNDO_MAX) _mdx.undo.shift();
+    _mdx.undoAt = _mdx.undo.length - 1;
+  }
+  // A space or a line break ends the word, so the next key starts a new step.
+  _mdx.undoOpen = typing && !/\s$/.test((e && e.data) || '') && e.inputType !== 'insertLineBreak';
+  _mdx.undoLast = now;
+  _mdx.undoTool = false;
+}
+function _mdxHistStep(dir) {
+  const ta = document.getElementById('file-edit-ta');
+  if (!ta || ta.readOnly) return;
+  if (!_mdx.undo) _mdxHistReset(ta);
+  const to = _mdx.undoAt + dir;
+  ta.focus();
+  if (to < 0 || to >= _mdx.undo.length) { _mdxBeacon(dir < 0 ? 'undo_none' : 'redo_none', {}); return; }
+  const st = _mdx.undo[to];
+  _mdx.undoAt = to; _mdx.undoOpen = false;
+  ta.value = st.v;
+  try { ta.setSelectionRange(st.s, st.e); } catch (e) { console.warn('[mdx] undo could not place the caret', e); }
+  _mdxChanged();   // highlight, preview, and the save that undo owes the file
+  _mdxLevelSync();
+}
 function _mdxReplace(start, end, text, selStart, selEnd) {
   const ta = document.getElementById('file-edit-ta');
   if (!ta || ta.readOnly) return;
   ta.focus();
+  _mdx.undoTool = true;   // one undo step, apart from typing
   ta.setSelectionRange(start, end);
   let ok = false;
   try { ok = document.execCommand('insertText', false, text); } catch (e) {}
@@ -33542,8 +35527,8 @@ function _mdxLevelAt() {
   return m ? m[1].length : 0;
 }
 Object.assign(_mdxTools, {
-  undo() { const ta = document.getElementById('file-edit-ta'); ta.focus(); document.execCommand('undo'); },
-  redo() { const ta = document.getElementById('file-edit-ta'); ta.focus(); document.execCommand('redo'); },
+  undo() { _mdxHistStep(-1); },
+  redo() { _mdxHistStep(1); },
   strike() { _mdxWrap('~~', '~~', 'struck text'); },
   quote() {
     _mdxPrefix(ls => { const all = ls.every(l => /^\s*>/.test(l) || !l.trim()); return ls.map(l => !l.trim() ? l : all ? l.replace(/^(\s*)>\s?/, '$1') : '> ' + l); });
@@ -33753,6 +35738,8 @@ function _mdxKeydown(e) {
   if (ta.readOnly) return;
   if (_mdxSlashKey(e)) return;
   const mod = e.metaKey || e.ctrlKey;
+  if (mod && !e.altKey && e.key.toLowerCase() === 'z') { e.preventDefault(); _mdxHistStep(e.shiftKey ? 1 : -1); return; }
+  if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'y') { e.preventDefault(); _mdxHistStep(1); return; }
   if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'x') { e.preventDefault(); _mdxTools.strike(); return; }
   if (mod && !e.altKey && !e.shiftKey) {
     const k = e.key.toLowerCase();
@@ -33793,6 +35780,34 @@ function _mdxKeydown(e) {
     _mdxReplace(a, a, next, a + next.length);
   }
 }
+
+// Tab in the file editor for files that are not markdown (owner, 2026-11-18:
+// "make sure the editor has the same kind of formatting stuff like tabbing to
+// indent"). Markdown gets _mdxKeydown; everything else got nothing, so Tab
+// left the editor. Tab inserts two spaces or indents the selected lines;
+// Shift+Tab outdents them. Undo keeps working (execCommand insertText).
+document.addEventListener('keydown', (e) => {
+  const ta = e.target;
+  if (!ta || ta.id !== 'file-edit-ta' || ta.readOnly || e.key !== 'Tab' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (typeof _mdxActive === 'function' && _mdxActive()) return;
+  e.preventDefault();
+  const v = ta.value, a = ta.selectionStart, b = ta.selectionEnd, ind = '  ';
+  const put = (from, to, text, ca, cb) => {
+    ta.setSelectionRange(from, to);
+    if (!document.execCommand || !document.execCommand('insertText', false, text)) { ta.setRangeText(text, from, to, 'end'); ta.dispatchEvent(new Event('input', { bubbles: true })); }
+    ta.setSelectionRange(ca, cb);
+  };
+  if (a === b && !e.shiftKey) { put(a, b, ind, a + ind.length, a + ind.length); return; }
+  // A caret (no selection) outdents its whole line: wherever it sits, even
+  // inside the leading spaces (land review F1).
+  const lineEnd = v.indexOf('\n', b) < 0 ? v.length : v.indexOf('\n', b);
+  const s = v.lastIndexOf('\n', a - 1) + 1, end = a === b ? lineEnd : (v[b - 1] === '\n' ? b - 1 : b);
+  const lines = v.slice(s, end).split('\n');
+  const out = lines.map(l => e.shiftKey ? l.replace(/^( {1,2}|\t)/, '') : ind + l).join('\n');
+  const first = e.shiftKey ? (lines[0].match(/^( {1,2}|\t)/) || [''])[0].length * -1 : ind.length;
+  if (a === b) put(s, end, out, Math.max(s, a + first), Math.max(s, a + first));
+  else put(s, end, out, Math.max(s, a + first), s + out.length);
+}, true);
 
 // ── Diff ──
 // Line by line: the saved file (or a past commit) against the source now.
@@ -33856,13 +35871,14 @@ async function _mdxRenderHistory() {
   const alt = document.getElementById('mdx-alt');
   if (!alt || !_fileData) return;
   const path = _fileData.path;
-  if (_mdx.histFor && _mdx.histFor.path === path) { _mdxDrawHistory(_mdx.histFor.data); return; }
+  // Read again after 15 s: a commit or a land since the last read must show.
+  if (_mdx.histFor && _mdx.histFor.path === path && Date.now() - (_mdx.histFor.at || 0) < 15000) { _mdxDrawHistory(_mdx.histFor.data); return; }
   alt.innerHTML = '<div class="mdx-empty">Reading history…</div>';
   try {
     const r = await fetch(API + '/api/file/history?path=' + encodeURIComponent(path), { headers: _authHeaders() });
     const d = await r.json();
     if (!r.ok || d.measured === false) throw new Error(d.why_unmeasured || d.error || ('HTTP ' + r.status));
-    _mdx.histFor = { path, data: d };
+    _mdx.histFor = { path, data: d, at: Date.now() };
     if (_mdx.tab === 'history' && _fileData && _fileData.path === path) _mdxDrawHistory(d);
   } catch (e) {
     alt.innerHTML = '<div class="ui-error">History could not be read: ' + esc(e.message || String(e)) + '</div>';
@@ -33981,7 +35997,13 @@ function _mdxBind() {
   if (_mdxBound) return;
   _mdxBound = true;
   const ta = document.getElementById('file-edit-ta');
-  ta.addEventListener('input', e => { if (_mdxActive()) { if (e.isTrusted) _mdx.tickSaving = false; _mdxChanged(); _mdxSlashInput(); } });
+  ta.addEventListener('input', e => { if (_mdxActive()) { if (e.isTrusted) _mdx.tickSaving = false; _mdxHistRecord(ta, e); _mdxChanged(); _mdxSlashInput(); } });
+  // The Mac app's Edit menu and a context menu's Undo reach the page as these.
+  ta.addEventListener('beforeinput', e => {
+    if (!_mdxActive() || (e.inputType !== 'historyUndo' && e.inputType !== 'historyRedo')) return;
+    e.preventDefault();
+    _mdxHistStep(e.inputType === 'historyUndo' ? -1 : 1);
+  });
   ta.addEventListener('scroll', () => { if (_mdxActive()) _mdxSyncScroll(); });
   ['keyup', 'click', 'select'].forEach(ev => ta.addEventListener(ev, () => { if (_mdxActive()) { _mdxStatus(); _mdxLevelSync(); } }));
   ta.addEventListener('blur', () => { if (_mdxSlash) _mdxSlashClose(); });
@@ -35491,6 +37513,7 @@ function _fileHashSync(path) {
 async function openFilePreview(path, options = {}) {
   if (options.readOnly && !/\.(md|json|txt|png|webm)$/i.test(path)) return;
   if (!/\.mdai$/i.test(path || '') || options.raw) _feRecordOpen(path);
+  if (!options.readOnly) _navVisit('file', path, String(path || '').split('/').pop());
   // .mdai files open in the dedicated MDAI viewer (Ethan, AMUX-3317): it shows
   // the node's metadata (model / date / cached), lets you scroll the run
   // versions, and RUNS THE CHAIN on open — none of which the generic file body
@@ -35747,6 +37770,15 @@ function _fileEditBeacon(verdict) {
         is_new: !!(_fileData && _fileData._isNew), measured: true, n_considered: 1, ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?') }) }).catch(() => {});
   } catch (e) {}
 }
+// THE PERSON CLOSING THE FILE (✕, Escape, swipe). closeFilePreview is also
+// called on the way somewhere else (Show in folder, rename and move reopening
+// the file, a worker link, Back); only a dismissal runs what follows a close:
+// the link viewer's return and clearing the address a #path= link opened.
+let _fileDismissPath = null;
+function dismissFilePreview() {
+  _fileDismissPath = (_fileData && _fileData.path) || '';
+  closeFilePreview();
+}
 function closeFilePreview() {
   if (_fileEditDirty()) {
     if (_fileIsScratchpad(_fileData.path)) {
@@ -35754,13 +37786,13 @@ function closeFilePreview() {
       // stays open with the text, so nothing is lost.
       _fileEditBeacon('scratchpad_saved_on_close');
       _fileSave().then(() => {
-        if (_fileEditDirty()) { _fileEditBeacon('scratchpad_save_on_close_failed'); showToast('Note not saved yet: it stays open so your text is kept'); return; }
+        if (_fileEditDirty()) { _fileDismissPath = null; _fileEditBeacon('scratchpad_save_on_close_failed'); showToast('Note not saved yet: it stays open so your text is kept'); return; }
         closeFilePreview();
       });
       return;
     }
     showConfirm('This file has unsaved edits. Close without saving?', 'Discard changes', true).then(ok => {
-      if (!ok || !_fileData) return;
+      if (!ok || !_fileData) { _fileDismissPath = null; return; }
       _fileEditBeacon('discarded_after_confirm');
       _fileData.content = document.getElementById('file-edit-ta').value;
       closeFilePreview();
@@ -35769,7 +37801,7 @@ function closeFilePreview() {
   }
   if (_xlsxEd && _xlsxEd.dirty) {
     showConfirm('This spreadsheet has unsaved changes. Close without saving?', 'Discard changes', true)
-      .then(ok => { if (ok && _xlsxEd) { _xlsxEd.dirty = false; closeFilePreview(); } });
+      .then(ok => { if (ok && _xlsxEd) { _xlsxEd.dirty = false; closeFilePreview(); } else _fileDismissPath = null; });
     return;
   }
   _xlsxEditorTeardown();
@@ -35795,12 +37827,38 @@ function closeFilePreview() {
   if (searchTab) searchTab.style.display = 'none';
   document.getElementById('file-edit-wrap').style.display = 'none';
   document.getElementById('file-body').style.display = '';
+  const closingPath = (_fileData && _fileData.path) || null;
   _fileData = null;
   _fileViewMode = 'preview';
   // A load still in flight belongs to a viewer that is gone: without this its
   // cache read or reply passed the generation check and set _fileData on a
   // closed overlay (2026-11-06).
   _filePreviewGen++;
+  // A link viewer has nothing behind the file: closing it goes back to where
+  // the link was clicked.
+  const dismissed = _fileDismissPath !== null && _fileDismissPath === (closingPath || '');
+  _fileDismissPath = null;
+  const boot = _fileBootLinkPath;
+  if (boot && boot === closingPath) _fileBootLinkPath = null;   // closed by any means, the link is spent
+  if (!dismissed) return;
+  if (_linkViewer) { _linkViewerReturn(); return; }
+  if (boot && boot === closingPath) _fileBootLinkClose();
+}
+// THE FILE A PAGE WAS OPENED ON LEAVES NO ADDRESS WHEN CLOSED (owner,
+// 2026-11-23: "if I close the file, the path param ... remains in my browser
+// URL"). A #path= link opens the Files view on the file's folder and the file
+// over it; the close rewrote the address to #path=<folder>, so the link's path
+// stayed in the bar. Dismissing that file now clears the address and lands
+// where an empty address does. Only that file, only a dismissal, and only
+// while the address is still a #path=: a file opened later, an internal close
+// (Show in folder), or a page moved elsewhere keeps the usual close.
+let _fileBootLinkPath = null;
+function _fileBootLinkClose() {
+  if (location.hash && !location.hash.startsWith('#path=')) return;
+  try { history.replaceState(history.state, '', location.pathname + location.search); } catch (e) { console.warn('[amux] file_link_close: address not cleared', e); return; }
+  console.info('[amux] file_link_close', { verdict: 'address_cleared' });
+  amuxTrack('file_link_close', { verdict: 'address_cleared', measured: true, n_considered: 1 });
+  switchView('sessions');
 }
 
 async function _downloadFileBytes(url, filename) {
@@ -41253,6 +43311,9 @@ document.addEventListener('click', e => {
   // A worker tagged in markdown has its own handler (_bindMdFileLinks): it
   // closes the file it sits in first, so the worker is not opened beneath it.
   if (a.classList.contains('md-worker-link')) return;
+  // A path in worker output opens through its own handler (_openLinkedPath),
+  // which asks the server where a relative path really is.
+  if (a.matches('a.file-link[data-path], a.md-link[data-path]')) return;
   if (_ownLinkHash(a.getAttribute('href'))) {
     e.preventDefault(); e.stopPropagation();
     _openOwnLink(a.href, 'anchor');
@@ -41564,7 +43625,7 @@ function _exploreSearchFilter(q) {
     const dyEnd = Math.abs(e.changedTouches[0].clientY - sy);
     if (dx > _SWIPE_CLOSE && dx > dyEnd * _SWIPE_RATIO) {
       el.style.transform = 'translateX(100%)';
-      setTimeout(() => { closeFilePreview(); el.style.transform = ''; el.style.transition = ''; }, 260);
+      setTimeout(() => { dismissFilePreview(); el.style.transform = ''; el.style.transition = ''; }, 260);
     } else {
       el.style.transform = '';
       setTimeout(() => { el.style.transition = ''; }, 260);
@@ -43124,7 +45185,7 @@ document.addEventListener('keydown', (e) => {
       // cancels a cell edit or closes a panel, and never closes the workbook
       // (closing on Escape threw away a half-typed cell, 2026-10-26). The ✕ closes.
       if (_xlsxEd) return;
-      closeFilePreview();
+      dismissFilePreview();
     }
     return;
   }
@@ -43185,6 +45246,155 @@ document.addEventListener('keydown', (e) => {
     }
   }
 });
+
+// ── Key mode: the keyboard does what the key chips do ─────────────────────
+// Answering a picker or a yes/no prompt meant reaching for the ↑ ↓ Enter Esc
+// chips (2026-11-17). Ctrl+; in the worker view turns key mode on: arrows,
+// Enter, Esc, Tab, Space, Backspace and y/n/1/2/3 go to the worker's pane
+// through the same keys endpoint the chips use, in the order pressed. Any other
+// key turns it off and reaches the composer as usual; so do Ctrl+; again,
+// closing the worker view and 10s without a key (a setting on the hotkey can
+// keep it on while idle). The badge on the composer
+// says it is on, because Esc here goes to the worker instead of closing the view.
+// The toggle is the `key_mode` hotkey (Hotkeys tab), so it can be rebound; the
+// badge and the hint shown on the focused composer name whatever it is bound to.
+const _KM_IDLE_MS = 10000;
+const _KM_MAP = { ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Enter: 'Enter',
+  Escape: 'Escape', Tab: 'Tab', ' ': 'Space', Backspace: 'BSpace', Home: 'Home', End: 'End',
+  PageUp: 'PageUp', PageDown: 'PageDown' };
+const _KM_CHARS = new Set(['y', 'n', '1', '2', '3']);
+const _KM_GLYPH = { Up: '↑', Down: '↓', Left: '←', Right: '→', Enter: '↵', Escape: 'Esc', Tab: 'Tab', BTab: '⇧Tab',
+  Space: 'Space', BSpace: '⌫' };
+const _KM_MODIFIERS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'OS', 'CapsLock', 'Fn']);
+let _km = null; // { session, timer, sent, chain }
+
+// The enabled key_mode hotkeys, and whether this keydown is one of them.
+function _kmBindings() {
+  return (typeof _hkList !== 'undefined' ? _hkList : [])
+    .filter(h => h.action === 'key_mode' && h.type === 'keys' && h.enabled && !h.deleted);
+}
+function _kmIsToggle(e) {
+  const combo = typeof _hkComboFromEvent === 'function' ? _hkComboFromEvent(e) : '';
+  return !!combo && _kmBindings().some(h => h.trigger === combo);
+}
+// The first binding as glyphs (⌃; on a Mac, Ctrl+; elsewhere), or ''.
+function _kmComboLabel() {
+  const h = _kmBindings()[0];
+  if (!h) return '';
+  const mac = typeof _HK_IS_MAC !== 'undefined' && _HK_IS_MAC;
+  const glyph = mac ? { Mod: '⌘', Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Globe: '🌐' } : { Mod: 'Ctrl', Alt: 'Alt', Shift: 'Shift', Globe: '🌐' };
+  const parts = String(h.trigger).split(/[+ ]/).filter(Boolean).map(k => glyph[k] || k);
+  return parts.join(mac ? '' : '+');
+}
+function _kmToggle() {
+  const ov = document.getElementById('peek-overlay');
+  if (!(ov && ov.classList.contains('active') && peekSession)) { showToast('Key mode works in a worker: open one first'); return; }
+  if (_km) _kmExit('toggle'); else _kmEnter(peekSession);
+}
+// The hint on a focused, empty composer: how to turn key mode on. Only with a
+// fine pointer that can hover (a desktop): a touch-only phone has no arrow keys
+// to send, so it never gets the element (the CSS rule is the same test).
+const _KM_HINT_MQ = '(hover: hover) and (pointer: fine)';
+function _kmHintRender() {
+  const wrap = document.querySelector('#peek-overlay .peek-composer-input');
+  if (!wrap) return;
+  const label = window.matchMedia && window.matchMedia(_KM_HINT_MQ).matches ? _kmComboLabel() : '';
+  let hint = document.getElementById('peek-keymode-hint');
+  if (!label) { if (hint) hint.remove(); return; }
+  if (!hint) {
+    hint = document.createElement('kbd');
+    hint.id = 'peek-keymode-hint';
+    hint.className = 'keymode-hint-idle';
+    wrap.appendChild(hint);
+  }
+  hint.textContent = label + ' keys';
+  hint.title = 'Press ' + label + ' to send arrows, Enter and Esc straight to the worker. Change it in the Hotkeys tab.';
+}
+document.addEventListener('focusin', (e) => { if (e.target && e.target.id === 'peek-cmd-input') _kmHintRender(); });
+// The tmux key name for a keydown, or null when key mode does not forward it.
+function _kmKeyName(e) {
+  if (e.metaKey || e.altKey || e.ctrlKey) return null;
+  if (e.key === 'Tab' && e.shiftKey) return 'BTab';
+  if (e.shiftKey && e.key !== 'Tab' && !/^Arrow|^Page|^Home$|^End$/.test(e.key)) return null;
+  if (_KM_MAP[e.key]) return _KM_MAP[e.key];
+  if (_KM_CHARS.has(e.key)) return e.key;
+  return null;
+}
+function _kmRender(lastKey) {
+  const wrap = document.querySelector('#peek-overlay .peek-composer-input');
+  if (!wrap) return;
+  let badge = document.getElementById('peek-keymode-badge');
+  if (!_km) {
+    wrap.classList.remove('key-mode');
+    if (badge) badge.remove();
+    return;
+  }
+  wrap.classList.add('key-mode');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.id = 'peek-keymode-badge';
+    badge.className = 'keymode-badge';
+    badge.setAttribute('role', 'status');
+    badge.title = 'Arrows, Enter, Esc, Tab, Space, Backspace and y/n/1/2/3 go to the worker. '
+    + (_kmComboLabel() ? _kmComboLabel() + ' or a' : 'A') + 'ny other key to stop.';
+    wrap.appendChild(badge);
+  }
+  badge.innerHTML = '<span class="keymode-label">⌨ Keys → worker</span>'
+    + (lastKey ? '<kbd class="keymode-last">' + esc(_KM_GLYPH[lastKey] || lastKey) + '</kbd>' : '')
+    + '<span class="keymode-hint">' + esc(_kmComboLabel() || 'Any other key') + ' to stop</span>';
+}
+// The idle turn-off is a setting on the Key mode hotkey (on unless unticked).
+function _kmIdleOff() {
+  const h = _kmBindings()[0];
+  return !h || h.idle_off !== false;
+}
+function _kmArm() {
+  clearTimeout(_km.timer);
+  if (_kmIdleOff()) _km.timer = setTimeout(() => _kmExit('idle'), _KM_IDLE_MS);
+}
+function _kmEnter(session) {
+  if (_workerRenderer(session) !== 'terminal') { showToast('Key mode needs a terminal worker'); return; }
+  _km = { session, timer: 0, sent: 0, chain: Promise.resolve() };
+  _kmArm();
+  _kmRender();
+  if (typeof amuxTrack === 'function') amuxTrack('key_mode', { on: true, session, idle_off: _kmIdleOff(), ver: APP_VER, measured: true, n_considered: 1 });
+}
+function _kmExit(reason) {
+  if (!_km) return;
+  clearTimeout(_km.timer);
+  const { session, sent } = _km;
+  _km = null;
+  _kmRender();
+  if (typeof amuxTrack === 'function') amuxTrack('key_mode', { on: false, reason, session, keys_sent: sent, ver: APP_VER, measured: true, n_considered: 1 });
+}
+// Keys go one after another so a fast ↓ ↓ Enter lands in that order.
+function _kmSend(keys) {
+  const session = _km.session;
+  _km.sent++;
+  _stopKeyBeacon(session, keys, 'key-mode');
+  _km.chain = _km.chain.then(() => doKeys(session, keys)).then((r) => {
+    if (r && !r.accepted) showToast(`${keys} was not sent${r.message ? ': ' + r.message : ''}`);
+    _refreshPeekSoon();
+  }).catch((err) => console.warn('amux: key mode send failed', err));
+}
+function _kmKeydown(e) {
+  if (e.isComposing || e.keyCode === 229) return;
+  const ov = document.getElementById('peek-overlay');
+  const open = !!(ov && ov.classList.contains('active') && peekSession);
+  if (_km && (!open || _km.session !== peekSession)) _kmExit('peek-closed');
+  if (!open) return;
+  if (_kmIsToggle(e)) return; // the Hotkeys dispatcher runs _kmToggle
+  if (!_km || _KM_MODIFIERS.has(e.key)) return;
+  const k = _kmKeyName(e);
+  if (!k) { _kmExit('typing'); return; } // falls through to the composer
+  e.preventDefault(); e.stopImmediatePropagation();
+  _kmArm();
+  _kmRender(k);
+  _kmSend(k);
+}
+// Capture on window runs before the composer's own keydown (history, newline)
+// and the document handler that closes the view on Escape.
+window.addEventListener('keydown', _kmKeydown, true);
 
 // ⌃F outside a text box opens the Mac app's Find bar (desktop/amux-find.swift);
 // in a text box it stays the Mac's move-forward and a terminal gets it as
@@ -43538,6 +45748,7 @@ function toggleSortMode() {   // legacy entry point; cycles through the options
 
 function initSortable() {
   if (typeof Sortable === 'undefined') return;
+  if (_deferForSortableDrag(initSortable, 'worker-cards')) return;
   if (sortMode !== 'natural') { destroySortable(); return; }
   destroySortable();
   const cards = document.querySelector('.cards');
@@ -44337,8 +46548,29 @@ function statusStyle(id) {
 }
 
 // ═══════ CHROME TABS ═══════
+// The hashes that name where to land. Restoring the last screen must not run
+// over any of them (the screen restore and the tab bar read this one list).
+// reconnect joined it on 2026-11-08: a connector alert's link opened
+// Connectors and its prompt, then the restore reopened the last worker over
+// them.
+const _DEEPLINK_HASH_RE = /^#(?:peek|issue|menu|view|path|edit|browser|bq|task|reconnect)=/;
 const _isInTab = new URLSearchParams(location.search).has('_tab');
 if (_isInTab) document.body.classList.add('in-tab');
+// A LINK OPENED IN A NEW BROWSER TAB IS A VIEWER, NOT A WINDOW (owner,
+// 2026-11-23: a middle-clicked path "shows the markdown under one of your
+// existing tabs ... that may not even correlate with where the relative link
+// came from"). A worker-output link carries ?_viewer=1 plus the worker and the
+// in-page tab it was clicked in (_linkViewerQuery). Such a page shows the file
+// with no tab bar and no nav, reads and writes no tab state, and on close
+// (_linkViewerReturn) becomes the full page on the tab the link came from, or
+// a new tab on that worker when that tab is gone.
+let _linkViewer = null;
+(function _linkViewerBoot() {
+  const q = new URLSearchParams(location.search);
+  if (_isInTab || !q.has('_viewer')) return;
+  _linkViewer = { session: q.get('_from') || '', tab: parseInt(q.get('_from_tab'), 10) || 0 };
+  document.body.classList.add('link-viewer');
+})();
 // EACH TAB OF THE IN-PAGE TAB BAR KEEPS ITS OWN PLACE (owner, 2026-11-13:
 // "the other tab will then also become that session"). Tabs after the first
 // are iframes, rebuilt after any reload of the page (a deploy, Chrome
@@ -44404,26 +46636,54 @@ if (_nativePaneBridge()) {
 // tabs last used. A tab's iframe reads nothing and seeds nothing here.
 const _CHROME_STATE_KEY = 'amux_chrome_state';
 function _chromeLoad() {
-  const one = { tabs: [{id: 1, name: 'Tab 1'}], active: 1 };
-  if (_isInTab) return one;
+  const one = { tabs: [{id: 1, name: 'Tab 1'}], active: 1, page: 1 };
+  if (_isInTab || _linkViewer) return one;
   try {
     const s = JSON.parse(sessionStorage.getItem(_CHROME_STATE_KEY) || 'null');
-    if (s && Array.isArray(s.tabs) && s.tabs.length) return { tabs: s.tabs, active: s.active };
+    if (s && Array.isArray(s.tabs) && s.tabs.length) return { tabs: s.tabs, active: s.active, page: s.page };
   } catch (e) {}
   let snap = null;
   try { snap = JSON.parse(localStorage.getItem('amux_chrome_tabs2') || 'null'); } catch (e) {}
   if (!Array.isArray(snap) || !snap.length) return one;
-  snap.slice(1).forEach(t => {
-    if (t && typeof t.hash === 'string' && t.hash.charAt(0) === '#') {
+  // A snapshot from before the page tab was named had the page first.
+  const pageTab = snap.find(t => t && t.page) || snap[0];
+  snap.forEach(t => {
+    if (t && t !== pageTab && typeof t.hash === 'string' && t.hash.charAt(0) === '#') {
       try { sessionStorage.setItem(_CHROME_TAB_VIEW_KEY + t.id, t.hash); } catch (e) {}
     }
   });
-  return { tabs: snap.map(t => ({ id: t.id, name: t.name || '' })), active: parseInt(localStorage.getItem('amux_chrome_active2')) };
+  return { tabs: snap.map(t => ({ id: t.id, name: t.name || '' })), active: parseInt(localStorage.getItem('amux_chrome_active2')), page: pageTab && pageTab.id };
 }
 const _chromeLoaded = _chromeLoad();
 let _chromeTabs = _chromeLoaded.tabs;
-let _chromeActiveId = (_nativeTabs ? null : parseInt(_chromeLoaded.active)) || _chromeTabs[0]?.id || 1;
-if (!_chromeTabs.some(t => t.id === _chromeActiveId)) _chromeActiveId = _chromeTabs[0].id;
+// THE PAGE IS ONE TAB, WHEREVER IT SITS (owner, 2026-11-23: after a drag,
+// going back to a tab "loads like the worker screen and then quickly loads
+// your session ... is there any way to have it persist"). One tab is this page
+// itself and every other is an iframe. That tab was always the first, so a
+// drag that put another tab first moved the page to it and rebuilt the old
+// first as a new iframe, which loaded the list and then its worker. The page
+// tab is now named by id and keeps its place in the order, so a drag only
+// moves labels: every tab keeps its live page.
+let _chromePageId = parseInt(_chromeLoaded.page);
+if (!_chromeTabs.some(t => t.id === _chromePageId)) _chromePageId = _chromeTabs[0].id;
+let _chromeActiveId = (_nativeTabs ? null : parseInt(_chromeLoaded.active)) || _chromePageId;
+if (!_chromeTabs.some(t => t.id === _chromeActiveId)) _chromeActiveId = _chromePageId;
+// A BROWSER TAB OPENED ON A LINK SHOWS THE LINK (owner, 2026-11-22: a
+// middle-clicked path "did open a new tab but it did not deep link into that
+// JSONL file"). The page is its own tab and the link is its address; the bar
+// a new browser tab starts from had a later tab open, whose iframe covered
+// the page and the file it opened. A reload or a discarded tab coming back
+// keeps the tab that was open: only a fresh navigation is a link.
+(function _chromeBootOnLink() {
+  if (_isInTab || _nativeTabs || _chromeActiveId === _chromePageId) return;
+  if (!_DEEPLINK_HASH_RE.test(location.hash) && !/[?&]view=/.test(location.search)) return;
+  let nav = '';
+  try { nav = (performance.getEntriesByType('navigation')[0] || {}).type || ''; } catch (e) { console.warn('[amux] chrome_tab_link_boot: navigation type unreadable, keeping the saved tab', e); }
+  if (nav !== 'navigate' || document.wasDiscarded) return;
+  const from = _chromeActiveId;
+  _chromeActiveId = _chromePageId;
+  console.info('[amux] chrome_tab_link_boot', { verdict: 'link_shown_on_page_tab', from, link: location.hash.slice(0, location.hash.indexOf('=') + 1) });
+})();
 let _chromeNextId = Math.max(..._chromeTabs.map(t => t.id), 0) + 1;
 let _chromeCollapsed = localStorage.getItem('amux_chrome_collapsed') === '1';
 
@@ -44441,10 +46701,52 @@ function _chromeRender() {
     h += '<div class="chrome-tab'+cls+'" onclick="_chromeSwitchTab('+t.id+')" onmousedown="if(event.button===1){event.preventDefault();_chromeCloseTab('+t.id+')}" ondblclick="event.stopPropagation();_chromeRenameTab('+t.id+')" data-tab-id="'+t.id+'"><span class="chrome-tab-label">'+label+'</span>'+close+'</div>';
   }
   h += '<button class="chrome-tab-add" onclick="_chromeAddTab()" title="New tab" style="margin:0 var(--space-1) var(--space-1) var(--space-1);">+</button>';
-  h += '<button class="chrome-tab-collapse" onclick="_chromeToggleCollapse()" title="'+(_chromeCollapsed?'Show tabs':'Hide tabs')+'">'+(_chromeCollapsed?'&#x25BC;':'&#x25B2;')+'</button>';
+  // One chevron, turned by CSS: up hides the strip, down (on the pull tab
+  // left at the top edge) shows it again.
+  h += '<button class="chrome-tab-collapse" onclick="_chromeToggleCollapse()" title="'+(_chromeCollapsed?'Show tabs':'Hide tabs')+'" aria-label="'+(_chromeCollapsed?'Show tabs':'Hide tabs')+'"><svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true"><path d="M2.5 7.5 6 4l3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>';
   bar.innerHTML = h;
   _chromeShowActive();
   _chromeUpdateOffsets();
+}
+
+// DRAG A TAB TO REORDER THE STRIP (owner, 2026-11-23: "Dragging to order tabs
+// in Amux on the web is not working"). The strip never had a drag; only the ⊞
+// menus did. It uses the menus' pointer-driven Sortable (_tabMenuSortableCreate),
+// so the click a drop would send is swallowed and ✕ and the rename box stay
+// clicks. It is bound once to the bar, which every render keeps (only its
+// children are replaced). Sortable loads after this script, so setup waits for
+// the page's load event. Drags are beaconed as kind=tabcust-drag which=chrome and
+// each reorder as chrome_tab_reordered.
+function _chromeTabDragSetup(bar) {
+  if (_isInTab || _nativeTabs || bar._chromeSortable) return;
+  if (!window.Sortable && document.readyState !== 'complete') {
+    if (!bar._chromeSortableWait) {
+      bar._chromeSortableWait = true;
+      window.addEventListener('load', () => _chromeTabDragSetup(bar), { once: true });
+    }
+    return;
+  }
+  bar._chromeSortable = _tabMenuSortableCreate(bar, 'chrome', '.chrome-tab', () => {
+    const ids = [...bar.querySelectorAll('.chrome-tab[data-tab-id]')].map(el => parseInt(el.dataset.tabId, 10));
+    _chromeReorder(ids);
+  });
+}
+
+// A drop only reorders the strip. The page tab and every iframe stay as they
+// are, so no tab reloads (see _chromePageId).
+function _chromeReorder(ids) {
+  const byId = new Map(_chromeTabs.map(t => [t.id, t]));
+  const next = ids.map(id => byId.get(id)).filter(Boolean);
+  if (next.length !== _chromeTabs.length) {
+    // A strip that does not match the list (a render mid-drag) is put back, not saved.
+    amuxTrack('chrome_tab_reordered', {verdict: 'strip_mismatch', strip: ids.length, tabs: _chromeTabs.length, measured: true, n_considered: ids.length});
+    _chromeRender();
+    return;
+  }
+  amuxTrack('chrome_tab_reordered', {verdict: 'reordered', page_tab_at: next.findIndex(t => t.id === _chromePageId), measured: true, n_considered: next.length});
+  _chromeTabs = next;
+  _chromeRender();
+  _chromeSave();
 }
 
 function _chromeShowActive() {
@@ -44453,8 +46755,7 @@ function _chromeShowActive() {
   if (!fc) return;
   const tab = _chromeTabs.find(t => t.id === _chromeActiveId);
   if (!tab) return;
-  const isFirst = _chromeTabs[0] && _chromeTabs[0].id === _chromeActiveId;
-  if (isFirst) {
+  if (_chromeActiveId === _chromePageId) {
     fc.classList.remove('active');
   } else {
     fc.classList.add('active');
@@ -44572,8 +46873,13 @@ function _chromeUpdateOffsets() {
   });
 }
 
+// The tab you are leaving is the one a new tab copies when no default is saved.
+function _chromeNoteLastTab() {
+  try { sessionStorage.setItem(_LIST_LAST_TAB_KEY, _listKeyOfTab(_chromeActiveId)); } catch (e) { console.warn('[tabs] last tab not noted; a new tab starts clean', e); }
+}
 function _chromeSwitchTab(id) {
   if (_chromeActiveId === id) return;
+  _chromeNoteLastTab();
   _chromeActiveId = id;
   _chromeRender();
   _chromeSave();
@@ -44581,6 +46887,7 @@ function _chromeSwitchTab(id) {
 
 function _chromeAddTab() {
   const tab = {id: _chromeNextId++, name: ''};
+  _chromeNoteLastTab();
   _chromeTabs.push(tab);
   _chromeActiveId = tab.id;
   _chromeRender();
@@ -44598,8 +46905,8 @@ function _chromeTabLiveHash(id) {
   }
   return _chromeTabSavedHash(id);
 }
-// The first tab is this page itself; every later tab is an iframe. Closing
-// the first tab made the next one first, and the bar showed it AS this page,
+// One tab is this page itself; every other is an iframe. Closing the page
+// tab made the next one first, and the bar showed it AS this page,
 // which still held the closed tab's worker (owner, 2026-11-13: "the next tab,
 // which replaces the now-closed tab, becomes the session of the tab I
 // closed"). The page now moves to that tab's own place and its iframe goes.
@@ -44618,9 +46925,12 @@ function _chromeCloseTab(id) {
   if (idx < 0) return;
   const fc = document.getElementById('chrome-tab-frames');
   let moveTo = null;
-  if (idx === 0) {
-    const next = _chromeTabs[1];
+  const closingPage = id === _chromePageId;
+  if (closingPage) {
+    // The page moves to the tab beside it, which stops being an iframe.
+    const next = _chromeTabs[idx + 1] || _chromeTabs[idx - 1];
     moveTo = _chromeTabLiveHash(next.id);
+    _chromePageId = next.id;
     if (fc) { const nf = fc.querySelector('iframe[data-tab-id="' + next.id + '"]'); if (nf) nf.remove(); }
     try { sessionStorage.removeItem(_CHROME_TAB_VIEW_KEY + next.id); } catch (e) {}
     try { _takeTabListView(next.id); } catch (e) { console.warn('[tabs] could not carry the next tab\'s list view', e); }
@@ -44631,7 +46941,8 @@ function _chromeCloseTab(id) {
   // A closed tab's list view goes with it: ids are reused (max + 1), so a later
   // tab would otherwise open on the closed one's search and filters.
   try { sessionStorage.removeItem(_LIST_VIEW_TAB_KEY + id); } catch (e) {}
-  amuxTrack('chrome_tab_closed', {verdict: idx === 0 ? 'first_tab_page_moved_to_next' : 'later_tab_closed', has_address: moveTo ? 1 : 0, measured: true, n_considered: 1});
+  try { if (sessionStorage.getItem(_LIST_LAST_TAB_KEY) === _LIST_VIEW_TAB_KEY + id) sessionStorage.removeItem(_LIST_LAST_TAB_KEY); } catch (e) { console.warn('[tabs] last-tab pointer not cleared for a closed tab', e); }
+  amuxTrack('chrome_tab_closed', {verdict: closingPage ? 'page_tab_page_moved_to_next' : 'iframe_tab_closed', has_address: moveTo ? 1 : 0, measured: true, n_considered: 1});
   if (moveTo !== null) _chromePageGoTo(moveTo);
   _chromeTabs.splice(idx, 1);
   if (_chromeActiveId === id) {
@@ -44645,19 +46956,92 @@ function _chromeCloseTab(id) {
 // The snapshot a browser tab with no bar of its own starts from.
 let _chromeSnapLast = '';
 function _chromeSnapshot() {
-  const snap = JSON.stringify(_chromeTabs.map((t, i) => ({ id: t.id, name: t.name || '', hash: i === 0 ? (location.hash || '') : _chromeTabLiveHash(t.id) })));
+  // A link viewer has no bar: its one placeholder tab must not overwrite the
+  // snapshot of the window it came from, which _linkViewerReturn reads.
+  if (_linkViewer) return;
+  const snap = JSON.stringify(_chromeTabs.map(t => t.id === _chromePageId
+    ? { id: t.id, name: t.name || '', hash: location.hash || '', page: true }
+    : { id: t.id, name: t.name || '', hash: _chromeTabLiveHash(t.id) }));
   if (snap === _chromeSnapLast) return;
   _chromeSnapLast = snap;
   localStorage.setItem('amux_chrome_tabs2', snap);
   localStorage.setItem('amux_chrome_active2', String(_chromeActiveId));
 }
 function _chromeSave() {
-  if (_isInTab) return;
+  if (_isInTab || _linkViewer) return;
   try {
-    sessionStorage.setItem(_CHROME_STATE_KEY, JSON.stringify({ tabs: _chromeTabs, active: _chromeActiveId }));
+    sessionStorage.setItem(_CHROME_STATE_KEY, JSON.stringify({ tabs: _chromeTabs, active: _chromeActiveId, page: _chromePageId }));
     _chromeSnapLast = '';
     _chromeSnapshot();
   } catch(e) {}
+}
+// The query a worker-output link opens with in a new browser tab: the worker
+// and the in-page tab it was clicked in (the page itself is the first tab; an
+// iframe tab knows its id from ?_tab=).
+function _linkViewerQuery() {
+  const q = new URLSearchParams();
+  q.set('_viewer', '1');
+  const s = (typeof peekSession === 'string' && peekSession) || '';
+  if (s) q.set('_from', s);
+  let tab = 0;
+  try {
+    if (_isInTab) tab = parseInt(new URLSearchParams(location.search).get('_tab'), 10) || 0;
+    else if (!_nativeTabs && _chromeTabs.length) tab = _chromeTabs[0].id;
+  } catch (e) { console.warn('[amux] link_viewer: origin tab unreadable', e); }
+  if (tab) q.set('_from_tab', String(tab));
+  return '?' + q.toString();
+}
+// Whether a tab's address shows this worker (#peek=<name>, optionally &tab=).
+function _hashShowsSession(h, s) {
+  const p = '#peek=' + encodeURIComponent(s);
+  return typeof h === 'string' && (h === p || h.startsWith(p + '&'));
+}
+// Leave the link viewer: this browser tab becomes the full page, its bar
+// rebuilt from the snapshot of the window the link came from, on the tab the
+// link was clicked in when it still shows that worker, else on another tab
+// showing it, else on a new tab opened on the worker. In place, no reload.
+function _linkViewerReturn() {
+  const lv = _linkViewer;
+  if (!lv) return false;
+  _linkViewer = null;
+  document.body.classList.remove('link-viewer');
+  const peekHash = lv.session ? '#peek=' + encodeURIComponent(lv.session) : '';
+  let verdict = 'native_window', firstHash = peekHash;
+  if (!_nativeTabs) {
+    let snap = null;
+    try { snap = JSON.parse(localStorage.getItem('amux_chrome_tabs2') || 'null'); } catch (e) { console.warn('[amux] link_viewer: tab snapshot unreadable', e); }
+    const tabs = (Array.isArray(snap) ? snap : []).filter(t => t && Number.isInteger(t.id))
+      .map(t => ({ id: t.id, name: t.name || '', page: t.page === true, hash: (typeof t.hash === 'string' && t.hash.charAt(0) === '#') ? t.hash : '' }));
+    const shows = t => !lv.session || _hashShowsSession(t.hash, lv.session);
+    let target = tabs.find(t => t.id === lv.tab && shows(t));
+    verdict = 'origin_tab';
+    if (!target && lv.session) { target = tabs.find(shows); verdict = 'tab_showing_worker'; }
+    if (!target) {
+      target = { id: Math.max(0, ...tabs.map(t => t.id)) + 1, name: '', hash: peekHash };
+      tabs.push(target);
+      verdict = tabs.length === 1 ? 'new_window' : 'new_tab';
+    }
+    // The page is the tab the snapshot marks as the page, wherever it sits
+    // (as _chromeLoad reads it); a snapshot from before that had it first.
+    const pageTab = tabs.find(t => t.page) || tabs[0];
+    tabs.filter(t => t !== pageTab).forEach(t => {
+      try { if (t.hash) sessionStorage.setItem(_CHROME_TAB_VIEW_KEY + t.id, t.hash); else sessionStorage.removeItem(_CHROME_TAB_VIEW_KEY + t.id); } catch (e) { console.warn('[amux] link_viewer: tab ' + t.id + ' address not saved, it opens bare', e); }
+    });
+    firstHash = pageTab.hash;
+    _chromeTabs = tabs.map(t => ({ id: t.id, name: t.name }));
+    _chromePageId = pageTab.id;
+    _chromeActiveId = target.id;
+    _chromeNextId = Math.max(..._chromeTabs.map(t => t.id), 0) + 1;
+    const fc = document.getElementById('chrome-tab-frames');
+    if (fc) fc.querySelectorAll('iframe').forEach(f => f.remove());
+  }
+  console.info('[amux] link_viewer_return', { verdict, from_tab: lv.tab, has_worker: !!lv.session });
+  amuxTrack('link_viewer_return', { verdict, measured: true, n_considered: 1 });
+  try { history.replaceState(null, '', location.pathname + location.hash); } catch (e) { console.warn('[amux] link_viewer: viewer query not cleared from the address', e); }
+  _chromePageGoTo(firstHash);
+  _chromeRender();
+  _chromeSave();
+  return true;
 }
 // Addresses move without a save (a worker opened inside a tab), so the
 // snapshot follows them, written only when it changed, and when the page is
@@ -44676,6 +47060,8 @@ function switchView(view) {
   // The Projects tab is removed; a saved #view=projects lands on the Board,
   // where new work starts, instead of a blank screen.
   if (view === 'projects') view = 'board';
+  _navVisit('view', view, ((document.querySelector('[id^="tab-"][onclick*="switchView(\'' + view + '\')"]') || {}).textContent || view)
+    .replace(/[^\p{L}\p{N} &'-]/gu, ' ').replace(/\s+/g, ' ').trim());
   // Explicit navigation supersedes a pending restore of an older worker.
   if (typeof _peekOpenGeneration !== 'undefined' && !peekSession) _peekOpenGeneration++;
   if (document.getElementById('grid-view').classList.contains('active')) exitGridMode();
@@ -44707,7 +47093,7 @@ function switchView(view) {
     ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
     ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'], ['draw', 'draw', 'flex'], ['vault', 'vault', 'flex'], ['tasks', 'tasks', 'flex'],
     ['pages', 'pages', 'flex'], ['hotkeys', 'hotkeys', 'flex'], ['photos', 'photos', 'flex'],
-    ['calls', 'calls', 'flex'], ['dictation', 'dictation', 'flex'],
+    ['calls', 'calls', 'flex'], ['dictation', 'dictation', 'flex'], ['crm', 'crm', 'flex'],
     ['home', 'home', 'flex'],
   ];
   for (const [domId, name, display] of _svViews) {
@@ -44754,6 +47140,7 @@ function switchView(view) {
   if (view === 'mdai') _mdaiTabLoad();
   if (view === 'email') _emailLoad();
   if (view === 'calls') _callsLoad(); else if (typeof _callsClose === 'function' && _callsOpenId) _callsClose();
+  if (view === 'crm') _crmLoad(); else if (typeof _crmClose === 'function' && _crm.open) _crmClose();
   if (view === 'connectors') _connectorsTabLoad();
   if (view === 'photos') _photosEnter(); else if (typeof _photosLeave === 'function') _photosLeave();
   if (view !== 'map' && typeof _mapMeStop === 'function') _mapMeStop();   // live location only while the map is open
@@ -44945,6 +47332,541 @@ async function _callsDrawerRender() {
   if (c.transcript_path) h += '<div class="calls-meta">Saved to ' + esc(c.transcript_path) + '</div>';
   h += '</div></div>';
   el.innerHTML = h;
+}
+
+// ── CRM tab ──────────────────────────────────────────────────────────────────
+// docs/design/crm.md (owner, 2026-11-23): one place for every relationship,
+// Mixpeek, amux and personal. People, companies, deals and follow-ups over
+// /api/crm; each person and company carries its contact info, ICP grade (A to
+// D, with reasons) and lookalikes. Any change, from this page, another device
+// or a worker, arrives as a crm_* state event and the open view reloads.
+// People and companies come 200 at a time; "Show more" asks for the next 200.
+const _CRM_PAGE = 200;
+const _crm = { view: 'people', q: '', grade: '', status: '', stage: '', data: {}, summary: null, open: null, err: '', timer: 0, limit: _CRM_PAGE };
+const _CRM_STATUSES = ['lead', 'active', 'customer', 'partner', 'personal', 'do_not_contact'];
+const _CRM_STAGES = ['lead', 'qualification', 'demo', 'trial', 'proposal', 'won', 'lost'];
+const _CRM_TYPES = ['email', 'call', 'meeting', 'dm', 'note', 'event', 'other'];
+
+function _crmFit() {
+  const view = document.getElementById('crm-view');
+  if (!view || view.style.display === 'none') return;
+  requestAnimationFrame(() => { window.scrollTo(0, 0); view.style.setProperty('--crm-top', Math.max(0, view.getBoundingClientRect().top) + 'px'); });
+}
+window.addEventListener('resize', _crmFit);
+
+async function _crmApi(path, opts = {}) {
+  const r = await fetch(API + '/api/crm' + path, { ...opts, headers: _authHeaders(opts.body ? { 'Content-Type': 'application/json' } : {}) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(d.error || ('HTTP ' + r.status)); e.status = r.status; e.data = d; throw e; }
+  return d;
+}
+
+async function _crmLoad() {
+  _crmFit();
+  const qs = (o) => { const p = new URLSearchParams(); for (const [k, v] of Object.entries(o)) if (v) p.set(k, v); const s = p.toString(); return s ? '?' + s : ''; };
+  const want = {
+    people: () => _crmApi('/contacts' + qs({ q: _crm.q, grade: _crm.grade, status: _crm.status, limit: _crm.limit })),
+    companies: () => _crmApi('/accounts' + qs({ q: _crm.q, grade: _crm.grade, limit: _crm.limit })),
+    deals: () => _crmApi('/deals' + qs({ stage: _crm.stage })),
+    followups: () => _crmApi('/followups'),
+    approvals: () => _crmApi('/touches?status=drafted'),
+    sequences: () => _crmApi('/sequences'),
+  };
+  try {
+    const [summary, rows] = await Promise.all([_crmApi('/summary'), want[_crm.view]()]);
+    _crm.summary = summary; _crm.data[_crm.view] = rows; _crm.err = '';
+  } catch (e) {
+    _crm.err = 'Could not load the CRM: ' + e.message;
+    console.warn('[crm] load failed', e);
+  }
+  _crmRender();
+  // A refresh from elsewhere (another device, a worker) never rebuilds the
+  // drawer under the owner's cursor: what they are typing saves on blur, and
+  // the next refresh catches up.
+  if (_crm.open && !_crmEditing()) _crmDrawerRender();
+}
+
+function _crmEditing() {
+  const a = document.activeElement, d = document.getElementById('crm-drawer');
+  return !!(a && d && d.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName));
+}
+
+// A crm_* write anywhere: reload what is on screen, once per burst.
+function _crmOnEvent() {
+  if (activeView !== 'crm') return;
+  clearTimeout(_crm.timer);
+  _crm.timer = setTimeout(_crmLoad, 400);
+}
+
+function _crmSearch(v) {
+  _crm.q = v.trim(); _crm.limit = _CRM_PAGE;
+  clearTimeout(_crm.timer);
+  _crm.timer = setTimeout(_crmLoad, 250);
+}
+
+function _crmSet(kind, v) {
+  _crm.limit = _CRM_PAGE;
+  if (kind === 'view') { _crm.view = v; _crm.stage = ''; }
+  else if (kind === 'grade') _crm.grade = _crm.grade === v ? '' : v;
+  else if (kind === 'status') _crm.status = _crm.status === v ? '' : v;
+  else if (kind === 'stage') _crm.stage = _crm.stage === v ? '' : v;
+  _crmLoad();
+}
+
+function _crmGrade(g) { return '<span class="crm-grade" data-g="' + esc(g || '') + '" title="' + (g ? 'ICP grade ' + esc(g) : 'Not graded') + '">' + esc(g || '–') + '</span>'; }
+function _crmLabel(s) { return String(s || '').replace(/_/g, ' '); }
+function _crmToday() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
+
+function _crmRender() {
+  const chips = document.getElementById('crm-chips'), list = document.getElementById('crm-list'), note = document.getElementById('crm-note');
+  if (!chips || !list) return;
+  const s = _crm.summary || {};
+  const chip = (kind, v, label, on, n) => '<button class="cx-filter' + (on ? ' on' : '') + '" data-kind="' + kind + '" data-v="' + esc(v)
+    + '" onclick="_crmSet(this.dataset.kind,this.dataset.v)">' + esc(label) + (n != null ? '<span class="crm-chip-n">' + esc(n) + '</span>' : '') + '</button>';
+  let h = chip('view', 'people', 'People', _crm.view === 'people', s.people)
+    + chip('view', 'companies', 'Companies', _crm.view === 'companies', s.companies)
+    + chip('view', 'deals', 'Deals', _crm.view === 'deals', s.deals)
+    + chip('view', 'followups', 'Follow-ups', _crm.view === 'followups', s.followups_due || null)
+    + chip('view', 'approvals', 'To approve', _crm.view === 'approvals', s.to_approve || null)
+    + chip('view', 'sequences', 'Sequences', _crm.view === 'sequences', null);
+  if (_crm.view === 'people' || _crm.view === 'companies') {
+    h += '<span class="crm-sep" aria-hidden="true"></span>' + ['A', 'B', 'C', 'D'].map(g => chip('grade', g, 'ICP ' + g, _crm.grade === g)).join('');
+  }
+  // Status is one select, not six chips: the row stays short enough to read whole on a laptop.
+  if (_crm.view === 'people') h += '<select class="input crm-status" aria-label="Status" onchange="_crm.status=this.value;_crmLoad()">'
+    + '<option value="">Any status</option>' + _CRM_STATUSES.map(st => '<option value="' + st + '"' + (_crm.status === st ? ' selected' : '') + '>' + esc(_crmLabel(st)) + '</option>').join('') + '</select>';
+  if (_crm.view === 'deals') h += '<span class="crm-sep" aria-hidden="true"></span>' + _CRM_STAGES.map(st => chip('stage', st, st, _crm.stage === st, (s.stages || {})[st] || null)).join('');
+  chips.innerHTML = h;
+  note.textContent = _crm.err;
+  const rows = _crm.data[_crm.view] || [];
+  if (!rows.length) {
+    list.innerHTML = '<div class="crm-empty">' + (_crm.err ? '' : _crm.q || _crm.grade || _crm.status || _crm.stage ? 'Nothing matches.' : 'Nothing here yet. Add one with + New, or ask a worker to.') + '</div>';
+    return;
+  }
+  const row = (kind, id, inner) => '<div class="crm-row" role="button" tabindex="0" data-kind="' + kind + '" data-id="' + esc(id) + '"'
+    + ' onclick="_crmOpen(this.dataset.kind,this.dataset.id)" onkeydown="if(event.key===\'Enter\')_crmOpen(this.dataset.kind,this.dataset.id)">' + inner + '</div>';
+  if (_crm.view === 'people') {
+    list.innerHTML = rows.map(p => row('person', p.id, _crmGrade(p.icp_grade)
+      + '<div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(p.name) + '</span>'
+      + (p.status ? '<span class="cx-pill cx-idle">' + esc(_crmLabel(p.status)) + '</span>' : '') + '</div>'
+      + '<div class="crm-meta">' + esc([p.role, p.account_name || p.company].filter(Boolean).join(' · ') || p.email || '') + '</div>'
+      + '<div class="crm-meta">' + esc([p.last_date ? 'last ' + p.last_date : 'no contact yet', p.next_followup ? 'follow up ' + p.next_followup : ''].filter(Boolean).join(' · ')) + '</div>'
+      + '</div>')).join('') + _crmMore(rows.length);
+  } else if (_crm.view === 'companies') {
+    list.innerHTML = rows.map(a => row('company', a.id, _crmGrade(a.icp_grade)
+      + '<div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(a.name) + '</span>'
+      + (a.open_deals ? '<span class="cx-pill cx-warn">' + esc(a.open_deals) + ' open deal' + (a.open_deals > 1 ? 's' : '') + '</span>' : '') + '</div>'
+      + '<div class="crm-meta">' + esc([a.domain, a.industry, a.people + ' ' + (a.people === 1 ? 'person' : 'people')].filter(Boolean).join(' · ')) + '</div>'
+      + '</div>')).join('') + _crmMore(rows.length);
+  } else if (_crm.view === 'deals') {
+    const by = {};
+    for (const d of rows) (by[d.stage] = by[d.stage] || []).push(d);
+    list.innerHTML = _CRM_STAGES.filter(st => by[st]).map(st => '<div class="crm-stage-h">' + esc(st) + ' · ' + by[st].length + '</div>'
+      + by[st].map(d => row('deal', d.id, '<div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(d.title) + '</span>'
+        + (d.amount != null ? '<span class="cx-pill cx-ok">' + esc((d.currency || 'USD') + ' ' + Number(d.amount).toLocaleString()) + '</span>' : '') + '</div>'
+        + '<div class="crm-meta">' + esc([d.account_name, d.next_step, d.close_date ? 'close ' + d.close_date : ''].filter(Boolean).join(' · ')) + '</div></div>')).join('')).join('');
+  } else if (_crm.view === 'approvals') {
+    // The owner's queue: drafts a worker wrote for someone outside the company.
+    list.innerHTML = rows.map(t => _crmTouchCard(t, true)).join('');
+  } else if (_crm.view === 'sequences') {
+    // Outbound sequences (api/crm_outbound.rs): who is in each and how it is going.
+    list.innerHTML = rows.map(q => '<div class="crm-row" data-id="' + esc(q.id) + '"><div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(q.name) + '</span>'
+      + (q.active ? '<span class="cx-pill cx-warn">' + esc(q.active) + ' active</span>' : '')
+      + (q.replied ? '<span class="cx-pill cx-ok">' + esc(q.replied) + ' replied</span>' : '') + '</div>'
+      + '<div class="crm-meta">' + esc([q.goal, q.enrolled + ' enrolled', q.assignee ? 'by ' + q.assignee : ''].filter(Boolean).join(' · ')) + '</div>'
+      + '<div class="crm-meta">' + esc(_crmSteps(q.steps)) + '</div></div></div>').join('')
+      || '<div class="crm-empty">No sequences yet. A worker makes one with amux crm sequence.</div>';
+  } else {
+    const today = _crmToday();
+    list.innerHTML = rows.map(f => row('person', f.id, '<div class="crm-main"><div class="crm-line"><span class="crm-name">' + esc(f.name) + '</span>'
+      + '<span class="cx-pill ' + (f.follow_up_date <= today ? 'cx-bad' : 'cx-idle') + '">' + esc(f.follow_up_date) + '</span></div>'
+      + '<div class="crm-meta">' + esc([f.company, f.follow_up_note].filter(Boolean).join(' · ')) + '</div></div>')).join('');
+  }
+}
+
+// A full page means there may be more: one row asks for the next 200.
+function _crmMore(n) {
+  if (n < _crm.limit) return '';
+  const total = (_crm.summary || {})[_crm.view === 'companies' ? 'companies' : 'people'];
+  return '<button class="btn crm-more" onclick="_crm.limit+=_CRM_PAGE;_crmLoad()">Show ' + _CRM_PAGE + ' more'
+    + (total && !_crm.q && !_crm.grade && !_crm.status ? ' (' + n + ' of ' + total + ')' : '') + '</button>';
+}
+
+// ── Channels and touches (the agent side: api/crm_agent.rs) ──
+const _CRM_KINDS = ['linkedin', 'x', 'instagram', 'website', 'careers', 'email', 'phone', 'youtube', 'tiktok', 'github', 'sms', 'whatsapp', 'slack', 'discord', 'community', 'post', 'event', 'in_person', 'other'];
+const _CRM_ACTIONS = ['dm', 'comment', 'connect', 'email', 'follow', 'like', 'call', 'note', 'text', 'voicemail', 'letter', 'gift', 'meet', 'invite', 'intro', 'visit'];
+const _CRM_TOUCH_PILL = { planned: 'cx-idle', drafted: 'cx-warn', approved: 'cx-ok', done: 'cx-ok', skipped: 'cx-idle', failed: 'cx-bad' };
+
+function _crmChannels(list, ownerKind, ownerId) {
+  const rows = (list || []).map(c => {
+    const href = c.url ? (/^https?:\/\//i.test(c.url) ? c.url : 'https://' + c.url) : '';
+    const meta = [c.watch ? 'watched every ' + (c.check_every_min >= 60 ? Math.round(c.check_every_min / 60) + 'h' : c.check_every_min + 'm') + ' by ' + (c.how === 'fetch' ? 'amux' : 'a worker') : '',
+      c.last_changed_at ? 'changed ' + timeAgo(c.last_changed_at) : (c.last_checked_at ? 'checked ' + timeAgo(c.last_checked_at) : ''), c.last_error].filter(Boolean).join(' · ');
+    return '<div class="crm-ch"><span class="cx-pill cx-idle">' + esc(c.kind) + '</span>'
+      + (href ? '<a class="crm-link crm-ch-where" target="_blank" rel="noopener" href="' + esc(href) + '">' + esc(c.handle || c.url) + '</a>' : '<span class="crm-ch-where">' + esc(c.handle) + '</span>')
+      + '<label class="crm-ch-watch"><input type="checkbox" data-id="' + esc(c.id) + '"' + (c.watch ? ' checked' : '') + (c.url ? '' : ' disabled title="A url is needed to watch"')
+      + ' onchange="_crmWatch(this.dataset.id,this.checked)"> Watch</label>'
+      + (meta ? '<span class="crm-meta crm-ch-meta">' + esc(meta) + '</span>' : '') + '</div>';
+  }).join('');
+  return '<div class="cx-sec">Channels</div><div class="crm-stack">' + (rows || '<div class="crm-meta">None yet: add where to reach or watch them.</div>')
+    + '<div class="crm-form-row crm-form"><select id="crm-ch-kind" class="input" aria-label="Channel">' + _CRM_KINDS.map(k => '<option>' + k + '</option>').join('') + '</select>'
+    + '<input id="crm-ch-where" class="input" placeholder="URL or @handle" aria-label="URL or handle">'
+    + '<label class="crm-ch-watch"><input id="crm-ch-w" type="checkbox"> Watch</label>'
+    + '<button class="btn" data-kind="' + ownerKind + '" data-id="' + esc(ownerId) + '" onclick="_crmAddChannel(this.dataset.kind,this.dataset.id)">Add</button></div></div>';
+}
+
+async function _crmAddChannel(ownerKind, ownerId) {
+  const kind = document.getElementById('crm-ch-kind').value, where = document.getElementById('crm-ch-where').value.trim();
+  const watch = document.getElementById('crm-ch-w').checked;
+  if (!where) { showToast('Give a URL or handle', true); return; }
+  const isUrl = /[/.]/.test(where.replace(/^@/, ''));
+  try {
+    await _crmApi('/channels', { method: 'POST', body: JSON.stringify({ owner_kind: ownerKind, owner_id: ownerId, kind, watch, [isUrl ? 'url' : 'handle']: where }) });
+    showToast(watch ? 'Watching ' + kind : 'Channel added');
+    _crmDrawerRender();
+  } catch (e) { showToast('Not added: ' + e.message, true); }
+}
+
+async function _crmWatch(id, on) {
+  try { await _crmApi('/channels/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ watch: on }) }); showToast(on ? 'Watching' : 'Not watching'); }
+  catch (e) { showToast('Not changed: ' + e.message, true); }
+}
+
+// A touch: its channel and action, the text, who does it, and the owner's buttons.
+// "1 email · day 3 linkedin dm · day 7 post letter": a sequence's steps on one line.
+function _crmSteps(steps) {
+  let list = steps;
+  if (typeof list === 'string') { try { list = JSON.parse(list); } catch (_) { list = []; } }
+  return (list || []).map((x, i) => (i ? 'day ' + (x.day || 0) + ' ' : '') + x.channel + ' ' + x.action).join(' · ');
+}
+
+// The voice check of the text (api/crm_voice.rs; Ethan, 2026-11-24: "a voice
+// that we're able to capture and adhere to"): what broke, a worker's reason
+// for sending it anyway, and what the link check found.
+function _crmVoiceLine(t) {
+  let v = t.voice_check;
+  if (typeof v === 'string') { try { v = JSON.parse(v); } catch (_) { v = null; } }
+  if (!v || !t.body) return '';
+  const links = v.links || {};
+  const linkText = links.measured === true ? 'links: ' + (links.summary || links.checked + ' checked') : 'links not checked yet';
+  const head = v.ok ? 'Voice: fits' + (v.rule ? ' ' + v.rule : '') : 'Voice: ' + (v.problems || []).join('; ');
+  const slop = v.slop === true ? 'slop pass attested' : 'slop pass NOT attested';
+  return '<span class="crm-meta crm-voice' + (v.ok && v.slop === true ? '' : ' crm-voice-bad') + '">' + esc(head)
+    + (v.override ? ' · sent as written because: ' + esc(v.override) : '') + ' · ' + esc(linkText) + ' · ' + esc(slop) + '</span>';
+}
+
+function _crmTouchCard(t, withWho) {
+  const open = ['planned', 'drafted', 'approved'].includes(t.status);
+  const who = withWho ? '<button class="crm-link" data-id="' + esc(t.contact_id || t.account_id) + '" data-kind="' + (t.contact_id ? 'person' : 'company') + '" onclick="_crmOpen(this.dataset.kind,this.dataset.id)">' + esc(t.contact_name || t.account_name) + '</button> · ' : '';
+  return '<div class="crm-ix crm-touch" data-id="' + esc(t.id) + '"><span class="crm-ix-head">' + who + esc([t.channel, t.action, t.sequence ? t.sequence + ' step ' + t.step : '', t.due_date ? 'due ' + t.due_date : '', t.assignee ? 'by ' + t.assignee : ''].filter(Boolean).join(' · '))
+    + ' <span class="cx-pill ' + (_CRM_TOUCH_PILL[t.status] || 'cx-idle') + '">' + esc(t.status) + '</span></span>'
+    + (open && t.status !== 'approved'
+      ? '<textarea class="input crm-ta" aria-label="Touch text" data-id="' + esc(t.id) + '" onchange="_crmTouchText(this.dataset.id,this.value)">' + esc(t.body || '') + '</textarea>'
+      : (t.body ? '<span class="crm-ix-text">' + esc(t.body) + '</span>' : ''))
+    + _crmVoiceLine(t)
+    // A worker writes result_url: only an http(s) link becomes a link (never javascript:).
+    + (t.result || t.result_url ? '<span class="crm-meta">' + esc(t.result || '') + (/^https?:\/\//i.test(t.result_url || '') ? ' · <a class="crm-link" target="_blank" rel="noopener" href="' + esc(t.result_url) + '">link</a>' : '') + '</span>' : '')
+    + (open ? '<div class="crm-actions">'
+      + (t.status === 'drafted' ? '<button class="btn primary" data-id="' + esc(t.id) + '" onclick="_crmTouchApprove(this.dataset.id)">Approve</button>' : '')
+      // An approved touch that happens off a screen (a call, a letter, a meeting) is recorded here.
+      + (t.status === 'approved' ? '<button class="btn" data-id="' + esc(t.id) + '" onclick="_crmTouchDone(this.dataset.id)">Done</button>' : '')
+      + '<button class="btn" data-id="' + esc(t.id) + '" onclick="_crmTouchSkip(this.dataset.id)">Skip</button></div>' : '')
+    + '</div>';
+}
+
+function _crmTouches(list, ownerKind, ownerId) {
+  const workers = (typeof sessions !== 'undefined' ? sessions : []).filter(s => !s.archived).map(s => s.name).sort();
+  const pref = workers.includes('gtm-engine') ? 'gtm-engine' : workers[0] || '';
+  return '<div class="cx-sec">Touches</div><div class="crm-stack">' + ((list || []).map(t => _crmTouchCard(t, false)).join('') || '<div class="crm-meta">No touches planned.</div>')
+    + '<div class="crm-form"><div class="crm-form-row"><select id="crm-t-ch" class="input" aria-label="Channel">' + _CRM_KINDS.map(k => '<option>' + k + '</option>').join('') + '</select>'
+    + '<select id="crm-t-act" class="input" aria-label="Action">' + _CRM_ACTIONS.map(k => '<option>' + k + '</option>').join('') + '</select>'
+    + '<input id="crm-t-due" class="input" type="date" aria-label="Due"></div>'
+    + '<div class="crm-form-row"><select id="crm-t-who" class="input" aria-label="Worker that does it">' + workers.map(w => '<option' + (w === pref ? ' selected' : '') + '>' + esc(w) + '</option>').join('') + '</select></div>'
+    + '<textarea id="crm-t-body" class="input crm-ta" placeholder="Text (optional: the worker can draft it)" aria-label="Touch text"></textarea>'
+    + '<button class="btn" data-kind="' + ownerKind + '" data-id="' + esc(ownerId) + '" onclick="_crmAddTouch(this.dataset.kind,this.dataset.id)">Plan touch</button></div></div>';
+}
+
+async function _crmAddTouch(ownerKind, ownerId) {
+  const v = (id) => (document.getElementById(id) || {}).value || '';
+  try {
+    await _crmApi('/touches', { method: 'POST', body: JSON.stringify({ [ownerKind === 'account' ? 'account_id' : 'contact_id']: ownerId, channel: v('crm-t-ch'), action: v('crm-t-act'),
+      due_date: v('crm-t-due'), assignee: v('crm-t-who'), body: v('crm-t-body') }) });
+    showToast('Touch planned');
+    _crmDrawerRender(); _crmLoad();
+  } catch (e) { showToast('Not planned: ' + e.message, true); }
+}
+
+async function _crmTouchText(id, body) {
+  try { await _crmApi('/touches/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ body }) }); showToast('Saved'); }
+  catch (e) { showToast('Not saved: ' + e.message, true); }
+}
+
+async function _crmTouchApprove(id) {
+  try {
+    const d = await _crmApi('/touches/' + encodeURIComponent(id) + '/approve', { method: 'POST' });
+    showToast('Approved' + (d.touch && d.touch.assignee ? ': ' + d.touch.assignee + ' does it now' : ''));
+    _crmLoad(); if (_crm.open) _crmDrawerRender();
+  } catch (e) { showToast('Not approved: ' + e.message, true); }
+}
+
+async function _crmTouchDone(id) {
+  try { await _crmApi('/touches/' + encodeURIComponent(id) + '/done', { method: 'POST', body: JSON.stringify({ result: 'done (recorded in the CRM tab)' }) }); }
+  catch (e) { showToast('Could not record it: ' + e.message, true); return; }
+  showToast('Recorded');
+  _crmLoad(); if (_crm.open) _crmDrawerRender();
+}
+
+async function _crmTouchSkip(id) {
+  try { await _crmApi('/touches/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify({ status: 'skipped' }) }); showToast('Skipped'); _crmLoad(); if (_crm.open) _crmDrawerRender(); }
+  catch (e) { showToast('Not skipped: ' + e.message, true); }
+}
+
+function _crmOpen(kind, id) { _crm.open = { kind, id }; _crmDrawerRender(); }
+function _crmClose() { _crm.open = null; const el = document.getElementById('crm-drawer'); if (el) el.remove(); }
+
+function _crmDrawerEl() {
+  let el = document.getElementById('crm-drawer');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'crm-drawer';
+    el.className = 'cx-drawer-wrap';
+    el.onclick = (e) => { if (e.target === el) _crmClose(); };
+    el.onkeydown = (e) => { if (e.key === 'Escape') _crmClose(); };
+    el.tabIndex = -1;
+    document.body.appendChild(el);
+    el.focus();
+  }
+  return el;
+}
+
+// Contact links: mail, phone, LinkedIn, X, website. Each opens the app for it.
+function _crmContactLinks(o) {
+  const out = [];
+  if (o.email) out.push('<a class="btn" href="mailto:' + esc(o.email) + '">Email</a>');
+  if (o.phone) out.push('<a class="btn" href="tel:' + esc(String(o.phone).replace(/[^\d+]/g, '')) + '">Call</a>');
+  const web = (u) => /^https?:\/\//i.test(u) ? u : 'https://' + u;
+  if (o.linkedin) out.push('<a class="btn" target="_blank" rel="noopener" href="' + esc(web(o.linkedin)) + '">LinkedIn</a>');
+  if (o.twitter) out.push('<a class="btn" target="_blank" rel="noopener" href="' + esc(web(/^@/.test(o.twitter) ? 'x.com/' + o.twitter.slice(1) : o.twitter)) + '">X</a>');
+  if (o.website || o.domain) out.push('<a class="btn" target="_blank" rel="noopener" href="' + esc(web(o.website || o.domain)) + '">Website</a>');
+  return out.join('');
+}
+
+// An editable field: saved on change, by PATCH to `path`.
+function _crmField(label, key, value, path, type = 'text') {
+  const id = 'crmf-' + key;
+  return '<dt><label for="' + id + '">' + esc(label) + '</label></dt><dd><input id="' + id + '" class="input" type="' + type + '" value="' + esc(value || '')
+    + '" data-path="' + esc(path) + '" data-key="' + key + '" onchange="_crmSave(this.dataset.path,this.dataset.key,this.value)"></dd>';
+}
+
+async function _crmSave(path, key, value) {
+  try {
+    await _crmApi(path, { method: 'PATCH', body: JSON.stringify({ [key]: value }) });
+    showToast('Saved');
+    _crmLoad();
+  } catch (e) { showToast('Not saved: ' + e.message, true); }
+}
+
+function _crmGradePicker(path, g, reasons) {
+  return '<div class="cx-sec">ICP grade</div><div class="crm-grades">'
+    + ['A', 'B', 'C', 'D', ''].map(x => '<button class="cx-filter' + ((g || '') === x ? ' on' : '') + '" data-path="' + esc(path) + '" data-g="' + x
+      + '" onclick="_crmSave(this.dataset.path,\'icp_grade\',this.dataset.g)">' + (x || 'None') + '</button>').join('') + '</div>'
+    + '<textarea class="input crm-ta" aria-label="Why this grade" placeholder="Why this grade" data-path="' + esc(path)
+    + '" onchange="_crmSave(this.dataset.path,\'icp_reasons\',this.value)">' + esc(reasons || '') + '</textarea>';
+}
+
+function _crmLookalikes(list, fromId) {
+  const rows = (list || []).map(l => '<div class="crm-row" role="button" tabindex="0" data-id="' + esc(l.id) + '" onclick="_crmOpen(\'company\',this.dataset.id)">'
+    + _crmGrade(l.icp_grade) + '<div class="crm-main"><span class="crm-name">' + esc(l.name) + '</span>'
+    + '<span class="crm-meta">' + esc([l.domain, l.score ? Math.round(l.score * 100) + '% alike' : '', l.reason].filter(Boolean).join(' · ')) + '</span></div></div>').join('');
+  return '<div class="cx-sec">Lookalikes</div><div class="crm-stack">' + (rows || '<div class="crm-meta">None yet. Add one, or ask a worker to find companies like this one.</div>')
+    + '<div class="crm-form-row crm-form"><input id="crm-look-name" class="input" placeholder="Company like this (name)" aria-label="Lookalike company name">'
+    + '<input id="crm-look-domain" class="input" placeholder="domain.com" aria-label="Lookalike domain">'
+    + '<button class="btn" data-from="' + esc(fromId) + '" onclick="_crmAddLookalike(this.dataset.from)">Add lookalike</button></div></div>';
+}
+
+async function _crmAddLookalike(fromId) {
+  const name = (document.getElementById('crm-look-name') || {}).value || '';
+  const domain = (document.getElementById('crm-look-domain') || {}).value || '';
+  if (!name.trim()) { showToast('Name the company', true); return; }
+  try {
+    let toId;
+    try { toId = (await _crmApi('/accounts', { method: 'POST', body: JSON.stringify({ name, domain, status: 'lead', source: 'lookalike:' + fromId }) })).id; }
+    catch (e) { if (e.status === 409 && e.data && e.data.id) toId = e.data.id; else throw e; }
+    await _crmApi('/lookalikes', { method: 'POST', body: JSON.stringify({ kind: 'account', from_id: fromId, to_id: toId, score: 0.7, reason: 'added by the owner' }) });
+    showToast('Lookalike added');
+    _crmDrawerRender(); _crmLoad();
+  } catch (e) { showToast('Not added: ' + e.message, true); }
+}
+
+function _crmTimeline(items) {
+  return '<div class="cx-sec">Activity</div><div class="crm-stack">' + ((items || []).map(i => '<div class="crm-ix"><span class="crm-ix-head">'
+    + esc([i.date, i.type, i.direction, i.contact_name].filter(Boolean).join(' · ')) + '</span>'
+    + (i.subject ? '<span class="crm-ix-text"><b>' + esc(i.subject) + '</b></span>' : '')
+    + '<span class="crm-ix-text">' + esc(i.notes || '') + '</span>'
+    + (i.follow_up_date ? '<span class="crm-meta">Follow up ' + esc(i.follow_up_date) + (i.follow_up_note ? ': ' + esc(i.follow_up_note) : '') + '</span>' : '')
+    + '</div>').join('') || '<div class="crm-meta">No activity yet.</div>') + '</div>';
+}
+
+function _crmLogForm(contactId) {
+  return '<div class="cx-sec">Log</div><div class="crm-form">'
+    + '<div class="crm-form-row"><select id="crm-ix-type" class="input" aria-label="Kind">' + _CRM_TYPES.map(t => '<option>' + t + '</option>').join('') + '</select>'
+    + '<input id="crm-ix-fu" class="input" type="date" aria-label="Follow up on"></div>'
+    + '<textarea id="crm-ix-notes" class="input crm-ta" placeholder="What happened" aria-label="What happened"></textarea>'
+    + '<input id="crm-ix-funote" class="input" placeholder="Follow-up note (optional)" aria-label="Follow-up note">'
+    + '<button class="btn primary" data-id="' + esc(contactId) + '" onclick="_crmLog(this.dataset.id)">Log it</button></div>';
+}
+
+async function _crmLog(contactId) {
+  const v = (id) => (document.getElementById(id) || {}).value || '';
+  if (!v('crm-ix-notes').trim() && !v('crm-ix-fu')) { showToast('Say what happened, or set a follow-up', true); return; }
+  try {
+    await _crmApi('/contacts/' + encodeURIComponent(contactId) + '/interactions', { method: 'POST',
+      body: JSON.stringify({ type: v('crm-ix-type'), notes: v('crm-ix-notes'), follow_up_date: v('crm-ix-fu'), follow_up_note: v('crm-ix-funote') }) });
+    showToast('Logged');
+    _crmDrawerRender(); _crmLoad();
+  } catch (e) { showToast('Not logged: ' + e.message, true); }
+}
+
+// Hand a person or company to a worker: research, grade, find lookalikes, draft outreach.
+function _crmAskForm(kind, id, name) {
+  const workers = (typeof sessions !== 'undefined' ? sessions : []).filter(s => !s.archived).map(s => s.name).sort();
+  const pref = workers.includes('gtm-engine') ? 'gtm-engine' : workers[0] || '';
+  return '<div class="cx-sec">Ask a worker</div><div class="crm-form"><select id="crm-ask-w" class="input" aria-label="Worker">'
+    + workers.map(w => '<option' + (w === pref ? ' selected' : '') + '>' + esc(w) + '</option>').join('') + '</select>'
+    + '<textarea id="crm-ask-t" class="input crm-ta" aria-label="What to ask">' + esc('For CRM ' + kind + ' ' + id + ' (' + name + '): research them, set the ICP grade with reasons (PATCH /api/crm/' + (kind === 'company' ? 'accounts' : 'contacts') + '/' + id + '), and add lookalike companies (POST /api/crm/lookalikes).') + '</textarea>'
+    + '<button class="btn" onclick="_crmAsk()">Send</button></div>';
+}
+
+async function _crmAsk() {
+  const w = (document.getElementById('crm-ask-w') || {}).value, text = (document.getElementById('crm-ask-t') || {}).value || '';
+  if (!w || !text.trim()) return;
+  try {
+    const r = await _directInteractionFetch(API + '/api/sessions/' + encodeURIComponent(w) + '/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + r.status));
+    showToast(String(d.message || '').startsWith('queued') ? 'Queued for ' + w : 'Sent to ' + w);
+  } catch (e) { showToast('Not sent: ' + e.message, true); }
+}
+
+async function _crmDrawerRender() {
+  const o = _crm.open;
+  if (!o) return;
+  const gen = _crm.drawerGen = (_crm.drawerGen || 0) + 1;
+  const el = _crmDrawerEl();
+  if (o.kind === 'new') { _crm.shown = 'new'; el.innerHTML = _crmNewHtml(o.id); return; }
+  const path = o.kind === 'person' ? '/contacts/' : o.kind === 'company' ? '/accounts/' : '/deals';
+  let x, chans = [], touches = [];
+  try {
+    if (o.kind === 'deal') x = ((await _crmApi('/deals')) || []).find(d => d.id === o.id);
+    else {
+      const ok = o.kind === 'person' ? 'contact' : 'account';
+      [x, chans, touches] = await Promise.all([_crmApi(path + encodeURIComponent(o.id)),
+        _crmApi('/channels?owner_kind=' + ok + '&owner_id=' + encodeURIComponent(o.id)),
+        _crmApi('/touches?' + (ok === 'contact' ? 'contact_id' : 'account_id') + '=' + encodeURIComponent(o.id))]);
+    }
+  } catch (e) { console.warn('[crm] drawer load failed', e); }
+  if (!_crm.open || _crm.open.id !== o.id || gen !== _crm.drawerGen) return;
+  // The owner may have started typing while this fetched (CI 45299042749: a
+  // refresh wiped a lookalike name typed during it). A re-render of the record
+  // already on screen yields to them; opening another record still renders.
+  const key = o.kind + ':' + o.id;
+  if (_crm.shown === key && _crmEditing()) return;
+  _crm.shown = key;
+  if (!x) { el.innerHTML = '<div class="cx-drawer" role="dialog"><div class="cx-dhead"><span class="crm-name">Not found</span><button class="cx-x" aria-label="Close" onclick="_crmClose()">&#x2715;</button></div></div>'; return; }
+  const p = (o.kind === 'deal' ? '/deals/' : path) + encodeURIComponent(o.id);
+  let h = '<div class="cx-drawer" role="dialog" aria-label="' + esc(x.name || x.title) + '"><div class="cx-dhead">'
+    + (o.kind !== 'deal' ? _crmGrade(x.icp_grade) : '') + '<span class="crm-name crm-dname">' + esc(x.name || x.title) + '</span>'
+    + '<button class="cx-x" aria-label="Close" onclick="_crmClose()">&#x2715;</button></div><div class="cx-dbody">';
+  if (o.kind === 'person') {
+    h += '<div class="crm-meta">' + esc([x.id, x.source ? 'added by ' + x.source : ''].filter(Boolean).join(' · ')) + '</div>';
+    h += '<div class="crm-actions">' + _crmContactLinks(x) + '</div>';
+    if (x.unsubscribed_at || x.bounced_at) h += '<div class="crm-note">' + (x.unsubscribed_at ? 'Unsubscribed. ' : '') + (x.bounced_at ? 'Email bounced.' : '') + '</div>';
+    h += '<div class="cx-sec">Contact info</div><dl class="crm-kv">' + _crmField('Name', 'name', x.name, p) + _crmField('Email', 'email', x.email, p, 'email')
+      + _crmField('Phone', 'phone', x.phone, p, 'tel') + _crmField('Role', 'role', x.role, p) + _crmField('LinkedIn', 'linkedin', x.linkedin, p)
+      + _crmField('X', 'twitter', x.twitter, p) + _crmField('Location', 'location', x.location, p) + _crmField('Company', 'company', x.company, p)
+      + '<dt><label for="crmf-status">Status</label></dt><dd><select id="crmf-status" class="input" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'status\',this.value)">'
+      + ['', ..._CRM_STATUSES].map(st => '<option value="' + st + '"' + ((x.status || '') === st ? ' selected' : '') + '>' + (st ? esc(_crmLabel(st)) : 'Not set') + '</option>').join('') + '</select></dd></dl>';
+    if (x.account) h += '<div class="crm-meta">At <button class="crm-link" data-id="' + esc(x.account.id) + '" onclick="_crmOpen(\'company\',this.dataset.id)">' + esc(x.account.name) + '</button></div>';
+    h += _crmGradePicker(p, x.icp_grade, x.icp_reasons);
+    if ((x.tags || []).length) h += '<div class="cx-sec">Tags</div><div class="crm-meta">' + x.tags.map(esc).join(', ') + '</div>';
+    if ((x.deals || []).length) h += '<div class="cx-sec">Deals</div><div class="crm-stack">' + x.deals.map(d => '<div class="crm-row" role="button" tabindex="0" data-id="' + esc(d.id) + '" onclick="_crmOpen(\'deal\',this.dataset.id)"><div class="crm-main"><span class="crm-name">' + esc(d.title) + '</span><span class="crm-meta">' + esc(d.stage) + '</span></div></div>').join('') + '</div>';
+    if (x.account) h += _crmLookalikes(x.lookalikes, x.account.id);
+    h += _crmChannels(chans, 'contact', x.id) + _crmTouches(touches, 'contact', x.id);
+    h += _crmTimeline(x.interactions) + _crmLogForm(x.id);
+    if (x.notes) h += '<div class="cx-sec">Notes</div><div class="crm-ix-text">' + esc(x.notes) + '</div>';
+    h += _crmAskForm('person', x.id, x.name);
+  } else if (o.kind === 'company') {
+    h += '<div class="crm-meta">' + esc([x.id, x.source ? 'added by ' + x.source : ''].filter(Boolean).join(' · ')) + '</div>';
+    h += '<div class="crm-actions">' + _crmContactLinks(x) + '</div>';
+    h += '<div class="cx-sec">Company</div><dl class="crm-kv">' + _crmField('Name', 'name', x.name, p) + _crmField('Domain', 'domain', x.domain, p)
+      + _crmField('Industry', 'industry', x.industry, p) + _crmField('Size', 'size', x.size, p) + _crmField('Location', 'location', x.location, p)
+      + _crmField('LinkedIn', 'linkedin', x.linkedin, p) + '</dl>';
+    h += _crmGradePicker(p, x.icp_grade, x.icp_reasons);
+    h += '<div class="cx-sec">People</div><div class="crm-stack">' + ((x.people || []).map(pp => '<div class="crm-row" role="button" tabindex="0" data-id="' + esc(pp.id) + '" onclick="_crmOpen(\'person\',this.dataset.id)">'
+      + _crmGrade(pp.icp_grade) + '<div class="crm-main"><span class="crm-name">' + esc(pp.name) + '</span><span class="crm-meta">' + esc(pp.role || pp.email || '') + '</span></div></div>').join('') || '<div class="crm-meta">No people yet.</div>') + '</div>';
+    if ((x.deals || []).length) h += '<div class="cx-sec">Deals</div><div class="crm-stack">' + x.deals.map(d => '<div class="crm-row" role="button" tabindex="0" data-id="' + esc(d.id) + '" onclick="_crmOpen(\'deal\',this.dataset.id)"><div class="crm-main"><span class="crm-name">' + esc(d.title) + '</span><span class="crm-meta">' + esc(d.stage) + '</span></div></div>').join('') + '</div>';
+    h += _crmChannels(chans, 'account', x.id) + _crmTouches(touches, 'account', x.id);
+    h += _crmLookalikes(x.lookalikes, x.id) + _crmTimeline(x.activity) + _crmAskForm('company', x.id, x.name);
+  } else {
+    h += '<div class="crm-meta">' + esc([x.id, x.account_name, x.source ? 'added by ' + x.source : ''].filter(Boolean).join(' · ')) + '</div>';
+    h += '<dl class="crm-kv">' + _crmField('Title', 'title', x.title, p)
+      + '<dt><label for="crmf-stage">Stage</label></dt><dd><select id="crmf-stage" class="input" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'stage\',this.value)">'
+      + _CRM_STAGES.map(st => '<option' + (x.stage === st ? ' selected' : '') + '>' + st + '</option>').join('') + '</select></dd>'
+      + '<dt><label for="crmf-amount">Amount</label></dt><dd><input id="crmf-amount" class="input" type="number" value="' + esc(x.amount != null ? x.amount : '') + '" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'amount\',this.value===\'\'?null:Number(this.value))"></dd>'
+      + _crmField('Close date', 'close_date', x.close_date, p, 'date') + _crmField('Next step', 'next_step', x.next_step, p) + _crmField('Owner', 'owner', x.owner, p) + '</dl>';
+    if (x.account_id) h += '<div class="crm-actions"><button class="btn" data-id="' + esc(x.account_id) + '" onclick="_crmOpen(\'company\',this.dataset.id)">Open company</button></div>';
+    h += '<div class="cx-sec">Notes</div><textarea class="input crm-ta" aria-label="Deal notes" data-path="' + esc(p) + '" onchange="_crmSave(this.dataset.path,\'notes\',this.value)">' + esc(x.notes || '') + '</textarea>';
+  }
+  h += '</div></div>';
+  el.innerHTML = h;
+}
+
+// + New: what kind is on screen decides the form (a person, a company or a deal).
+function _crmNew() {
+  _crmOpen('new', _crm.view === 'companies' ? 'company' : _crm.view === 'deals' ? 'deal' : 'person');
+}
+
+function _crmNewHtml(kind) {
+  const f = (id, ph, type = 'text') => '<input id="crm-new-' + id + '" class="input" type="' + type + '" placeholder="' + esc(ph) + '" aria-label="' + esc(ph) + '">';
+  let body = kind === 'company' ? f('name', 'Company name') + f('domain', 'domain.com') + f('industry', 'Industry')
+    : kind === 'deal' ? f('title', 'Deal title') + f('account', 'Company name') + f('amount', 'Amount (USD)', 'number')
+    : f('name', 'Full name') + f('email', 'Email', 'email') + f('phone', 'Phone', 'tel') + f('company', 'Company') + f('role', 'Role') + f('linkedin', 'LinkedIn URL');
+  return '<div class="cx-drawer" role="dialog" aria-label="New ' + kind + '"><div class="cx-dhead"><span class="crm-name crm-dname">New ' + kind + '</span>'
+    + '<button class="cx-x" aria-label="Close" onclick="_crmClose()">&#x2715;</button></div><div class="cx-dbody"><div class="crm-form">' + body
+    + '<button class="btn primary" data-kind="' + kind + '" onclick="_crmCreate(this.dataset.kind)">Add</button></div></div></div>';
+}
+
+// The company for a name: the existing one (by name), else a new one.
+async function _crmAccountFor(name) {
+  name = (name || '').trim();
+  if (!name) return '';
+  const found = ((await _crmApi('/accounts?q=' + encodeURIComponent(name))) || []).find(a => a.name.toLowerCase() === name.toLowerCase());
+  if (found) return found.id;
+  return (await _crmApi('/accounts', { method: 'POST', body: JSON.stringify({ name }) })).id;
+}
+
+async function _crmCreate(kind) {
+  const v = (id) => ((document.getElementById('crm-new-' + id) || {}).value || '').trim();
+  try {
+    let id;
+    if (kind === 'company') {
+      if (!v('name')) throw new Error('name it');
+      id = (await _crmApi('/accounts', { method: 'POST', body: JSON.stringify({ name: v('name'), domain: v('domain'), industry: v('industry') }) })).id;
+    } else if (kind === 'deal') {
+      if (!v('title')) throw new Error('give it a title');
+      id = (await _crmApi('/deals', { method: 'POST', body: JSON.stringify({ title: v('title'), account_id: await _crmAccountFor(v('account')), amount: v('amount') ? Number(v('amount')) : null }) })).id;
+    } else {
+      if (!v('name')) throw new Error('name them');
+      id = (await _crmApi('/contacts', { method: 'POST', body: JSON.stringify({ name: v('name'), email: v('email'), phone: v('phone'), company: v('company'),
+        role: v('role'), linkedin: v('linkedin'), account_id: await _crmAccountFor(v('company')) }) })).id;
+    }
+    showToast('Added');
+    _crmOpen(kind === 'company' ? 'company' : kind === 'deal' ? 'deal' : 'person', id);
+    _crmLoad();
+  } catch (e) {
+    if (e.status === 409 && e.data && e.data.id) { showToast('Already in the CRM: opening it'); _crmOpen(kind === 'company' ? 'company' : 'person', e.data.id); return; }
+    showToast('Not added: ' + e.message, true);
+  }
 }
 
 // ── Habits tab ───────────────────────────────────────────────────────────────
@@ -49755,6 +52677,12 @@ function _bindMdFileLinks(container) {
       return;
     }
     const w = e.target.closest && e.target.closest('.md-worker-link');
+    if (w && container.contains(w) && w.dataset.worker && !(e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      e.stopPropagation();
+      _mdTaskOpen(w);
+      return;
+    }
     if (w && container.contains(w) && w.dataset.worker) {
       e.preventDefault();
       e.stopPropagation();
@@ -49893,7 +52821,31 @@ function _mdUseWikiLinks() {   // and math (the same marked.use call)
       return { type: 'workerMention', raw: m[0], name: m[1] };
     },
     renderer(t) {
-      return '<a href="#peek=' + encodeURIComponent(t.name) + '" class="md-worker-link" data-worker="' + esc(t.name) + '" title="Open ' + esc(t.name) + '">@' + esc(t.name) + '</a>';
+      return '<a href="#peek=' + encodeURIComponent(t.name) + '" class="md-worker-link" data-worker="' + esc(t.name) + '" title="Status and ask ' + esc(t.name) + ' (⌘-click opens it)">'
+        + '<span class="md-worker-dot" data-status="' + esc(_mdWorkerDotStatus(t.name)) + '" aria-hidden="true"></span>@' + esc(t.name) + '</a>';
+    },
+  }, {
+    // A file path written as plain text in a file's preview is a link to that
+    // file (owner, 2026-11-18: "file path is clickable and on mouseover shows
+    // a preview"). Absolute or ~/ paths only; trailing punctuation stays text.
+    // Same gate as @worker: a preview asked for it.
+    name: 'filePath', level: 'inline',
+    start(src) {
+      if (!_mdWorkerLinks) return undefined;
+      const m = /(^|[\s(])(?:~|\/(?:Users|home|Volumes|private|opt|tmp|var|etc))\//.exec(src);
+      return m ? m.index + m[1].length : undefined;
+    },
+    tokenizer(src) {
+      if (!_mdWorkerLinks) return undefined;
+      const m = /^(?:~|\/(?:Users|home|Volumes|private|opt|tmp|var|etc))\/[^\s<>()\[\]"'`]+/.exec(src);
+      if (!m) return undefined;
+      const path = m[0].replace(/[.,;:!?]+$/, '');
+      if (path.split('/').filter(Boolean).length < 2) return undefined;
+      return { type: 'filePath', raw: path, path };
+    },
+    renderer(t) {
+      const isDir = t.path.endsWith('/');
+      return '<a href="#" class="md-file-link md-path-link" data-file="' + esc(t.path) + '"' + (isDir ? ' data-dir="1"' : '') + ' title="' + esc(t.path) + '">' + esc(t.path) + '</a>';
     },
   }, {
     // #tag in the editor's preview: a chip, and a click finds the others.
@@ -52481,6 +55433,7 @@ function renderBoard() {
   _boardEnsureFull();
   // Skip re-render while a drag is in progress — queue it for when drag ends
   if (document.body.classList.contains('board-dragging')) { _boardRenderPending = true; return; }
+  if (_deferForSortableDrag(renderBoard, 'board')) return;
   renderBoardFilters();
   const container = document.getElementById('board-columns');
   // Global columns scroll horizontally. Keep activity above them, outside the
@@ -53880,6 +56833,7 @@ async function openBoardDetail(id) {
   }
   if (!detailIdentityCurrent()) return;
   boardDetailId = id;
+  _navVisit('card', id, item.title || id);
   // Render instantly from cache, then correct it from the server. Blocking the
   // modal on a fetch would make every card open feel slow for a field most
   // opens never edit.
@@ -57033,6 +59987,9 @@ function connectSSE() {
           if (a.type === 'steering_delivered' && a.session === peekSession) { if (_peekTab === 'steering') _steeringRender(); else _steeringUpdateBadge(); }
         }
       } else if (msg.type === 'state' && msg.payload && msg.payload.entity_type
+                 && msg.payload.entity_type.kind === 'other' && /^crm_/.test(msg.payload.entity_type.data || '')) {
+        _crmOnEvent();
+      } else if (msg.type === 'state' && msg.payload && msg.payload.entity_type
                  && msg.payload.entity_type.kind === 'other' && msg.payload.entity_type.data === 'conversation') {
         let ev = {};
         try { ev = JSON.parse(msg.payload.entity_id || '{}'); } catch (_) { ev = {}; }
@@ -57333,6 +60290,7 @@ loadBranding();
 
 // Initialize chrome tabs
 _chromeRender();
+{ const _ctb = document.getElementById('chrome-tabs-bar'); if (_ctb) _chromeTabDragSetup(_ctb); }
 // This browser tab owns its bar from its first load, so its reload reads its own.
 _chromeSave();
 _chromeUpdateOffsets();
@@ -58828,6 +61786,7 @@ function _vaultGroupsOf(i) { return String(i.target || '').split(',').map(g => g
 const _vault = { items: [], workers: [], groups: [], keystore: '', tab: 'secrets', q: '', scope: '', group: '',
   worker: '', sort: 'name', prov: null, revealed: {}, timers: {}, loadErr: '' };
 const _VAULT_ICONS = {
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M13.5 9.5l2 2"/>',
   card: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18"/>',
   shield: '<path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
@@ -59103,7 +62062,10 @@ function _vaultTableHtml(list, idPrefix) {
       return '<tr class="vault-row" data-id="' + esc(i.id) + '">'
         + '<td data-label="Name"><div class="vault-name"><code>' + esc(i.key) + '</code>' + _vaultIdBadge(i.id) + (i.note ? '<span class="ui-help">' + esc(i.note) + '</span>' : '') + '</div></td>'
         + '<td data-label="Value"><div class="vault-value"><span class="vault-mask' + (shown ? ' revealed' : '') + '" id="' + idPrefix + esc(i.id) + '">' + (shown ? esc(_vault.revealed[i.id]) : '••••••••••••') + '</span>'
-        + '<button class="vault-icon-btn" aria-label="' + (shown ? 'Hide ' : 'Reveal ') + esc(i.key) + '" aria-pressed="' + shown + '" title="' + (shown ? 'Hide' : 'Reveal (recorded in the audit log)') + '" onclick="_vaultReveal(\'' + escJs(i.id) + '\')">' + _vaultIcon(shown ? 'eyeOff' : 'eye') + '</button></div></td>'
+        + '<button class="vault-icon-btn" aria-label="' + (shown ? 'Hide ' : 'Reveal ') + esc(i.key) + '" aria-pressed="' + shown + '" title="' + (shown ? 'Hide' : 'Reveal (recorded in the audit log)') + '" onclick="_vaultReveal(\'' + escJs(i.id) + '\')">' + _vaultIcon(shown ? 'eyeOff' : 'eye') + '</button>'
+        // Copy only while revealed (owner, 2026-11-18): it reads the value by id, never from the markup.
+        + (shown ? '<button class="vault-icon-btn vault-copy" aria-label="Copy ' + esc(i.key) + '" title="Copy the value" onclick="_vaultCopy(\'' + escJs(i.id) + '\')">' + _vaultIcon('copy') + '</button>' : '')
+        + '</div></td>'
         + '<td data-label="Scope">' + _vaultChip(i.scope) + '</td>'
         + '<td data-label="Provisioned to">' + _vaultProvisionedTo(i) + forWorker + '</td>'
         + '<td data-label="Updated"><span title="' + esc(new Date((i.updated || 0) * 1000).toLocaleString()) + '">' + esc(timeAgo(i.updated)) + '</span><span class="ui-help"> · v' + esc(String(i.version || 1)) + '</span></td>'
@@ -59145,6 +62107,11 @@ function _vaultMenu(event, id) {
 function _vaultMask(id) {
   clearTimeout(_vault.timers[id]); delete _vault.timers[id];
   delete _vault.revealed[id];
+}
+function _vaultCopy(id) {
+  if (!Object.prototype.hasOwnProperty.call(_vault.revealed, id)) { showToast('Reveal it first'); return; }
+  const item = (_vault.items || []).find(x => x.id === id);
+  _copyTextWithToast(_vault.revealed[id], 'Copied ' + ((item && item.key) || 'the value'));
 }
 function _vaultMaskAll() { for (const id of Object.keys(_vault.revealed)) _vaultMask(id); }
 async function _vaultReveal(id) {
@@ -59427,8 +62394,109 @@ async function _vaultAudit(key) {
       + '<span class="vault-audit-what">' + line(x) + '</span><time class="ui-help" title="' + esc(new Date((x.ts || 0) * 1000).toLocaleString()) + '">' + esc(timeAgo(x.ts)) + '</time></li>').join('') + '</ol>'
       : '<p class="ui-help">Nothing recorded yet.</p>');
 }
+// ── Settings > This Mac: the Mac app's own settings, in the one Settings ──
+// The app answers through amuxSettings (desktop/amux-settings.swift
+// settingsAction) and calls _macSettingsState with what to draw; ⌘, and every
+// "Settings…" menu item open this tab (owner, 2026-11-25: "consolidate all our
+// settings"). A browser has no such bridge, so the tab stays hidden there.
+let _macSettings = null;
+function _macSettingsBridge() { return window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.amuxSettings; }
+function _macSettingsSend(action, name, value) {
+  const b = _macSettingsBridge();
+  if (b) b.postMessage({ action, name: name || '', value });
+}
+function _macSettingsTabSync() {
+  const t = document.getElementById('settings-tab-mac');
+  if (t) t.hidden = !_macSettingsBridge();
+}
+// Called by the app (showSettings). True means the tab is open.
+function _macSettingsOpen() {
+  if (!_macSettingsBridge()) return false;
+  _macSettingsTabSync();
+  const menu = document.getElementById('settings-menu');
+  if (!menu) return false;
+  if (!menu.classList.contains('open')) toggleSettings();
+  _settingsTab('mac');
+  return true;
+}
+function _macSettingsState(s) {
+  _macSettings = s || null;
+  _macSettingsRender();
+}
+function _macToggleRow(key, label, hint) {
+  const on = !!(_macSettings.toggles || {})[key];
+  return '<div class="settings-row mac-set-row"><label class="mac-set-label" for="mac-set-' + key + '"><b>' + esc(label) + '</b>'
+    + (hint ? '<span class="ui-help">' + esc(hint) + '</span>' : '') + '</label>'
+    + '<label class="theme-toggle"><input type="checkbox" id="mac-set-' + key + '"' + (on ? ' checked' : '')
+    + ' onchange="_macSettingsSend(\'toggle\',\'' + key + '\',this.checked)"><span class="theme-track"><span class="theme-thumb"></span></span></label></div>';
+}
+let _macSettingsDraws = 0;
+function _macSettingsRender() {
+  const host = document.getElementById('mac-settings');
+  if (!host) return;
+  host.dataset.draws = String(++_macSettingsDraws);
+  const s = _macSettings;
+  if (!s) { host.innerHTML = '<p class="ui-help">Loading this Mac\'s settings…</p>'; return; }
+  const sec = (label, body) => '<div class="settings-section-label">' + esc(label) + '</div>' + body + '<div class="settings-sep"></div>';
+  const ws = s.workspaces || [];
+  const wsRows = ws.length ? ws.map(w => {
+    // A name can carry any character (a workspace saved on another Mac syncs here): escJs.
+    const n = "'" + escJs(w.name) + "'";
+    return '<div class="settings-row mac-set-row mac-set-stack"><div class="mac-set-label"><b>' + esc(w.name) + '</b><span class="ui-help">'
+      + esc(w.summary) + (w.open ? ' · open now' : '') + ' · saved ' + esc(w.saved) + '</span></div>'
+      + '<span class="mac-set-actions"><button class="btn primary" onclick="_macSettingsSend(\'open\',' + n + ')">Open</button>'
+      + '<button class="btn" title="Replace with the windows open now" onclick="_macSettingsSend(\'update\',' + n + ')">Update</button>'
+      + '<button class="btn" onclick="_macSettingsSend(\'rename\',' + n + ')">Rename</button>'
+      + '<button class="btn danger" onclick="_macSettingsSend(\'delete\',' + n + ')">Delete</button></span></div>';
+  }).join('') : '<p class="ui-help">No saved workspaces yet. Arrange your windows across your Desktops, then save them here.</p>';
+  const opt = (v, t, cur) => '<option value="' + esc(v) + '"' + (v === cur ? ' selected' : '') + '>' + esc(t) + '</option>';
+  const launch = [['last', 'Reopen the windows from last time'], ['new', 'Open one new window']]
+    .concat(ws.map(w => ['layout:' + w.name, 'Open workspace: ' + w.name])).map(o => opt(o[0], o[1], s.launch)).join('');
+  const split = [['right', 'To the right'], ['below', 'Below'], ['longer', "Along the pane's longer side"]].map(o => opt(o[0], o[1], s.split)).join('');
+  const perms = (s.permissions || []).map(p => {
+    const on = p.state === 'on';
+    return '<div class="settings-row mac-set-row" data-permission="' + esc(p.id || '') + '"><div class="mac-set-label"><b>' + esc(p.name || '') + '</b><span class="ui-help">' + esc(p.for || '') + '</span></div>'
+      + '<span class="mac-perm-state" data-state="' + esc(p.state || '') + '">' + (on ? 'On' : p.state === 'off' ? 'Off' : 'Not set up') + '</span>'
+      + (on ? '' : '<button class="btn" onclick="_macSettingsSend(\'permission\',\'' + escJs(p.id || '') + '\')">Turn On</button>') + '</div>';
+  }).join('');
+  const u = s.update || {};
+  // The app redraws this on every change from any window; a name being typed survives it.
+  const typing = document.getElementById('mac-ws-name');
+  const typed = typing ? typing.value : '', hadFocus = typing && document.activeElement === typing;
+  host.innerHTML =
+    sec('Workspaces', wsRows + '<div class="settings-row mac-set-row"><input class="input" id="mac-ws-name" placeholder="Name this workspace, e.g. Morning triage"'
+      + ' onkeydown="if(event.key===\'Enter\')_macSettingsSaveWs()"><button class="btn primary" id="mac-ws-save" onclick="_macSettingsSaveWs()">Save current windows</button></div>')
+    + sec('Computer use', _macToggleRow('computerUse', "Let workers use this Mac's apps",
+      "In the background, with their own cursor: your pointer and keyboard stay yours. Each worker may use only the apps you approve for it (AMUX_MAC_APPS in its Scope tab); terminals, password managers and System Settings stay off limits. ⌘⇧Esc stops it from any app. Now: " + (s.computerUseNow || '') + '.'))
+    + sec('Permissions', perms || '<p class="ui-help">No permissions to show.</p>')
+    + sec('Quick Ask', _macToggleRow('quickAsk', '⌥Space asks a worker from any app', 'A small panel to send a worker a message, with the window you were in or the text you selected attached if you want.'))
+    + sec('When amux opens', '<div class="settings-row mac-set-row"><select class="input" id="mac-set-launch" onchange="_macSettingsSend(\'launch\',\'\',this.value)">' + launch + '</select></div>'
+      + _macToggleRow('openAtLogin', 'Open amux at login', 'So a restart comes back to your windows on their Desktops. Now: ' + (s.openAtLoginNow || '') + '.')
+      + '<p class="ui-help">Each window goes back to its display and Desktop (' + (s.spacesCanMove ? 'available on this Mac' : 'not available on this macOS, so windows open on the current Desktop') + ').</p>')
+    + sec('Windows', _macToggleRow('menuBar', 'Show in menu bar', 'The amux icon, with who needs you, new windows, recording, computer use, pins and workspaces.')
+      + _macToggleRow('notifications', 'Notifications', 'Each new item waiting on you, and Messages addressed to you.')
+      + _macToggleRow('dockBadge', 'Show count on Dock icon', 'The number of items waiting on you.')
+      + _macToggleRow('zoomAllWindows', 'Zoom all windows together', 'Zooming one window zooms every amux window.')
+      + _macToggleRow('snapToGrid', 'Snap windows to a grid', 'While you drag, an outline shows where the window lands. Hold Option to place it freely.')
+      + '<div class="settings-row mac-set-row"><label class="mac-set-label" for="mac-set-split"><b>Split opens the new pane</b></label><select class="input" id="mac-set-split" onchange="_macSettingsSend(\'splitDirection\',\'\',this.value)">' + split + '</select></div>')
+    + sec('Updates', '<div class="settings-row mac-set-row mac-set-stack"><div class="mac-set-label"><b>This app: ' + esc(u.built || '') + '</b><span class="ui-help" id="mac-upd-status" data-state="' + esc(u.state || '') + '">'
+      + esc(u.detail || 'Check whether a newer build is out.') + '</span></div><span class="mac-set-actions">'
+      + (u.canInstall ? '<button class="btn primary" id="mac-upd-install" onclick="_macSettingsSend(\'update-install\')"' + (u.busy ? ' disabled' : '') + '>Update and Relaunch</button>' : '')
+      + '<button class="btn" id="mac-upd-check" onclick="_macSettingsSend(\'update-check\')"' + (u.busy ? ' disabled' : '') + '>Check for Updates</button></span></div>')
+    + '<div class="settings-section-label">Server</div><div class="settings-row mac-set-row"><div class="mac-set-label"><b>' + esc(s.server || 'not connected') + '</b><span class="ui-help">Every window connects here.</span></div>'
+      + '<button class="btn" onclick="_macSettingsSend(\'server\')">Change…</button></div>';
+  const again = document.getElementById('mac-ws-name');
+  if (again && typed) again.value = typed;
+  if (again && hadFocus) again.focus();
+}
+function _macSettingsSaveWs() {
+  const i = document.getElementById('mac-ws-name');
+  const v = i && i.value.trim();
+  if (v) { i.value = ''; _macSettingsSend('save', v); }
+}
 function _settingsTab(name) {
   if (name === 'integrations') setTimeout(() => { _chatgptAppLoad(); }, 0);
+  if (name === 'mac') { _macSettingsTabSync(); _macSettingsRender(); _macSettingsSend('state'); }
   const menu = document.getElementById('settings-menu');
   if (!menu) return;
   menu.querySelectorAll('.settings-tab-btn').forEach(b =>
@@ -59503,9 +62571,11 @@ function toggleSettings() {
   const open = menu.classList.toggle('open');
   if(!open) closeSettings();
   if (open) {
+    _macSettingsTabSync();
     // Restore the last-used settings tab (default: account) before painting.
     let savedTab = 'account';
     try { savedTab = localStorage.getItem('amux_settings_tab') || 'account'; } catch (e) {}
+    if (savedTab === 'mac' && !_macSettingsBridge()) savedTab = 'account';
     _settingsTab(savedTab);
     // Load the server-saved caps before painting, so the selects show the real
     // values rather than defaults that then silently change under the user.
@@ -59938,6 +63008,53 @@ async function sendTestAlert(btn) {
   } catch(e) { if (st) st.textContent = 'Error: ' + e.message; }
   if (btn) btn.disabled = false;
 }
+
+// Settings opens INSIDE the window, wherever the gear is. On a wide screen the
+// menu hung under the gear, so when the Needs-you approvals above the header
+// pushed the gear down (777px in an 832px Mac app window, 2026-11-25) the menu
+// started 55px from the bottom and the owner could not open Settings at all.
+// Under the gear when there is room for most of it, else beside the gear from
+// the top, so the gear stays clickable. A phone keeps its own CSS placement.
+function _settingsPlace() {
+  const menu = document.getElementById('settings-menu');
+  if (!menu) return;
+  const st = menu.style;
+  // The menu lives in the sticky header, whose stacking level (40) is under
+  // the held-email strip's (90): wherever they overlap the strip painted over
+  // the menu. While Settings is open the header sits above the strip, still
+  // under the overlays (100+, AF-390).
+  const header = menu.closest('.header-row');
+  if (!menu.classList.contains('open') || window.matchMedia('(max-width: 600px)').matches) {
+    st.position = st.top = st.right = st.maxHeight = st.maxWidth = '';
+    if (header) header.style.zIndex = '';
+    return;
+  }
+  if (header) header.style.zIndex = '95';
+  const vh = window.innerHeight, vw = document.documentElement.clientWidth;
+  const btn = document.getElementById('settings-btn');
+  const r = btn ? btn.getBoundingClientRect() : null;
+  const seen = r && r.width > 0 && r.bottom > 0 && r.top < vh;
+  // Below the in-page tab bar when there is one.
+  const floor = 8 + (parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--chrome-tab-h')) || 0);
+  let top = floor, right = 12;
+  if (seen && vh - r.bottom - 18 >= Math.min(480, vh * 0.6)) { top = r.bottom + 6; right = vw - r.right; }
+  else if (seen) { right = Math.max(8, vw - r.left + 8); }
+  st.position = 'fixed';
+  st.top = Math.round(top) + 'px';
+  st.right = Math.round(right) + 'px';
+  st.maxHeight = Math.max(200, Math.round(vh - top - 12)) + 'px';
+  st.maxWidth = Math.max(260, Math.min(440, Math.round(vw - right - 8))) + 'px';
+}
+(function _settingsPlaceWatch() {
+  const go = () => {
+    const menu = document.getElementById('settings-menu');
+    if (!menu) return;
+    new MutationObserver(_settingsPlace).observe(menu, { attributes: true, attributeFilter: ['class'] });
+    window.addEventListener('resize', _settingsPlace);
+    document.addEventListener('scroll', _settingsPlace, { capture: true, passive: true });
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go); else go();
+})();
 
 function closeSettings() {
   document.getElementById('settings-menu').classList.remove('open');
@@ -61041,6 +64158,7 @@ async function _handleDeeplink(hash) {
         return;
       }
       if (attempt < 20) setTimeout(() => tryOpen(attempt + 1), 400);
+      else _peekBootReveal('worker_not_found', target);
     };
     tryOpen(0);
     return;
@@ -61249,6 +64367,7 @@ async function _handleDeeplink(hash) {
       _filesPath = parent;
       switchView('files');
       await openFilePreview(dpath);
+      _fileBootLinkPath = (_fileData && _fileData.path) || null;
       if (edit) {
         const ok = !!(_fileData && _fileData.path && _fileEditable(_fileData));
         if (ok) setFileViewMode('edit');
@@ -61268,11 +64387,8 @@ async function _handleDeeplink(hash) {
 // any open session peek. Bounded to 24h so a days-later open still lands on a
 // sane default rather than a stale heavy tab.
 const _UI_RESTORE_MAX_AGE = 24 * 3600 * 1000;
-// The hashes that name where to land. Restoring the last screen must not run
-// over any of them (both checks below read this one list). reconnect joined it
-// on 2026-11-08: a connector alert's link opened Connectors and its prompt,
-// then the restore reopened the last worker over them.
-const _DEEPLINK_HASH_RE = /^#(?:peek|issue|menu|view|path|edit|browser|bq|task|reconnect)=/;
+// _DEEPLINK_HASH_RE (the hashes that name where to land) is defined above the
+// in-page tab bar, which reads it at load.
 // Set in sessionStorage by a tab's first boot: a later boot of the same tab
 // (a reload, a discarded tab coming back) restores from its own state.
 const _UI_TAB_SEEN_KEY = 'amux_tab_seen';
@@ -67980,17 +71096,8 @@ const _TRASH_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="1
 
 // ── Pinned notes on home screen ──────────────────────────────────────────────
 
-// The CRM / People view was removed (AMUX-2590, Ethan 2026-08-09): its tab,
-// markup, styles and every _crm* function are gone from this client. The
-// serve-time AMUX-FEATURE-FLAGS CSS in static_files.rs stays as the one
-// greppable line to reverse.
-//
-// This comment used to add "the /api/crm endpoints still exist for agents".
-// That was FALSE when written: the routes went with the python server at
-// 792ce1f, so POST /api/crm/contacts answered 405 and GET /api/crm answered
-// 404, while 308 contacts sat in the tables migrations kept maintaining. It is
-// true now only because AMUX-2929 ported them back — the comment was a claim
-// about another file, and nothing checks those (ethos rule 6).
+// The CRM / People view was removed on 2026-08-09 (AMUX-2590) and came back on
+// 2026-11-23 as the CRM tab (docs/design/crm.md; search "── CRM tab").
 
 // ── Gmail Inbox tab ────────────────────────────────────────────────────────────
 let _gmailAccounts = [];
@@ -69853,6 +72960,9 @@ async function _bwImportProfile() {
   html += '</div>';
   html += '<div style="margin-top:var(--space-1);"><label style="font-size:var(--fs-md);font-weight:500;">Destination profile name</label>';
   html += '<input id="bwi-dest" class="bw-in" style="width:100%;box-sizing:border-box;margin-top:var(--space-1);" placeholder="e.g. chrome-default" value="imported-chrome"></div>';
+  // Per site, as Athena imports: only the sign-ins a profile needs, not a whole browser's.
+  html += '<div class="bwi-sites-row"><label for="bwi-sites" class="bwi-sites-label">Only these sites <span class="bwi-sites-hint">(optional, comma-separated)</span></label>';
+  html += '<input id="bwi-sites" class="bw-in bwi-sites-input" placeholder="e.g. github.com, linear.app" value=""></div>';
 
   var ok = await showFormModal('Import browser profile', html, 'Import');
   if (!ok) return;
@@ -69864,6 +72974,7 @@ async function _bwImportProfile() {
   var profileName = parts[1];
   var dest = (document.getElementById('bwi-dest') || {}).value || '';
   dest = dest.trim();
+  var sites = ((document.getElementById('bwi-sites') || {}).value || '').split(/[\s,]+/).map(function (x) { return x.trim(); }).filter(Boolean);
   if (!dest) { showToast('Destination name is required'); return; }
 
   _bwStatus('Importing cookies...');
@@ -69871,7 +72982,7 @@ async function _bwImportProfile() {
     var r = await fetch('/api/browser/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ browser_id: browserId, profile_name: profileName, destination: dest })
+      body: JSON.stringify({ browser_id: browserId, profile_name: profileName, destination: dest, sites: sites })
     });
     var d = await r.json();
     if (d.error) {
@@ -69879,8 +72990,8 @@ async function _bwImportProfile() {
       _bwStatus('Import failed');
       return;
     }
-    var msg = 'Imported ' + d.imported_cookies + ' cookies into profile "' + esc(d.profile) + '"';
-    if (d.skipped_cookies) msg += ' (' + d.skipped_cookies + ' skipped)';
+    var msg = 'Imported ' + d.imported_cookies + ' cookies' + (sites.length ? ' for ' + sites.join(', ') : '') + ' into profile "' + esc(d.profile) + '"';
+    if (d.skipped_cookies) msg += ' (' + d.skipped_cookies + (sites.length ? ' for other sites left out)' : ' skipped)');
     showToast(msg);
     _bwStatus(msg);
     await _bwLoadProfiles();
@@ -77914,17 +81025,87 @@ function _cmdkLocal() {
     ...(l.pin || []), ...(l.connector || []), ...(l.skill || []), ...(l.secret || []), ...(l.payment || [])];
 }
 
-// What you opened from here, and how often: { "kind:id": [count, lastMs, title] }.
-function _cmdkUsage() {
+// ── Where you went (owner, 2026-11-23) ──
+// Every worker, tab, file, group and card you open, from anywhere (not only
+// from here), kept on the server so the phone and the Mac share it
+// (api/palette_history.rs), plus which result you chose for what you typed.
+// { "kind:id": [count, lastMs, title] } and { query: { "kind:id": [picks, lastMs] } }.
+const _NAV = { usage: null, picks: {}, loadedAt: 0, loading: null, bootAt: Date.now(), last: {} };
+const _NAV_BOOT_MS = 3000;   // the page restoring its last view and worker is not a visit
+function _navLocalUsage() {
   try { return JSON.parse(localStorage.getItem(_CMDK_USAGE_KEY) || '{}') || {}; } catch (e) { return {}; }
+}
+function _navLoad(force) {
+  if (_NAV.loading) return _NAV.loading;
+  if (!force && _NAV.usage && Date.now() - _NAV.loadedAt < 60_000) return Promise.resolve();
+  _NAV.loading = fetch(API + '/api/palette/history', { headers: _authHeaders(), signal: AbortSignal.timeout(8000) })
+    .then(r => r.ok ? r.json() : Promise.reject(new Error('palette history ' + r.status)))
+    .then(d => {
+      const u = {}, p = {};
+      for (const v of d.visits || []) u[v.kind + ':' + v.id] = [v.visits, v.last_at, v.title];
+      for (const v of d.picks || []) (p[v.query] = p[v.query] || {})[v.kind + ':' + v.id] = [v.picks, v.last_at];
+      // A browser's history from before the server kept it goes up once.
+      const old = _navLocalUsage();
+      if (!Object.keys(u).length && Object.keys(old).length) {
+        const visits = Object.entries(old).map(([k, e]) => { const kind = k.split(':')[0]; return { kind, id: k.slice(kind.length + 1), title: e[2] || '', visits: e[0], last_at: e[1] }; });
+        fetch(API + '/api/palette/history/import', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify({ visits }) })
+          .catch(e => console.warn('[amux] palette history import failed', e));
+        Object.assign(u, old);
+      }
+      // A visit or a pick made while this read was in flight is kept.
+      for (const [k, e] of Object.entries(_NAV.usage || {})) if (!u[k] || u[k][1] < e[1]) u[k] = e;
+      for (const [q, hits] of Object.entries(_NAV.picks || {})) for (const [k, e] of Object.entries(hits)) {
+        const pq = (p[q] = p[q] || {});
+        if (!pq[k] || pq[k][1] < e[1]) pq[k] = e;
+      }
+      _NAV.usage = u; _NAV.picks = p; _NAV.loadedAt = Date.now();
+    })
+    .catch(e => { console.warn('[amux] palette history unavailable; using this browser\'s', e); if (!_NAV.usage) _NAV.usage = _navLocalUsage(); })
+    .finally(() => { _NAV.loading = null; });
+  return _NAV.loading;
+}
+// Read once the page has settled, so Cmd-K's first frame already has Recent.
+setTimeout(() => { _navLoad(); }, _NAV_BOOT_MS);
+// One open of kind:id, from anywhere. `query` is what was typed in Cmd-K, when
+// it was chosen there. The same thing again within 30 s is the same visit.
+function _navVisit(kind, id, title, query) {
+  if (!kind || !id) return;
+  const now = Date.now(), k = kind + ':' + id;
+  if (!query && now - _NAV.bootAt < _NAV_BOOT_MS) return;
+  if (!query && now - (_NAV.last[k] || 0) < 30_000) return;
+  _NAV.last[k] = now;
+  const u = _NAV.usage || (_NAV.usage = _navLocalUsage()), prev = u[k] || [0, 0, ''];
+  u[k] = [prev[0] + 1, now, title || prev[2]];
+  const q = String(query || '').trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 40);
+  if (q) { const pq = (_NAV.picks[q] = _NAV.picks[q] || {}), pp = pq[k] || [0, 0]; pq[k] = [pp[0] + 1, now]; }
+  fetch(API + '/api/palette/visit', { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ kind, id: String(id), title: String(title || ''), query: q }), keepalive: true })
+    .then(r => { if (!r.ok) console.warn('[amux] palette visit not recorded', r.status); })
+    .catch(e => console.warn('[amux] palette visit not recorded', e));
+}
+// What you opened, and how often: { "kind:id": [count, lastMs, title] }.
+function _cmdkUsage() {
+  return _NAV.usage || _navLocalUsage();
+}
+// What you chose before for this query, or for a longer one it starts (typing
+// "de" on the way to "dec"): up to +900 over every match tier, a month halving it.
+function _cmdkPickBoost(q, it) {
+  if (!q || q.length < 2) return 0;
+  const k = it.kind + ':' + it.id;
+  let best = 0;
+  for (const [pq, hits] of Object.entries(_NAV.picks || {})) {
+    if (pq !== q && !pq.startsWith(q)) continue;
+    const e = hits[k];
+    if (!e) continue;
+    const days = Math.max(0, Date.now() - e[1]) / 86_400_000;
+    best = Math.max(best, Math.round(Math.min(900, 300 * Math.log2(1 + e[0])) * Math.pow(0.5, days / 30)) * (pq === q ? 1 : 0.8));
+  }
+  return best;
 }
 
 function _cmdkRecord(r) {
   if (!r.id || r.kind === 'more' || r.kind === 'hidden') return;
-  const u = _cmdkUsage(), k = r.kind + ':' + r.id, prev = u[k] || [0, 0, ''];
-  u[k] = [prev[0] + 1, Date.now(), r.title];
-  const keep = Object.entries(u).sort((a, b) => b[1][1] - a[1][1]).slice(0, 60);
-  try { localStorage.setItem(_CMDK_USAGE_KEY, JSON.stringify(Object.fromEntries(keep))); } catch (e) {}
+  _navVisit(r.kind, r.id, r.title, _cmdk.q);
 }
 
 // Up to +200 for something opened often and lately; a week halves it.
@@ -78057,8 +81238,9 @@ function _cmdkCompute() {
       const m = _cmdkMatch(it, q, toks);
       if (!m) continue;
       if (it.archived && !_cmdk.hidden) { _cmdk.hiddenLocal++; continue; }
-      scored.push([{ ...it, tier: m.tier, match: m.match,
-        snippet: m.match === 'body' ? _cmdkSnippet(String(it.body), toks) : '' }, m.tier * 10000 + _cmdkBoost(it, m, u)]);
+      const pick = _cmdkPickBoost(q, it);
+      scored.push([{ ...it, tier: m.tier, match: pick ? 'learned' : m.match,
+        snippet: m.match === 'body' ? _cmdkSnippet(String(it.body), toks) : '' }, (pick ? 60000 + pick : m.tier * 10000) + _cmdkBoost(it, m, u)]);
     }
     // A file you pinned shows once, as the pin.
     const pinned = new Set(scored.filter(([it]) => it.kind === 'pin' && it.body).map(([it]) => it.body));
@@ -78072,7 +81254,9 @@ function _cmdkCompute() {
       const it = { kind: h.kind, id: h.id, title: h.title, status: h.kind === 'file' ? '' : h.status, session: h.session, archived: h.archived,
         sub,
         tier, match: h.match || '', snippet: h.snippet || '' };
-      scored.push([it, tier * 10000 + (h.boost || 0) + _cmdkContext(it) + _cmdkFrecency(u, it)]);
+      const pick = _cmdkPickBoost(q, it);
+      if (pick) it.match = 'learned';
+      scored.push([it, (pick ? 60000 + pick : tier * 10000) + (h.boost || 0) + _cmdkContext(it) + _cmdkFrecency(u, it)]);
     }
     all = scored.sort((a, b) => b[1] - a[1]).slice(0, 40).map(([it]) => it);
   }
@@ -78235,6 +81419,7 @@ function openCmdk() {
   _cmdkRender();
   inp.focus();
   _cmdkLoadLists().then(() => { if (ov.classList.contains('active')) _cmdkRender(); });
+  _navLoad().then(() => { if (ov.classList.contains('active')) _cmdkRender(); });
 }
 
 function closeCmdk() {
@@ -78355,6 +81540,8 @@ const _HK_ACTIONS = {
   open_hotkeys: { label: 'Open Hotkeys', desc: 'Come back to this tab', ico: '⌘', tone: 'gray', run: () => switchView('hotkeys') },
   go_back: { label: 'Back', desc: 'Go back to the previous tab, worker, card or file', ico: '‹', tone: 'gray', run: () => navBack() },
   go_forward: { label: 'Forward', desc: 'Go forward again after going back', ico: '›', tone: 'gray', run: () => navForward() },
+  key_mode: { label: 'Key mode', desc: 'In a worker: arrows, Enter, Esc, Tab, Space, Backspace and y/n/1/2/3 go to the worker until you type something else',
+    ico: '⌨', tone: 'blue', run: () => _kmToggle() },
 };
 // Shortcuts bound elsewhere in amux. Shown so this tab is the whole map, and
 // so a new hotkey cannot silently shadow one of them.
@@ -78380,6 +81567,9 @@ const _HK_DEFAULTS = [
   { id: 'hk-back', action: 'go_back', type: 'keys', trigger: 'Mod+[', enabled: true, remove: true, indicator: false },
   { id: 'hk-forward', action: 'go_forward', type: 'keys', trigger: 'Mod+]', enabled: true, remove: true, indicator: false },
   { id: 'hk-record', action: 'record', type: 'keys', trigger: 'Alt+Shift+R', enabled: true, remove: true, indicator: false },
+  // ⌃; on a Mac (⌘; is taken by the system spelling menu), Ctrl+; elsewhere.
+  { id: 'hk-key-mode', action: 'key_mode', type: 'keys', trigger: /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '') ? 'Ctrl+;' : 'Mod+;',
+    enabled: true, remove: true, indicator: false },
 ];
 let _hkList = _HK_DEFAULTS.map(h => Object.assign({}, h));
 let _hkLoaded = false;
@@ -78714,6 +81904,7 @@ function _hkOpenDialog(id) {
     + '<button type="button" class="btn" id="hk-record" onclick="_hkRecord()">Record shortcut</button></div>'
     + '<span class="ui-help" id="hk-trigger-help"></span></div>'
     + '<label class="sx-check" id="hk-remove-row"><input type="checkbox" id="hk-remove"><span><b>Remove the trigger text</b><span class="ui-help">Delete the typed trigger (like ##) when it fires</span></span></label>'
+    + '<label class="sx-check" id="hk-km-idle-row"><input type="checkbox" id="hk-km-idle"><span><b>Turn off after ' + (_KM_IDLE_MS / 1000) + ' seconds without a key</b><span class="ui-help">Off: key mode stays on until you press the shortcut again, type, or close the worker</span></span></label>'
     + '<label class="sx-check"><input type="checkbox" id="hk-indicator"><span><b>Show a small indicator</b><span class="ui-help">A short toast when it fires</span></span></label>'
     + '<div class="hk-modal-foot">'
     + (src ? '<button class="btn danger" onclick="_hkDelete()">' + (_HK_DEFAULTS.some(d => d.id === src.id) ? 'Remove' : 'Delete') + '</button>' : '')
@@ -78725,7 +81916,9 @@ function _hkOpenDialog(id) {
   ov.querySelector('#hk-trigger').value = e.trigger;
   ov.querySelector('#hk-remove').checked = !!e.remove;
   ov.querySelector('#hk-indicator').checked = !!e.indicator;
+  ov.querySelector('#hk-km-idle').checked = e.idle_off !== false;
   ov.querySelectorAll('input[name="hk-type"]').forEach(r => r.addEventListener('change', _hkTypeUI));
+  ov.querySelector('#hk-action').addEventListener('change', _hkTypeUI);
   _hkTypeUI();
   ov.classList.add('active');
   setTimeout(() => ov.querySelector('#hk-action').focus(), 0);
@@ -78735,6 +81928,7 @@ function _hkTypeUI() {
   document.getElementById('hk-trigger-label').textContent = text ? 'Text trigger' : 'Shortcut';
   document.getElementById('hk-record').hidden = text;
   document.getElementById('hk-remove-row').style.display = text ? '' : 'none';
+  document.getElementById('hk-km-idle-row').style.display = document.getElementById('hk-action').value === 'key_mode' ? '' : 'none';
   const act = _HK_ACTIONS[document.getElementById('hk-action').value];
   document.getElementById('hk-action').title = act ? act.desc : '';
   document.getElementById('hk-record').style.display = text ? 'none' : '';
@@ -78783,6 +81977,8 @@ async function _hkSaveDialog() {
     remove: document.getElementById('hk-remove').checked,
     indicator: document.getElementById('hk-indicator').checked,
   });
+  if (next.action === 'key_mode') next.idle_off = document.getElementById('hk-km-idle').checked;
+  else delete next.idle_off;
   delete next.isNew;
   const why = _hkConflict(next, _hkList);
   const t = document.getElementById('hk-trigger');

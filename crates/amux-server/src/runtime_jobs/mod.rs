@@ -45,6 +45,8 @@
 
 pub mod autofix;
 pub mod board_drain;
+pub mod pickup_admission;
+pub mod pickup_receipt_admission;
 pub mod board_drive;
 pub mod board_hygiene;
 pub mod browser_login_sync;
@@ -81,6 +83,7 @@ pub mod task_titles;
 pub mod desc_refresh;
 pub mod email_events;
 pub mod linkedin_events;
+pub mod crm_watch;
 pub mod event_dispatch;
 pub mod host_guard;
 pub mod host_metrics;

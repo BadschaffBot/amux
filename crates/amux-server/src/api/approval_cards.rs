@@ -49,7 +49,7 @@ use super::AppState;
 pub const MODE_ENV: &str = "AMUX_APPROVAL_CARDS";
 const CREATOR: &str = "approval-cards";
 /// Kinds a standing approval can answer.
-const REMEMBERABLE: [&str; 3] = ["email", "grant", "publish"];
+const REMEMBERABLE: [&str; 4] = ["email", "grant", "publish", "chat"];
 
 static STORE: OnceLock<crate::db::SharedStore> = OnceLock::new();
 
@@ -652,6 +652,7 @@ pub fn remember_in(conn: &Connection, link: &Link, granted_by: &str, until: Opti
     }
     let (category, allowed, amount) = match link.kind.as_str() {
         "email" => ("customer_outbound", format!("{worker} may email {} without asking", key.trim_start_matches("to:")), None),
+        "chat" => ("customer_outbound", format!("{worker} may post into {} without asking", key.trim_start_matches("chat:")), None),
         "grant" => {
             let amt = link.meta["amount_usd"].as_f64();
             ("budget", format!("{worker} may charge {} up to ${:.2} without asking",
@@ -703,6 +704,19 @@ pub async fn dispatch(state: &AppState, headers: HeaderMap, link: &Link, approve
                 super::email::reject(axum::Extension(ctx), headers, AxPath(id), b).await
             }
         }
+        "chat" => {
+            let by = super::human_proof::proven(&headers).map(|p| p.actor()).unwrap_or_else(|| "unproven".into());
+            let r = if approve { crate::bridge::approve_by(state, &id, &by).await } else { crate::bridge::reject(state, &id, &by).await };
+            match r {
+                Ok(v) => Json(v).into_response(),
+                Err(e) => bad(StatusCode::NOT_FOUND, &e),
+            }
+        }
+        "social" => match id.parse::<i64>() {
+            Ok(n) => super::social_publish::decide(state, &headers, n, approve, body.get("reason").and_then(Value::as_str).map(str::to_string)).await,
+            Err(_) => bad(StatusCode::BAD_REQUEST, &format!("{id} is not a social queue id")),
+        },
+        "outbound" => super::outbound::decide(state, &headers, &id, approve, body.get("reason").and_then(Value::as_str).map(str::to_string)).await,
         "grant" => {
             if approve {
                 super::grants::approve(headers, AxPath(id)).await
@@ -739,7 +753,11 @@ pub async fn dispatch(state: &AppState, headers: HeaderMap, link: &Link, approve
                 resolved("capability", &id, "rejected", &by, reason).await;
                 return Json(json!({"ok": true, "rejected": link.approval_ref})).into_response();
             }
-            let Some(write) = link.meta.get("grant").filter(|g| g.is_object()).cloned() else {
+            // A time-boxed grant starts when the owner approves, not when it was asked.
+            let fresh = (cap == "mac_outside")
+                .then(|| super::capabilities::grant_write(&crate::integrations::browser::amux_home(), lane, cap, ""))
+                .flatten();
+            let Some(write) = fresh.or_else(|| link.meta.get("grant").filter(|g| g.is_object()).cloned()) else {
                 return (StatusCode::CONFLICT, Json(json!({"ok": false, "code": "grant_by_hand",
                     "error": format!("granting '{cap}' to {lane} is not a single setting"),
                     "next": link.meta.get("hint").cloned().unwrap_or(Value::Null)}))).into_response();
@@ -1020,6 +1038,11 @@ pub fn annotate_in(conn: &Connection, items: &mut Vec<Value>) {
         let card = it["card"].as_str().unwrap_or("").to_string();
         if let Some(l) = links.iter().find(|l| l.card_id.as_deref() == Some(card.as_str())) {
             it["approval"] = approval(l);
+            // The whole held message (api/outbound.rs context), so the owner
+            // decides from the full text, the reason and what it answers.
+            if l.meta.get("outbound").is_some_and(Value::is_object) {
+                it["outbound"] = l.meta["outbound"].clone();
+            }
         }
     }
 }

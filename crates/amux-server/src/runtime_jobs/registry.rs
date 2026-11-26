@@ -101,6 +101,7 @@ pub mod ids {
     pub const EVENT_DISPATCH: &str = "event-dispatch";
     pub const EMAIL_EVENTS: &str = "email-events";
     pub const LINKEDIN_EVENTS: &str = "linkedin-events";
+    pub const CRM_WATCH: &str = "crm-watch";
     pub const ORCH_RUNTIME: &str = "orchestrator-runtime";
     pub const EVENT_PROCESSORS: &str = "event-processors";
     pub const SCAN: &str = "terminal-scan";
@@ -218,6 +219,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::EVENT_DISPATCH,
     ids::EMAIL_EVENTS,
     ids::LINKEDIN_EVENTS,
+    ids::CRM_WATCH,
     ids::STATUS_HISTORY,
     ids::BROWSER_LOGIN_SYNC,
     ids::CONNECTOR_MAINTENANCE,
@@ -921,6 +923,14 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/subscriptions/catalog"),
     },
     Doc {
+        id: ids::CRM_WATCH,
+        name: "CRM watch and capture",
+        purpose: "Every 2 minutes, fetches each watched public page in the CRM that is due (a company's website or careers page, on its own check interval) and emits crm.channel.changed when it shows lines it did not before; then attaches new email.received and linkedin.message_received events, and delivered sends in the sent-mail log, to the people they are from or to, emitting crm.contact.replied for inbound. Social profiles are checked by workers, which report through /api/crm/channels/<id>/observed.",
+        env: &[EnvControl { var: "AMUX_CRM_WATCH_SECS", effect: "seconds between passes, default 120; 0 stops CRM watching and capture", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/crm/channels?watch=1"),
+    },
+    Doc {
         id: ids::DESC_REFRESH,
         name: "Worker descriptions",
         purpose: "Keeps each worker's description (CC_DESC, which peers route by) current with how it is used. Hourly, a few non-isolated, non-archived, non-paused workers with new owner messages or closed cards since their last check (at most daily) are read against their description; the helper model answers KEEP or a replacement in the same style. A replacement keeps the old text (Revert in Configuration), is marked auto, and refreshes the peer rosters. A locked description (CC_DESC_LOCK=1, set by the owner's own edit) is never changed.",
@@ -940,6 +950,7 @@ pub const CATALOG: &[Doc] = &[
             EnvControl { var: "AMUX_HOST_GUARD_SECS", effect: "0 disables the guard (no level, nothing deferred, nothing reniced)", off: Some("0") },
             EnvControl { var: "AMUX_HOST_LOAD_STRAINED", effect: "load per core (5-min avg) that is strained, default 1.5", off: None },
             EnvControl { var: "AMUX_HOST_LOAD_CRITICAL", effect: "load per core (5-min avg) that is critical, default 2.5", off: None },
+            EnvControl { var: "AMUX_HOST_DEFER_FLOOR_MIN", effect: "minutes a schedule held through a critical host waits before it fires anyway, one per tick, default 30", off: Some("0") },
             EnvControl { var: "AMUX_HOST_DISK_STRAINED_GB", effect: "free GiB on the amux home volume that is strained, default 40", off: None },
             EnvControl { var: "AMUX_HOST_DISK_CRITICAL_GB", effect: "free GiB that is critical, default 10", off: None },
             EnvControl { var: "AMUX_RUNAWAY_MIN_SECS", effect: "age before a worker tool process can be a runaway, default 900", off: None },
