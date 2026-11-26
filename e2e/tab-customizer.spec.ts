@@ -6,7 +6,7 @@ import { test, expect } from '@playwright/test';
 // each project now gets, happens right where these tests call page.evaluate.
 // The result was "Execution context was destroyed, most likely because of a
 // navigation" on a spec about CSS geometry: a red that says nothing about the
-// menu it is guarding. sw-fail-bar.spec.ts owns the worker's real behaviour.
+// menu it is guarding. sw-offline-notice.spec.ts owns the worker's real behaviour.
 test.use({ serviceWorkers: 'block' });
 
 // Ethan, 2026-08-13: "I still can't view the tabs when I click the box which was
@@ -18,6 +18,21 @@ test.use({ serviceWorkers: 'block' });
 // The customizer is static markup, so it needs a visible overlay, not a live worker —
 // openPeek() is called directly rather than seeding a session the harness has none of.
 async function openPeek(page) {
+  // SUPPRESS THE WALKTHROUGH (AMUX-4986). `_wtMaybeStart` opens it 1500ms
+  // after load when `sessions.length === 0` and this key is unset. Every CI
+  // project gets an isolated server with a clean home and therefore NO
+  // workers, so that is the normal state there and never the normal state on
+  // a dev box with a live fleet — which is why this passed locally and died
+  // in CI. The tooltip covers the button and `locator.click` retries against
+  // it until the entire test budget is gone.
+  //
+  // Verbatim from the e2e-shards(4) trace on b08e1802:
+  //   locator.click: Test timeout of 90000ms exceeded
+  //     - <div id="wt-tooltip">…</div> intercepts pointer events
+  //
+  // Reproduced locally by stubbing /api/sessions to [] and waiting past
+  // 1500ms; fixed by this line, same probe, 3 passed.
+  await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).openPeek === 'function', { timeout: 20000 });
   await page.evaluate(() => (window as any).openPeek('e2e-probe'));
@@ -113,6 +128,9 @@ test('the customizer button is reachable without scrolling the tab strip', async
 // position:absolute under a bar with overflow-x:auto. Verifying one menu and
 // reporting "the tab customizer works" is how the wrong control gets cleared.
 test('the GLOBAL tab customizer opens and its rows are visible on screen', async ({ page }, info) => {
+  // Same walkthrough suppression as openPeek (AMUX-4986): CI's empty fleet
+  // opens #wt-overlay over this button too, and the click retries until timeout.
+  await page.addInitScript(() => localStorage.setItem('amux_walkthrough_done', '1'));
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any).toggleTabCustomizer === 'function',
                              { timeout: 20000 });
@@ -163,3 +181,35 @@ test('the GLOBAL tab customizer opens and its rows are visible on screen', async
 
   await page.screenshot({ path: `../test-results/tabcust-global-${info.project.name}.png` });
 });
+
+// DASHBOARD ZOOM (Ethan, 2026-09-26: "i click this it doesnt appear"). The
+// desktop zoom setting puts CSS `zoom` on <html>, and an inline left/top on the
+// fixed menu is multiplied by it while the button's rect is not. At 120% the
+// menu drew at x=1333 in a 1280px window, which is exactly what his
+// tabcust-geo beacons recorded. Every test above runs at 100%, where the two
+// coordinate systems coincide, so none of them could see it. Touch devices
+// scale font-size instead of zoom, so this only applies with a fine pointer.
+for (const zoom of [90, 120, 150]) {
+  test(`the tab customizer hangs under its button at ${zoom}% dashboard zoom`, async ({ page }) => {
+    const coarse = await page.evaluate(() => matchMedia('(pointer: coarse)').matches);
+    test.skip(coarse, 'touch devices scale font-size, not CSS zoom');
+    const vp = page.viewportSize()!;
+    test.skip(vp.width <= 600, 'the phone layout is a bottom sheet with no anchor');
+    await page.addInitScript(z => localStorage.setItem('amux_zoom', String(z)), zoom);
+    await openPeek(page);
+    await page.locator('#peek-tab-customize').click();
+    await expect(page.locator('#peek-tab-customizer-menu')).toBeVisible();
+    const g = await page.evaluate(() => {
+      const b = document.getElementById('peek-tab-customize')!.getBoundingClientRect();
+      const m = document.getElementById('peek-tab-customizer-menu')!.getBoundingClientRect();
+      return { b: [b.left, b.top, b.right, b.bottom], m: [m.left, m.top, m.right, m.bottom], vw: innerWidth, vh: innerHeight };
+    });
+    const [ml, mt, mr] = g.m;
+    expect(ml, `menu off-screen left: ${JSON.stringify(g)}`).toBeGreaterThanOrEqual(0);
+    expect(mr, `menu off-screen right: ${JSON.stringify(g)}`).toBeLessThanOrEqual(g.vw);
+    expect(mt, `menu below the fold: ${JSON.stringify(g)}`).toBeLessThan(g.vh);
+    // Same presentation as the worker-list ⊞: right edge under the button's.
+    expect(Math.abs(mr - g.b[2]), `menu not aligned under ⊞: ${JSON.stringify(g)}`).toBeLessThan(6);
+    expect(Math.abs(mt - g.b[3]), `menu not directly under ⊞: ${JSON.stringify(g)}`).toBeLessThan(12);
+  });
+}

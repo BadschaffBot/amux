@@ -57,7 +57,9 @@ impl CalendarCtx {
         Arc::new(CalendarCtx {
             publisher,
             registry: integrations::global_registry().clone(),
-            s3_bucket: std::env::var("AMUX_S3_BUCKET").ok().filter(|s| !s.trim().is_empty()),
+            s3_bucket: std::env::var("AMUX_S3_BUCKET")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         })
     }
 }
@@ -69,7 +71,10 @@ pub fn routes() -> Router<AppState> {
 pub fn routes_with(ctx: Arc<CalendarCtx>) -> Router<AppState> {
     Router::new()
         .route("/", get(list).post(create))
-        .route("/{id}", axum::routing::patch(patch_event).delete(delete_event))
+        .route(
+            "/{id}",
+            axum::routing::patch(patch_event).delete(delete_event),
+        )
         .layer(Extension(ctx))
 }
 
@@ -99,7 +104,7 @@ pub(crate) fn query_rows_json(
     params: &[&dyn rusqlite::types::ToSql],
 ) -> rusqlite::Result<Vec<Value>> {
     let mut stmt = conn.prepare(sql)?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let cols: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let rows = stmt.query_map(params, |row| {
         let mut obj = Map::new();
         for (i, name) in cols.iter().enumerate() {
@@ -125,6 +130,20 @@ fn get_event_json(conn: &Connection, id: &str) -> rusqlite::Result<Option<Value>
 /// when no bucket is configured; when a bucket IS configured but the
 /// publisher cannot deliver (the pre-aws-sdk-s3 state), the registry says
 /// so instead of a fake success (RR-0073).
+/// Publish the iCal feed after a calendar write made outside this module
+/// (a dated map pin writes cal_events directly, map_store::sync_event).
+pub(crate) fn publish_feed(state: &AppState) {
+    push_ical_bg(state, &CalendarCtx::new_default());
+}
+
+/// The publish runs behind the response. It reads the store and uploads to S3,
+/// and inline it held the caller and a runtime thread for it: 20 calendar edits
+/// in 7 days averaged 4.7 s, worst 13.5 s (AF-1145).
+fn push_ical_bg(state: &AppState, ctx: &Arc<CalendarCtx>) {
+    let (state, ctx) = (state.clone(), ctx.clone());
+    tokio::task::spawn_blocking(move || push_ical(&state, &ctx));
+}
+
 fn push_ical(state: &AppState, ctx: &CalendarCtx) {
     if ctx.s3_bucket.is_none() {
         return;
@@ -158,7 +177,8 @@ fn push_ical(state: &AppState, ctx: &CalendarCtx) {
         Ok(()) => ctx.registry.set("calendar_s3", IntegrationState::Available),
         Err(e) => {
             tracing::warn!(error = %e, "ical publish failed");
-            ctx.registry.set("calendar_s3", IntegrationState::Degraded { reason: e });
+            ctx.registry
+                .set("calendar_s3", IntegrationState::Degraded { reason: e });
         }
     }
 }
@@ -190,20 +210,35 @@ pub async fn create(
     Extension(ctx): Extension<Arc<CalendarCtx>>,
     Json(body): Json<Value>,
 ) -> Response {
-    let get_trim =
-        |k: &str| body.get(k).and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+    let get_trim = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
     let title = get_trim("title");
     let start = get_trim("start");
     if title.is_empty() || start.is_empty() {
-        return err(StatusCode::BAD_REQUEST, json!({ "error": "title and start are required" }));
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "title and start are required" }),
+        );
     }
     // Python: `body.get("end") or None` — falsy strings become NULL.
     let opt = |k: &str| -> Option<String> {
-        body.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(String::from)
+        body.get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
     };
     let all_day = body.get("all_day").map(truthy).unwrap_or(false) as i64;
-    let (end, location, description, rrule) =
-        (opt("end"), opt("location"), opt("description"), opt("rrule"));
+    let (end, location, description, rrule) = (
+        opt("end"),
+        opt("location"),
+        opt("description"),
+        opt("rrule"),
+    );
 
     let slot: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -224,7 +259,7 @@ pub async fn create(
         .await;
     match write {
         Ok(_) => {
-            push_ical(&state, &ctx); // events drive the external calendar feed
+            push_ical_bg(&state, &ctx); // events drive the external calendar feed
             let row = slot.lock().expect("slot").take().unwrap_or(Value::Null);
             Json(row).into_response() // Python answers 200, not 201
         }
@@ -237,8 +272,15 @@ use super::py_truthy as truthy;
 
 // ---- PATCH /api/cal-events/{id} -------------------------------------------
 
-const PATCH_ALLOWED: [&str; 7] =
-    ["title", "start", "end", "all_day", "location", "description", "rrule"];
+const PATCH_ALLOWED: [&str; 7] = [
+    "title",
+    "start",
+    "end",
+    "all_day",
+    "location",
+    "description",
+    "rrule",
+];
 
 pub async fn patch_event(
     State(state): State<AppState>,
@@ -271,7 +313,10 @@ pub async fn patch_event(
         vals.push(stored);
     }
     if sets.is_empty() {
-        return err(StatusCode::BAD_REQUEST, json!({ "error": "no updatable fields" }));
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "no updatable fields" }),
+        );
     }
 
     let slot: Arc<Mutex<Option<Option<Value>>>> = Arc::new(Mutex::new(None));
@@ -281,8 +326,10 @@ pub async fn patch_event(
         .store
         .write_async(move |conn| {
             let now = chrono::Utc::now().timestamp();
-            let sql =
-                format!("UPDATE cal_events SET {},updated=? WHERE id=?", sets.join(","));
+            let sql = format!(
+                "UPDATE cal_events SET {},updated=? WHERE id=?",
+                sets.join(",")
+            );
             let mut params: Vec<rusqlite::types::Value> = vals;
             params.push(rusqlite::types::Value::Integer(now));
             params.push(rusqlite::types::Value::Text(id_w.clone()));
@@ -291,13 +338,17 @@ pub async fn patch_event(
             *slot_w.lock().expect("slot") = Some(row);
             Ok(WriteOutcome {
                 applied: n > 0,
-                events: if n > 0 { vec![ev(&id_w, MutationKind::Updated)] } else { vec![] },
+                events: if n > 0 {
+                    vec![ev(&id_w, MutationKind::Updated)]
+                } else {
+                    vec![]
+                },
             })
         })
         .await;
     match write {
         Ok(_) => {
-            push_ical(&state, &ctx);
+            push_ical_bg(&state, &ctx);
             match slot.lock().expect("slot").take().flatten() {
                 Some(row) => Json(row).into_response(),
                 None => err(StatusCode::NOT_FOUND, json!({ "error": "not found" })),
@@ -325,13 +376,17 @@ pub async fn delete_event(
             )?;
             Ok(WriteOutcome {
                 applied: n > 0,
-                events: if n > 0 { vec![ev(&id_w, MutationKind::Deleted)] } else { vec![] },
+                events: if n > 0 {
+                    vec![ev(&id_w, MutationKind::Deleted)]
+                } else {
+                    vec![]
+                },
             })
         })
         .await;
     match write {
         Ok(_) => {
-            push_ical(&state, &ctx);
+            push_ical_bg(&state, &ctx);
             // Python answers {"deleted": id} without checking existence.
             Json(json!({ "deleted": id })).into_response()
         }
@@ -406,7 +461,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let registry = Arc::new(IntegrationRegistry::new());
         let ctx = Arc::new(CalendarCtx {
@@ -441,7 +496,9 @@ mod tests {
         };
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, v)
@@ -468,7 +525,13 @@ mod tests {
         assert!(row["created"].as_i64().is_some());
 
         // Missing title/start -> Python's exact 400.
-        let (st, e) = send(&app, "POST", "/api/cal-events", Some(json!({ "title": "x" }))).await;
+        let (st, e) = send(
+            &app,
+            "POST",
+            "/api/cal-events",
+            Some(json!({ "title": "x" })),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"], json!("title and start are required"));
     }
@@ -530,22 +593,35 @@ mod tests {
         .await;
         let id = row["id"].as_str().unwrap().to_string();
         // Python: body[k] or None -> "" becomes NULL.
-        let (st, patched) =
-            send(&app, "PATCH", &format!("/api/cal-events/{id}"), Some(json!({ "location": "" })))
-                .await;
+        let (st, patched) = send(
+            &app,
+            "PATCH",
+            &format!("/api/cal-events/{id}"),
+            Some(json!({ "location": "" })),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(patched["location"], Value::Null);
 
         // No updatable fields -> Python's exact 400.
-        let (st, e) =
-            send(&app, "PATCH", &format!("/api/cal-events/{id}"), Some(json!({ "bogus": 1 })))
-                .await;
+        let (st, e) = send(
+            &app,
+            "PATCH",
+            &format!("/api/cal-events/{id}"),
+            Some(json!({ "bogus": 1 })),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"], json!("no updatable fields"));
 
         // Unknown id -> 404 {"error":"not found"}.
-        let (st, e) =
-            send(&app, "PATCH", "/api/cal-events/EVT-999", Some(json!({ "title": "x" }))).await;
+        let (st, e) = send(
+            &app,
+            "PATCH",
+            "/api/cal-events/EVT-999",
+            Some(json!({ "title": "x" })),
+        )
+        .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
         assert_eq!(e["error"], json!("not found"));
     }
@@ -580,7 +656,10 @@ mod tests {
             Some(json!({ "title": "Feed check", "start": "2026-08-10T10:00:00" })),
         )
         .await;
-        let req = Request::builder().uri("/api/calendar.ics").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/api/calendar.ics")
+            .body(Body::empty())
+            .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
@@ -591,12 +670,52 @@ mod tests {
             res.headers().get(header::CONTENT_DISPOSITION).unwrap(),
             "inline; filename=\"amux.ics\""
         );
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let feed = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(feed.starts_with("BEGIN:VCALENDAR\r\n"));
         assert!(feed.contains("SUMMARY:Feed check"));
         assert!(feed.ends_with("END:VCALENDAR\r\n"));
         assert!(feed.contains("EVT-1@amux"));
+    }
+
+    /// The publish runs behind the response, so a test waits for its result.
+    async fn published_state(reg: &IntegrationRegistry) -> Option<IntegrationState> {
+        for _ in 0..200 {
+            if let Some(state) = reg.get("calendar_s3") {
+                return Some(state);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        None
+    }
+
+    struct SlowPublisher;
+    impl IcalPublisher for SlowPublisher {
+        fn is_configured(&self) -> bool {
+            true
+        }
+        fn publish(&self, _ical: &str) -> Result<(), String> {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            Ok(())
+        }
+    }
+
+    /// AF-1145: a calendar write answers without waiting for the S3 upload.
+    #[tokio::test]
+    async fn a_slow_publish_does_not_hold_the_response() {
+        let (app, _dir, reg) = app_with(Some("some-bucket"), Arc::new(SlowPublisher));
+        let started = std::time::Instant::now();
+        let (_, _) = send(
+            &app,
+            "POST",
+            "/api/cal-events",
+            Some(json!({ "title": "t", "start": "2026-08-10T10:00" })),
+        )
+        .await;
+        assert!(started.elapsed().as_millis() < 1000, "{:?}", started.elapsed());
+        assert_eq!(published_state(&reg).await, Some(IntegrationState::Available));
     }
 
     #[tokio::test]
@@ -611,7 +730,7 @@ mod tests {
             Some(json!({ "title": "t", "start": "2026-08-10T10:00" })),
         )
         .await;
-        match reg.get("calendar_s3") {
+        match published_state(&reg).await {
             Some(IntegrationState::Unavailable { reason }) => {
                 assert!(reason.contains("S3 publisher is not built"), "{reason}");
             }
@@ -621,7 +740,9 @@ mod tests {
 
     #[tokio::test]
     async fn configured_publisher_receives_feed_and_reports_available() {
-        let publisher = Arc::new(RecordingPublisher { published: Mutex::new(Vec::new()) });
+        let publisher = Arc::new(RecordingPublisher {
+            published: Mutex::new(Vec::new()),
+        });
         let (app, _dir, reg) = app_with(Some("some-bucket"), publisher.clone());
         let (_, _) = send(
             &app,
@@ -630,15 +751,17 @@ mod tests {
             Some(json!({ "title": "Published event", "start": "2026-08-10T10:00" })),
         )
         .await;
+        assert_eq!(published_state(&reg).await, Some(IntegrationState::Available));
         let feeds = publisher.published.lock().unwrap();
         assert_eq!(feeds.len(), 1);
         assert!(feeds[0].contains("SUMMARY:Published event"));
-        assert_eq!(reg.get("calendar_s3"), Some(IntegrationState::Available));
     }
 
     #[tokio::test]
     async fn no_bucket_means_no_publish_attempt_and_no_registry_noise() {
-        let publisher = Arc::new(RecordingPublisher { published: Mutex::new(Vec::new()) });
+        let publisher = Arc::new(RecordingPublisher {
+            published: Mutex::new(Vec::new()),
+        });
         let (app, _dir, reg) = app_with(None, publisher.clone());
         let (_, _) = send(
             &app,

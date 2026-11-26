@@ -1,9 +1,31 @@
 {
-  "measured": true,
-  "n_considered": 2052,
   "command_handlers": {
+    "_addToPinGroup": {
+      "kind": "command._addToPinGroup",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_applyEmbedView": {
       "kind": "command._applyEmbedView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_applyPeekTabVisibility": {
+      "kind": "command._applyPeekTabVisibility",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_applyTheme": {
+      "kind": "command._applyTheme",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_applyWorkerRenames": {
+      "kind": "command._applyWorkerRenames",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -14,14 +36,80 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_applyZoom": {
+      "kind": "command._applyZoom",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_apprApprove": {
       "kind": "command._apprApprove",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_apprAttachOpen": {
+      "kind": "command._apprAttachOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_apprBeacon": {
+      "kind": "command._apprBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_apprEdit": {
+      "kind": "command._apprEdit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_apprEditCancel": {
+      "kind": "command._apprEditCancel",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_apprReject": {
       "kind": "command._apprReject",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_apprSchedule": {
+      "kind": "command._apprSchedule",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_apprScheduleClose": {
+      "kind": "command._apprScheduleClose",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_apprScheduleConfirm": {
+      "kind": "command._apprScheduleConfirm",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_apprToggle": {
+      "kind": "command._apprToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_approvalsBoot": {
+      "kind": "command._approvalsBoot",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_approvalsRefresh": {
+      "kind": "command._approvalsRefresh",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -68,6 +156,30 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_attachPreview": {
+      "kind": "command._attachPreview",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_attachPreviewOpen": {
+      "kind": "command._attachPreviewOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bdAnswer": {
+      "kind": "command._bdAnswer",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bdAnswerCancel": {
+      "kind": "command._bdAnswerCancel",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bdArtifactHref": {
       "kind": "command._bdArtifactHref",
       "feedback_required": true,
@@ -100,6 +212,12 @@
     },
     "_bdHydrate": {
       "kind": "command._bdHydrate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bdOpenAnswer": {
+      "kind": "command._bdOpenAnswer",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -188,6 +306,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_binPrevBeacon": {
+      "kind": "command._binPrevBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bindMdFileLinks": {
       "kind": "command._bindMdFileLinks",
       "feedback_required": true,
@@ -208,6 +332,12 @@
     },
     "_boardColSortableCreate": {
       "kind": "command._boardColSortableCreate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_boardCtxMenu": {
+      "kind": "command._boardCtxMenu",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -236,6 +366,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_boardLiveTick": {
+      "kind": "command._boardLiveTick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_boardOneSet": {
+      "kind": "command._boardOneSet",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_boardQuick": {
       "kind": "command._boardQuick",
       "feedback_required": true,
@@ -250,6 +392,12 @@
     },
     "_boardSaveCurrentView": {
       "kind": "command._boardSaveCurrentView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_boardSetTriage": {
+      "kind": "command._boardSetTriage",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -326,6 +474,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_bwAdvanceRouting": {
+      "kind": "command._bwAdvanceRouting",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bwAgentRun": {
       "kind": "command._bwAgentRun",
       "feedback_required": true,
@@ -338,6 +492,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_bwClearInspect": {
+      "kind": "command._bwClearInspect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bwClick": {
       "kind": "command._bwClick",
       "feedback_required": true,
@@ -346,6 +506,18 @@
     },
     "_bwClickIndex": {
       "kind": "command._bwClickIndex",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwFetch": {
+      "kind": "command._bwFetch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwFetchViewport": {
+      "kind": "command._bwFetchViewport",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -386,6 +558,24 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_bwLoadElements": {
+      "kind": "command._bwLoadElements",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwLoadInspect": {
+      "kind": "command._bwLoadInspect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwLoadRouting": {
+      "kind": "command._bwLoadRouting",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bwLoadTargets": {
       "kind": "command._bwLoadTargets",
       "feedback_required": true,
@@ -404,8 +594,26 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_bwRefreshInspect": {
+      "kind": "command._bwRefreshInspect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwRoutingDiscoveryDiscarded": {
+      "kind": "command._bwRoutingDiscoveryDiscarded",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bwSaveProfile": {
       "kind": "command._bwSaveProfile",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwSaveRouting": {
+      "kind": "command._bwSaveRouting",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -440,6 +648,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_bwToggleElements": {
+      "kind": "command._bwToggleElements",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_bwToggleInspect": {
+      "kind": "command._bwToggleInspect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_bwToggleLive": {
       "kind": "command._bwToggleLive",
       "feedback_required": true,
@@ -464,8 +684,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_callsDecide": {
+      "kind": "command._callsDecide",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_cancelUpload": {
       "kind": "command._cancelUpload",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cardsRenderDefer": {
+      "kind": "command._cardsRenderDefer",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -478,6 +710,120 @@
     },
     "_changeWorkerPaused": {
       "kind": "command._changeWorkerPaused",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatConnect": {
+      "kind": "command._chatConnect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatInterrupt": {
+      "kind": "command._chatInterrupt",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatJumpToLatest": {
+      "kind": "command._chatJumpToLatest",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatLoad": {
+      "kind": "command._chatLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatMount": {
+      "kind": "command._chatMount",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatOnEvent": {
+      "kind": "command._chatOnEvent",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatPaintCached": {
+      "kind": "command._chatPaintCached",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatReadAloud": {
+      "kind": "command._chatReadAloud",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatReadBeacon": {
+      "kind": "command._chatReadBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatReconnect": {
+      "kind": "command._chatReconnect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatRefresh": {
+      "kind": "command._chatRefresh",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatRender": {
+      "kind": "command._chatRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatRetryTurn": {
+      "kind": "command._chatRetryTurn",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatStartWatchdog": {
+      "kind": "command._chatStartWatchdog",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatUnmount": {
+      "kind": "command._chatUnmount",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatgptDecide": {
+      "kind": "command._chatgptDecide",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatgptPublish": {
+      "kind": "command._chatgptPublish",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chatgptRevoke": {
+      "kind": "command._chatgptRevoke",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_checkDirGit": {
+      "kind": "command._checkDirGit",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -500,6 +846,54 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_chipChatAction": {
+      "kind": "command._chipChatAction",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chipCommitOrder": {
+      "kind": "command._chipCommitOrder",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chipKeySequence": {
+      "kind": "command._chipKeySequence",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chipPress": {
+      "kind": "command._chipPress",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chipsBeacon": {
+      "kind": "command._chipsBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chipsPrefPost": {
+      "kind": "command._chipsPrefPost",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chromeCloseTab": {
+      "kind": "command._chromeCloseTab",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_chromePageGoTo": {
+      "kind": "command._chromePageGoTo",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_clearBlockedOps": {
       "kind": "command._clearBlockedOps",
       "feedback_required": true,
@@ -512,8 +906,116 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_clipBeacon": {
+      "kind": "command._clipBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_cloudBillingPortal": {
       "kind": "command._cloudBillingPortal",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cloudOfferCheckLongJob": {
+      "kind": "command._cloudOfferCheckLongJob",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cloudOfferDismiss": {
+      "kind": "command._cloudOfferDismiss",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cloudOfferInit": {
+      "kind": "command._cloudOfferInit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cloudOfferMark": {
+      "kind": "command._cloudOfferMark",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cloudOfferTry": {
+      "kind": "command._cloudOfferTry",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkActions": {
+      "kind": "command._cmdkActions",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkCompute": {
+      "kind": "command._cmdkCompute",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkLocal": {
+      "kind": "command._cmdkLocal",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkOpen": {
+      "kind": "command._cmdkOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkPlacesAck": {
+      "kind": "command._cmdkPlacesAck",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkQueryServer": {
+      "kind": "command._cmdkQueryServer",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkRecord": {
+      "kind": "command._cmdkRecord",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkRender": {
+      "kind": "command._cmdkRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkRun": {
+      "kind": "command._cmdkRun",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkStartRows": {
+      "kind": "command._cmdkStartRows",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cmdkToggleHidden": {
+      "kind": "command._cmdkToggleHidden",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_colMenu": {
+      "kind": "command._colMenu",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -536,6 +1038,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_composerLockTake": {
+      "kind": "command._composerLockTake",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_composerLockWatch": {
+      "kind": "command._composerLockWatch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_composerRestore": {
       "kind": "command._composerRestore",
       "feedback_required": true,
@@ -544,6 +1058,18 @@
     },
     "_composerUnconfirmed": {
       "kind": "command._composerUnconfirmed",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connAddAccount": {
+      "kind": "command._connAddAccount",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connConnect": {
+      "kind": "command._connConnect",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -560,6 +1086,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_connDisconnect": {
+      "kind": "command._connDisconnect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connPillClick": {
+      "kind": "command._connPillClick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_connReconnect": {
       "kind": "command._connReconnect",
       "feedback_required": true,
@@ -572,8 +1110,44 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_connScopePatch": {
+      "kind": "command._connScopePatch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_connScopePicker": {
       "kind": "command._connScopePicker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connectionCertificateSave": {
+      "kind": "command._connectionCertificateSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connectionSecurityLoad": {
+      "kind": "command._connectionSecurityLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connectionSecurityRequest": {
+      "kind": "command._connectionSecurityRequest",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connectionSignIn": {
+      "kind": "command._connectionSignIn",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_connectionSignOut": {
+      "kind": "command._connectionSignOut",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -614,6 +1188,264 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_createAndLaunchPin": {
+      "kind": "command._createAndLaunchPin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_crmAsk": {
+      "kind": "command._crmAsk",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvAttach": {
+      "kind": "command._cvAttach",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvClearInput": {
+      "kind": "command._cvClearInput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvDelete": {
+      "kind": "command._cvDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvDictate": {
+      "kind": "command._cvDictate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvEditKey": {
+      "kind": "command._cvEditKey",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvEnter": {
+      "kind": "command._cvEnter",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvManageChannels": {
+      "kind": "command._cvManageChannels",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvMarkRead": {
+      "kind": "command._cvMarkRead",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvMaybeNotify": {
+      "kind": "command._cvMaybeNotify",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvNewMessage": {
+      "kind": "command._cvNewMessage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvOnInput": {
+      "kind": "command._cvOnInput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvOnKey": {
+      "kind": "command._cvOnKey",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvOnLive": {
+      "kind": "command._cvOnLive",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvOpenPath": {
+      "kind": "command._cvOpenPath",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvOpenThreadOrScroll": {
+      "kind": "command._cvOpenThreadOrScroll",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvPaste": {
+      "kind": "command._cvPaste",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvPin": {
+      "kind": "command._cvPin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvPoll": {
+      "kind": "command._cvPoll",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvPollOnce": {
+      "kind": "command._cvPollOnce",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvReact": {
+      "kind": "command._cvReact",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvResume": {
+      "kind": "command._cvResume",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSaveEdit": {
+      "kind": "command._cvSaveEdit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSearch": {
+      "kind": "command._cvSearch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSelect": {
+      "kind": "command._cvSelect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSend": {
+      "kind": "command._cvSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSendThread": {
+      "kind": "command._cvSendThread",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSetAvatar": {
+      "kind": "command._cvSetAvatar",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvShowPins": {
+      "kind": "command._cvShowPins",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSqKey": {
+      "kind": "command._cvSqKey",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSqOpen": {
+      "kind": "command._cvSqOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSqRender": {
+      "kind": "command._cvSqRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSqRun": {
+      "kind": "command._cvSqRun",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvSqSetTok": {
+      "kind": "command._cvSqSetTok",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvThumbFailed": {
+      "kind": "command._cvThumbFailed",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvUploadVoice": {
+      "kind": "command._cvUploadVoice",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvVoiceDone": {
+      "kind": "command._cvVoiceDone",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_cvVoiceToggle": {
+      "kind": "command._cvVoiceToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dbAskRun": {
+      "kind": "command._dbAskRun",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_descLockToggle": {
+      "kind": "command._descLockToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_descPatch": {
+      "kind": "command._descPatch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_descRevert": {
+      "kind": "command._descRevert",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_dictAddWord": {
       "kind": "command._dictAddWord",
       "feedback_required": true,
@@ -622,6 +1454,24 @@
     },
     "_dictAiEdit": {
       "kind": "command._dictAiEdit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictAskFix": {
+      "kind": "command._dictAskFix",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictBeacon": {
+      "kind": "command._dictBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictClearAll": {
+      "kind": "command._dictClearAll",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -656,8 +1506,116 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_dictInsert": {
+      "kind": "command._dictInsert",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictInsertId": {
+      "kind": "command._dictInsertId",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictLiveClear": {
+      "kind": "command._dictLiveClear",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictLiveSave": {
+      "kind": "command._dictLiveSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictLoad": {
+      "kind": "command._dictLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictMicMissing": {
+      "kind": "command._dictMicMissing",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictMicSettle": {
+      "kind": "command._dictMicSettle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictNativeDone": {
+      "kind": "command._dictNativeDone",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictOfferCorrection": {
+      "kind": "command._dictOfferCorrection",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_dictOpenPopup": {
       "kind": "command._dictOpenPopup",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictOpenSettings": {
+      "kind": "command._dictOpenSettings",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictOutboxAdd": {
+      "kind": "command._dictOutboxAdd",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictOutboxDel": {
+      "kind": "command._dictOutboxDel",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictOutboxPatch": {
+      "kind": "command._dictOutboxPatch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictPendingBadge": {
+      "kind": "command._dictPendingBadge",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictPruneDone": {
+      "kind": "command._dictPruneDone",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictRecoverLive": {
+      "kind": "command._dictRecoverLive",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictRender": {
+      "kind": "command._dictRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictRenderHistory": {
+      "kind": "command._dictRenderHistory",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -668,14 +1626,50 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_dictRetryAll": {
+      "kind": "command._dictRetryAll",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_dictSaveKey": {
       "kind": "command._dictSaveKey",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_dictSendDirect": {
+      "kind": "command._dictSendDirect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictSettingsPut": {
+      "kind": "command._dictSettingsPut",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictSettingsSave": {
+      "kind": "command._dictSettingsSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_dictStartRec": {
       "kind": "command._dictStartRec",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictStoreHung": {
+      "kind": "command._dictStoreHung",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictTeach": {
+      "kind": "command._dictTeach",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -692,14 +1686,32 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_dictTrySendOnce": {
+      "kind": "command._dictTrySendOnce",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_dictUndo": {
       "kind": "command._dictUndo",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_dictUpdate": {
+      "kind": "command._dictUpdate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_dictUpload": {
       "kind": "command._dictUpload",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictWatchField": {
+      "kind": "command._dictWatchField",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -752,6 +1764,378 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_drawBeacon": {
+      "kind": "command._drawBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawDeletePath": {
+      "kind": "command._drawDeletePath",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawDeleteSelection": {
+      "kind": "command._drawDeleteSelection",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawEnter": {
+      "kind": "command._drawEnter",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawExcalidrawProps": {
+      "kind": "command._drawExcalidrawProps",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawExport": {
+      "kind": "command._drawExport",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawFlush": {
+      "kind": "command._drawFlush",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawFullscreen": {
+      "kind": "command._drawFullscreen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawImportFiles": {
+      "kind": "command._drawImportFiles",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawImportInput": {
+      "kind": "command._drawImportInput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawInsertLibItem": {
+      "kind": "command._drawInsertLibItem",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawInsertMermaid": {
+      "kind": "command._drawInsertMermaid",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawItemAction": {
+      "kind": "command._drawItemAction",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawLeave": {
+      "kind": "command._drawLeave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawLiveKey": {
+      "kind": "command._drawLiveKey",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawLoadLib": {
+      "kind": "command._drawLoadLib",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawLoadLibrary": {
+      "kind": "command._drawLoadLibrary",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawMount": {
+      "kind": "command._drawMount",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawNew": {
+      "kind": "command._drawNew",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawNewInDir": {
+      "kind": "command._drawNewInDir",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOnApi": {
+      "kind": "command._drawOnApi",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOnChange": {
+      "kind": "command._drawOnChange",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOnHide": {
+      "kind": "command._drawOnHide",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOnLibraryChange": {
+      "kind": "command._drawOnLibraryChange",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOnPaste": {
+      "kind": "command._drawOnPaste",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOpen": {
+      "kind": "command._drawOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOpenDirInFiles": {
+      "kind": "command._drawOpenDirInFiles",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOpenInFiles": {
+      "kind": "command._drawOpenInFiles",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOpenPath": {
+      "kind": "command._drawOpenPath",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawOpenSend": {
+      "kind": "command._drawOpenSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawPersistSettings": {
+      "kind": "command._drawPersistSettings",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawPinPage": {
+      "kind": "command._drawPinPage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawPoll": {
+      "kind": "command._drawPoll",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawPopOpen": {
+      "kind": "command._drawPopOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawPrefSet": {
+      "kind": "command._drawPrefSet",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawPruneDrafts": {
+      "kind": "command._drawPruneDrafts",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawRecoverDraft": {
+      "kind": "command._drawRecoverDraft",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawRename": {
+      "kind": "command._drawRename",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawRenamePath": {
+      "kind": "command._drawRenamePath",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawRenderRoot": {
+      "kind": "command._drawRenderRoot",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawResolveConflict": {
+      "kind": "command._drawResolveConflict",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawRetryNow": {
+      "kind": "command._drawRetryNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawRtApply": {
+      "kind": "command._drawRtApply",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawRtFrame": {
+      "kind": "command._drawRtFrame",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawRtJoin": {
+      "kind": "command._drawRtJoin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSave": {
+      "kind": "command._drawSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSaveFailed": {
+      "kind": "command._drawSaveFailed",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSaveInDir": {
+      "kind": "command._drawSaveInDir",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSaveLibrary": {
+      "kind": "command._drawSaveLibrary",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSaveNow": {
+      "kind": "command._drawSaveNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSaveRecents": {
+      "kind": "command._drawSaveRecents",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawScheduleSave": {
+      "kind": "command._drawScheduleSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSendToWorker": {
+      "kind": "command._drawSendToWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSetDefaultDir": {
+      "kind": "command._drawSetDefaultDir",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSetLive": {
+      "kind": "command._drawSetLive",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSyncOffsets": {
+      "kind": "command._drawSyncOffsets",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawSyncOffsetsSoon": {
+      "kind": "command._drawSyncOffsetsSoon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawToggleLib": {
+      "kind": "command._drawToggleLib",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawToggleLive": {
+      "kind": "command._drawToggleLive",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawToggleSnap": {
+      "kind": "command._drawToggleSnap",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawUpload": {
+      "kind": "command._drawUpload",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_drawWriteDraft": {
+      "kind": "command._drawWriteDraft",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_editSelectChanged": {
       "kind": "command._editSelectChanged",
       "feedback_required": true,
@@ -760,6 +2144,24 @@
     },
     "_emailAnnotate": {
       "kind": "command._emailAnnotate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_emailFolderPick": {
+      "kind": "command._emailFolderPick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_emailLoad": {
+      "kind": "command._emailLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_emailPick": {
+      "kind": "command._emailPick",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -788,6 +2190,48 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_evCatalog": {
+      "kind": "command._evCatalog",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_evNew": {
+      "kind": "command._evNew",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_evOpen": {
+      "kind": "command._evOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_evRefresh": {
+      "kind": "command._evRefresh",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_evRemove": {
+      "kind": "command._evRemove",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_evSet": {
+      "kind": "command._evSet",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_evSubsFetch": {
+      "kind": "command._evSubsFetch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_expandPeekInput": {
       "kind": "command._expandPeekInput",
       "feedback_required": true,
@@ -806,14 +2250,8 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_feBuildRow": {
-      "kind": "command._feBuildRow",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_feToggleExpand": {
-      "kind": "command._feToggleExpand",
+    "_feRecordOpen": {
+      "kind": "command._feRecordOpen",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -830,14 +2268,104 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_fileBootLinkClose": {
+      "kind": "command._fileBootLinkClose",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileConflictResolve": {
+      "kind": "command._fileConflictResolve",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileCtxMenu": {
+      "kind": "command._fileCtxMenu",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileCtxRun": {
+      "kind": "command._fileCtxRun",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileDeleteOpen": {
+      "kind": "command._fileDeleteOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_fileDownload": {
       "kind": "command._fileDownload",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_fileSave": {
-      "kind": "command._fileSave",
+    "_fileDuplicate": {
+      "kind": "command._fileDuplicate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileEditBeacon": {
+      "kind": "command._fileEditBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileMoveOpen": {
+      "kind": "command._fileMoveOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileOpenInWorker": {
+      "kind": "command._fileOpenInWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_filePinOverlay": {
+      "kind": "command._filePinOverlay",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileReconcile": {
+      "kind": "command._fileReconcile",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileRenameOpen": {
+      "kind": "command._fileRenameOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileSaveOnce": {
+      "kind": "command._fileSaveOnce",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileShowCached": {
+      "kind": "command._fileShowCached",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileShowInFolder": {
+      "kind": "command._fileShowInFolder",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fileViewRefresh": {
+      "kind": "command._fileViewRefresh",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -850,6 +2378,18 @@
     },
     "_filesAddBookmarkPath": {
       "kind": "command._filesAddBookmarkPath",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_filesAddBookmarkTo": {
+      "kind": "command._filesAddBookmarkTo",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_filesBmWriteKey": {
+      "kind": "command._filesBmWriteKey",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -872,8 +2412,26 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_filesPinItems": {
+      "kind": "command._filesPinItems",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_filesPinMenu": {
+      "kind": "command._filesPinMenu",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_filesRemoveBookmark": {
       "kind": "command._filesRemoveBookmark",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_filesRemoveBookmarkFrom": {
+      "kind": "command._filesRemoveBookmarkFrom",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -908,12 +2466,6 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_filesUp": {
-      "kind": "command._filesUp",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
     "_fillWorkerModelSelect": {
       "kind": "command._fillWorkerModelSelect",
       "feedback_required": true,
@@ -928,6 +2480,12 @@
     },
     "_fireSessionNotif": {
       "kind": "command._fireSessionNotif",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fitRules": {
+      "kind": "command._fitRules",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1028,6 +2586,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_frozenWorker": {
+      "kind": "command._frozenWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_fsRename": {
       "kind": "command._fsRename",
       "feedback_required": true,
@@ -1040,8 +2604,56 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_getChips": {
-      "kind": "command._getChips",
+    "_fselBeacon": {
+      "kind": "command._fselBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fselCopyPaths": {
+      "kind": "command._fselCopyPaths",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fselDelete": {
+      "kind": "command._fselDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fselDownload": {
+      "kind": "command._fselDownload",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fselMove": {
+      "kind": "command._fselMove",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fselRefreshView": {
+      "kind": "command._fselRefreshView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_fselReport": {
+      "kind": "command._fselReport",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_gmailAddAccount": {
+      "kind": "command._gmailAddAccount",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_gmailReconnect": {
+      "kind": "command._gmailReconnect",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1220,6 +2832,96 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_hkBeacon": {
+      "kind": "command._hkBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_hkDelete": {
+      "kind": "command._hkDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_hkDictDeliver": {
+      "kind": "command._hkDictDeliver",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_hkDictate": {
+      "kind": "command._hkDictate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_hkRun": {
+      "kind": "command._hkRun",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_hkSave": {
+      "kind": "command._hkSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_hkSaveDialog": {
+      "kind": "command._hkSaveDialog",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_hkToggle": {
+      "kind": "command._hkToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_homeCardOutcomes": {
+      "kind": "command._homeCardOutcomes",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_homeIdeaStart": {
+      "kind": "command._homeIdeaStart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_homeOpenFromPeek": {
+      "kind": "command._homeOpenFromPeek",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_homeOutcomeIndexLoad": {
+      "kind": "command._homeOutcomeIndexLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_homeSetPane": {
+      "kind": "command._homeSetPane",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_homeShowEverything": {
+      "kind": "command._homeShowEverything",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_homeShowWork": {
+      "kind": "command._homeShowWork",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_hostContrastCheck": {
       "kind": "command._hostContrastCheck",
       "feedback_required": true,
@@ -1234,6 +2936,12 @@
     },
     "_initWsTermPane": {
       "kind": "command._initWsTermPane",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_intentRoute": {
+      "kind": "command._intentRoute",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1256,6 +2964,24 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_journalInit": {
+      "kind": "command._journalInit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_journalLoad": {
+      "kind": "command._journalLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_jrnlCalDayClick": {
+      "kind": "command._jrnlCalDayClick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_jrnlDelete": {
       "kind": "command._jrnlDelete",
       "feedback_required": true,
@@ -1268,8 +2994,56 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_jrnlFilterTag": {
+      "kind": "command._jrnlFilterTag",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_jrnlNew": {
+      "kind": "command._jrnlNew",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_jrnlRenderCurrentView": {
+      "kind": "command._jrnlRenderCurrentView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_jrnlRenderMap": {
+      "kind": "command._jrnlRenderMap",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_jrnlSave": {
+      "kind": "command._jrnlSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_jrnlSaveConfig": {
       "kind": "command._jrnlSaveConfig",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_jrnlSearch": {
+      "kind": "command._jrnlSearch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_jrnlSelect": {
+      "kind": "command._jrnlSelect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_jrnlSwitchSub": {
+      "kind": "command._jrnlSwitchSub",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1280,14 +3054,32 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_launchFanOut": {
-      "kind": "command._launchFanOut",
+    "_kmKeydown": {
+      "kind": "command._kmKeydown",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_kmSend": {
+      "kind": "command._kmSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_lazyLib": {
+      "kind": "command._lazyLib",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
     "_libOpenBook": {
       "kind": "command._libOpenBook",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_linkViewerReturn": {
+      "kind": "command._linkViewerReturn",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1334,6 +3126,42 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_lockRequest": {
+      "kind": "command._lockRequest",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_macSettingsOpen": {
+      "kind": "command._macSettingsOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapBulk": {
+      "kind": "command._mapBulk",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapBulkApply": {
+      "kind": "command._mapBulkApply",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapBulkDelete": {
+      "kind": "command._mapBulkDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapDeleteList": {
+      "kind": "command._mapDeleteList",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_mapDeletePin": {
       "kind": "command._mapDeletePin",
       "feedback_required": true,
@@ -1342,6 +3170,18 @@
     },
     "_mapDeleteTag": {
       "kind": "command._mapDeleteTag",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapDupIgnore": {
+      "kind": "command._mapDupIgnore",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapDupMerge": {
+      "kind": "command._mapDupMerge",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1358,14 +3198,74 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_mapInit": {
+      "kind": "command._mapInit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapLinkAllPlaces": {
+      "kind": "command._mapLinkAllPlaces",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_mapLoad": {
       "kind": "command._mapLoad",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_mapMerge": {
+      "kind": "command._mapMerge",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapMergeSelected": {
+      "kind": "command._mapMergeSelected",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapPlaceCall": {
+      "kind": "command._mapPlaceCall",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapPlaceLink": {
+      "kind": "command._mapPlaceLink",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapPlaceRefresh": {
+      "kind": "command._mapPlaceRefresh",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapPutPin": {
+      "kind": "command._mapPutPin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapRemovePin": {
+      "kind": "command._mapRemovePin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_mapSave": {
       "kind": "command._mapSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapSaveList": {
+      "kind": "command._mapSaveList",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1382,6 +3282,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_mapSetBase": {
+      "kind": "command._mapSetBase",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_mapSetDefaultView": {
       "kind": "command._mapSetDefaultView",
       "feedback_required": true,
@@ -1390,6 +3296,30 @@
     },
     "_mapSetSort": {
       "kind": "command._mapSetSort",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapShareToggle": {
+      "kind": "command._mapShareToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapSwRoute": {
+      "kind": "command._mapSwRoute",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapSwStop": {
+      "kind": "command._mapSwStop",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mapTogglePins": {
+      "kind": "command._mapTogglePins",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1412,8 +3342,146 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_mdAskAll": {
+      "kind": "command._mdAskAll",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdAskPaint": {
+      "kind": "command._mdAskPaint",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdAskPoll": {
+      "kind": "command._mdAskPoll",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdAskSelBtn": {
+      "kind": "command._mdAskSelBtn",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdAskSelSync": {
+      "kind": "command._mdAskSelSync",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdAskStart": {
+      "kind": "command._mdAskStart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdBeacon": {
+      "kind": "command._mdBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdTaskEl": {
+      "kind": "command._mdTaskEl",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdTaskOpen": {
+      "kind": "command._mdTaskOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdTaskOpenWorker": {
+      "kind": "command._mdTaskOpenWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdTaskPaint": {
+      "kind": "command._mdTaskPaint",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdTaskReadReply": {
+      "kind": "command._mdTaskReadReply",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdTaskSend": {
+      "kind": "command._mdTaskSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdWorkerDotsPaint": {
+      "kind": "command._mdWorkerDotsPaint",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiCancel": {
+      "kind": "command._mdaiCancel",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiCancelSend": {
+      "kind": "command._mdaiCancelSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiChatKey": {
+      "kind": "command._mdaiChatKey",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiChatSend": {
+      "kind": "command._mdaiChatSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiChatUndo": {
+      "kind": "command._mdaiChatUndo",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_mdaiConnectPicker": {
       "kind": "command._mdaiConnectPicker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiCreatePage": {
+      "kind": "command._mdaiCreatePage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiCreateSubmit": {
+      "kind": "command._mdaiCreateSubmit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiCrumb": {
+      "kind": "command._mdaiCrumb",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiDelete": {
+      "kind": "command._mdaiDelete",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1424,8 +3492,8 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_mdaiHistNav": {
-      "kind": "command._mdaiHistNav",
+    "_mdaiEditKey": {
+      "kind": "command._mdaiEditKey",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1448,14 +3516,8 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_mdaiRemoveSource": {
-      "kind": "command._mdaiRemoveSource",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_mdaiRender": {
-      "kind": "command._mdaiRender",
+    "_mdaiPutDoc": {
+      "kind": "command._mdaiPutDoc",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1466,38 +3528,212 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_mdaiSaveBody": {
-      "kind": "command._mdaiSaveBody",
+    "_mdaiRunMenu": {
+      "kind": "command._mdaiRunMenu",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_mdaiSavePrompt": {
-      "kind": "command._mdaiSavePrompt",
+    "_mdaiSave": {
+      "kind": "command._mdaiSave",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_mdaiSetBottomTab": {
-      "kind": "command._mdaiSetBottomTab",
+    "_mdaiSaveDoc": {
+      "kind": "command._mdaiSaveDoc",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_mdaiTabLoad": {
-      "kind": "command._mdaiTabLoad",
+    "_mdaiSaveDocNow": {
+      "kind": "command._mdaiSaveDocNow",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_mdaiWriteFile": {
-      "kind": "command._mdaiWriteFile",
+    "_mdaiSaveSettings": {
+      "kind": "command._mdaiSaveSettings",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiSaveSources": {
+      "kind": "command._mdaiSaveSources",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdaiSetModel": {
+      "kind": "command._mdaiSetModel",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxBeacon": {
+      "kind": "command._mdxBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxBind": {
+      "kind": "command._mdxBind",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxChanged": {
+      "kind": "command._mdxChanged",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxCopy": {
+      "kind": "command._mdxCopy",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxFollow": {
+      "kind": "command._mdxFollow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxHistStep": {
+      "kind": "command._mdxHistStep",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxHistoryAct": {
+      "kind": "command._mdxHistoryAct",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxKeydown": {
+      "kind": "command._mdxKeydown",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxRenderHistory": {
+      "kind": "command._mdxRenderHistory",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxRenderPreview": {
+      "kind": "command._mdxRenderPreview",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxRunBlock": {
+      "kind": "command._mdxRunBlock",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxSetMode": {
+      "kind": "command._mdxSetMode",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxSetTab": {
+      "kind": "command._mdxSetTab",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxShow": {
+      "kind": "command._mdxShow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxSlashInput": {
+      "kind": "command._mdxSlashInput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxSlashKey": {
+      "kind": "command._mdxSlashKey",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxSlashPick": {
+      "kind": "command._mdxSlashPick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxSlashRender": {
+      "kind": "command._mdxSlashRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxTabClick": {
+      "kind": "command._mdxTabClick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxToggleSplit": {
+      "kind": "command._mdxToggleSplit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxToggleTask": {
+      "kind": "command._mdxToggleTask",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mdxView": {
+      "kind": "command._mdxView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mediaBeacon": {
+      "kind": "command._mediaBeacon",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
     "_metricsRunSpeedtest": {
       "kind": "command._metricsRunSpeedtest",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mlInput": {
+      "kind": "command._mlInput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mlPollIdentity": {
+      "kind": "command._mlPollIdentity",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mlPollOutput": {
+      "kind": "command._mlPollOutput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_mlSignedIn": {
+      "kind": "command._mlSignedIn",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1538,8 +3774,134 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_nativeRecorderPaint": {
+      "kind": "command._nativeRecorderPaint",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_nativeRecorderPollSync": {
+      "kind": "command._nativeRecorderPollSync",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_nativeRecorderPost": {
+      "kind": "command._nativeRecorderPost",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_nativeRecorderTrack": {
+      "kind": "command._nativeRecorderTrack",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_navBeacon": {
+      "kind": "command._navBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_navLoad": {
+      "kind": "command._navLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_navRestore": {
+      "kind": "command._navRestore",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_navVisit": {
+      "kind": "command._navVisit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niAct": {
+      "kind": "command._niAct",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niApply": {
+      "kind": "command._niApply",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niApproveAllRun": {
+      "kind": "command._niApproveAllRun",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niAutoSet": {
+      "kind": "command._niAutoSet",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niAutoSweep": {
+      "kind": "command._niAutoSweep",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niCard": {
+      "kind": "command._niCard",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niChip": {
+      "kind": "command._niChip",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niEmail": {
+      "kind": "command._niEmail",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niLog": {
+      "kind": "command._niLog",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niOpenTarget": {
+      "kind": "command._niOpenTarget",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niSend": {
+      "kind": "command._niSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_niSnooze": {
+      "kind": "command._niSnooze",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_notifFireNative": {
       "kind": "command._notifFireNative",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_notifOpen": {
+      "kind": "command._notifOpen",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1586,6 +3948,72 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_ocComboMouse": {
+      "kind": "command._ocComboMouse",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ocForget": {
+      "kind": "command._ocForget",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ocGroupsClick": {
+      "kind": "command._ocGroupsClick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ocHistEdit": {
+      "kind": "command._ocHistEdit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ocHistEditNow": {
+      "kind": "command._ocHistEditNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ocHistRecord": {
+      "kind": "command._ocHistRecord",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ocLoadModels": {
+      "kind": "command._ocLoadModels",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ocProviderChanged": {
+      "kind": "command._ocProviderChanged",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ocProviders": {
+      "kind": "command._ocProviders",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_officeBeacon": {
+      "kind": "command._officeBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_officeCommentsMount": {
+      "kind": "command._officeCommentsMount",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_offlineCapSet": {
       "kind": "command._offlineCapSet",
       "feedback_required": true,
@@ -1610,14 +4038,44 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_openConnectionSecurity": {
+      "kind": "command._openConnectionSecurity",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_openIssue": {
       "kind": "command._openIssue",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_openLinkedPath": {
+      "kind": "command._openLinkedPath",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_openOwnLink": {
+      "kind": "command._openOwnLink",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_openOwnPage": {
+      "kind": "command._openOwnPage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_openPathFromOutput": {
       "kind": "command._openPathFromOutput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_openPathInFiles": {
+      "kind": "command._openPathInFiles",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1646,32 +4104,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_orchPlan": {
-      "kind": "command._orchPlan",
+    "_openXlsxEditor": {
+      "kind": "command._openXlsxEditor",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_orchStartRec": {
-      "kind": "command._orchStartRec",
+    "_openXlsxPreview": {
+      "kind": "command._openXlsxPreview",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_orchTextRoute": {
-      "kind": "command._orchTextRoute",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_orchToggleRec": {
-      "kind": "command._orchToggleRec",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_orchTranscribe": {
-      "kind": "command._orchTranscribe",
+    "_outboxBlockedMessageDecision": {
+      "kind": "command._outboxBlockedMessageDecision",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1682,14 +4128,170 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_outboxDeliveryLock": {
+      "kind": "command._outboxDeliveryLock",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_outboxDiagnostic": {
       "kind": "command._outboxDiagnostic",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_outboxDropAnswerNow": {
+      "kind": "command._outboxDropAnswerNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxEditMessage": {
+      "kind": "command._outboxEditMessage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxFastConfirm": {
+      "kind": "command._outboxFastConfirm",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_outboxFetch": {
       "kind": "command._outboxFetch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxLock": {
+      "kind": "command._outboxLock",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxMessageProgress": {
+      "kind": "command._outboxMessageProgress",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxRearmUnreached": {
+      "kind": "command._outboxRearmUnreached",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxRemoveMessage": {
+      "kind": "command._outboxRemoveMessage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxRestoreOwned": {
+      "kind": "command._outboxRestoreOwned",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxRetryNow": {
+      "kind": "command._outboxRetryNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxSettleDecisions": {
+      "kind": "command._outboxSettleDecisions",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxStorageLock": {
+      "kind": "command._outboxStorageLock",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outboxViewsRefresh": {
+      "kind": "command._outboxViewsRefresh",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomeAttach": {
+      "kind": "command._outcomeAttach",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomeDefaults": {
+      "kind": "command._outcomeDefaults",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomePlan": {
+      "kind": "command._outcomePlan",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomePresetDelete": {
+      "kind": "command._outcomePresetDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomePresetPick": {
+      "kind": "command._outcomePresetPick",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomePresets": {
+      "kind": "command._outcomePresets",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomePresetsEdit": {
+      "kind": "command._outcomePresetsEdit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomeSavePresets": {
+      "kind": "command._outcomeSavePresets",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_outcomeStart": {
+      "kind": "command._outcomeStart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ownLinkRetarget": {
+      "kind": "command._ownLinkRetarget",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_ownPageBeacon": {
+      "kind": "command._ownPageBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pagesEnter": {
+      "kind": "command._pagesEnter",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pagesWorker": {
+      "kind": "command._pagesWorker",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1702,6 +4304,48 @@
     },
     "_paintPeekRegions": {
       "kind": "command._paintPeekRegions",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pasteImagesIntoNote": {
+      "kind": "command._pasteImagesIntoNote",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pasteTextInto": {
+      "kind": "command._pasteTextInto",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pcuAddApp": {
+      "kind": "command._pcuAddApp",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pcuAllowApp": {
+      "kind": "command._pcuAllowApp",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pcuDecide": {
+      "kind": "command._pcuDecide",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pcuRemoveApp": {
+      "kind": "command._pcuRemoveApp",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pcuWriteApps": {
+      "kind": "command._pcuWriteApps",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1730,8 +4374,44 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekChatScope": {
+      "kind": "command._peekChatScope",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekChatSet": {
+      "kind": "command._peekChatSet",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekChatStateSync": {
+      "kind": "command._peekChatStateSync",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekClearInput": {
       "kind": "command._peekClearInput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekComputerHeadLoad": {
+      "kind": "command._peekComputerHeadLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekComputerLoad": {
+      "kind": "command._peekComputerLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekComputerStart": {
+      "kind": "command._peekComputerStart",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1748,8 +4428,14 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_peekFanOut": {
-      "kind": "command._peekFanOut",
+    "_peekExtendKindHints": {
+      "kind": "command._peekExtendKindHints",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekFileBrowser": {
+      "kind": "command._peekFileBrowser",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1778,8 +4464,32 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekHistExpand": {
+      "kind": "command._peekHistExpand",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekIdentityDiscard": {
       "kind": "command._peekIdentityDiscard",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekInsetReport": {
+      "kind": "command._peekInsetReport",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekIntentList": {
+      "kind": "command._peekIntentList",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekIntentTabPaint": {
+      "kind": "command._peekIntentTabPaint",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1808,14 +4518,56 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekLoadEarlierUntil": {
+      "kind": "command._peekLoadEarlierUntil",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekLoadKindHints": {
       "kind": "command._peekLoadKindHints",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekLoadSchedules": {
+      "kind": "command._peekLoadSchedules",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekLogAtClose": {
+      "kind": "command._peekLogAtClose",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekLogAtMore": {
+      "kind": "command._peekLogAtMore",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekLogAtPaint": {
+      "kind": "command._peekLogAtPaint",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekLookupSelection": {
       "kind": "command._peekLookupSelection",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekLookupUnknownKinds": {
+      "kind": "command._peekLookupUnknownKinds",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekMarkupWarn": {
+      "kind": "command._peekMarkupWarn",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1832,8 +4584,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekMessagesBadge": {
+      "kind": "command._peekMessagesBadge",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekMessagesLoad": {
       "kind": "command._peekMessagesLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekMessagesRender": {
+      "kind": "command._peekMessagesRender",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1892,14 +4656,32 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekOpenLogAt": {
+      "kind": "command._peekOpenLogAt",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekPollBeacon": {
       "kind": "command._peekPollBeacon",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekPollNow": {
+      "kind": "command._peekPollNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekPollStop": {
       "kind": "command._peekPollStop",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekPressRelease": {
+      "kind": "command._peekPressRelease",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1928,14 +4710,116 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekSearchFlush": {
+      "kind": "command._peekSearchFlush",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSearchTimed": {
+      "kind": "command._peekSearchTimed",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSearchTyped": {
+      "kind": "command._peekSearchTyped",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekShellRun": {
+      "kind": "command._peekShellRun",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekShowSelPopover": {
       "kind": "command._peekShowSelPopover",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekSplitAddPane": {
+      "kind": "command._peekSplitAddPane",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitClosePane": {
+      "kind": "command._peekSplitClosePane",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitMenu": {
+      "kind": "command._peekSplitMenu",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitNestedRefuse": {
+      "kind": "command._peekSplitNestedRefuse",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitOpen": {
+      "kind": "command._peekSplitOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitOpenFile": {
+      "kind": "command._peekSplitOpenFile",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitRenderPanes": {
+      "kind": "command._peekSplitRenderPanes",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitSetActive": {
+      "kind": "command._peekSplitSetActive",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitSetPane": {
+      "kind": "command._peekSplitSetPane",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekSplitShow": {
+      "kind": "command._peekSplitShow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekStopFollowing": {
       "kind": "command._peekStopFollowing",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekTabActivate": {
+      "kind": "command._peekTabActivate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekTabApply": {
+      "kind": "command._peekTabApply",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekTabObserve": {
+      "kind": "command._peekTabObserve",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1952,14 +4836,26 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_peekUpdateTabCounts": {
+      "kind": "command._peekUpdateTabCounts",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekViewApply": {
+      "kind": "command._peekViewApply",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_peekWatchBottom": {
       "kind": "command._peekWatchBottom",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_pendingCancel": {
-      "kind": "command._pendingCancel",
+    "_persistAttachment": {
+      "kind": "command._persistAttachment",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1976,26 +4872,68 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_placeFixedAt": {
+      "kind": "command._placeFixedAt",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_placeMenuAtPointer": {
+      "kind": "command._placeMenuAtPointer",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_placePeekTabCustomizer": {
+      "kind": "command._placePeekTabCustomizer",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pmLoadPins": {
+      "kind": "command._pmLoadPins",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pmPin": {
+      "kind": "command._pmPin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_pmResend": {
       "kind": "command._pmResend",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_proxyDelete": {
-      "kind": "command._proxyDelete",
+    "_pmSelAll": {
+      "kind": "command._pmSelAll",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_proxyStart": {
-      "kind": "command._proxyStart",
+    "_pmSelNone": {
+      "kind": "command._pmSelNone",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_proxyStop": {
-      "kind": "command._proxyStop",
+    "_pmSelToggle": {
+      "kind": "command._pmSelToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pmShowPins": {
+      "kind": "command._pmShowPins",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_psfAcceptResponse": {
+      "kind": "command._psfAcceptResponse",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2006,14 +4944,74 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_psfRenderEntries": {
+      "kind": "command._psfRenderEntries",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_psfSetSort": {
+      "kind": "command._psfSetSort",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_psfViewFile": {
       "kind": "command._psfViewFile",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_pushChipsToServer": {
-      "kind": "command._pushChipsToServer",
+    "_pubApprove": {
+      "kind": "command._pubApprove",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pubAsPerson": {
+      "kind": "command._pubAsPerson",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pubMenu": {
+      "kind": "command._pubMenu",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pubNew": {
+      "kind": "command._pubNew",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pubRename": {
+      "kind": "command._pubRename",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pubUploadShare": {
+      "kind": "command._pubUploadShare",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pullContributeNote": {
+      "kind": "command._pullContributeNote",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pushChipsNow": {
+      "kind": "command._pushChipsNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_pushReconcile": {
+      "kind": "command._pushReconcile",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2054,14 +5052,62 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_recAddNote": {
+      "kind": "command._recAddNote",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recRename": {
+      "kind": "command._recRename",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recSetFilter": {
+      "kind": "command._recSetFilter",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recSetQuery": {
+      "kind": "command._recSetQuery",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recToggleAction": {
+      "kind": "command._recToggleAction",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_reclaimCancelScan": {
       "kind": "command._reclaimCancelScan",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_reclaimCleanSafe": {
+      "kind": "command._reclaimCleanSafe",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_reclaimPurge": {
       "kind": "command._reclaimPurge",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_reclaimPurgeAllStaged": {
+      "kind": "command._reclaimPurgeAllStaged",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_reclaimPurgeOld": {
+      "kind": "command._reclaimPurgeOld",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2074,6 +5120,12 @@
     },
     "_reclaimRestore": {
       "kind": "command._reclaimRestore",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_reclaimRunHostCleanup": {
+      "kind": "command._reclaimRunHostCleanup",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2096,6 +5148,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_recorderBeacon": {
+      "kind": "command._recorderBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderDeleteLocal": {
+      "kind": "command._recorderDeleteLocal",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_recorderFinalize": {
       "kind": "command._recorderFinalize",
       "feedback_required": true,
@@ -2104,6 +5168,42 @@
     },
     "_recorderInit": {
       "kind": "command._recorderInit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderLiveSync": {
+      "kind": "command._recorderLiveSync",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderNotesFlush": {
+      "kind": "command._recorderNotesFlush",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderNotesInput": {
+      "kind": "command._recorderNotesInput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderOpenSession": {
+      "kind": "command._recorderOpenSession",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderPauseToggle": {
+      "kind": "command._recorderPauseToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderRender": {
+      "kind": "command._recorderRender",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2128,6 +5228,42 @@
     },
     "_recorderScheduleSync": {
       "kind": "command._recorderScheduleSync",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderSetInput": {
+      "kind": "command._recorderSetInput",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderSetMeeting": {
+      "kind": "command._recorderSetMeeting",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderSetOption": {
+      "kind": "command._recorderSetOption",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderSetSystem": {
+      "kind": "command._recorderSetSystem",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderShipChunks": {
+      "kind": "command._recorderShipChunks",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderShipSoon": {
+      "kind": "command._recorderShipSoon",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2162,6 +5298,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_recorderUploadSession": {
+      "kind": "command._recorderUploadSession",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_recorderWriteNotes": {
+      "kind": "command._recorderWriteNotes",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_refreshBoardActivityOnSessions": {
       "kind": "command._refreshBoardActivityOnSessions",
       "feedback_required": true,
@@ -2174,6 +5322,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_refreshPeekFrame": {
+      "kind": "command._refreshPeekFrame",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_refreshPeekSoon": {
       "kind": "command._refreshPeekSoon",
       "feedback_required": true,
@@ -2182,6 +5336,12 @@
     },
     "_removeQueuedOperation": {
       "kind": "command._removeQueuedOperation",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_renderBinaryPreview": {
+      "kind": "command._renderBinaryPreview",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2228,14 +5388,26 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_renderIcalBody": {
-      "kind": "command._renderIcalBody",
+    "_renderOffice": {
+      "kind": "command._renderOffice",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
     "_renderOrgSwitcher": {
       "kind": "command._renderOrgSwitcher",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_renderPdf": {
+      "kind": "command._renderPdf",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_renderPeekIssuesBody": {
+      "kind": "command._renderPeekIssuesBody",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2252,6 +5424,24 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_renderPeekWorkerActions": {
+      "kind": "command._renderPeekWorkerActions",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_renderReportChart": {
+      "kind": "command._renderReportChart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_renderSessionCard": {
+      "kind": "command._renderSessionCard",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_reportWorkFrontier": {
       "kind": "command._reportWorkFrontier",
       "feedback_required": true,
@@ -2260,6 +5450,12 @@
     },
     "_reportWorkerActionParity": {
       "kind": "command._reportWorkerActionParity",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_rerenderLayoutPresetMenu": {
+      "kind": "command._rerenderLayoutPresetMenu",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2306,6 +5502,48 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_rtBeacon": {
+      "kind": "command._rtBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_rtConnect": {
+      "kind": "command._rtConnect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_rtConnectSse": {
+      "kind": "command._rtConnectSse",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_rtDispatch": {
+      "kind": "command._rtDispatch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_rtFlushUp": {
+      "kind": "command._rtFlushUp",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_rtGap": {
+      "kind": "command._rtGap",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_rtSchedule": {
+      "kind": "command._rtSchedule",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_runDeltaSync": {
       "kind": "command._runDeltaSync",
       "feedback_required": true,
@@ -2314,6 +5552,12 @@
     },
     "_runLogSearch": {
       "kind": "command._runLogSearch",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_runScheduleNowOnce": {
+      "kind": "command._runScheduleNowOnce",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2336,8 +5580,8 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_saveChips": {
-      "kind": "command._saveChips",
+    "_runWorkerActionNames": {
+      "kind": "command._runWorkerActionNames",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2348,8 +5592,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_scheduleDeltaSyncRetry": {
+      "kind": "command._scheduleDeltaSyncRetry",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_schedulePeekPoll": {
       "kind": "command._schedulePeekPoll",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_scheduleSessionInvalidation": {
+      "kind": "command._scheduleSessionInvalidation",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2366,6 +5622,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_scopeBpSave": {
+      "kind": "command._scopeBpSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_scopeEditClose": {
       "kind": "command._scopeEditClose",
       "feedback_required": true,
@@ -2378,8 +5640,44 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_scopeLoad": {
+      "kind": "command._scopeLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_scopeRowToggle": {
+      "kind": "command._scopeRowToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_scopeVaultManage": {
+      "kind": "command._scopeVaultManage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_scratchpadLoad": {
+      "kind": "command._scratchpadLoad",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_scratchpadNewFolder": {
+      "kind": "command._scratchpadNewFolder",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_selectProvider": {
       "kind": "command._selectProvider",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_selectWorkerType": {
+      "kind": "command._selectWorkerType",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2392,6 +5690,12 @@
     },
     "_sessionReadRecovered": {
       "kind": "command._sessionReadRecovered",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_settingsTab": {
+      "kind": "command._settingsTab",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2414,8 +5718,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_showPinGroupPicker": {
+      "kind": "command._showPinGroupPicker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_simplePlayEntry": {
       "kind": "command._simplePlayEntry",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_skillPinToggle": {
+      "kind": "command._skillPinToggle",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2438,8 +5754,122 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_spArchive": {
+      "kind": "command._spArchive",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spCaptureSave": {
+      "kind": "command._spCaptureSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spCaptureSaveTyped": {
+      "kind": "command._spCaptureSaveTyped",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spCleanArchive": {
+      "kind": "command._spCleanArchive",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spHandlePaste": {
+      "kind": "command._spHandlePaste",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spMakeRow": {
+      "kind": "command._spMakeRow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spNav": {
+      "kind": "command._spNav",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spRender": {
+      "kind": "command._spRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spSaveFile": {
+      "kind": "command._spSaveFile",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spSetRetain": {
+      "kind": "command._spSetRetain",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spSetupEditableTitle": {
+      "kind": "command._spSetupEditableTitle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spShowMenu": {
+      "kind": "command._spShowMenu",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spSortBy": {
+      "kind": "command._spSortBy",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spUpdateTitle": {
+      "kind": "command._spUpdateTitle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spUploadFiles": {
+      "kind": "command._spUploadFiles",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_spWireCapture": {
+      "kind": "command._spWireCapture",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_splitBeacon": {
+      "kind": "command._splitBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_splitPaneOpen": {
+      "kind": "command._splitPaneOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_stalledChip": {
       "kind": "command._stalledChip",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_standingApprovalRevoke": {
+      "kind": "command._standingApprovalRevoke",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2456,8 +5886,32 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_steeringDelayPrompt": {
+      "kind": "command._steeringDelayPrompt",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_steeringEdit": {
+      "kind": "command._steeringEdit",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_steeringSendNow": {
       "kind": "command._steeringSendNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_steeringSetDelay": {
+      "kind": "command._steeringSetDelay",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_stopKeyBeacon": {
+      "kind": "command._stopKeyBeacon",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2486,6 +5940,30 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_sxBulk": {
+      "kind": "command._sxBulk",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_sxModalBeacon": {
+      "kind": "command._sxModalBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_sxNew": {
+      "kind": "command._sxNew",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_sxOpenWorker": {
+      "kind": "command._sxOpenWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_syncBannerBeacon": {
       "kind": "command._syncBannerBeacon",
       "feedback_required": true,
@@ -2498,6 +5976,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_syncChipsOnce": {
+      "kind": "command._syncChipsOnce",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_syncLockRequest": {
+      "kind": "command._syncLockRequest",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_syncOneDraft": {
       "kind": "command._syncOneDraft",
       "feedback_required": true,
@@ -2506,6 +5996,18 @@
     },
     "_syncOneUpload": {
       "kind": "command._syncOneUpload",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_syncUrlHash": {
+      "kind": "command._syncUrlHash",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_syncWorkerRenames": {
+      "kind": "command._syncWorkerRenames",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2528,8 +6030,44 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_takeTabListView": {
+      "kind": "command._takeTabListView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_tapTraceEv": {
       "kind": "command._tapTraceEv",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_tasksByWorker": {
+      "kind": "command._tasksByWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_tasksOpenCard": {
+      "kind": "command._tasksOpenCard",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_tasksOpenMessage": {
+      "kind": "command._tasksOpenMessage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_tasksResend": {
+      "kind": "command._tasksResend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_tasksReveal": {
+      "kind": "command._tasksReveal",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2542,6 +6080,42 @@
     },
     "_termDisconnect": {
       "kind": "command._termDisconnect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_termLinkOpen": {
+      "kind": "command._termLinkOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_themeDelete": {
+      "kind": "command._themeDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_themeEditSave": {
+      "kind": "command._themeEditSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_themeSelectChanged": {
+      "kind": "command._themeSelectChanged",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_themeSyncCustom": {
+      "kind": "command._themeSyncCustom",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_themeUse": {
+      "kind": "command._themeUse",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2594,6 +6168,18 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_transcriptionOpenSettings": {
+      "kind": "command._transcriptionOpenSettings",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_transcriptionSave": {
+      "kind": "command._transcriptionSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_trendsFocusTheme": {
       "kind": "command._trendsFocusTheme",
       "feedback_required": true,
@@ -2612,32 +6198,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_tunnelSettingsStart": {
-      "kind": "command._tunnelSettingsStart",
+    "_typingPing": {
+      "kind": "command._typingPing",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_tunnelSettingsStop": {
-      "kind": "command._tunnelSettingsStop",
+    "_updateBoardItemSend": {
+      "kind": "command._updateBoardItemSend",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "_tunnelStartUI": {
-      "kind": "command._tunnelStartUI",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_tunnelStatus": {
-      "kind": "command._tunnelStatus",
-      "feedback_required": true,
-      "target": "control-or-request",
-      "queue_policy": "transport-declared"
-    },
-    "_tunnelStopUI": {
-      "kind": "command._tunnelStopUI",
+    "_updatePendingPill": {
+      "kind": "command._updatePendingPill",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2672,8 +6246,98 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_upqCancel": {
+      "kind": "command._upqCancel",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_upqDrain": {
       "kind": "command._upqDrain",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_upqListBounded": {
+      "kind": "command._upqListBounded",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_upqOpenRecordings": {
+      "kind": "command._upqOpenRecordings",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_upqReadOk": {
+      "kind": "command._upqReadOk",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_upqRemove": {
+      "kind": "command._upqRemove",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_upqRenderBadge": {
+      "kind": "command._upqRenderBadge",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_upqTimeoutReport": {
+      "kind": "command._upqTimeoutReport",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultCardSave": {
+      "kind": "command._vaultCardSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultDelete": {
+      "kind": "command._vaultDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultOfferRestart": {
+      "kind": "command._vaultOfferRestart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultRemove": {
+      "kind": "command._vaultRemove",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultRestart": {
+      "kind": "command._vaultRestart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultReveal": {
+      "kind": "command._vaultReveal",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultSave": {
+      "kind": "command._vaultSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vaultSecretSave": {
+      "kind": "command._vaultSecretSave",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2686,6 +6350,234 @@
     },
     "_voiceToggle": {
       "kind": "command._voiceToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxAskChat": {
+      "kind": "command._vxAskChat",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxCallButton": {
+      "kind": "command._vxCallButton",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxChunker": {
+      "kind": "command._vxChunker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxDelete": {
+      "kind": "command._vxDelete",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxEnd": {
+      "kind": "command._vxEnd",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxEnqueue": {
+      "kind": "command._vxEnqueue",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxEnsureAudio": {
+      "kind": "command._vxEnsureAudio",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxFlushUtterance": {
+      "kind": "command._vxFlushUtterance",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxLinkOpen": {
+      "kind": "command._vxLinkOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxLoadHistory": {
+      "kind": "command._vxLoadHistory",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxNew": {
+      "kind": "command._vxNew",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxOnPeekClose": {
+      "kind": "command._vxOnPeekClose",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxOnPeekOpen": {
+      "kind": "command._vxOnPeekOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxPlayToggle": {
+      "kind": "command._vxPlayToggle",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxPump": {
+      "kind": "command._vxPump",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxRecStart": {
+      "kind": "command._vxRecStart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxRender": {
+      "kind": "command._vxRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxRtEvent": {
+      "kind": "command._vxRtEvent",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxRtSend": {
+      "kind": "command._vxRtSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxRtStart": {
+      "kind": "command._vxRtStart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxRtTool": {
+      "kind": "command._vxRtTool",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxRtTyped": {
+      "kind": "command._vxRtTyped",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxSave": {
+      "kind": "command._vxSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxSaveNow": {
+      "kind": "command._vxSaveNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxSay": {
+      "kind": "command._vxSay",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxSelect": {
+      "kind": "command._vxSelect",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxSendUtterance": {
+      "kind": "command._vxSendUtterance",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxStart": {
+      "kind": "command._vxStart",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxSweepNow": {
+      "kind": "command._vxSweepNow",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxToggleMute": {
+      "kind": "command._vxToggleMute",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxTrack": {
+      "kind": "command._vxTrack",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_vxTypeSend": {
+      "kind": "command._vxTypeSend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_watchPeekTabAnchor": {
+      "kind": "command._watchPeekTabAnchor",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_wfwCreateWorker": {
+      "kind": "command._wfwCreateWorker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_whereReport": {
+      "kind": "command._whereReport",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_whereSoon": {
+      "kind": "command._whereSoon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_whoOpen": {
+      "kind": "command._whoOpen",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_wkHoverShow": {
+      "kind": "command._wkHoverShow",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2720,6 +6612,24 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_workerTypeSet": {
+      "kind": "command._workerTypeSet",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_workerWorktreeProfile": {
+      "kind": "command._workerWorktreeProfile",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_workerWorktreeWiden": {
+      "kind": "command._workerWorktreeWiden",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_writeUserStorage": {
       "kind": "command._writeUserStorage",
       "feedback_required": true,
@@ -2728,6 +6638,42 @@
     },
     "_wsTermSetupHandlers": {
       "kind": "command._wsTermSetupHandlers",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_wselRun": {
+      "kind": "command._wselRun",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_xlNormalizeComments": {
+      "kind": "command._xlNormalizeComments",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_xlsxBeacon": {
+      "kind": "command._xlsxBeacon",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_xlsxEditorTeardown": {
+      "kind": "command._xlsxEditorTeardown",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_xlsxSave": {
+      "kind": "command._xlsxSave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_zoomFontModeSync": {
+      "kind": "command._zoomFontModeSync",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2752,6 +6698,12 @@
     },
     "addChipFromPicker": {
       "kind": "command.addChipFromPicker",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "amuxNotifyAllowed": {
+      "kind": "command.amuxNotifyAllowed",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -2888,6 +6840,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "clearPeekBoard": {
+      "kind": "command.clearPeekBoard",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "clearPeekFiles": {
       "kind": "command.clearPeekFiles",
       "feedback_required": true,
@@ -2936,8 +6894,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "closeFilePreview": {
+      "kind": "command.closeFilePreview",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "closePeek": {
       "kind": "command.closePeek",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "closeVault": {
+      "kind": "command.closeVault",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3032,6 +7002,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "dismissFilePreview": {
+      "kind": "command.dismissFilePreview",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "doConnect": {
       "kind": "command.doConnect",
       "feedback_required": true,
@@ -3070,6 +7046,12 @@
     },
     "doStop": {
       "kind": "command.doStop",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "duplicateSchedule": {
+      "kind": "command.duplicateSchedule",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3236,8 +7218,32 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "loadTunnelSettings": {
-      "kind": "command.loadTunnelSettings",
+    "loadLayoutPreset": {
+      "kind": "command.loadLayoutPreset",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "loadReportData": {
+      "kind": "command.loadReportData",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "modelLogin": {
+      "kind": "command.modelLogin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "modelLoginCancel": {
+      "kind": "command.modelLoginCancel",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "modelLoginSubmitCode": {
+      "kind": "command.modelLoginSubmitCode",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3278,14 +7284,14 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "openChipPicker": {
-      "kind": "command.openChipPicker",
+    "openCmdHistoryModal": {
+      "kind": "command.openCmdHistoryModal",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "openCmdHistoryModal": {
-      "kind": "command.openCmdHistoryModal",
+    "openCmdk": {
+      "kind": "command.openCmdk",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3326,6 +7332,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "openOutcome": {
+      "kind": "command.openOutcome",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "openPeek": {
       "kind": "command.openPeek",
       "feedback_required": true,
@@ -3346,6 +7358,18 @@
     },
     "openTeamInvite": {
       "kind": "command.openTeamInvite",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "openUsage": {
+      "kind": "command.openUsage",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "openVault": {
+      "kind": "command.openVault",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3416,6 +7440,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "pickMemberPhoto": {
+      "kind": "command.pickMemberPhoto",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "pullFromRemote": {
       "kind": "command.pullFromRemote",
       "feedback_required": true,
@@ -3448,6 +7478,12 @@
     },
     "removeChip": {
       "kind": "command.removeChip",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "removeMember": {
+      "kind": "command.removeMember",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3506,8 +7542,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "resetGroupView": {
+      "kind": "command.resetGroupView",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "resetTokenStats": {
       "kind": "command.resetTokenStats",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "resetZoom": {
+      "kind": "command.resetZoom",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3530,6 +7578,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "rtJoin": {
+      "kind": "command.rtJoin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "runScheduleNow": {
       "kind": "command.runScheduleNow",
       "feedback_required": true,
@@ -3542,14 +7596,20 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "saveAlertConfig": {
-      "kind": "command.saveAlertConfig",
+    "runVisibleWorkerAction": {
+      "kind": "command.runVisibleWorkerAction",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "saveApiKey": {
-      "kind": "command.saveApiKey",
+    "runWorkerGroupAction": {
+      "kind": "command.runWorkerGroupAction",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "saveAlertConfig": {
+      "kind": "command.saveAlertConfig",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3644,6 +7704,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "saveUiFont": {
+      "kind": "command.saveUiFont",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "sendFromInput": {
       "kind": "command.sendFromInput",
       "feedback_required": true,
@@ -3710,6 +7776,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "setMemberAdmin": {
+      "kind": "command.setMemberAdmin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "setOnline": {
       "kind": "command.setOnline",
       "feedback_required": true,
@@ -3728,6 +7800,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "setReportPeriod": {
+      "kind": "command.setReportPeriod",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "setSortMode": {
       "kind": "command.setSortMode",
       "feedback_required": true,
@@ -3740,8 +7818,8 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "showIcalInfo": {
-      "kind": "command.showIcalInfo",
+    "showSendingIndicator": {
+      "kind": "command.showSendingIndicator",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3800,8 +7878,38 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
-    "syncPeekMemory": {
-      "kind": "command.syncPeekMemory",
+    "tailnetJoin": {
+      "kind": "command.tailnetJoin",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "tailnetLeave": {
+      "kind": "command.tailnetLeave",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "themeActivate": {
+      "kind": "command.themeActivate",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "themeDeleteCustom": {
+      "kind": "command.themeDeleteCustom",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "themeSaveCustom": {
+      "kind": "command.themeSaveCustom",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "themeSyncPending": {
+      "kind": "command.themeSyncPending",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3926,6 +8034,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "togglePeekBoardPolicy": {
+      "kind": "command.togglePeekBoardPolicy",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "togglePeekCommitGuard": {
       "kind": "command.togglePeekCommitGuard",
       "feedback_required": true,
@@ -4046,6 +8160,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "toggleTheme": {
+      "kind": "command.toggleTheme",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "toggleYolo": {
       "kind": "command.toggleYolo",
       "feedback_required": true,
@@ -4072,6 +8192,12 @@
     },
     "uploadAndAttach": {
       "kind": "command.uploadAndAttach",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "usageConnect": {
+      "kind": "command.usageConnect",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -4108,6 +8234,18 @@
     },
     "wsTermSendTmux": {
       "kind": "command.wsTermSendTmux",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "zoomIn": {
+      "kind": "command.zoomIn",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "zoomOut": {
+      "kind": "command.zoomOut",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

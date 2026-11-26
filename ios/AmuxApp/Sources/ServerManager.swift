@@ -5,39 +5,106 @@ import os.log
 private let logger = Logger(subsystem: "io.amux.app", category: "ServerManager")
 
 class ServerManager: ObservableObject {
-    @Published var serverURL: URL?
+    /// One loaded dashboard per recently used server (ServerPanes.swift). The first is on screen.
+    @Published private(set) var panes = ServerPanes()
     @Published var hasServer: Bool = false
+    /// The page the server on screen was asked to load.
+    var serverURL: URL? { panes.active?.url }
     @Published var serverStatus: [String: ServerStatus] = [:]  // url -> status
 
     @Published var savedServers: [SavedServer] {
         didSet {
             if let data = try? JSONEncoder().encode(savedServers) {
-                UserDefaults.standard.set(data, forKey: "savedServers")
+                AmuxStore.defaults.set(data, forKey: AmuxStore.savedServersKey)
             }
+            refreshQuickActions()
         }
     }
+    private var quickActionObserver: NSObjectProtocol?
 
     init() {
-        if let data = UserDefaults.standard.data(forKey: "savedServers"),
+        AmuxStore.migrateFromStandardIfNeeded()
+        if let data = AmuxStore.defaults.data(forKey: AmuxStore.savedServersKey),
            let servers = try? JSONDecoder().decode([SavedServer].self, from: data) {
             self.savedServers = servers
         } else {
             self.savedServers = []
         }
 
-        if let urlString = UserDefaults.standard.string(forKey: "serverURL"),
+        if let urlString = AmuxStore.defaults.string(forKey: AmuxStore.serverURLKey),
            let url = URL(string: urlString) {
-            self.serverURL = url
+            self.panes.show(url, navigate: false)
             self.hasServer = true
         }
+        quickActionObserver = NotificationCenter.default.addObserver(forName: QuickActions.picked, object: nil,
+                                                                     queue: .main) { [weak self] _ in
+            self?.takeQuickAction()
+        }
+        refreshQuickActions()
+    }
+
+    /// Opens the server picked from the Home Screen quick actions (QuickActions.swift), if any.
+    func takeQuickAction() {
+        guard let url = QuickActions.takePending() else { return }
+        selectServer(url)
+    }
+
+    private func refreshQuickActions() {
+        UIApplication.shared.shortcutItems = QuickActions.items(servers: savedServers,
+                                                                recent: panes.panes.map(\.key))
     }
 
     func selectServer(_ urlString: String) {
         guard let url = URL(string: urlString) else { return }
-        serverURL = url
+        let (verdict, closed) = panes.show(url, navigate: false)
+        guard verdict != .refused else {
+            logger.warning("ios_server_switch verdict=refused url=\(urlString, privacy: .public)")
+            return
+        }
         hasServer = true
-        UserDefaults.standard.set(url.absoluteString, forKey: "serverURL")
-        logger.info("Switched to server: \(urlString)")
+        AmuxStore.defaults.set(url.absoluteString, forKey: AmuxStore.serverURLKey)
+        refreshQuickActions()
+        logger.info("ios_server_switch verdict=\(verdict.rawValue, privacy: .public) host=\(url.host ?? "-", privacy: .public) open=\(self.panes.panes.count) closed=\(closed ?? "-", privacy: .public)")
+    }
+
+    /// Loads `url` in its server's pane (a deep link, a sign-in link), opening the pane if needed.
+    private func navigate(_ url: URL) {
+        let (verdict, _) = panes.show(url, navigate: true)
+        logger.info("ios_server_switch verdict=\(verdict.rawValue, privacy: .public) host=\(url.host ?? "-", privacy: .public) link=1")
+    }
+
+    /// Opens a server through a one-time sign-in link (Sign in with Apple, via cloud.amux.io).
+    /// The server's address is what is remembered; the link only loads once, and the door's
+    /// cookie keeps the person signed in after that.
+    func openServer(_ urlString: String, signInLink: URL?) {
+        selectServer(urlString)
+        if let signInLink { navigate(signInLink) }
+    }
+
+    /// Opens a copied file link (DeepLink.swift) on its server. An `amux://` link
+    /// can come from any web page, so it opens only a server already saved or in
+    /// use. An https link reached the app only because its domain's
+    /// apple-app-site-association names this app (an amux server), so its server
+    /// is opened, and saved if new; the server still asks for its own sign-in.
+    @discardableResult
+    func open(deepLink url: URL) -> Bool {
+        guard let link = DeepLink.parse(url) else {
+            logger.info("deep_link verdict=not_a_link")
+            return false
+        }
+        let origin = link.server.absoluteString
+        let known = savedServers.contains { DeepLink.origin(of: URL(string: $0.url) ?? link.server)?.absoluteString == origin }
+            || serverURL.flatMap { DeepLink.origin(of: $0) }?.absoluteString == origin
+        let universal = url.scheme?.lowercased() == "https"
+        guard known || universal else {
+            logger.info("deep_link verdict=unknown_server_refused host=\(link.server.host ?? "-", privacy: .public)")
+            return false
+        }
+        if !known { _ = addServer(name: link.server.host ?? origin, urlString: origin) }
+        selectServer(origin)
+        navigate(link.load)
+        logger.info("deep_link verdict=opened host=\(link.server.host ?? "-", privacy: .public)")
+        return true
     }
 
     func addServer(name: String, urlString: String) -> Bool {
@@ -53,14 +120,29 @@ class ServerManager: ObservableObject {
     func removeServer(at offsets: IndexSet) {
         for i in offsets {
             logger.info("Removed server: \(self.savedServers[i].name)")
+            if let url = URL(string: savedServers[i].url), let key = ServerPanes.key(of: url) {
+                panes.close(key)
+            }
         }
         self.savedServers.remove(atOffsets: offsets)
+        // The server on screen was removed: show the next open one, or go back to setup.
+        if let next = panes.active {
+            AmuxStore.defaults.set(DashboardPage.root(of: next.url).absoluteString, forKey: AmuxStore.serverURLKey)
+        } else if hasServer {
+            resetServer()
+        }
+    }
+
+    /// Whether `server` (a saved server's address) is the one on screen.
+    func isActive(_ server: SavedServer) -> Bool {
+        guard let url = URL(string: server.url) else { return false }
+        return ServerPanes.key(of: url) != nil && ServerPanes.key(of: url) == panes.active?.key
     }
 
     func resetServer() {
-        serverURL = nil
+        panes.closeAll()
         hasServer = false
-        UserDefaults.standard.removeObject(forKey: "serverURL")
+        AmuxStore.defaults.removeObject(forKey: AmuxStore.serverURLKey)
         logger.info("Reset to server picker")
     }
 
@@ -73,6 +155,7 @@ class ServerManager: ObservableObject {
 
     func checkServer(_ urlString: String) {
         guard let url = URL(string: urlString + "/api/release-notes") else { return }
+        if serverStatus[urlString] == nil { serverStatus[urlString] = .checking }
         var req = URLRequest(url: url, timeoutInterval: 5)
         req.httpMethod = "GET"
         let session = URLSession(configuration: .ephemeral, delegate: TrustAllDelegate(), delegateQueue: nil)

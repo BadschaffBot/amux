@@ -16,7 +16,7 @@
 # Fail-open by design: any error lets the push proceed. Outside amux
 # ($AMUX_SESSION unset) it is a no-op — the human is always allowed to push.
 # Intentional cross-session push: AMUX_ALLOW_FOREIGN=1 git push ...
-import datetime, json, os, ssl, subprocess, sys, urllib.parse, urllib.request
+import datetime, glob, json, os, re, shutil, ssl, subprocess, sys, tempfile, time, urllib.parse, urllib.request
 
 ZERO = "0" * 40
 
@@ -67,6 +67,100 @@ def _session_is_isolated(name):
     except Exception:
         return False
     return False
+
+
+def _consent_message(msg_id, expect_origin, sha):
+    """Verify a consent CITATION of the form `<sha>:<session>:msg:<MSG-id>`.
+
+    WHY THIS FORM EXISTS (AMUX-4972). The two-field author form is refused for
+    an ISOLATED author, reasoning that `amux send` to it is refused by
+    construction so its consent cannot have been obtained. That is true of
+    INBOUND sends and false as a claim about the worker: isolation does not
+    stop an isolated lane from INITIATING. On 2026-09-23 amux-helper sent this
+    lane an unprompted, server-stamped message asking to push and naming the
+    commits, which is precisely the yes the guard asserted could not exist,
+    and no field here could carry it. The remaining exits each asserted
+    something nobody had said, which is ethos rule 3: a constraint with no
+    truthful path in a legitimate state.
+
+    So a volunteered yes is admitted only when it can be CHECKED, against the
+    record the SERVER stamps rather than against text the caller supplies:
+
+      1. the record's `origin` must equal the session named by the commit's
+         Amux-Session trailer. `origin` is the SENDER. `session` on that same
+         record is the RECIPIENT, and reading the wrong one compares a lane
+         against its own name, which silently passes or silently fails
+         depending only on who is pushing.
+      2. the message must POSTDATE the commit. A yes recorded before the
+         commit existed cannot be about it, and back-dating is the cheapest
+         way to fabricate one.
+      3. anything that cannot be resolved REFUSES.
+
+    FAILS CLOSED, and that is the design rather than a caveat. CI has no amux
+    server, so this probe cannot resolve there and every citation refuses.
+    `_session_is_isolated` above carries the scar from the opposite choice: it
+    used to ask the server, and a verdict that depended on the host's state
+    turned main red. "I could not check" is only safe to be wrong about in the
+    refusing direction, because the other reading turns an offline server into
+    a blanket override, which is the exact shape this whole mechanism exists
+    to avoid.
+
+    Returns (ok, reason). `reason` is printed on refusal and recorded in the
+    audit line on acceptance, so an accepted citation names its own evidence.
+    """
+    mid = str(msg_id or "").strip()
+    if mid.upper().startswith("MSG-"):
+        mid = mid[4:]
+    if not mid.isdigit():
+        return False, ("message id %r is not a MSG-<n> id. These are cmd_history "
+                       "row ids, the `MSG-27463` form you see and paste" % (msg_id,))
+
+    base = (os.environ.get("AMUX_URL") or "https://localhost:8824").rstrip("/")
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        rec = json.loads(urllib.request.urlopen(
+            "%s/api/history/%s" % (base, mid), context=ctx,
+            timeout=_API_TIMEOUT_S).read())
+    except Exception as exc:
+        return False, ("MSG-%s could not be read from the message store at %s (%s). "
+                       "A citation that cannot be checked is REFUSED, never assumed"
+                       % (mid, base, type(exc).__name__))
+    if not isinstance(rec, dict):
+        return False, "MSG-%s did not resolve to a record" % mid
+
+    origin = str(rec.get("origin") or "").strip()
+    if not origin:
+        return False, ("MSG-%s carries no server-stamped origin, so there is nothing "
+                       "to attribute it to. A body-text signature is not provenance"
+                       % mid)
+    if origin != expect_origin:
+        return False, ("MSG-%s was sent by %r, not by %r, the session that authored "
+                       "the commit" % (mid, origin, expect_origin))
+
+    raw_ts = rec.get("ts")
+    try:
+        ts = float(raw_ts)
+    except (TypeError, ValueError):
+        return False, "MSG-%s has no usable timestamp (%r)" % (mid, raw_ts)
+    # The store records milliseconds. Normalise rather than assume, so a
+    # seconds-valued record does not read as 1970 and pass the ordering test
+    # against every commit.
+    msg_s = ts / 1000.0 if ts > 1e11 else ts
+
+    got = subprocess.run(["git", "log", "-1", "--format=%ct", sha],
+                         capture_output=True, text=True, timeout=15)
+    if got.returncode != 0 or not got.stdout.strip():
+        return False, "could not read the commit time of %s" % sha
+    commit_s = float(got.stdout.strip())
+    if msg_s <= commit_s:
+        return False, ("MSG-%s predates the commit it consents to (message %s, commit "
+                       "%s), so it cannot be about it"
+                       % (mid, datetime.datetime.fromtimestamp(msg_s).isoformat(),
+                          datetime.datetime.fromtimestamp(commit_s).isoformat()))
+    return True, ("MSG-%s from %s at %s"
+                  % (mid, origin, datetime.datetime.fromtimestamp(msg_s).isoformat()))
 
 
 def _patch_ids(argv, timeout=25):
@@ -175,6 +269,408 @@ def _audit(kind, detail):
         pass
 
 
+# SPA GATES BEFORE THE PUSH (velocity audit 2026-10-26). rust.yml's spa-gates
+# job runs the dashboard's node:test suites 20-30 minutes after a push, and a
+# red there holds every deploy. On 2026-10-25 it went red twice from dashboard
+# commits: b095589a0 (36 failures, reverted 69 minutes later) and b920ec409
+# (4 failures in peek-freshness). The same suites take about 7 seconds here.
+#
+# They run on the PUSHED COMMIT'S bytes (git archive), never the worktree,
+# which on a shared checkout holds peers' drafts. A test that also fails on
+# the remote's tip is not this push's doing and does not block it.
+_SPA_SUITE_DIRS = ("crates/amux-dashboard/", "skills/chrome-cdp/scripts/")
+_SPA_SUITE_FILES = ("tests/dashboard-outage-recovery.mjs", "package.json", "package-lock.json",
+                    # rust.yml's spa-gates also runs these, and spa-lint.sh fails on
+                    # what they generate going stale. Leaving spa-lint out let
+                    # e0b64b05f pass here and redden spa-gates on 3 runs
+                    # (velocity audit 2026-10-27).
+                    "tests/spa-no-undeclared-global-assignment.test.mjs", "eslint.config.mjs",
+                    "scripts/spa-lint.sh", "scripts/gen-spa-globals.mjs",
+                    "scripts/build-state.mjs", "scripts/button-audit.mjs",
+                    "docs/ux/button-feedback-audit.md")
+_SPA_NOT_OK = re.compile(r"^\s*not ok \d+ - (.+?)(?:\s+#.*)?$")
+# Why the last _spa_failures run could not be measured, for the hook's line.
+_SPA_UNREAD = {"why": ""}
+
+
+def _spa_touched(path):
+    return (path.startswith(_SPA_SUITE_DIRS) or path in _SPA_SUITE_FILES
+            or (path.startswith("e2e/") and path.endswith(".test.mjs")))
+
+
+def _spa_failures(sha, node_modules):
+    """Run the suites on `sha`'s tree. Returns (tests, failing names) or None
+    when the run could not be measured."""
+    tmp = tempfile.mkdtemp(prefix="amux-spa-gate-")
+    try:
+        arch = subprocess.run("git archive %s | tar -x -C %s" % (sha, tmp), shell=True,
+                              capture_output=True, text=True, timeout=60)
+        if arch.returncode != 0:
+            _SPA_UNREAD["why"] = "git archive failed: " + (arch.stderr.strip().splitlines() or ["?"])[-1][:160]
+            return None
+        os.symlink(node_modules, os.path.join(tmp, "node_modules"))
+        suites = [s for s in ["tests/dashboard-outage-recovery.mjs",
+                              "tests/spa-no-undeclared-global-assignment.test.mjs"]
+                  if os.path.exists(os.path.join(tmp, s))]
+        suites += sorted(os.path.relpath(p, tmp)
+                         for p in glob.glob(os.path.join(tmp, "e2e", "*.test.mjs")))
+        tests, names = 0, set()
+        # spa-gates' first step. It regenerates and checks the SPA's generated
+        # files, then runs eslint; a failure counts as one named test.
+        if os.path.exists(os.path.join(tmp, "scripts", "spa-lint.sh")):
+            lint = subprocess.run(["bash", "scripts/spa-lint.sh"], cwd=tmp, capture_output=True,
+                                  text=True, timeout=180)
+            tests += 1
+            if lint.returncode != 0:
+                said = [l.strip() for l in (lint.stdout + lint.stderr).splitlines()
+                        if re.search(r"stale|error|✖", l)]
+                names.add("scripts/spa-lint.sh: " + (said[0] if said else "exit %d" % lint.returncode))
+        if suites:
+            # TAP, asked for by name: the counts below are read from TAP lines,
+            # and node's default reporter depends on the version and on whether
+            # stdout is a terminal. On 2026-10-31 CI read this as "could not be
+            # read" from 09:38Z on and every SPA gate went unmeasured.
+            r = subprocess.run(["node", "--test", "--test-reporter=tap"] + suites, cwd=tmp,
+                               capture_output=True, text=True, timeout=180)
+            m = re.search(r"^# tests (\d+)$", r.stdout, re.M)
+            if not m:
+                tail = (r.stdout + r.stderr).strip().splitlines()[-2:]
+                _SPA_UNREAD["why"] = "node --test printed no '# tests' line (exit %d): %s" % (r.returncode, " | ".join(tail)[:200])
+                return None
+            run_names = {x.group(1) for x in map(_SPA_NOT_OK.match, r.stdout.splitlines()) if x}
+            if r.returncode != 0 and not run_names:
+                _SPA_UNREAD["why"] = "node --test exited %d without a named failure" % r.returncode
+                return None
+            tests += int(m.group(1))
+            names |= run_names
+        return tests, sorted(names)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _harness_guard(sha):
+    """AF-561's guard (scripts/test-harness-guard.sh: every verdict-printing
+    test-*.sh carries `set -e`) on `sha`'s tree. It reddened `checks` twice in
+    24h to 2026-10-26 (b219fbda1, 2642d3295) and takes about a second. Returns
+    (rc, output), or None when it could not run."""
+    tmp = tempfile.mkdtemp(prefix="amux-harness-guard-")
+    try:
+        arch = subprocess.run("git archive %s | tar -x -C %s" % (sha, tmp), shell=True,
+                              capture_output=True, text=True, timeout=60)
+        guard = os.path.join(tmp, "scripts", "test-harness-guard.sh")
+        if arch.returncode != 0 or not os.path.exists(guard):
+            return None
+        r = subprocess.run(["bash", guard], cwd=tmp, capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _harness_guard_gate(refs):
+    for local, remote, touched in refs:
+        if not any(p.startswith("scripts/test-") and p.endswith(".sh") for p in touched):
+            continue
+        got = _harness_guard(local)
+        if not got or got[0] == 0:
+            continue
+        base = _harness_guard(remote) if remote != ZERO else None
+        if base and base[0] != 0:
+            sys.stderr.write("amux pre-push: the AF-561 harness guard also fails on the remote's "
+                             "tip, so not blocking this push verdict=harness_guard_inherited\n")
+            continue
+        _audit("harness_guard", "verdict=harness_guard_fail sha=%s" % local[:9])
+        sys.stderr.write("\nBLOCKED: a test harness in this push prints a verdict without "
+                         "`set -e` (AF-561).\nThis is the step `checks` runs:\n\n")
+        sys.stderr.write("\n".join(l for l in got[1].splitlines() if not l.startswith("  ok"))[-3000:])
+        sys.stderr.write("\n\nOverride for this push:\n  AMUX_SKIP_HARNESS_GUARD=1 git push ...\n")
+        if os.environ.get("AMUX_SKIP_HARNESS_GUARD", "").strip().lower() not in (
+                "1", "true", "yes", "on"):
+            return 1
+    return 0
+
+
+# AF-1073: land_gate.py runs Rust tests and e2e specs and no scripts/test-*.sh,
+# so a script whose only test is a checks.yml step lands untested. 5d52181bc
+# (AF-1055) and 8d6057fb7 each reddened main's checks that way on 2026-10-30
+# and 10-31. This leg runs the shell tests checks.yml runs that name a changed
+# script, on the pushed tree, and blocks only on a failure the remote's tip
+# does not share.
+# Every form checks.yml uses: `./scripts/test-x.sh`, `bash scripts/test-x.sh`,
+# behind `run:`, chained with `&&`, with arguments or an env prefix. A test
+# with arguments runs here without them; if that makes it fail, it fails on
+# the remote's tip the same way and counts as inherited (review F1).
+# And `python3 scripts/test-x.py`: bfc81b6d5 broke scripts/test-cargo-budget.py,
+# which this pattern did not match, and main's checks was red 8 hours (AF-1197).
+_SCRIPT_TEST_STEP = re.compile(r"(?:\./|\bbash\s+|\bpython3\s+)(scripts/test-[A-Za-z0-9_.-]+\.(?:sh|py))\b")
+# The failing cases a test names: unittest's `FAIL: test_x (...)` and
+# `ERROR: ...`, and the `FAIL: ...` lines of the shell tests. A test that
+# already fails on the remote for one case must not hide a new case: on a Mac
+# test-cargo-budget.py always fails its /proc case, which made bfc81b6d5's new
+# failure in the same file read as inherited (AF-1197).
+_FAIL_CASE = re.compile(r"^(?:FAIL|ERROR)\b:?\s*(.+)$", re.M)
+_TMP_PATH = re.compile(r"(?:/private)?/var/folders/\S+|/tmp/\S+")
+
+
+def _failing_cases(out, tree):
+    return {_TMP_PATH.sub("<tmp>", m.replace(tree, "<tree>")).strip() for m in _FAIL_CASE.findall(out)}
+_SCRIPT_TESTS_MAX = 12
+_SCRIPT_TEST_TIMEOUT_S = 300
+
+
+def _git_show(sha, path):
+    r = subprocess.run(["git", "show", "%s:%s" % (sha, path)], capture_output=True, text=True, timeout=30)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def _script_tests_for(sha, touched):
+    """The checks.yml shell tests that name a changed script, then the
+    scripts/git-hooks/test_*.py that name a changed hook: (selected, wired
+    count). A changed test selects itself. ab340f923 changed pre-push and ran
+    none of the hook tests, and one of them reddened main (AF-1128)."""
+    changed = [p for p in touched if p.startswith("scripts/") and "/" not in p[len("scripts/"):]]
+    hooks = [p for p in touched if p.startswith("scripts/git-hooks/")]
+    if not changed and not hooks:
+        return [], 0
+    steps = "\n".join(l for l in _git_show(sha, ".github/workflows/checks.yml").splitlines()
+                      if not l.lstrip().startswith("#"))
+    wired = list(dict.fromkeys(_SCRIPT_TEST_STEP.findall(steps)))
+    picked = []
+    for t in wired:
+        if t in changed:
+            picked.append(t)
+            continue
+        body = _git_show(sha, t)
+        if any(os.path.basename(c) in body for c in changed):
+            picked.append(t)
+    if hooks:
+        listed = subprocess.run(["git", "ls-tree", "--name-only", sha, "scripts/git-hooks/"],
+                                capture_output=True, text=True, timeout=30).stdout.split()
+        for t in (x for x in listed if os.path.basename(x).startswith("test_") and x.endswith(".py")):
+            wired.append(t)
+            if t in hooks or any(os.path.basename(h) in _git_show(sha, t) for h in hooks):
+                picked.append(t)
+    return picked, len(wired)
+
+
+def _script_test_failures(sha, tests, secs=None):
+    """Run `tests` on `sha`'s tree with no amux session in the environment, so
+    a test cannot reach the live server. Returns failing names, or None.
+    `secs`, when given, gets each test's wall time."""
+    tmp = tempfile.mkdtemp(prefix="amux-script-tests-")
+    try:
+        arch = subprocess.run("git archive %s | tar -x -C %s" % (sha, tmp), shell=True,
+                              capture_output=True, text=True, timeout=60)
+        if arch.returncode != 0:
+            return None
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("AMUX_", "CC_", "GIT_")) and k not in ("TMUX", "TMUX_PANE")}
+        env["HOME"] = os.path.join(tmp, ".home")
+        os.makedirs(env["HOME"])
+        failing = []
+        for t in tests:
+            if not os.path.exists(os.path.join(tmp, t)):
+                continue
+            t0 = time.monotonic()
+            try:
+                run = [sys.executable, t] if t.endswith(".py") else ["bash", t]
+                r = subprocess.run(run, cwd=tmp, env=env, capture_output=True, text=True,
+                                   timeout=_SCRIPT_TEST_TIMEOUT_S)
+                if r.returncode != 0:
+                    failing.append((t, "\n".join((r.stdout + r.stderr).strip().splitlines()[-6:]),
+                                    _failing_cases(r.stdout + r.stderr, tmp)))
+            except subprocess.TimeoutExpired:
+                failing.append((t, "did not finish in %ds" % _SCRIPT_TEST_TIMEOUT_S, set()))
+            if secs is not None:
+                secs[t] = secs.get(t, 0) + time.monotonic() - t0
+        return failing
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _script_tests_gate(refs):
+    """refs: [(local_sha, remote_sha, touched paths)]. Returns 1 to refuse."""
+    if os.environ.get("AMUX_SKIP_SCRIPT_TESTS", "").strip().lower() in ("1", "true", "yes", "on"):
+        _audit("script_tests", "verdict=script_tests_skipped")
+        return 0
+    for local, remote, touched in refs:
+        tests, wired = _script_tests_for(local, touched)
+        if not tests:
+            continue
+        short = local[:9]
+        dropped = tests[_SCRIPT_TESTS_MAX:]
+        tests = tests[:_SCRIPT_TESTS_MAX]
+        t0 = datetime.datetime.now()
+        # Per test, both trees: lanes skipped this leg after runs of 1,391 to
+        # 1,779 s that logged no test names, so nobody could say which test
+        # was slow (AF-1197). The audit line and the summary now name them.
+        per = {}
+        failing = _script_test_failures(local, tests, per)
+        if failing is None:
+            sys.stderr.write("amux pre-push: script tests on %s could not run (git archive failed); "
+                             "CI's checks still runs them verdict=script_tests_unmeasured\n" % short)
+            _audit("script_tests", "verdict=script_tests_unmeasured sha=%s" % short)
+            continue
+        inherited, new_cases = [], {}
+        if failing:
+            base = remote if remote != ZERO else subprocess.run(
+                ["git", "rev-parse", "-q", "--verify", "origin/main"], capture_output=True,
+                text=True, timeout=10).stdout.strip()
+            was = _script_test_failures(base, [t for t, _, _ in failing], per) if base else None
+            if was is None:
+                # A first push, or a base tree that cannot be read: this leg
+                # blocks only what it can show is new, so CI decides (AF-1128).
+                sys.stderr.write("amux pre-push: script tests on %s: %d failing, not compared (%s); "
+                                 "CI's checks still runs them verdict=script_tests_unmeasured\n"
+                                 % (short, len(failing), "base %s could not be read" % base[:9]
+                                    if base else "no remote tip"))
+                _audit("script_tests", "verdict=script_tests_unmeasured sha=%s" % short)
+                continue
+            was_cases = {t: cases for t, _, cases in was}
+            # Inherited only when the remote fails it too, and for every case
+            # this push fails it for. A test that names no case compares whole.
+            inherited = [t for t, _, cases in failing if t in was_cases and cases <= was_cases[t]]
+            new_cases = {t: cases - was_cases.get(t, set()) for t, _, cases in failing}
+        mine = [(t, why if not (new_cases.get(t) and t in was_cases) else
+                 "new failing case(s), the remote fails only the others:\n" + "\n".join(sorted(new_cases[t])))
+                for t, why, _ in failing if t not in inherited]
+        secs = (datetime.datetime.now() - t0).total_seconds()
+        slowest = ",".join("%s:%.0f" % (os.path.basename(t), n) for t, n in
+                           sorted(per.items(), key=lambda x: -x[1])[:3])
+        verdict = "script_tests_fail" if mine else "script_tests_pass"
+        sys.stderr.write("amux pre-push: script tests on %s: %d of %d wired tests name a "
+                         "changed script or hook, %d failing from this push, %d already failing on the remote, "
+                         "%d not run (cap %d), %.0fs (slowest %s) verdict=%s\n"
+                         % (short, len(tests), wired, len(mine), len(inherited), len(dropped),
+                            _SCRIPT_TESTS_MAX, secs, slowest or "-", verdict))
+        _audit("script_tests", "verdict=%s sha=%s tests=%d mine=%d inherited=%d secs=%.0f slowest=%s"
+               % (verdict, short, len(tests), len(mine), len(inherited), secs, slowest or "-"))
+        if mine:
+            sys.stderr.write("\nBLOCKED: this push fails tests that CI runs:\n")
+            for t, why in mine:
+                sys.stderr.write("  %s\n    %s\n" % (t, why.replace("\n", "\n    ")))
+            sys.stderr.write("\nReproduce: run that test on your commit.\nOverride for this push, if "
+                             "you are deliberately landing it red:\n  AMUX_SKIP_SCRIPT_TESTS=1 git push ...\n")
+            return 1
+    return 0
+
+
+def _spa_gates(refs):
+    """refs: [(local_sha, remote_sha, touched paths)]. Returns 1 to refuse."""
+    if os.environ.get("AMUX_SKIP_SPA_GATES", "").strip().lower() in ("1", "true", "yes", "on"):
+        _audit("spa_gates", "verdict=spa_gates_skipped")
+        return 0
+    for local, remote, touched in refs:
+        if not any(_spa_touched(p) for p in touched):
+            continue
+        root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+        nm = next((c for c in (os.environ.get("AMUX_SPA_GATE_NODE_MODULES", ""),
+                               os.path.join(root, "node_modules"),
+                               os.path.join(os.path.dirname(common), "node_modules"))
+                   if c and os.path.isdir(c)), "")
+        short = local[:9]
+        if not nm or not shutil.which("node"):
+            sys.stderr.write("amux pre-push: SPA gates not run on %s: no node or node_modules "
+                             "here; CI's spa-gates still runs verdict=spa_gates_unmeasured\n" % short)
+            _audit("spa_gates", "verdict=spa_gates_unmeasured sha=%s" % short)
+            continue
+        t0 = datetime.datetime.now()
+        got = _spa_failures(local, nm)
+        secs = (datetime.datetime.now() - t0).total_seconds()
+        if got is None:
+            sys.stderr.write("amux pre-push: SPA gates on %s could not be read (%s); CI's spa-gates "
+                             "still runs verdict=spa_gates_unmeasured\n" % (short, _SPA_UNREAD["why"] or "no reason recorded"))
+            _audit("spa_gates", "verdict=spa_gates_unmeasured sha=%s" % short)
+            continue
+        tests, failing = got
+        inherited, new_cases = [], {}
+        if failing:
+            base = remote if remote != ZERO else subprocess.run(
+                ["git", "rev-parse", "-q", "--verify", "origin/main"], capture_output=True,
+                text=True, timeout=10).stdout.strip()
+            was = _spa_failures(base, nm) if base else None
+            if was is not None:
+                inherited = [n for n in failing if n in was[1]]
+        mine = [n for n in failing if n not in inherited]
+        verdict = "spa_gates_fail" if mine else "spa_gates_pass"
+        sys.stderr.write("amux pre-push: SPA gates on %s: %d tests, %d failing from this push, "
+                         "%d already failing on the remote, %.0fs verdict=%s\n"
+                         % (short, tests, len(mine), len(inherited), secs, verdict))
+        _audit("spa_gates", "verdict=%s sha=%s tests=%d mine=%d inherited=%d secs=%.0f"
+               % (verdict, short, tests, len(mine), len(inherited), secs))
+        if mine:
+            sys.stderr.write("\nBLOCKED: this push fails the dashboard suites rust.yml's "
+                             "spa-gates job runs:\n")
+            for n in mine[:20]:
+                sys.stderr.write("  not ok - %s\n" % n)
+            sys.stderr.write(
+                "\nReproduce on your commit: node --test tests/dashboard-outage-recovery.mjs "
+                "e2e/*.test.mjs\nOverride for this push, if you are deliberately landing it red:\n"
+                "  AMUX_SKIP_SPA_GATES=1 git push ...\n")
+            return 1
+    return 0
+
+
+def _land_gate_leg(stdin_text):
+    """scripts/land_gate.py --pre-push for each push to main: an owner-gated
+    change needs the owner's approval of its exact diff, a change to a
+    workflow, installer, guard or schema says how to revert it, and an agent's
+    commits carry a passing land-gate receipt (the checks main runs, run on
+    origin/main plus the change before it lands). ORIGIN/MAIN'S COPY of the
+    gate runs, never the pushed one, so a change cannot loosen its own gate.
+    Returns 1 to refuse."""
+    root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True,
+                          text=True, timeout=10).stdout.strip()
+    tmp = tempfile.mkdtemp(prefix="amux-land-gate-")
+    try:
+        for name in ("land_gate.py", "land_review.py"):
+            r = subprocess.run(["git", "show", "origin/main:scripts/" + name], capture_output=True,
+                               text=True, timeout=30)
+            if r.returncode != 0:
+                sys.stderr.write("amux pre-push: scripts/%s is not on origin/main yet, so the land "
+                                 "gate did not run verdict=land_gate_not_on_main\n" % name)
+                return 0
+            with open(os.path.join(tmp, name), "w") as f:
+                f.write(r.stdout)
+        for line in stdin_text.splitlines():
+            p = line.split()
+            if len(p) < 4 or p[1].strip("0") == "" or p[2] != "refs/heads/main":
+                continue
+            r = subprocess.run([sys.executable, os.path.join(tmp, "land_gate.py"), "--pre-push",
+                                "--local", p[1], "--remote", p[3]], cwd=root, timeout=300)
+            if r.returncode != 0:
+                return 1
+        return 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _kill_switch_engaged():
+    """The reason, if the owner's kill switch is engaged; None if it is not.
+    AMUX_KILL_SWITCH=off makes it inert. A file that exists but cannot be
+    read reads as engaged: a stop the owner asked for fails closed."""
+    if os.environ.get("AMUX_KILL_SWITCH", "").strip().lower() in ("off", "0", "false", "no"):
+        return None
+    home = os.environ.get("AMUX_HOME") or os.path.join(os.environ.get("HOME", ""), ".amux")
+    path = os.path.join(home, "governance", "kill-switch.json")
+    try:
+        with open(path) as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return "kill-switch file unreadable"
+    try:
+        d = json.loads(raw)
+    except Exception:
+        return "kill-switch file unreadable"
+    if isinstance(d, dict) and d.get("engaged") is True:
+        return str(d.get("reason") or "")
+    return None
+
+
 def main():
     # DATA-LOSS GUARD FIRST, and BEFORE the session early-returns: a stale
     # shared-file republish (MG-1483 — 10 pushed entry-lines silently reverted,
@@ -182,6 +678,19 @@ def main():
     # append-only guard runs for humans and AMUX_ALLOW_FOREIGN pushes too.
     # Stdin is consumed once here and shared with the attribution walk below.
     stdin_text = sys.stdin.read()
+    # THE OWNER'S KILL SWITCH (governance PR 19) comes before everything else
+    # and no override skips it. It reads the file the server writes
+    # (<AMUX_HOME>/governance/kill-switch.json), so it holds with the server
+    # down. A person pushing outside a worker ($AMUX_SESSION unset) is never
+    # stopped: the switch stops automation, not the people cleaning up.
+    killed = _kill_switch_engaged()
+    if killed is not None and os.environ.get("AMUX_SESSION"):
+        sys.stderr.write(
+            "amux pre-push: REFUSED. The owner's kill switch is engaged (%s); no worker\n"
+            "pushes until the owner lifts it (amux audit kill-switch off). Nothing was pushed.\n"
+            "verdict=kill_switch_refused\n" % (killed or "no reason given"))
+        _audit("kill_switch", "verdict=kill_switch_refused")
+        return 1
     try:
         guard = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              "append-only-push-guard")
@@ -258,6 +767,87 @@ def main():
                     sys.stderr.write("AMUX_SKIP_HARNESS_WIRED set — landing it anyway.\n")
     except Exception:
         pass  # fail open, same rule as the guard above
+
+    # THE RULE TREE AND THE SLOP RATCHET (VISION.md, 2026-10-30). Selected from
+    # the pushed range like the harness check above: the rule tree runs when a
+    # push touches a rule file, the ratchet when it touches server Rust or the
+    # dashboard's scripts. AMUX_SKIP_RULES_TREE / AMUX_SKIP_SLOP_RATCHET skip
+    # once, said on stderr.
+    try:
+        _touch2, _heads = [], []
+        for _line in stdin_text.splitlines():
+            _p = _line.split()
+            if len(_p) < 4 or _p[1].strip("0") == "":
+                continue
+            _heads.append(_p[1])
+            _rng = [_p[1], "--not", "--remotes=origin"]
+            if _p[3] != ZERO:
+                _rng.append(_p[3])
+            _r = subprocess.run(["git", "log", "--name-only", "--format="] + _rng,
+                                capture_output=True, text=True, timeout=30)
+            _touch2.extend(x for x in _r.stdout.splitlines() if x.strip())
+        _root = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+        _skip = lambda k: os.environ.get(k, "").strip().lower() in ("1", "true", "yes", "on")
+        if any(x == "VISION.md" or x.endswith("CLAUDE.md") or x.endswith("AGENTS.md") for x in _touch2):
+            _chk = os.path.join(_root, "scripts", "check_rules_tree.py")
+            # At each pushed head's committed bytes, never the shared working tree.
+            for _h in (_heads if os.path.exists(_chk) else []):
+                _w = subprocess.run([sys.executable, _chk, "--root", _root, "--ref", _h],
+                                    capture_output=True, text=True, timeout=60)
+                if _w.returncode != 0:
+                    sys.stderr.write("\nBLOCKED: the rule tree under VISION.md is broken at %s.\n\n" % _h[:9] + _w.stdout + _w.stderr)
+                    if not _skip("AMUX_SKIP_RULES_TREE"):
+                        return 1
+                    sys.stderr.write("AMUX_SKIP_RULES_TREE set: pushing anyway.\n")
+        _code = [x for x in _touch2 if (x.endswith(".rs") and x.startswith("crates/") and "/src/" in x)
+                 or (x.startswith("crates/amux-dashboard/static/") and x.endswith((".js", ".mjs")))]
+        _chk = os.path.join(_root, "scripts", "check_slop_ratchet.py")
+        if _code and os.path.exists(_chk):
+            for _h in _heads:
+                _base = subprocess.run(["git", "merge-base", "origin/main", _h],
+                                       capture_output=True, text=True, timeout=30).stdout.strip()
+                if not _base:
+                    continue
+                _w = subprocess.run([sys.executable, _chk, "--base", _base, "--head", _h],
+                                    capture_output=True, text=True, timeout=300)
+                sys.stderr.write(_w.stdout)
+                if _w.returncode != 0:
+                    sys.stderr.write("\nBLOCKED: the slop ratchet (scripts/check_slop_ratchet.py).\n")
+                    if not _skip("AMUX_SKIP_SLOP_RATCHET"):
+                        return 1
+                    sys.stderr.write("AMUX_SKIP_SLOP_RATCHET set: pushing anyway.\n")
+    except Exception as _e:
+        sys.stderr.write("amux pre-push: rule tree / slop ratchet could not run (%s); not blocking "
+                         "(verdict=rules_slop_unmeasured)\n" % _e)
+
+    # SPA GATES (_spa_gates above). Also before the session early-returns: a
+    # red spa-gates holds the deploy for everyone, whoever pushed it.
+    try:
+        _refs = []
+        for _line in stdin_text.splitlines():
+            _p = _line.split()
+            if len(_p) < 4 or _p[1].strip("0") == "":
+                continue
+            _rng = [_p[1], "--not", "--remotes=origin"] + ([_p[3]] if _p[3] != ZERO else [])
+            _r = subprocess.run(["git", "log", "--name-only", "--format="] + _rng,
+                                capture_output=True, text=True, timeout=30)
+            _refs.append((_p[1], _p[3], [x for x in _r.stdout.splitlines() if x.strip()]))
+        if _spa_gates(_refs) or _harness_guard_gate(_refs) or _script_tests_gate(_refs):
+            return 1
+    except Exception as e:
+        sys.stderr.write("amux pre-push: the pushed-commit gates errored (%s); CI still runs "
+                         "them verdict=spa_gates_unmeasured\n" % e)
+
+    # LAND GATE (_land_gate_leg above). Before the session early-returns too:
+    # the gate itself tells an agent's push from a person's.
+    try:
+        if _land_gate_leg(stdin_text):
+            return 1
+    except Exception as e:
+        sys.stderr.write("amux pre-push: the land gate errored (%s); not blocking "
+                         "verdict=land_gate_unmeasured\n" % e)
+        _audit("land_gate", "verdict=land_gate_unmeasured error=%s" % str(e)[:200])
 
     sess = os.environ.get("AMUX_SESSION", "")
     if not sess or os.environ.get("AMUX_ALLOW_FOREIGN"):
@@ -469,11 +1059,20 @@ def main():
             # from author consent, because "the owner authorized this on behalf
             # of a worker that cannot speak" is a different fact from "the
             # author said yes" and the audit should not blur them.
+            # FOUR FIELDS = A CITED, CHECKABLE AUTHOR CONSENT (AMUX-4972).
+            # `<sha>:<session>:msg:<MSG-id>` names the server-stamped message
+            # in which that session volunteered the yes. It is the only form
+            # available to an ISOLATED author, whose consent the two-field
+            # form refuses on the reasoning that it could not have been
+            # obtained. See _consent_message for why that reasoning is half
+            # right and what is verified instead.
             bits = [b.strip() for b in tok.split(":")]
-            if len(bits) == 3 and bits[2].lower() == "owner":
-                pairs.append((bits[0], bits[1], True))
+            if len(bits) == 4 and bits[2].lower() == "msg":
+                pairs.append((bits[0], bits[1], False, bits[3]))
+            elif len(bits) == 3 and bits[2].lower() == "owner":
+                pairs.append((bits[0], bits[1], True, None))
             elif len(bits) == 2:
-                pairs.append((bits[0], bits[1], False))
+                pairs.append((bits[0], bits[1], False, None))
             else:
                 malformed.append(tok)
         # A malformed entry is REFUSED, never skipped. Silently ignoring one
@@ -487,7 +1086,7 @@ def main():
                 % ", ".join(malformed))
             return 1
         cleared, mismatched = [], []
-        for sha_in, who_in, owner_grant in pairs:
+        for sha_in, who_in, owner_grant, msg_id in pairs:
             real = subprocess.run(
                 ["git", "log", "-1",
                  "--format=%h%x1f%(trailers:key=Amux-Session,valueonly)", sha_in],
@@ -500,6 +1099,18 @@ def main():
             if real_who != who_in:
                 mismatched.append(
                     (sha_in, who_in, "actually authored by %s" % (real_who or "(no trailer)")))
+                continue
+            if msg_id:
+                # CHECKED BEFORE the isolation branches below, deliberately. A
+                # cited message is STRONGER evidence than the bare two-field
+                # form, not a special case of it, so it is not gated on the
+                # author being isolated: the citation either resolves to that
+                # author's own stamped yes or it does not.
+                ok_msg, why_msg = _consent_message(msg_id, who_in, sha_in)
+                if not ok_msg:
+                    mismatched.append((sha_in, who_in, why_msg))
+                    continue
+                cleared.append((bits[0], who_in, False, why_msg))
                 continue
             if owner_grant and not _session_is_isolated(who_in):
                 # FAIL CLOSED. Unreachable-or-not-isolated both land here: if we
@@ -531,11 +1142,17 @@ def main():
                 mismatched.append((
                     sha_in, who_in,
                     "'%s' is an ISOLATED (raw-agent) worker — `amux send` to it is refused "
-                    "by construction, so its author consent cannot have been obtained. "
-                    "Only the owner can grant this, and it is recorded distinctly: use "
-                    "%s:%s:owner" % (who_in, sha_in, who_in)))
+                    "by construction, so its author consent cannot have been ASKED FOR. "
+                    "Two exits, and they assert different things:\n"
+                    "         %s:%s:msg:<MSG-id>  if %s VOLUNTEERED a yes unprompted "
+                    "(isolation blocks inbound sends, not outbound ones). The message is "
+                    "resolved against the store and must be stamped from %s and postdate "
+                    "the commit.\n"
+                    "         %s:%s:owner          if the OWNER is granting it on their "
+                    "behalf. Do not spell one as the other; they are audited separately"
+                    % (who_in, sha_in, who_in, who_in, who_in, sha_in, who_in)))
                 continue
-            cleared.append((bits[0], who_in, owner_grant))
+            cleared.append((bits[0], who_in, owner_grant, None))
         if mismatched:
             sys.stderr.write(
                 "\namux push-guard: AMUX_FOREIGN_CONSENT does not match the commits.\n"
@@ -552,16 +1169,30 @@ def main():
             if keep:
                 remaining[who] = keep
         if not remaining:
+            # THREE DISTINCT FACTS, THREE DISTINCT AUDIT KINDS. "the author
+            # said yes", "the owner authorized it on behalf of a worker that
+            # cannot speak" and "the author's own stamped message says yes,
+            # and here is its id" are different claims, and an audit that
+            # blurs them cannot answer who authorized a push months later.
+            # CONSENT-MSG is the only one that carries its own evidence.
+            _kind = ("CONSENT-OWNER" if any(c[2] for c in cleared)
+                     else "CONSENT-MSG" if any(c[3] for c in cleared)
+                     else "CONSENT")
             _audit(
-                "CONSENT-OWNER" if any(c[2] for c in cleared) else "CONSENT",
+                _kind,
                 "cleared=%s" % ",".join(
-                    "%s:%s%s" % (c[0], c[1], ":owner-granted" if c[2] else "") for c in cleared))
+                    "%s:%s%s" % (c[0], c[1],
+                                 ":owner-granted" if c[2]
+                                 else (":%s" % c[3].split(" from ")[0]) if c[3] else "")
+                    for c in cleared))
             sys.stderr.write(
                 "\namux push-guard: %d foreign commit(s) cleared by recorded author consent:\n"
                 "  %s\n"
                 "  (logged to ~/.amux/logs/push-guard.log — this is an AUDITED exit, not a bypass)\n\n"
                 % (len(cleared), ", ".join(
-                    "%s (%s%s)" % (c[0], c[1], ", owner-granted: isolated worker" if c[2] else "")
+                    "%s (%s%s)" % (c[0], c[1],
+                                   ", owner-granted: isolated worker" if c[2]
+                                   else ", cited: %s" % c[3] if c[3] else "")
                     for c in cleared)))
             return 0
         # PARTIAL consent still blocks, and says exactly what is uncovered —
@@ -708,8 +1339,12 @@ def main():
           "      AMUX_FOREIGN_CONSENT=\"%s\" git push ...\n" % _consent)
         if _isolated:
             w("    (that string covers the reachable authors only — the isolated ones\n"
-              "     above need their own `:owner` entries, and every foreign commit\n"
-              "     must be covered or the push stays blocked.)\n")
+              "     above need their own entry, and every foreign commit must be\n"
+              "     covered or the push stays blocked. For an isolated author there\n"
+              "     are two, and they are not interchangeable: `<sha>:<session>:msg:\n"
+              "     <MSG-id>` if that session VOLUNTEERED a yes unprompted, which\n"
+              "     isolation permits because it only blocks inbound sends; or\n"
+              "     `<sha>:<session>:owner` if the owner is granting it for them.)\n")
     w("  - or, if the HUMAN explicitly asked you to ship everything regardless of\n"
       "    who wrote it:\n"
       "      AMUX_ALLOW_FOREIGN=1 git push ...\n\n")
@@ -803,11 +1438,16 @@ def main():
                     # for an isolated lane the answer does not depend on whether
                     # it is live. It cannot be nudged either way.
                     w("  BLOCKING RUN: the %d commit(s) at the bottom belong to %s, which is\n"
-                      "  ISOLATED and cannot be asked or nudged — its live status does not\n"
-                      "  matter here. Selective pushes cannot drain past them. The exit is the\n"
-                      "  owner grant named above, not the blanket override:\n"
+                      "  ISOLATED, so it cannot be ASKED or nudged and its live status does\n"
+                      "  not matter here. Selective pushes cannot drain past them. Two exits,\n"
+                      "  neither of them the blanket override, asserting different things:\n"
+                      "      AMUX_FOREIGN_CONSENT=\"...%s:%s:msg:<MSG-id>\" git push ...\n"
+                      "        if %s already volunteered a yes. Isolation blocks inbound\n"
+                      "        sends, not outbound ones, so a message from it can exist and\n"
+                      "        is checked against the store.\n"
                       "      AMUX_FOREIGN_CONSENT=\"...%s:%s:owner\" git push ...\n"
-                      % (_brun, _bown, _bsha_hint, _bown))
+                      "        if the owner is granting it on their behalf.\n"
+                      % (_brun, _bown, _bsha_hint, _bown, _bown, _bsha_hint, _bown))
                 elif not _api_ok:
                     # AH-91: the API was unreachable, so the blocker's LIVE status
                     # is unknown — but the OWNER is not: it came from the

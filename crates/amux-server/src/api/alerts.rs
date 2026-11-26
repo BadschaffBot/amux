@@ -55,6 +55,25 @@ pub trait AlertChannels: Send + Sync {
     /// and sms needs his phone, but a connected Gmail account already exists and
     /// its own inbox is a destination. `(ok, detail)`, detail names the account.
     async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String);
+    /// Low-priority owner FYI (AMUX-5270): an escalation a standing approval
+    /// answered. Deliberately NOT one of the three fire-alarm channels above.
+    /// Default is a no-op so a test double can never reach a device by
+    /// forgetting to override it; `RealChannels` sends a plain web push.
+    async fn fyi(&self, _state: &AppState, _session: &str, _text: &str) {}
+}
+
+/// The owner's inbox and whether it was PINNED: `AMUX_OWNER_EMAIL` if set,
+/// else the most recently refreshed connected Gmail account (AMUX-3203/3524).
+/// Shared by the fire alarm and the non-urgent owner digests (AMUX-5240) so
+/// the two can never disagree about where "the owner" reads mail.
+pub(crate) fn owner_email_destination(home: &std::path::Path) -> Option<(String, bool)> {
+    if let Some(pinned) = effective_env(home, "AMUX_OWNER_EMAIL").filter(|e| !e.trim().is_empty()) {
+        return Some((pinned, true));
+    }
+    crate::integrations::email::connected_accounts_by_freshness_in(home)
+        .into_iter()
+        .next()
+        .map(|a| (a, false))
 }
 
 /// Production channels: web push via crate::push, SMS via Twilio-or-osascript.
@@ -82,6 +101,10 @@ impl AlertChannels for RealChannels {
         send_sms(phone, text).await
     }
 
+    async fn fyi(&self, state: &AppState, session: &str, text: &str) {
+        super::standing_approvals::send_fyi_push(state, session, text).await
+    }
+
     async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String) {
         let gc = crate::integrations::email::GmailClient::new_default();
         // Try connected accounts NEWEST-TOKEN-FIRST until one actually sends. A
@@ -97,12 +120,22 @@ impl AlertChannels for RealChannels {
         }
         let mut last_err = String::new();
         for from in &accounts {
-            match gc.compose_send(from, to, subject, body, "", "", "", "", true, &[]).await {
+            match gc
+                .compose_send(from, to, subject, body, "", "", "", "", true, &[])
+                .await
+            {
                 Ok(_) => return (true, format!("email via {from}")),
                 Err(e) => last_err = format!("email error via {from}: {}", truncate(&e, 80)),
             }
         }
-        (false, if last_err.is_empty() { "email send failed".into() } else { last_err })
+        (
+            false,
+            if last_err.is_empty() {
+                "email send failed".into()
+            } else {
+                last_err
+            },
+        )
     }
 }
 
@@ -122,13 +155,16 @@ impl AlertChannels for RealChannels {
 ///     as dispatched") reported "sent" for a page nobody received.
 ///
 /// "sent" must mean an endpoint took it, never the send call's self-description.
-fn push_delivery_verdict(results: &[Value]) -> Result<(), String> {
+pub(crate) fn push_delivery_verdict(results: &[Value]) -> Result<(), String> {
     if results.len() == 1 {
         let r = &results[0];
         if r.get("host").and_then(Value::as_str) == Some("")
             && r.get("status").and_then(Value::as_u64) == Some(0)
         {
-            let detail = r.get("detail").and_then(Value::as_str).unwrap_or("push failed");
+            let detail = r
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("push failed");
             if detail.starts_with("vapid:") || detail.starts_with("db") {
                 return Err(detail.to_string());
             }
@@ -137,9 +173,9 @@ fn push_delivery_verdict(results: &[Value]) -> Result<(), String> {
     if results.is_empty() {
         return Err("no push subscriptions — nobody is registered to receive it".into());
     }
-    let delivered = results.iter().any(|r| {
-        matches!(r.get("status").and_then(Value::as_u64), Some(s) if (200..300).contains(&s))
-    });
+    let delivered = results.iter().any(
+        |r| matches!(r.get("status").and_then(Value::as_u64), Some(s) if (200..300).contains(&s)),
+    );
     if !delivered {
         return Err(format!(
             "push not delivered — {} subscription(s), 0 accepted (all rejected/expired)",
@@ -167,7 +203,12 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
             .build()
         {
             Ok(c) => c,
-            Err(e) => return (false, format!("twilio error: {}", truncate(&e.to_string(), 120))),
+            Err(e) => {
+                return (
+                    false,
+                    format!("twilio error: {}", truncate(&e.to_string(), 120)),
+                )
+            }
         };
         let url = format!("https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json");
         let res = client
@@ -178,8 +219,17 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
             .await;
         return match res {
             Ok(r) if r.status().is_success() => (true, "twilio".into()),
-            Ok(r) => (false, format!("twilio error: {}", truncate(&format!("HTTP {}", r.status()), 120))),
-            Err(e) => (false, format!("twilio error: {}", truncate(&e.to_string(), 120))),
+            Ok(r) => (
+                false,
+                format!(
+                    "twilio error: {}",
+                    truncate(&format!("HTTP {}", r.status()), 120)
+                ),
+            ),
+            Err(e) => (
+                false,
+                format!("twilio error: {}", truncate(&e.to_string(), 120)),
+            ),
         };
     }
     // Circuit breaker on the TCC wall (AMUX-3492). With the Automation
@@ -212,13 +262,20 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
     }
     let run = tokio::process::Command::new("osascript")
         .args([
-            "-e", "on run {msg, ph}",
-            "-e", "tell application \"Messages\"",
-            "-e", "set s to first service whose service type = iMessage",
-            "-e", "set b to buddy ph of s",
-            "-e", "send msg to b",
-            "-e", "end tell",
-            "-e", "end run",
+            "-e",
+            "on run {msg, ph}",
+            "-e",
+            "tell application \"Messages\"",
+            "-e",
+            "set s to first service whose service type = iMessage",
+            "-e",
+            "set b to buddy ph of s",
+            "-e",
+            "send msg to b",
+            "-e",
+            "end tell",
+            "-e",
+            "end run",
             "--",
         ])
         .arg(text)
@@ -263,7 +320,10 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
             );
             (false, imessage_wall_reason().into())
         }
-        Ok(Err(e)) => (false, format!("imessage error: {}", truncate(&e.to_string(), 100))),
+        Ok(Err(e)) => (
+            false,
+            format!("imessage error: {}", truncate(&e.to_string(), 100)),
+        ),
         Ok(Ok(out)) if out.status.success() => {
             IMSG_WALL_TS.store(0, std::sync::atomic::Ordering::Relaxed);
             clear_imessage_wall(&home);
@@ -271,7 +331,10 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
         }
         Ok(Ok(out)) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            (false, format!("imessage error: {}", truncate(stderr.trim(), 100)))
+            (
+                false,
+                format!("imessage error: {}", truncate(stderr.trim(), 100)),
+            )
         }
     }
 }
@@ -384,7 +447,11 @@ pub(crate) fn urgent_alert_decision(
         // Still storming: extend rather than count down toward a resume.
         return (AlertAction::Muted, hist.to_vec(), now + STORM_MUTE);
     }
-    let mut recent: Vec<f64> = hist.iter().copied().filter(|t| now - t < STORM_WINDOW).collect();
+    let mut recent: Vec<f64> = hist
+        .iter()
+        .copied()
+        .filter(|t| now - t < STORM_WINDOW)
+        .collect();
     recent.push(now);
     if recent.len() >= STORM_THRESHOLD {
         return (AlertAction::StormNotice, recent, now + STORM_MUTE);
@@ -429,6 +496,48 @@ fn guard_state_from_ledger(
     (hist, last)
 }
 
+/// The same alert, reworded only by numbers or a re-notify clause. 2026-10-07
+/// (Ethan: "look at all the alerts amux has sent ... if not necessary fix"):
+/// the MVS restore canary paged hourly with "5 missing ... (checked 140)",
+/// then "4 missing ...", and the homepage canary re-paged every 61 min with
+/// "RE-NOTIFY: same condition, still unresolved after 61 min". Each differed
+/// from the last only in digits or that clause, so the exact-message guard
+/// never matched and every one reached the owner.
+pub(crate) fn alert_shape(msg: &str) -> String {
+    let mut lower = msg.to_lowercase();
+    // Drop the re-notify sentence itself, keeping what follows it.
+    if let Some(i) = lower.find("re-notify") {
+        let end = lower[i..].find('.').map(|j| i + j + 1).unwrap_or(lower.len());
+        lower.replace_range(i..end, "");
+    }
+    lower.chars().filter(|c| !c.is_ascii_digit()).collect::<String>()
+        .split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// How long the same alert from the same sender stays quiet after it was sent
+/// (AMUX_ALERT_REPEAT_S, default 4 h). It is still recorded every time.
+fn alert_repeat_s() -> f64 {
+    std::env::var("AMUX_ALERT_REPEAT_S").ok().and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v >= 0.0).unwrap_or(4.0 * 3600.0)
+}
+
+/// When the same-shaped alert from `session` was last SENT within `window_s`.
+fn repeat_sent_within(conn: &rusqlite::Connection, session: &str, msg: &str, now: f64, window_s: f64) -> Option<f64> {
+    if window_s <= 0.0 {
+        return None;
+    }
+    let shape = alert_shape(msg);
+    let mut stmt = conn.prepare(
+        "SELECT ts, message FROM owner_alerts WHERE claimed=?1 AND COALESCE(deduped,0)=0 AND ts >= ?2 ORDER BY ts DESC LIMIT 200",
+    ).ok()?;
+    let rows: Vec<(f64, String)> = stmt
+        .query_map(rusqlite::params![session, now - window_s], |r| Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?)))
+        .ok()?
+        .flatten()
+        .collect();
+    rows.into_iter().find(|(_, m)| alert_shape(m) == shape).map(|(t, _)| t)
+}
+
 /// Per-router guard state (Python's `_urgent_alert_last` / `_hist` / `_mute`
 /// module dicts). Keyed by sha256(claimed_session + "|" + msg)[..16].
 #[derive(Default)]
@@ -448,8 +557,14 @@ pub fn routes() -> Router<AppState> {
 
 pub fn routes_with(channels: Arc<dyn AlertChannels>) -> Router<AppState> {
     Router::new()
-        .route("/config", axum::routing::get(get_config).patch(patch_config))
-        .route("/owner", axum::routing::post(post_owner).get(get_owner_ledger))
+        .route(
+            "/config",
+            axum::routing::get(get_config).patch(patch_config),
+        )
+        .route(
+            "/owner",
+            axum::routing::post(post_owner).get(get_owner_ledger),
+        )
         .layer(Extension(channels))
         .layer(Extension(Arc::new(Mutex::new(AlertGuard::default()))))
 }
@@ -458,11 +573,27 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// True when `origin` names a worker this server has never registered, on a
+/// server that registers workers at all.
+pub(crate) fn unknown_origin(origin: &str) -> bool {
+    if origin.is_empty() {
+        return false;
+    }
+    // One resolver for both questions (land review): the sessions directory is
+    // the parent of the worker's own registration file.
+    let reg = super::session_verbs::env_path(origin);
+    reg.parent().is_some_and(|d| d.is_dir()) && !reg.exists()
+}
+
 /// Python `_hdr_worker`: X-Amux-Worker canonical, X-Amux-Session accepted.
 /// The urgent-alert handler truncates it to 64 chars.
 pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
     for name in ["x-amux-worker", "x-amux-session"] {
-        if let Some(v) = headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim) {
+        if let Some(v) = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+        {
             if !v.is_empty() {
                 return v.to_string();
             }
@@ -484,8 +615,14 @@ fn sms_gate(home: &std::path::Path) -> (bool, Option<&'static str>) {
     if effective_env(home, "AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) == "0" {
         return (false, Some("disabled (AMUX_URGENT_SMS=0)"));
     }
-    if effective_env(home, "AMUX_OWNER_PHONE").unwrap_or_default().is_empty() {
-        return (false, Some("no phone configured (AMUX_OWNER_PHONE is empty)"));
+    if effective_env(home, "AMUX_OWNER_PHONE")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return (
+            false,
+            Some("no phone configured (AMUX_OWNER_PHONE is empty)"),
+        );
     }
     (true, None)
 }
@@ -514,14 +651,20 @@ async fn patch_config(body: Option<Json<Value>>) -> Response {
     if let Some(v) = body.get("phone") {
         let phone = v.as_str().unwrap_or("").trim().to_string();
         if let Err(e) = set_server_env_key(&home, "AMUX_OWNER_PHONE", &phone) {
-            return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() }));
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": e.to_string() }),
+            );
         }
     }
     for (key, env_key) in [("push", "AMUX_URGENT_PUSH"), ("sms", "AMUX_URGENT_SMS")] {
         if let Some(v) = body.get(key) {
             let val = if truthy(v) { "1" } else { "0" };
             if let Err(e) = set_server_env_key(&home, env_key, val) {
-                return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() }));
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": e.to_string() }),
+                );
             }
         }
     }
@@ -548,8 +691,12 @@ async fn record_owner_alert(
     channels: &Map<String, Value>,
     deduped: bool,
 ) {
-    let (origin, claimed, message, reason) =
-        (origin.to_string(), claimed.to_string(), message.to_string(), reason.to_string());
+    let (origin, claimed, message, reason) = (
+        origin.to_string(),
+        claimed.to_string(),
+        message.to_string(),
+        reason.to_string(),
+    );
     let channels_json = serde_json::to_string(channels).unwrap_or_else(|_| "{}".into());
     let ts = now_f64() as i64;
     let res = state
@@ -558,9 +705,20 @@ async fn record_owner_alert(
             conn.execute(
                 "INSERT INTO owner_alerts (ts, origin, claimed, message, reason, channels, deduped)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![ts, origin, claimed, message, reason, channels_json, deduped as i64],
+                rusqlite::params![
+                    ts,
+                    origin,
+                    claimed,
+                    message,
+                    reason,
+                    channels_json,
+                    deduped as i64
+                ],
             )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await;
     if let Err(e) = res {
@@ -579,14 +737,25 @@ async fn post_owner(
     let message = body.get("message").and_then(Value::as_str).unwrap_or("");
     // Claimed origin is the body's self-report; the verified origin is the
     // header identity — the ledger records BOTH (AMUX-1795).
-    let session = body.get("session").and_then(Value::as_str).unwrap_or("").to_string();
-    let reason = body.get("reason").and_then(Value::as_str).unwrap_or("").to_string();
+    let session = body
+        .get("session")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let reason = body
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let origin = truncate(&hdr_worker(&headers), 64);
 
     // Junk-message rejection (the 38-SMS night): flags and empty strings are
     // never legitimate pages; refuse loudly instead of texting the owner.
     let m = message.trim();
-    if m.is_empty() || m.starts_with('-') || ["help", "usage", "test"].contains(&m.to_lowercase().as_str()) {
+    if m.is_empty()
+        || m.starts_with('-')
+        || ["help", "usage", "test"].contains(&m.to_lowercase().as_str())
+    {
         let who = if !origin.is_empty() {
             origin.as_str()
         } else if !session.is_empty() {
@@ -605,7 +774,10 @@ async fn post_owner(
         .into_response();
     }
 
-    let dry_run = body.get("dry_run").and_then(Value::as_bool).unwrap_or(false);
+    let dry_run = body
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut msg = m.to_string();
     if !reason.is_empty() {
@@ -616,6 +788,106 @@ async fn post_owner(
         tracing::warn!(
             "[urgent-alert] PROVENANCE MISMATCH: verified origin={origin:?} but claimed session={session:?} — recording both"
         );
+    }
+    // A page from a worker this server has never registered is not a page.
+    // Test harnesses run the CLI with made-up worker names under a temporary
+    // HOME, the CLI falls back to localhost:8824, and they paged the owner by
+    // email and iMessage: about 100 of the last 500 pages came from "three",
+    // "four-skew" and "w" (land remote-lease tests), found 2026-11-17 while
+    // checking that urgent pages reach his phone. A home with no sessions
+    // directory at all (a fresh test home) cannot judge, so it is not checked.
+    if unknown_origin(&origin) {
+        tracing::warn!(origin = %origin, claimed = %session, measured = true, n_considered = 1,
+            verdict = "owner_alert_unknown_origin",
+            "[urgent-alert] REFUSED: the calling worker is not registered on this server (a test's or another home's); nobody was paged");
+        return Json(json!({
+            "error": format!("refused: {origin} is not a worker on this server, so nobody was paged (a test, or a worker from another home)"),
+            "sent": false, "origin": origin, "claimed": session,
+        }))
+        .into_response();
+    }
+
+    // STANDING APPROVALS (AMUX-5270), before the dedupe guard and before any
+    // channel. On 2026-09-27 two escalations paged Ethan for things he had
+    // already approved: a canary's paid lifecycle probe (approved the day
+    // before as gs-4 decision #7, visible only in gs-4's terminal) and a WAL
+    // reconciliation with both lineages preserved. "this shouldn't need my
+    // input". A covered ask is answered here: the lane gets the approval id and
+    // its limits (response + steer), the use is recorded, the owner gets a
+    // low-priority FYI, and nobody is paged.
+    //
+    // NOT written to `owner_alerts`: that ledger seeds the dedupe/storm guard,
+    // so a covered row would suppress the next real page of the same text
+    // (for example the one that fires when the per-day cap is spent). The
+    // uses table is the record for these.
+    let sa_session = if !origin.is_empty() {
+        origin.clone()
+    } else {
+        session.clone()
+    };
+    let mut sa_note: Option<Value> = None;
+    if let Some(v) = super::standing_approvals::evaluate(
+        &state,
+        "alert",
+        &sa_session,
+        &msg,
+        None,
+        "",
+        !dry_run,
+    )
+    .await
+    {
+        let now_i = now_f64() as i64;
+        if v.applied().is_some() {
+            if dry_run {
+                return Json(json!({
+                    "ok": true, "dry_run": true,
+                    "would": "auto-answer from a standing approval; the owner would NOT be paged",
+                    "standing_approval": v.to_json(now_i),
+                    "message": msg, "origin": origin, "claimed": session,
+                    "note": "no channel was contacted and no use was recorded",
+                }))
+                .into_response();
+            }
+            let instruction = v.instruction();
+            let mut steer = "not attempted (no caller identity)".to_string();
+            if !sa_session.is_empty() {
+                steer = match super::session_verbs::steer_enqueue(
+                    &state,
+                    &sa_session,
+                    &format!("[standing approval] {instruction}"),
+                    "standing-approval",
+                    "",
+                )
+                .await
+                {
+                    Ok(id) => format!("queued {id}"),
+                    Err(e) => {
+                        tracing::warn!(
+                            verdict = "standing_approval_steer_refused",
+                            session = %sa_session,
+                            error = %e,
+                            "could not steer the covered lane; it still has the response body"
+                        );
+                        format!("refused: {e}")
+                    }
+                };
+            }
+            if let Some(t) = super::standing_approvals::fyi_text(&v, &sa_session, "alert", &msg) {
+                channels.fyi(&state, &sa_session, &t).await;
+            }
+            return Json(json!({
+                // `delivered_any` stays false because nobody WAS paged; the CLI
+                // reads `standing_approval.applied` before it, so this is not
+                // reported as a failed alarm.
+                "ok": true, "paged": false, "delivered": 0, "delivered_any": false,
+                "channels": {}, "standing_approval": v.to_json(now_i), "steer": steer,
+                "message": msg, "origin": origin, "claimed": session,
+                "provenance_mismatch": mismatch,
+            }))
+            .into_response();
+        }
+        sa_note = Some(v.to_json(now_i));
     }
 
     let key = {
@@ -652,10 +924,23 @@ async fn post_owner(
             .collect(),
         _ => ledger_hist,
     };
+    let repeat_last = match state.store.read() {
+        Ok(conn) => repeat_sent_within(&conn, &session, &msg, now, alert_repeat_s()),
+        Err(_) => None,
+    };
+    if let Some(prev) = repeat_last {
+        tracing::info!(session = %session, minutes_since = ((now - prev) / 60.0) as i64, measured = true, n_considered = 1,
+            verdict = "owner_alert_repeat_suppressed",
+            "owner alert suppressed: the same alert from this sender was sent within the repeat window");
+    }
     let (action, hist_len) = {
         let mut g = guard.lock().unwrap_or_else(|e| e.into_inner());
         let mem_hist: Vec<f64> = g.hist.get(&key).cloned().unwrap_or_default();
-        let hist_in: Vec<f64> = if mem_hist.is_empty() { ledger_hist } else { mem_hist };
+        let hist_in: Vec<f64> = if mem_hist.is_empty() {
+            ledger_hist
+        } else {
+            mem_hist
+        };
         let last_in = g.last.get(&key).copied().or(ledger_last);
         let (action, new_hist, new_mute) = urgent_alert_decision(
             now,
@@ -664,6 +949,11 @@ async fn post_owner(
             last_in,
         );
         let hist_len = new_hist.len();
+        let action = if repeat_last.is_some() && matches!(action, AlertAction::Send | AlertAction::StormNotice) {
+            AlertAction::Dedupe
+        } else {
+            action
+        };
         // A DRY RUN MUST NOT MUTATE THE GUARD. Caught on the first live probe of
         // this very feature: four dry-runs of one message returned send, then
         // dedupe, dedupe, dedupe — because the first had written `last`. That
@@ -690,7 +980,7 @@ async fn post_owner(
             "ok": true, "dry_run": true,
             "would": match action {
                 AlertAction::Send => "send",
-                AlertAction::Dedupe => "suppress (dedupe: same message within 60s)",
+                AlertAction::Dedupe => "suppress (dedupe: the same alert within 60s, or the same alert from this sender within the repeat window)",
                 AlertAction::StormNotice => "send ONE storm notice, then mute",
                 AlertAction::Muted => "suppress (storm mute active)",
             },
@@ -709,6 +999,7 @@ async fn post_owner(
             "storm_mute_s": STORM_MUTE,
             "key": key,
             "message": msg, "origin": origin, "claimed": session,
+            "standing_approval": sa_note,
             "note": "no channel was contacted and no ledger row was written",
         }))
         .into_response();
@@ -727,7 +1018,10 @@ async fn post_owner(
             // Recorded, deliberately not delivered — the ledger still shows
             // every attempt, so suppression never hides the evidence.
             record_owner_alert(&state, &origin, &session, &msg, &reason, &Map::new(), true).await;
-            tracing::warn!("[urgent-alert] STORM-MUTED key={key} origin={origin:?} msg={:?}", truncate(&msg, 80));
+            tracing::warn!(
+                "[urgent-alert] STORM-MUTED key={key} origin={origin:?} msg={:?}",
+                truncate(&msg, 80)
+            );
             return Json(json!({
                 "ok": true, "deduped": true, "storm_muted": true, "channels": {},
                 "message": msg, "origin": origin, "claimed": session,
@@ -748,6 +1042,17 @@ async fn post_owner(
 
     let home = amux_home();
     let mut out_channels = Map::new();
+    // A link that opens the worker that raised the alarm (Ethan, 2026-10-26:
+    // "i need to be able to direct click these and it opens up the worker").
+    // The text is read on the phone, where only an https link opens amux, so
+    // the SMS carries that; the email adds the Mac app's amux:// link.
+    let link = worker_link(&home, &session);
+    match &link {
+        Ok(url) => tracing::info!(session = %session, url = %url, verdict = "alert_worker_link",
+            measured = true, n_considered = 1, "urgent alert carries a link to its worker"),
+        Err(why) => tracing::warn!(session = %session, why = %why, verdict = "alert_worker_link_missing",
+            measured = true, n_considered = 1, "urgent alert has no link to its worker"),
+    }
     // Track ACTUAL delivery, not the per-channel string. The CLI used to infer
     // "sent" from the presence of a channels map and printed "alert sent" + exit
     // 0 even when push reached zero subscriptions AND sms had no phone — a lying
@@ -799,19 +1104,30 @@ async fn post_owner(
         } else {
             "amux URGENT: ".to_string()
         };
-        let (ok, detail) = channels.sms(&phone, &format!("{sms_prefix}{}", msg.replace('\n', " — "))).await;
+        let (ok, detail) = channels
+            .sms(&phone, &format!("{sms_prefix}{}{}", msg.replace('\n', " — "),
+                link.as_ref().map(|u| format!(" {u}")).unwrap_or_default()))
+            .await;
         sms_delivered = ok;
-        out_channels.insert("sms".into(), json!(if ok { detail } else { format!("failed: {detail}") }));
+        out_channels.insert(
+            "sms".into(),
+            json!(if ok {
+                detail
+            } else {
+                format!("failed: {detail}")
+            }),
+        );
     }
     // EMAIL (AMUX-3203): the channel that reaches the owner with no manual setup.
     // Destination = AMUX_OWNER_EMAIL if set, else the connected account's own
     // inbox (self-send). This is why the fire alarm no longer depends on a push
     // subscription he never made or a phone he cleared after the 38-SMS night.
-    let email_enabled = effective_env(&home, "AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
-    let pinned_email = effective_env(&home, "AMUX_OWNER_EMAIL").filter(|e| !e.trim().is_empty());
-    let owner_email = pinned_email.clone().or_else(|| {
-        crate::integrations::email::connected_accounts_by_freshness_in(&home).into_iter().next()
-    });
+    let email_enabled =
+        effective_env(&home, "AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
+    let (owner_email, pinned) = match owner_email_destination(&home) {
+        Some((to, pinned)) => (Some(to), pinned),
+        None => (None, false),
+    };
     // SAY WHICH INBOX, AND WHY (AMUX-3524). With AMUX_OWNER_EMAIL unset the
     // destination is "whichever connected account was refreshed most
     // recently" — so the SAME alert class lands in different inboxes over
@@ -821,11 +1137,14 @@ async fn post_owner(
     // configured address must still reach someone) but it is no longer
     // silent: the channels map carries the destination and the reason, and
     // an unpinned send WARNs where sweeps look.
-    let owner_email_pinned = pinned_email.is_some();
+    let owner_email_pinned = pinned;
     if !email_enabled {
         out_channels.insert("email".into(), json!("disabled (AMUX_URGENT_EMAIL=0)"));
     } else if owner_email.is_none() {
-        out_channels.insert("email".into(), json!("no AMUX_OWNER_EMAIL and no connected Gmail account"));
+        out_channels.insert(
+            "email".into(),
+            json!("no AMUX_OWNER_EMAIL and no connected Gmail account"),
+        );
     }
     if email_enabled {
         if let Some(to) = owner_email.as_deref() {
@@ -834,7 +1153,11 @@ async fn post_owner(
             } else {
                 format!("amux URGENT [{session}]")
             };
-            let (ok, detail) = channels.email(to, &subject, &msg).await;
+            let body = match &link {
+                Ok(url) => format!("{msg}\n\nOpen the worker: {url}\n\nIn the Mac app: amux://worker/{session}"),
+                Err(_) => msg.clone(),
+            };
+            let (ok, detail) = channels.email(to, &subject, &body).await;
             email_delivered = ok;
             if !owner_email_pinned {
                 tracing::warn!(
@@ -844,14 +1167,31 @@ async fn post_owner(
                      Pin one address in server.env (AMUX-3524)."
                 );
             }
-            let how = if owner_email_pinned { "AMUX_OWNER_EMAIL" } else { "UNPINNED: freshest connected account (set AMUX_OWNER_EMAIL)" };
+            let how = if owner_email_pinned {
+                "AMUX_OWNER_EMAIL"
+            } else {
+                "UNPINNED: freshest connected account (set AMUX_OWNER_EMAIL)"
+            };
             out_channels.insert(
                 "email".into(),
-                json!(if ok { format!("{detail} -> {to} [{how}]") } else { format!("failed: {detail}") }),
+                json!(if ok {
+                    format!("{detail} -> {to} [{how}]")
+                } else {
+                    format!("failed: {detail}")
+                }),
             );
         }
     }
-    record_owner_alert(&state, &origin, &session, &msg, &reason, &out_channels, false).await;
+    record_owner_alert(
+        &state,
+        &origin,
+        &session,
+        &msg,
+        &reason,
+        &out_channels,
+        false,
+    )
+    .await;
     let delivered = (push_delivered as u8 + sms_delivered as u8 + email_delivered as u8) as i64;
     let delivered_any = delivered > 0;
     if delivered_any {
@@ -880,6 +1220,15 @@ async fn post_owner(
         "origin": origin, "claimed": session, "provenance_mismatch": mismatch,
         "delivered": delivered, "delivered_any": delivered_any,
     });
+    match &link {
+        Ok(url) => resp["worker_link"] = json!(url),
+        Err(why) => resp["worker_link_missing"] = json!(why),
+    }
+    if let Some(n) = sa_note {
+        // Why the owner WAS paged when an approval came close (cap spent, or
+        // no match): the lane can see it was checked.
+        resp["standing_approval"] = n;
+    }
     if !delivered_any {
         resp["fallback"] = json!(
             "no channel delivered — the owner was NOT paged; post to the board and say so in your turn output"
@@ -898,35 +1247,62 @@ pub struct LedgerQuery {
     limit: String,
 }
 
-async fn get_owner_ledger(State(state): State<AppState>, Query(qp): Query<LedgerQuery>) -> Response {
+async fn get_owner_ledger(
+    State(state): State<AppState>,
+    Query(qp): Query<LedgerQuery>,
+) -> Response {
     let q = qp.q.trim().to_lowercase();
     // Python: int() failure falls back to 50, then clamps to 1..=500.
     let limit = qp.limit.parse::<i64>().unwrap_or(50).clamp(1, 500) as usize;
     let fetch = if q.is_empty() { limit } else { limit * 4 };
     let store = state.store.clone();
     #[allow(clippy::type_complexity)] // one owner_alerts row, tuple-shaped
-    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(i64, i64, String, String, String, String, String, i64)>> {
-        let conn = store.read()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, ts, origin, claimed, message, reason, channels, deduped
+    let rows = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Vec<(i64, i64, String, String, String, String, String, i64)>> {
+            let conn = store.read()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, ts, origin, claimed, message, reason, channels, deduped
              FROM owner_alerts ORDER BY ts DESC LIMIT ?1",
-        )?;
-        let out = stmt
-            .query_map([fetch as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(out)
-    })
+            )?;
+            let out = stmt
+                .query_map([fetch as i64], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(out)
+        },
+    )
     .await;
     let rows = match rows {
         Ok(Ok(rows)) => rows,
-        Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+        Ok(Err(e)) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": e.to_string() }),
+            )
+        }
+        Err(e) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": e.to_string() }),
+            )
+        }
     };
     let mut out = Vec::new();
     for (id, ts, origin, claimed, message, reason, channels, deduped) in rows {
-        if !q.is_empty() && !message.to_lowercase().contains(&q) && !reason.to_lowercase().contains(&q) {
+        if !q.is_empty()
+            && !message.to_lowercase().contains(&q)
+            && !reason.to_lowercase().contains(&q)
+        {
             continue;
         }
         let ch: Value = serde_json::from_str(&channels).unwrap_or_else(|_| json!({}));
@@ -951,6 +1327,21 @@ async fn get_owner_ledger(State(state): State<AppState>, Query(qp): Query<Ledger
 // Tests — channels are ALWAYS mocked; no push, no osascript, no network.
 // ---------------------------------------------------------------------------
 
+/// The https link that opens `session` in the dashboard, built from the
+/// address the owner reaches this amux at. Err says why there is none.
+fn worker_link(home: &std::path::Path, session: &str) -> Result<String, String> {
+    if session.is_empty() {
+        return Err("no originating worker".into());
+    }
+    if !session.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.@".contains(&b)) {
+        return Err("worker name is not link-safe".into());
+    }
+    let base = crate::api::static_files::public_links::public_url(home).ok_or_else(|| {
+        "this amux's address is unknown: set AMUX_PUBLIC_URL in server.env, or open the dashboard at the address you use".to_string()
+    })?;
+    Ok(format!("{}/#peek={session}", base.trim_end_matches('/')))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -973,7 +1364,10 @@ mod tests {
 
         // It must say WHICH failure this is. -1712 (hang) and -1743 (denied) call
         // for opposite responses, and reporting the wrong one is the whole bug.
-        assert!(msg.contains("-1712"), "name the code so the claim is checkable: {msg}");
+        assert!(
+            msg.contains("-1712"),
+            "name the code so the claim is checkable: {msg}"
+        );
         assert!(
             msg.contains("not a denial"),
             "a timeout read as a denial is what sent everyone at the allowlist: {msg}"
@@ -981,7 +1375,10 @@ mod tests {
 
         // And it must name the attribution, or the reader cannot tell why there
         // is no entry to grant.
-        assert!(msg.contains("tmux"), "the attributed process is the mechanism: {msg}");
+        assert!(
+            msg.contains("tmux"),
+            "the attributed process is the mechanism: {msg}"
+        );
 
         // BOTH actionable paths, because the old line's fatal property was that
         // one real remedy and one impossible one sat in it looking identical.
@@ -1006,7 +1403,10 @@ mod tests {
         let skip = imessage_breaker_verdict(1_000_000, 1_000_010, 900).expect("must skip");
         assert!(skip.contains("10s ago"), "elapsed missing: {skip}");
         assert!(skip.contains("890s"), "retry-remaining missing: {skip}");
-        assert!(skip.contains("Automation permission"), "remedy missing: {skip}");
+        assert!(
+            skip.contains("Automation permission"),
+            "remedy missing: {skip}"
+        );
         // Cooldown exactly over, and past it: probe again.
         assert_eq!(imessage_breaker_verdict(1_000_000, 1_000_900, 900), None);
         assert_eq!(imessage_breaker_verdict(1_000_000, 1_001_000, 900), None);
@@ -1025,15 +1425,30 @@ mod tests {
     #[test]
     fn imessage_wall_stamp_survives_what_a_process_restart_destroys() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(imessage_wall_stamp_ts(dir.path()), 0, "absent stamp = probe");
+        assert_eq!(
+            imessage_wall_stamp_ts(dir.path()),
+            0,
+            "absent stamp = probe"
+        );
         stamp_imessage_wall(dir.path());
         let now = crate::config::now_f64() as u64;
         let ts = imessage_wall_stamp_ts(dir.path());
-        assert!(ts > 0 && now.abs_diff(ts) <= 5, "stamp must read ≈now, got {ts} vs {now}");
+        assert!(
+            ts > 0 && now.abs_diff(ts) <= 5,
+            "stamp must read ≈now, got {ts} vs {now}"
+        );
         let other = tempfile::tempdir().unwrap();
-        assert_eq!(imessage_wall_stamp_ts(other.path()), 0, "stamps are per-home");
+        assert_eq!(
+            imessage_wall_stamp_ts(other.path()),
+            0,
+            "stamps are per-home"
+        );
         clear_imessage_wall(dir.path());
-        assert_eq!(imessage_wall_stamp_ts(dir.path()), 0, "cleared stamp = probe again");
+        assert_eq!(
+            imessage_wall_stamp_ts(dir.path()),
+            0,
+            "cleared stamp = probe again"
+        );
     }
 
     /// The config view and the send path share one SMS gate (found verifying
@@ -1053,11 +1468,17 @@ mod tests {
             .unwrap();
         };
         env("0", "+15551234567");
-        assert_eq!(sms_gate(dir.path()), (false, Some("disabled (AMUX_URGENT_SMS=0)")));
+        assert_eq!(
+            sms_gate(dir.path()),
+            (false, Some("disabled (AMUX_URGENT_SMS=0)"))
+        );
         env("1", "");
         assert_eq!(
             sms_gate(dir.path()),
-            (false, Some("no phone configured (AMUX_OWNER_PHONE is empty)"))
+            (
+                false,
+                Some("no phone configured (AMUX_OWNER_PHONE is empty)")
+            )
         );
         env("1", "+15551234567");
         assert_eq!(sms_gate(dir.path()), (true, None));
@@ -1072,7 +1493,10 @@ mod tests {
         let row = |status: u64| json!({"host": "push.example", "status": status, "detail": "x"});
 
         // ≥1 endpoint accepted (2xx) -> the ONLY legitimate "sent".
-        assert!(push_delivery_verdict(&[row(201), row(410)]).is_ok(), "one 2xx is a real delivery");
+        assert!(
+            push_delivery_verdict(&[row(201), row(410)]).is_ok(),
+            "one 2xx is a real delivery"
+        );
         assert!(push_delivery_verdict(&[row(200)]).is_ok());
 
         // ZERO subscriptions -> not a send (AMUX-2938).
@@ -1082,15 +1506,22 @@ mod tests {
         // Subscriptions EXIST but every endpoint rejected (410 Gone / expired)
         // -> the gap MF-582 doesn't close. Must be an error, not "sent".
         let e = push_delivery_verdict(&[row(410), row(404), row(500)]).unwrap_err();
-        assert!(e.contains("not delivered") && e.contains("0 accepted"), "all-rejected must not be sent: {e}");
+        assert!(
+            e.contains("not delivered") && e.contains("0 accepted"),
+            "all-rejected must not be sent: {e}"
+        );
 
         // Broadcast couldn't be attempted (vapid/db) -> the synthetic error row.
-        let e = push_delivery_verdict(&[json!({"host":"","status":0,"detail":"vapid: bad key"})]).unwrap_err();
+        let e = push_delivery_verdict(&[json!({"host":"","status":0,"detail":"vapid: bad key"})])
+            .unwrap_err();
         assert!(e.starts_with("vapid:"), "{e}");
 
         // The negative control that proves the check bites: a non-2xx-only set
         // must NEVER read as delivered, however many rows it has.
-        assert!(push_delivery_verdict(&[row(429), row(429)]).is_err(), "'we called send' is not delivery");
+        assert!(
+            push_delivery_verdict(&[row(429), row(429)]).is_err(),
+            "'we called send' is not delivery"
+        );
     }
 
     /// MF-427. The guard was correct and its STATE was fiction: the in-memory
@@ -1117,12 +1548,18 @@ mod tests {
             hist = h;
             mute = m;
             match action {
-                AlertAction::Send | AlertAction::StormNotice => { sent += 1; last = Some(now); }
+                AlertAction::Send | AlertAction::StormNotice => {
+                    sent += 1;
+                    last = Some(now);
+                }
                 _ => suppressed += 1,
             }
         }
         // 38 attempts, and the owner is paged a handful of times, not 38.
-        assert!(sent < 10, "38 identical alerts paged the owner {sent} times — the guard did not hold");
+        assert!(
+            sent < 10,
+            "38 identical alerts paged the owner {sent} times — the guard did not hold"
+        );
         assert_eq!(sent + suppressed, 38);
 
         // THE CONTROL, and the actual bug: reset the state between every alert,
@@ -1131,7 +1568,9 @@ mod tests {
         for i in 0..38 {
             let now = t0 + (i as f64) * 302.0;
             let (action, _, _) = urgent_alert_decision(now, &[], 0.0, None);
-            if matches!(action, AlertAction::Send | AlertAction::StormNotice) { sent_amnesiac += 1; }
+            if matches!(action, AlertAction::Send | AlertAction::StormNotice) {
+                sent_amnesiac += 1;
+            }
         }
         assert_eq!(
             sent_amnesiac, 38,
@@ -1149,6 +1588,7 @@ mod tests {
         pushes: Mutex<Vec<(String, String)>>,
         smses: Mutex<Vec<(String, String)>>,
         emails: Mutex<Vec<(String, String, String)>>,
+        fyis: Mutex<Vec<(String, String)>>,
         push_result: Result<(), String>,
         sms_result: (bool, String),
         email_result: (bool, String),
@@ -1160,6 +1600,7 @@ mod tests {
                 pushes: Mutex::new(vec![]),
                 smses: Mutex::new(vec![]),
                 emails: Mutex::new(vec![]),
+                fyis: Mutex::new(vec![]),
                 push_result: Ok(()),
                 sms_result: (true, "imessage".into()),
                 email_result: (true, "email via ethan@example.com".into()),
@@ -1169,32 +1610,55 @@ mod tests {
 
     #[async_trait]
     impl AlertChannels for MockChannels {
-        async fn push(&self, _state: &AppState, session: &str, message: &str) -> Result<(), String> {
-            self.pushes.lock().unwrap().push((session.to_string(), message.to_string()));
+        async fn push(
+            &self,
+            _state: &AppState,
+            session: &str,
+            message: &str,
+        ) -> Result<(), String> {
+            self.pushes
+                .lock()
+                .unwrap()
+                .push((session.to_string(), message.to_string()));
             self.push_result.clone()
         }
         async fn sms(&self, phone: &str, text: &str) -> (bool, String) {
-            self.smses.lock().unwrap().push((phone.to_string(), text.to_string()));
+            self.smses
+                .lock()
+                .unwrap()
+                .push((phone.to_string(), text.to_string()));
             self.sms_result.clone()
         }
         async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String) {
-            self.emails.lock().unwrap().push((to.to_string(), subject.to_string(), body.to_string()));
+            self.emails.lock().unwrap().push((
+                to.to_string(),
+                subject.to_string(),
+                body.to_string(),
+            ));
             self.email_result.clone()
+        }
+        async fn fyi(&self, _state: &AppState, session: &str, text: &str) {
+            self.fyis
+                .lock()
+                .unwrap()
+                .push((session.to_string(), text.to_string()));
         }
     }
 
     fn app(channels: Arc<MockChannels>) -> axum::Router {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::db::Store::open(&dir.path().join("alerts-test.db")).unwrap();
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         let state = AppState {
             store: Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
-        Router::new().nest("/api/alert", routes_with(channels)).with_state(state)
+        Router::new()
+            .nest("/api/alert", routes_with(channels))
+            .with_state(state)
     }
 
     async fn send(
@@ -1217,7 +1681,9 @@ mod tests {
         };
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, v)
@@ -1261,7 +1727,10 @@ mod tests {
         let env = std::fs::read_to_string(dir.path().join("server.env")).unwrap();
         assert!(env.contains("AMUX_OWNER_PHONE=+15551234567"), "{env}");
         assert!(env.contains("AMUX_URGENT_PUSH=0"), "{env}");
-        assert!(!env.contains("AMUX_URGENT_SMS"), "absent key untouched: {env}");
+        assert!(
+            !env.contains("AMUX_URGENT_SMS"),
+            "absent key untouched: {env}"
+        );
 
         let (_, v) = send(&app, "GET", "/api/alert/config", &[], None).await;
         assert_eq!(v["phone"], json!("+15551234567"));
@@ -1335,11 +1804,17 @@ mod tests {
 
         // Channel senders received Python's exact payloads.
         let pushes = mock.pushes.lock().unwrap().clone();
-        assert_eq!(pushes, vec![("sender-a".into(), "prod is down\n(deploy failed)".into())]);
+        assert_eq!(
+            pushes,
+            vec![("sender-a".into(), "prod is down\n(deploy failed)".into())]
+        );
         let smses = mock.smses.lock().unwrap().clone();
         assert_eq!(
             smses,
-            vec![("+15550000001".into(), "amux URGENT [sender-a]: prod is down — (deploy failed)".into())]
+            vec![(
+                "+15550000001".into(),
+                "amux URGENT [sender-a]: prod is down — (deploy failed)".into()
+            )]
         );
 
         // The ledger recorded the attempt with parsed channels.
@@ -1352,6 +1827,27 @@ mod tests {
         assert_eq!(row["channels"]["sms"], json!("imessage"));
         assert_eq!(row["deduped"], json!(false));
         assert_eq!(row["provenance_mismatch"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn an_alert_links_to_the_worker_that_raised_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        set_server_env_key(dir.path(), "AMUX_OWNER_PHONE", "+15550000001").unwrap();
+        set_server_env_key(dir.path(), "AMUX_PUBLIC_URL", "https://mac.example.ts.net:8824").unwrap();
+        let mock = MockChannels::ok();
+        let app = app(mock.clone());
+        let body = json!({ "message": "disk is low", "session": "sender-a" });
+        let (_, v) = send(&app, "POST", "/api/alert/owner", &[], Some(body)).await;
+        assert_eq!(v["worker_link"], json!("https://mac.example.ts.net:8824/#peek=sender-a"), "{v}");
+        let smses = mock.smses.lock().unwrap().clone();
+        assert_eq!(smses[0].1,
+            "amux URGENT [sender-a]: disk is low https://mac.example.ts.net:8824/#peek=sender-a");
+        // With no known address the alert still goes out and says why it has no link.
+        let dir2 = tempfile::tempdir().unwrap();
+        assert!(worker_link(dir2.path(), "sender-a").unwrap_err().contains("AMUX_PUBLIC_URL"));
+        assert!(worker_link(dir2.path(), "").is_err());
+        assert!(worker_link(dir.path(), "a b").is_err());
     }
 
     #[tokio::test]
@@ -1385,6 +1881,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_owner_page_from_an_unregistered_worker_pages_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions").join("real-lane.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        let mock = MockChannels::ok();
+        let app = app(mock.clone());
+        let (_, v) = send(&app, "POST", "/api/alert/owner", &[("x-amux-worker", "four-skew")],
+            Some(json!({ "message": "amux land: main has waited 2s for the remote land lease", "session": "amux" }))).await;
+        assert_eq!(v["sent"], json!(false), "{v}");
+        assert!(v["error"].as_str().unwrap().contains("four-skew"), "{v}");
+        assert!(mock.pushes.lock().unwrap().is_empty() && mock.smses.lock().unwrap().is_empty() && mock.emails.lock().unwrap().is_empty(),
+            "a test's page reaches no channel");
+        let (st, v) = send(&app, "POST", "/api/alert/owner", &[("x-amux-worker", "real-lane")],
+            Some(json!({ "message": "prod is down", "session": "real-lane" }))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(v.get("error").is_none(), "a registered worker still pages: {v}");
+        let (_, v) = send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": "disk is full", "session": "cli" }))).await;
+        assert!(v.get("error").is_none(), "the owner's own CLI (no worker header) still pages: {v}");
+    }
+
+    #[tokio::test]
     async fn owner_alert_provenance_mismatch_is_flagged_not_believed() {
         let dir = tempfile::tempdir().unwrap();
         let _guard = test_env::set_home(dir.path());
@@ -1413,8 +1931,14 @@ mod tests {
         let app = app(mock.clone());
 
         for junk in ["--help", "", "  ", "TEST", "help"] {
-            let (st, v) =
-                send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": junk }))).await;
+            let (st, v) = send(
+                &app,
+                "POST",
+                "/api/alert/owner",
+                &[],
+                Some(json!({ "message": junk })),
+            )
+            .await;
             assert_eq!(st, StatusCode::OK);
             assert_eq!(v["sent"], json!(false), "{junk:?} must be refused");
             assert!(v["error"].as_str().unwrap().starts_with("refused: "), "{v}");
@@ -1444,8 +1968,14 @@ mod tests {
         set_server_env_key(dir.path(), "AMUX_URGENT_PUSH", "0").unwrap();
         let mock = MockChannels::ok();
         let app = app(mock.clone());
-        let (_, v) =
-            send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": "no channels case" }))).await;
+        let (_, v) = send(
+            &app,
+            "POST",
+            "/api/alert/owner",
+            &[],
+            Some(json!({ "message": "no channels case" })),
+        )
+        .await;
         assert_eq!(v["ok"], json!(true));
         assert_eq!(
             v["channels"],
@@ -1481,18 +2011,34 @@ mod tests {
             Some(json!({ "message": "prod down, only email left" })),
         )
         .await;
-        assert_eq!(v["delivered_any"], json!(true), "email must deliver the page: {v}");
-        assert!(v.get("fallback").is_none(), "a delivered page must not carry the miss fallback");
+        assert_eq!(
+            v["delivered_any"],
+            json!(true),
+            "email must deliver the page: {v}"
+        );
+        assert!(
+            v.get("fallback").is_none(),
+            "a delivered page must not carry the miss fallback"
+        );
         // AMUX-3524: an UNPINNED destination must SAY it is unpinned and name
         // the inbox it chose. Silence here is what let one alert class scatter
         // across three of Ethan's inboxes for a week unnoticed.
         let ch = v["channels"]["email"].as_str().unwrap_or_default();
-        assert!(ch.contains("ethan@example.com"), "the channel must name the destination: {ch}");
-        assert!(ch.contains("UNPINNED"), "an unset AMUX_OWNER_EMAIL must be stated: {ch}");
+        assert!(
+            ch.contains("ethan@example.com"),
+            "the channel must name the destination: {ch}"
+        );
+        assert!(
+            ch.contains("UNPINNED"),
+            "an unset AMUX_OWNER_EMAIL must be stated: {ch}"
+        );
         // The mock received the self-send to the connected account.
         let emails = mock.emails.lock().unwrap().clone();
         assert_eq!(emails.len(), 1, "exactly one email attempt");
-        assert_eq!(emails[0].0, "ethan@example.com", "owner email defaults to the connected account");
+        assert_eq!(
+            emails[0].0, "ethan@example.com",
+            "owner email defaults to the connected account"
+        );
     }
 
     /// AMUX-3524 CONTROL — with AMUX_OWNER_EMAIL set, the destination is that
@@ -1519,11 +2065,23 @@ mod tests {
         )
         .await;
         let ch = v["channels"]["email"].as_str().unwrap_or_default();
-        assert!(ch.contains("pinned@example.com"), "must page the PINNED address: {ch}");
-        assert!(ch.contains("AMUX_OWNER_EMAIL"), "must report the pin as the source: {ch}");
-        assert!(!ch.contains("UNPINNED"), "a pinned send must not warn unpinned: {ch}");
+        assert!(
+            ch.contains("pinned@example.com"),
+            "must page the PINNED address: {ch}"
+        );
+        assert!(
+            ch.contains("AMUX_OWNER_EMAIL"),
+            "must report the pin as the source: {ch}"
+        );
+        assert!(
+            !ch.contains("UNPINNED"),
+            "a pinned send must not warn unpinned: {ch}"
+        );
         let emails = mock.emails.lock().unwrap().clone();
-        assert_eq!(emails[0].0, "pinned@example.com", "the pin, not the connected account");
+        assert_eq!(
+            emails[0].0, "pinned@example.com",
+            "the pin, not the connected account"
+        );
     }
 
     /// A FIRE ALARM MUST NOT REPORT SUCCESS HAVING REACHED NOBODY (AMUX-2938).
@@ -1550,7 +2108,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let out = RealChannels.push(&state, "amux", "drill").await;
         assert!(
@@ -1573,13 +2131,20 @@ mod tests {
             pushes: Mutex::new(vec![]),
             smses: Mutex::new(vec![]),
             emails: Mutex::new(vec![]),
+                fyis: Mutex::new(vec![]),
             push_result: Err("vapid: unreadable key".into()),
             sms_result: (false, "imessage error: -1743".into()),
             email_result: (false, "email error: not_connected".into()),
         });
         let app = app(mock);
-        let (_, v) =
-            send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": "both channels fail" }))).await;
+        let (_, v) = send(
+            &app,
+            "POST",
+            "/api/alert/owner",
+            &[],
+            Some(json!({ "message": "both channels fail" })),
+        )
+        .await;
         // Failed channels are REPORTED, not hidden — Python's exact spellings.
         assert_eq!(v["channels"]["push"], json!("error: vapid: unreadable key"));
         assert_eq!(v["channels"]["sms"], json!("failed: imessage error: -1743"));
@@ -1587,9 +2152,16 @@ mod tests {
         // AMUX-3151/GCA-96: `ok:true` is "request processed", NOT "owner paged".
         // With BOTH channels failed the response must say so explicitly, or the
         // CLI reports a swallowed escalation as a delivered page.
-        assert_eq!(v["delivered_any"], json!(false), "both channels failed → delivered_any must be false");
+        assert_eq!(
+            v["delivered_any"],
+            json!(false),
+            "both channels failed → delivered_any must be false"
+        );
         assert_eq!(v["delivered"], json!(0));
-        assert!(v["fallback"].is_string(), "a zero-delivery response must carry the board fallback");
+        assert!(
+            v["fallback"].is_string(),
+            "a zero-delivery response must carry the board fallback"
+        );
     }
 
     /// The positive half: when a channel ACTUALLY delivers, delivered_any is true
@@ -1604,18 +2176,28 @@ mod tests {
             pushes: Mutex::new(vec![]),
             smses: Mutex::new(vec![]),
             emails: Mutex::new(vec![]),
+                fyis: Mutex::new(vec![]),
             push_result: Ok(()),
             sms_result: (true, "imessage".into()),
             email_result: (true, "email via a@b.com".into()),
         });
         let app = app(mock);
-        let (_, v) =
-            send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": "a real page" }))).await;
+        let (_, v) = send(
+            &app,
+            "POST",
+            "/api/alert/owner",
+            &[],
+            Some(json!({ "message": "a real page" })),
+        )
+        .await;
         assert_eq!(v["delivered_any"], json!(true));
         // push + sms landed; email is not attempted here (no connected account in
         // the temp home and no AMUX_OWNER_EMAIL), so the tally is 2, not 3.
         assert_eq!(v["delivered"], json!(2), "push + sms both landed");
-        assert!(v.get("fallback").is_none(), "a delivered page must NOT carry the failure fallback");
+        assert!(
+            v.get("fallback").is_none(),
+            "a delivered page must NOT carry the failure fallback"
+        );
     }
 
     #[tokio::test]
@@ -1623,7 +2205,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let _guard = test_env::set_home(dir.path());
         let app = app(MockChannels::ok());
-        for (i, msg) in ["alpha incident", "beta incident", "gamma routine"].iter().enumerate() {
+        for (i, msg) in ["alpha incident", "beta incident", "gamma routine"]
+            .iter()
+            .enumerate()
+        {
             let (_, v) = send(
                 &app,
                 "POST",
@@ -1647,6 +2232,24 @@ mod tests {
     }
 
     // ---- pure decision function (the storm replay) ------------------------
+
+    #[test]
+    fn an_alert_reworded_only_by_numbers_or_a_renotify_clause_is_the_same_alert() {
+        let a = "MVS restore canary: 0 probe(s) missing from the durable payload chain, 5 missing from API readback (checked 140).";
+        let b = "MVS restore canary: 0 probe(s) missing from the durable payload chain, 4 missing from API readback (checked 0).";
+        assert_eq!(alert_shape(a), alert_shape(b));
+        let h1 = "Homepage DOWN from outside. (uptime canary exit 1)";
+        let h2 = "Homepage DOWN from outside.    RE-NOTIFY: same condition, still unresolved after 61 min. (uptime canary exit 1)";
+        assert_eq!(alert_shape(h1), alert_shape(h2));
+        assert_ne!(alert_shape(a), alert_shape("TubeScience search down since 14:10Z"));
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE owner_alerts (id INTEGER PRIMARY KEY, ts REAL, origin TEXT, claimed TEXT, message TEXT, reason TEXT, channels TEXT, deduped INTEGER)").unwrap();
+        // The live table stores ts as INTEGER seconds; the fixture must too.
+        conn.execute("INSERT INTO owner_alerts (ts, claimed, message, deduped) VALUES (1000, 'gs12-mvs', ?1, 0)", [a]).unwrap();
+        assert_eq!(repeat_sent_within(&conn, "gs12-mvs", b, 1000.0 + 3600.0, 4.0 * 3600.0), Some(1000.0), "an hour later it is a repeat");
+        assert_eq!(repeat_sent_within(&conn, "gs12-mvs", b, 1000.0 + 5.0 * 3600.0, 4.0 * 3600.0), None, "after the window it sends again");
+        assert_eq!(repeat_sent_within(&conn, "gainz", b, 4600.0, 4.0 * 3600.0), None, "another sender is not a repeat");
+    }
 
     #[test]
     fn storm_decision_replays_the_302s_cadence_incident() {
@@ -1691,5 +2294,61 @@ mod tests {
         assert_eq!(py_repr("--help"), "'--help'");
         assert_eq!(py_repr(""), "''");
         assert_eq!(py_repr("it's"), r"'it\'s'");
+    }
+
+    // ---- standing approvals (AMUX-5270) ------------------------------------
+
+    /// The 2026-09-27 pages, replayed: both are answered by a seeded standing
+    /// approval, neither reaches push/SMS/email, and a control still pages.
+    #[tokio::test]
+    async fn covered_escalations_are_answered_not_paged() {
+        use crate::api::standing_approvals::tests as sa;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        std::env::remove_var(crate::api::standing_approvals::KILL_SWITCH_KEY);
+        set_server_env_key(dir.path(), "AMUX_OWNER_PHONE", "+15550000001").unwrap();
+        let mock = MockChannels::ok();
+        let state = sa::test_state();
+        let app = Router::new()
+            .nest("/api/alert", routes_with(mock.clone()))
+            .merge(crate::api::standing_approvals::routes())
+            .with_state(state);
+        sa::seed(&app).await;
+
+        for (lane, text, id) in [
+            ("mixpeek-cicd", sa::CICD_ESCALATION, "SA-1"),
+            ("mvs-infra", sa::MVS_ESCALATION, "SA-2"),
+        ] {
+            let (st, v) = send(
+                &app,
+                "POST",
+                "/api/alert/owner",
+                &[("x-amux-session", lane)],
+                Some(json!({ "message": text, "session": lane })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            assert_eq!(v["paged"], json!(false), "{v}");
+            assert_eq!(v["standing_approval"]["applied"], json!(true), "{v}");
+            assert_eq!(v["standing_approval"]["id"], json!(id), "{v}");
+            assert!(v["standing_approval"]["instruction"].as_str().unwrap().contains("report"));
+        }
+        assert!(mock.pushes.lock().unwrap().is_empty(), "no fire-alarm push");
+        assert!(mock.smses.lock().unwrap().is_empty(), "no SMS");
+        assert!(mock.emails.lock().unwrap().is_empty(), "no email");
+        assert_eq!(mock.fyis.lock().unwrap().len(), 2, "one low-priority FYI each");
+
+        // A control is paged exactly as before, and says it was checked.
+        let (_, v) = send(
+            &app,
+            "POST",
+            "/api/alert/owner",
+            &[("x-amux-session", "gtm-engine")],
+            Some(json!({ "message": "buy the $749 Advertising Week pass", "session": "gtm-engine" })),
+        )
+        .await;
+        assert!(v.get("paged").is_none(), "{v}");
+        assert_eq!(v["standing_approval"]["verdict"], json!("standing_approval_no_match"), "{v}");
+        assert_eq!(mock.pushes.lock().unwrap().len(), 1, "the control paged");
     }
 }

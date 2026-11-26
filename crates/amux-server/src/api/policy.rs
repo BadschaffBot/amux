@@ -120,6 +120,9 @@ pub(crate) fn authorize_dispatch(
 }
 
 fn actor(headers: &HeaderMap) -> String {
+    if let Some(app) = super::app_identity::actor(headers) {
+        return app.to_string();
+    }
     headers
         .get("x-amux-session")
         .and_then(|v| v.to_str().ok())
@@ -162,7 +165,6 @@ fn classify(method: &Method, path: &str) -> (ActionClass, bool) {
         "/api/push",
         "/api/alert",
         "/api/tunnel",
-        "/api/proxies",
     ]
     .iter()
     .any(|prefix| lower.starts_with(prefix))
@@ -206,13 +208,8 @@ fn reconciliation_requires_approval(method: &Method, path: &str) -> bool {
     )
 }
 
-fn require_reconciliation_approval(
-    method: &Method,
-    path: &str,
-    decision: &mut CapabilityDecision,
-) {
-    if reconciliation_requires_approval(method, path)
-        && decision.effect == CapabilityEffect::Allow
+fn require_reconciliation_approval(method: &Method, path: &str, decision: &mut CapabilityDecision) {
+    if reconciliation_requires_approval(method, path) && decision.effect == CapabilityEffect::Allow
     {
         decision.effect = CapabilityEffect::Ask;
         decision.rule_id = Some("builtin-reconciliation-exact-approval".into());
@@ -246,13 +243,15 @@ async fn record_receipt(
     let effect = effect_token(decision.effect).to_string();
     let rule = decision.rule_id.clone();
     let rationale = decision.rationale.clone();
+    let trace = super::trace::current();
+    let (trace_id, span_id) = (trace.as_ref().map(|t| t.trace_id.clone()), trace.map(|t| t.span_id));
     state
         .store
         .write_async(move |conn| {
             conn.execute(
                 "INSERT INTO _amux_policy_receipts
-                 (id,actor,role,action,resource,trust,reversible,effect,rule_id,rationale,cost_microusd,created_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                 (id,actor,role,action,resource,trust,reversible,effect,rule_id,rationale,cost_microusd,created_at,trace_id,span_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 rusqlite::params![
                     row_id,
                     actor,
@@ -266,6 +265,8 @@ async fn record_receipt(
                     rationale,
                     cost,
                     Utc::now().to_rfc3339(),
+                    trace_id,
+                    span_id,
                 ],
             )?;
             Ok(crate::db::WriteOutcome {
@@ -344,8 +345,20 @@ async fn request_trust(state: &AppState, headers: &HeaderMap) -> Result<TrustLev
         return Ok(TrustLevel::Untrusted);
     }
     let actor_name = actor(headers);
+    // A published app answers to anyone on the web: never Trusted, whatever
+    // a person allowed it to call.
+    if actor_name.starts_with("app:") {
+        return Ok(TrustLevel::Untrusted);
+    }
     if actor_name == "api-anonymous" {
-        return Ok(TrustLevel::Trusted);
+        // No worker header used to mean Trusted on its own. Now only a
+        // credential the server verified is (human_proof.rs); in enforce mode
+        // the unproven rest is Untrusted, which asks before an external or
+        // irreversible action and never expands a capability.
+        return Ok(match super::human_proof::check(headers, "policy_trust") {
+            super::human_proof::Verdict::Refused => TrustLevel::Untrusted,
+            _ => TrustLevel::Trusted,
+        });
     }
     state
         .store
@@ -355,15 +368,12 @@ async fn request_trust(state: &AppState, headers: &HeaderMap) -> Result<TrustLev
 }
 
 /// The verdict itself, unchanged, split out so it runs on the blocking pool.
-fn trust_from_conn(
-    conn: &rusqlite::Connection,
-    actor_name: &str,
-) -> anyhow::Result<TrustLevel> {
+fn trust_from_conn(conn: &rusqlite::Connection, actor_name: &str) -> anyhow::Result<TrustLevel> {
     let Some(worker) = crate::db::queries::get_worker(conn, actor_name)? else {
         return Ok(TrustLevel::Trusted);
     };
-    let worker_id = amux_core::ids::WorkerId::parse(&worker.id)
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let worker_id =
+        amux_core::ids::WorkerId::parse(&worker.id).map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let Some(command) = crate::db::commands::in_flight(conn, &worker_id)? else {
         return Ok(TrustLevel::Trusted);
     };
@@ -829,9 +839,15 @@ mod tests {
             (Method::DELETE, "/api/harness/reconciliations"),
             (Method::POST, "/api/harness/reconciliations/recon_1"),
             (Method::PUT, "/api/harness/reconciliations/recon_1/promote"),
-            (Method::POST, "/api/harness/reconciliations/recon_1/extra/promote"),
+            (
+                Method::POST,
+                "/api/harness/reconciliations/recon_1/extra/promote",
+            ),
         ] {
-            assert!(!reconciliation_requires_approval(&method, path), "{method} {path}");
+            assert!(
+                !reconciliation_requires_approval(&method, path),
+                "{method} {path}"
+            );
         }
     }
 

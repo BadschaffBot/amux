@@ -9,6 +9,8 @@ import importlib.machinery
 import os
 import subprocess
 import sys
+import tempfile
+from unittest.mock import patch
 
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amux-staged-guard")
 mod = importlib.machinery.SourceFileLoader("_asg_test", HOOK).load_module()
@@ -28,37 +30,24 @@ def main():
     failures = []
     real_run = subprocess.run
 
-    # CONTROL FIRST: an amux-prefixed pane name DOES resolve, so a matcher that
-    # silently always returns "" cannot hide behind an all-negative suite.
-    subprocess.run = _fake_run("amux-mixpeek-research\n")
-    got = mod._derive_session_from_tmux()
-    if got != "mixpeek-research":
-        failures.append(
-            f"control: 'amux-mixpeek-research' should derive 'mixpeek-research', got {got!r}")
-
-    # A human's own tmux session (no amux- prefix) must never be claimed as a
-    # lane — the whole point of scoping the fallback to the prefix.
-    subprocess.run = _fake_run("main\n")
-    got = mod._derive_session_from_tmux()
-    if got != "":
-        failures.append(f"a bare tmux session name must not resolve to a session: got {got!r}")
-
-    # Outside tmux entirely (or tmux missing from PATH): fail closed to "",
-    # never raise — this runs inside a git hook, which must not crash a commit.
-    def _raise(*a, **kw):
-        raise FileNotFoundError("no tmux")
-    subprocess.run = _raise
-    try:
-        got = mod._derive_session_from_tmux()
-        raised = None
-    except Exception as e:
-        got, raised = None, e
-    if raised is not None:
-        failures.append(f"must not raise when tmux is unavailable: {raised!r}")
-    elif got != "":
-        failures.append(f"tmux unavailable should derive '', got {got!r}")
-
-    subprocess.run = real_run
+    with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"AMUX_HOME": home}, clear=False):
+        os.makedirs(os.path.join(home, "sessions"))
+        open(os.path.join(home, "sessions", "mixpeek-research.env"), "w").close()
+        with patch.dict(os.environ, {"TMUX_PANE": ""}):
+            with patch.object(subprocess, "run") as run:
+                assert mod._derive_session_from_tmux() == ""
+                run.assert_not_called()  # Never attribute a focused peer to this shell.
+        with patch.dict(os.environ, {"TMUX_PANE": "%42"}):
+            with patch.object(subprocess, "run") as run:
+                run.return_value.stdout = "amux-mixpeek-research\n"
+                assert mod._derive_session_from_tmux() == "mixpeek-research"
+                assert run.call_args.args[0] == ["tmux", "display-message", "-t", "%42", "-p", "#S"]
+                run.return_value.stdout = "main\n"
+                assert mod._derive_session_from_tmux() == ""
+                run.return_value.stdout = "amux-unregistered\n"
+                assert mod._derive_session_from_tmux() == ""
+                run.side_effect = FileNotFoundError("no tmux")
+                assert mod._derive_session_from_tmux() == ""
 
     # GUARD_VERSION must have moved off the pre-fix baseline, or every already-
     # installed copy on this machine reads as current and never re-syncs (the
@@ -280,6 +269,50 @@ def main():
     ]:
         if needle not in txt:
             failures.append(f"orphan-deletion render omits {what} ({needle!r})")
+
+    # CONTRACT RULE 4 (AH-381): in a rule-4 lane's own LINKED worktree the
+    # cross-session check stands down and logs once; a main checkout never does.
+    with tempfile.TemporaryDirectory() as t:
+        main_dir, linked = os.path.join(t, "main"), os.path.join(t, "linked")
+        real_run(["git", "init", "-q", "-b", "main", main_dir], capture_output=True)
+        real_run(["git", "-C", main_dir, "-c", "user.email=t@t", "-c", "user.name=t",
+                  "commit", "-q", "--allow-empty", "-m", "i"], capture_output=True)
+        real_run(["git", "-C", main_dir, "worktree", "add", "-q", linked, "-b", "side"], capture_output=True)
+        home = os.path.join(t, "home")
+        os.makedirs(os.path.join(home, "logs"))
+        cwd = os.getcwd()
+        try:
+            os.chdir(main_dir)
+            if mod._in_linked_worktree():
+                failures.append("rule 4: a MAIN checkout read as a linked worktree")
+            os.chdir(linked)
+            if not mod._in_linked_worktree():
+                failures.append("rule 4: a linked worktree was not recognised")
+            env = {"AMUX_RULE4_ISOLATED": "1", "AMUX_SESSION": "lane-r4", "AMUX_HOME": home}
+            with patch.dict(os.environ, env), patch.object(mod, "index_worktree_divergence", return_value=False), \
+                    patch.object(mod, "post", side_effect=AssertionError("the server check must not run"), create=True):
+                rc = mod.main()
+            if rc != 0:
+                failures.append(f"rule 4: the staged-guard should stand down in the lane's worktree, rc={rc}")
+            log = open(os.path.join(home, "logs", "server-rs.log")).read() if os.path.exists(
+                os.path.join(home, "logs", "server-rs.log")) else ""
+            if 'verdict="shared_guard_skipped_isolated" guard=staged-guard' not in log:
+                failures.append(f"rule 4: the stand-down was not logged: {log!r}")
+        finally:
+            os.chdir(cwd)
+
+    # #28: a block marker past its TTL is an ended episode, not this commit's.
+    with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"AMUX_HOME": home}, clear=False):
+        mod._write_marker("s", "/repo", "v1", ["a"])
+        if (mod._read_marker("s", "/repo") or {}).get("verdict_id") != "v1":
+            failures.append("#28: a fresh marker should be read")
+        import json as _json
+        p = mod._marker_path("s", "/repo")
+        m = _json.load(open(p)); m["ts"] -= mod.MARKER_TTL_S + 60; _json.dump(m, open(p, "w"))
+        if mod._read_marker("s", "/repo") is not None:
+            failures.append("#28: a marker past its TTL should read as absent")
+        if os.path.exists(p):
+            failures.append("#28: an expired marker should be removed")
 
     if failures:
         print(f"FAIL {len(failures)}:")

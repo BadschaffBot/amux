@@ -101,6 +101,24 @@ pub struct SearchParams {
     limit: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+    /// Scope every family to one session (a card's session, a message's
+    /// session, a log's session).
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// Families searched only when asked for by name in `types=`. They are logs:
+/// every message sent to a worker, terminal scrollback and transcripts. Mixed
+/// into a default search they would bury the curated hits (AF-499's reason for
+/// keeping machine traffic out of `prompt`), so a default search is unchanged.
+pub const OPT_IN_TYPES: &[&str] = &["history", "log", "transcript"];
+
+#[derive(Deserialize, Default)]
+pub struct ReindexParams {
+    /// `firehose=1` also deletes the log/transcript index; the ingest job
+    /// rebuilds it from the files.
+    #[serde(default)]
+    firehose: Option<u8>,
 }
 
 use super::internal;
@@ -173,6 +191,29 @@ pub fn build_match(q: &str) -> Option<String> {
     Some(terms.join(" AND "))
 }
 
+/// A message-log query, split into what FTS5 can answer and what it cannot.
+///
+/// FTS5 matches WORDS: `browser routing` finds a message with both words in any
+/// order, which the old `LIKE '%browser routing%'` never did. But the tokenizer
+/// throws punctuation away, so a typed `100%` would also match a bare `100`.
+/// Any term that carries punctuation is therefore ALSO required literally, as a
+/// substring, which keeps `q=100%` meaning exactly what the typist wrote.
+///
+/// Returns (MATCH expression if the query has any word, literal substrings).
+/// Both empty means nothing searchable: the caller falls back to a plain
+/// substring match on the whole query.
+pub fn history_query(q: &str) -> (Option<String>, Vec<String>) {
+    let has_word = q.chars().any(char::is_alphanumeric);
+    let fts = if has_word { build_match(q) } else { None };
+    let literals = q
+        .split_whitespace()
+        .map(|t| t.trim_matches('"'))
+        .filter(|t| !t.is_empty() && t.chars().any(|c| !c.is_alphanumeric()))
+        .map(str::to_string)
+        .collect();
+    (fts, literals)
+}
+
 /// FTS5 string literal: wrap in double quotes, doubling any inner quote.
 /// Characters FTS5 treats as separators are harmless inside a quoted string.
 fn quote_term(t: &str) -> String {
@@ -208,7 +249,8 @@ fn render_snippet(raw: &str) -> String {
 fn types_in_index(conn: &Connection) -> Vec<String> {
     conn.prepare("SELECT DISTINCT entity_type FROM search_docs ORDER BY 1")
         .and_then(|mut st| {
-            st.query_map([], |r| r.get::<_, String>(0)).map(|it| it.flatten().collect())
+            st.query_map([], |r| r.get::<_, String>(0))
+                .map(|it| it.flatten().collect())
         })
         .unwrap_or_default()
 }
@@ -223,7 +265,11 @@ fn types_in_index(conn: &Connection) -> Vec<String> {
 /// the defect with the measurement ... a control built from the same mistaken
 /// assumption as the measurement cannot fail."
 fn types_missing_from(requested: &[String], have: &[String]) -> Vec<String> {
-    requested.iter().filter(|t| !have.contains(t)).cloned().collect()
+    requested
+        .iter()
+        .filter(|t| !have.contains(t))
+        .cloned()
+        .collect()
 }
 
 fn parse_types(raw: &Option<String>) -> Vec<String> {
@@ -246,12 +292,28 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
     let limit_raw = p.limit.unwrap_or(DEFAULT_LIMIT);
     let limit = limit_raw.clamp(1, MAX_LIMIT);
     let offset = p.offset.unwrap_or(0);
-    let types = parse_types(&p.types);
+    let all_types = parse_types(&p.types);
+    let opt_in: Vec<String> = all_types
+        .iter()
+        .filter(|t| OPT_IN_TYPES.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    let types: Vec<String> = all_types
+        .iter()
+        .filter(|t| !OPT_IN_TYPES.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    let session = p
+        .session
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let Some(match_expr) = build_match(&p.q) else {
         return Json(json!({
             "q": p.q,
-            "types": types,
+            "types": all_types,
             "hits": [],
             "total": 0,
             "total_capped": false,
@@ -287,7 +349,32 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
         );
     }
 
-    match run_search(&conn, &match_expr, &types, limit, offset) {
+    if !opt_in.is_empty() {
+        return search_merged(
+            &conn,
+            &p.q,
+            &match_expr,
+            &all_types,
+            &types,
+            &opt_in,
+            session.as_deref(),
+            limit,
+            limit_raw,
+            offset,
+            started,
+            not_in_index,
+            available,
+        );
+    }
+
+    match run_search(
+        &conn,
+        &match_expr,
+        &types,
+        session.as_deref(),
+        limit,
+        offset,
+    ) {
         Ok((hits, total, total_capped)) => {
             // A ZERO MUST SAY WHETHER THE MEASUREMENT RAN (TG-3303, ethos rule 4).
             //
@@ -306,7 +393,11 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
             // So the zero path, and only the zero path, pays one COUNT: an
             // index with no documents cannot answer any query, and returning
             // 200 with an empty list is the lie. That case is now a 503.
-            let indexed = if hits.is_empty() { index_doc_count(&conn) } else { None };
+            let indexed = if hits.is_empty() {
+                index_doc_count(&conn)
+            } else {
+                None
+            };
             if hits.is_empty() && indexed == Some(0) {
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -326,7 +417,7 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
             Json(json!({
                 "q": p.q,
                 "match": match_expr,
-                "types": types,
+                "types": all_types,
                 "hits": hits,
                 "total": total,
                 "total_capped": total_capped,
@@ -354,11 +445,188 @@ async fn search(State(st): State<AppState>, Query(p): Query<SearchParams>) -> Re
     }
 }
 
+/// Ranked message-log hits (`types=history`), in the shared hit shape.
+fn run_history(
+    conn: &Connection,
+    match_expr: &str,
+    session: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<(Vec<Value>, usize, bool)> {
+    let sess = if session.is_some() {
+        " AND h.session = ?3"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT h.id, h.session, h.type, h.ts, h.text, h.card_id,
+                snippet(history_fts, 0, char(1), char(2), '…', 16), bm25(history_fts) AS rank
+         FROM history_fts JOIN cmd_history h ON h.id = history_fts.rowid
+         WHERE history_fts MATCH ?1{sess}
+         ORDER BY rank LIMIT ?2"
+    );
+    let mut st = conn.prepare(&sql)?;
+    let map = |r: &rusqlite::Row| -> rusqlite::Result<Value> {
+        let id: i64 = r.get(0)?;
+        let session: String = r.get(1)?;
+        let text: String = r.get(4)?;
+        Ok(json!({
+            "doc_id": format!("history:{id}"),
+            "type": "history",
+            "id": format!("MSG-{id}"),
+            "title": text.replace('\n', " ").chars().take(80).collect::<String>(),
+            "scope": session,
+            "task_id": r.get::<_, Option<String>>(5)?,
+            "worker_id": session,
+            "link": format!("#history/{id}"),
+            "meta": {"session": session, "type": r.get::<_, String>(2)?},
+            "updated_at": r.get::<_, i64>(3)?,
+            "snippet": r.get::<_, String>(6)?,
+            "rank": r.get::<_, f64>(7)?,
+        }))
+    };
+    let hits: Vec<Value> = match session {
+        Some(s) => st
+            .query_map(rusqlite::params![match_expr, limit as i64, s], map)?
+            .collect::<rusqlite::Result<_>>()?,
+        None => st
+            .query_map(rusqlite::params![match_expr, limit as i64], map)?
+            .collect::<rusqlite::Result<_>>()?,
+    };
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM history_fts JOIN cmd_history h ON h.id = history_fts.rowid
+         WHERE history_fts MATCH ?1{sess} LIMIT ?2)"
+    );
+    let cap = (COUNT_CAP + 1) as i64;
+    let total: i64 = match session {
+        Some(s) => conn.query_row(&count_sql, rusqlite::params![match_expr, cap, s], |r| {
+            r.get(0)
+        })?,
+        None => conn.query_row(&count_sql, rusqlite::params![match_expr, cap], |r| r.get(0))?,
+    };
+    Ok((
+        hits,
+        (total as usize).min(COUNT_CAP),
+        total as usize > COUNT_CAP,
+    ))
+}
+
+/// Order hits from several indexes into one list: bm25 ascending (FTS5's rank
+/// is negative, more relevant is smaller), then the page window. Pure, so the
+/// merge has cells without three databases.
+pub fn merge_ranked(mut lists: Vec<Vec<Value>>, limit: usize, offset: usize) -> Vec<Value> {
+    let mut all: Vec<Value> = lists.drain(..).flatten().collect();
+    all.sort_by(|a, b| {
+        let ra = a["rank"].as_f64().unwrap_or(0.0);
+        let rb = b["rank"].as_f64().unwrap_or(0.0);
+        ra.partial_cmp(&rb).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all.into_iter().skip(offset).take(limit).collect()
+}
+
+/// A search that names an opt-in family: each index is asked for its best
+/// `offset + limit`, and the merged list is windowed once.
+#[allow(clippy::too_many_arguments)]
+fn search_merged(
+    conn: &Connection,
+    q: &str,
+    match_expr: &str,
+    all_types: &[String],
+    curated: &[String],
+    opt_in: &[String],
+    session: Option<&str>,
+    limit: usize,
+    limit_raw: usize,
+    offset: usize,
+    started: std::time::Instant,
+    not_in_index: Vec<String>,
+    available: Vec<String>,
+) -> Response {
+    let want = offset + limit;
+    let mut lists = Vec::new();
+    let mut total = 0usize;
+    let mut capped = false;
+    let mut add =
+        |r: rusqlite::Result<(Vec<Value>, usize, bool)>, render: bool| -> rusqlite::Result<()> {
+            let (mut hits, t, c) = r?;
+            if render {
+                for h in hits.iter_mut() {
+                    let raw = h["snippet"].as_str().unwrap_or("").to_string();
+                    h["snippet"] = json!(render_snippet(&raw));
+                }
+            }
+            lists.push(hits);
+            total += t;
+            capped |= c;
+            Ok(())
+        };
+    let home = crate::config::amux_home();
+    let firehose_kinds: Vec<&str> = opt_in
+        .iter()
+        .map(String::as_str)
+        .filter(|t| *t == "log" || *t == "transcript")
+        .collect();
+    let res = (|| -> rusqlite::Result<()> {
+        if !curated.is_empty() {
+            add(
+                run_search(conn, match_expr, curated, session, want, 0),
+                false,
+            )?;
+        }
+        if opt_in.iter().any(|t| t == "history") {
+            add(run_history(conn, match_expr, session, want), true)?;
+        }
+        if !firehose_kinds.is_empty() {
+            add(
+                crate::search_firehose::search(
+                    &home,
+                    match_expr,
+                    q,
+                    &firehose_kinds,
+                    session,
+                    want,
+                    COUNT_CAP,
+                ),
+                true,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = res {
+        return internal(e);
+    }
+    let hits = merge_ranked(lists, limit, offset);
+    // A log/transcript search answered while the index is still being built
+    // can miss hits, and a zero from it must not read as "not there"
+    // (TG-3303). Name the bytes the index has not reached yet.
+    let firehose_lag = (!firehose_kinds.is_empty())
+        .then(|| crate::search_firehose::pending_bytes(&home, &firehose_kinds, session));
+    Json(json!({
+        "index_lag_bytes": firehose_lag,
+        "q": q,
+        "match": match_expr,
+        "types": all_types,
+        "session": session,
+        "hits": hits,
+        "total": total,
+        "total_capped": capped,
+        "limit": limit,
+        "limit_capped": limit_raw > MAX_LIMIT,
+        "offset": offset,
+        "took_ms": started.elapsed().as_millis() as u64,
+        "types_not_in_index": not_in_index,
+        "types_available": available,
+    }))
+    .into_response()
+}
+
 /// How many documents the index holds, or `None` if the count could not be
 /// taken. `None` is deliberately not `0`: "I could not measure" and "there is
 /// nothing there" send a reader to different places.
 fn index_doc_count(conn: &Connection) -> Option<i64> {
-    conn.query_row("SELECT COUNT(*) FROM search_docs", [], |r| r.get::<_, i64>(0)).ok()
+    conn.query_row("SELECT COUNT(*) FROM search_docs", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .ok()
 }
 
 /// The ranked query. bm25 weights `title` 10x `body`, which is what makes a
@@ -369,18 +637,23 @@ fn run_search(
     conn: &Connection,
     match_expr: &str,
     types: &[String],
+    session: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> rusqlite::Result<(Vec<Value>, usize, bool)> {
+    let session_filter = match session {
+        Some(s) => format!(" AND d.scope = '{}'", s.replace('\'', "''")),
+        None => String::new(),
+    };
     let type_filter = if types.is_empty() {
-        String::new()
+        session_filter
     } else {
         let list = types
             .iter()
             .map(|t| format!("'{}'", t.replace('\'', "''")))
             .collect::<Vec<_>>()
             .join(",");
-        format!(" AND d.entity_type IN ({list})")
+        format!(" AND d.entity_type IN ({list}){session_filter}")
     };
 
     let sql = format!(
@@ -426,8 +699,9 @@ fn run_search(
     // COUNT. Measured on the real 5,021-doc board index: a common term
     // ("gate", >1000 matches) went 52ms -> 12ms by dropping the join, which is
     // the difference between missing and meeting the plan's <50ms target.
-    let count_sql = if types.is_empty() {
-        "SELECT COUNT(*) FROM (SELECT 1 FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2)".to_string()
+    let count_sql = if type_filter.is_empty() {
+        "SELECT COUNT(*) FROM (SELECT 1 FROM search_fts WHERE search_fts MATCH ?1 LIMIT ?2)"
+            .to_string()
     } else {
         format!(
             "SELECT COUNT(*) FROM (
@@ -465,7 +739,11 @@ pub fn index_status(conn: &Connection) -> rusqlite::Result<Value> {
         // A source table can legitimately be absent on a partially-migrated
         // file; report that instead of failing the whole status call.
         let live: Option<i64> = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table} WHERE {pred}"), [], |r| r.get(0))
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {pred}"),
+                [],
+                |r| r.get(0),
+            )
             .ok();
         let agrees = live.map(|l| l == indexed).unwrap_or(false);
         if !agrees {
@@ -480,6 +758,27 @@ pub fn index_status(conn: &Connection) -> rusqlite::Result<Value> {
             "consistent": agrees,
         }));
     }
+    // The message-log index (0119) is external content over cmd_history, so
+    // its own row count is the docsize table, one row per indexed message.
+    let h_indexed: Option<i64> = conn
+        .query_row("SELECT COUNT(*) FROM history_fts_docsize", [], |r| r.get(0))
+        .ok();
+    let h_live: Option<i64> = conn
+        .query_row("SELECT COUNT(*) FROM cmd_history", [], |r| r.get(0))
+        .ok();
+    let h_agrees = h_indexed.is_some() && h_indexed == h_live;
+    if !h_agrees {
+        consistent = false;
+    }
+    families.push(json!({
+        "type": "history",
+        "table": "cmd_history",
+        "predicate": "1=1",
+        "indexed": h_indexed,
+        "live": h_live,
+        "consistent": h_agrees,
+        "opt_in": true,
+    }));
     let total_docs: i64 = conn.query_row("SELECT COUNT(*) FROM search_docs", [], |r| r.get(0))?;
     // The FTS side is checked separately: search_docs can be right while the
     // FTS index behind it is empty (a failed trigger, a restored file), and
@@ -504,7 +803,15 @@ async fn status(State(st): State<AppState>) -> Response {
         Err(e) => return internal(e),
     };
     match index_status(&conn) {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut v) => {
+            let home = crate::config::amux_home();
+            v["firehose"] =
+                tokio::task::spawn_blocking(move || crate::search_firehose::status(&home))
+                    .await
+                    .unwrap_or(Value::Null);
+            v["opt_in_types"] = json!(OPT_IN_TYPES);
+            Json(v).into_response()
+        }
         Err(e) => internal(e),
     }
 }
@@ -601,6 +908,10 @@ pub fn rebuild(conn: &Connection) -> rusqlite::Result<Value> {
     // DELETE (not DROP): the search_docs delete trigger is what removes the
     // matching FTS rows, so the index cannot be left holding orphans.
     conn.execute("DELETE FROM search_docs", [])?;
+    conn.execute(
+        "INSERT INTO history_fts(history_fts) VALUES ('rebuild')",
+        [],
+    )?;
     let mut per_family = Vec::new();
     for (etype, sql) in BACKFILL_SQL {
         let inserted = conn.execute(sql, [])?;
@@ -615,7 +926,12 @@ pub fn rebuild(conn: &Connection) -> rusqlite::Result<Value> {
     }))
 }
 
-async fn reindex(State(st): State<AppState>) -> Response {
+async fn reindex(State(st): State<AppState>, Query(rp): Query<ReindexParams>) -> Response {
+    if rp.firehose == Some(1) {
+        if let Err(e) = crate::search_firehose::reset(&crate::config::amux_home()) {
+            return internal(e);
+        }
+    }
     // The rebuild report has to come back out of the writer closure, which
     // can only return a WriteOutcome. A slot the closure fills is the cheapest
     // way to keep the counts — the whole point of the endpoint — attached to
@@ -649,6 +965,70 @@ async fn reindex(State(st): State<AppState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_query_splits_words_from_literal_punctuation() {
+        let (m, lit) = history_query("browser routing");
+        assert_eq!(m.as_deref(), Some("\"browser\" AND \"routing\"*"));
+        assert!(lit.is_empty());
+        let (m, lit) = history_query("100%");
+        assert!(m.is_some());
+        assert_eq!(lit, vec!["100%"]);
+        let (m, lit) = history_query("%");
+        assert_eq!(m, None, "no word: nothing for FTS5");
+        assert_eq!(lit, vec!["%"]);
+    }
+
+    #[test]
+    fn merged_hits_rank_across_indexes_then_window() {
+        let a = vec![json!({"id":"a","rank":-1.0}), json!({"id":"c","rank":-9.0})];
+        let b = vec![json!({"id":"b","rank":-5.0})];
+        let ids = |v: Vec<Value>| {
+            v.iter()
+                .map(|h| h["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(merge_ranked(vec![a.clone(), b.clone()], 10, 0)),
+            vec!["c", "b", "a"]
+        );
+        assert_eq!(ids(merge_ranked(vec![a, b], 1, 1)), vec!["b"]);
+    }
+
+    /// `types=history` reaches every message through 0119's index, scoped by
+    /// session, and a default search still does not (AF-499).
+    #[test]
+    fn history_family_is_searchable_by_name_only() {
+        let conn = crate::db::migrate::test_memdb();
+        for (text, session, ty) in [
+            ("browser routing relay", "alpha", "session"),
+            ("routing the browser again", "beta", "user"),
+        ] {
+            conn.execute(
+                "INSERT INTO cmd_history (text, type, session, ts) VALUES (?1, ?3, ?2, 1)",
+                rusqlite::params![text, session, ty],
+            )
+            .unwrap();
+        }
+        let m = build_match("browser routing").unwrap();
+        let (hits, total, _) = run_history(&conn, &m, None, 10).unwrap();
+        assert_eq!(total, 2);
+        assert!(hits.iter().all(|h| h["type"] == json!("history")));
+        let (hits, ..) = run_history(&conn, &m, Some("alpha"), 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["id"], json!("MSG-1"));
+        // The status view counts it, and it agrees with the table.
+        let st = index_status(&conn).unwrap();
+        let fam = st["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["type"] == json!("history"))
+            .unwrap()
+            .clone();
+        assert_eq!(fam["indexed"], json!(2));
+        assert_eq!(fam["consistent"], json!(true));
+    }
 
     /// 0077's REPAIR CLAUSE CONVERTS THE ROWS 0056 ALREADY WROTE, AND ONLY ONCE
     /// (AMUX-4548).
@@ -694,29 +1074,46 @@ mod tests {
         let sql = include_str!("../../migrations/0077_search_docs_prompt_seconds.sql");
         conn.execute_batch(sql).expect("0077 applies");
         let after: i64 = conn
-            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:legacy'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT updated_at FROM search_docs WHERE doc_id='prompt:legacy'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(after, ms / 1000, "the legacy millisecond row must be converted");
+        assert_eq!(
+            after,
+            ms / 1000,
+            "the legacy millisecond row must be converted"
+        );
 
         // IDEMPOTENT. The guard is on magnitude, so a second run must not
         // divide again — a migration that re-runs on a repaired database would
         // put these rows in 1970.
         conn.execute_batch(sql).expect("0077 re-applies");
         let twice: i64 = conn
-            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:legacy'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT updated_at FROM search_docs WHERE doc_id='prompt:legacy'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(twice, after, "a second run must be a no-op, not a second division");
+        assert_eq!(
+            twice, after,
+            "a second run must be a no-op, not a second division"
+        );
 
         let control: i64 = conn
-            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='task:control'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT updated_at FROM search_docs WHERE doc_id='task:control'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(control, ms / 1000, "a seconds row of another family must be untouched");
+        assert_eq!(
+            control,
+            ms / 1000,
+            "a seconds row of another family must be untouched"
+        );
     }
 
     /// `search_docs.updated_at` HOLDS ONE UNIT, AND BOTH PROMPT WRITERS AGREE
@@ -752,7 +1149,11 @@ mod tests {
 
         // 1. The TRIGGER path, which is what runs in production.
         let via_trigger: i64 = conn
-            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT updated_at FROM search_docs WHERE doc_id='prompt:1'",
+                [],
+                |r| r.get(0),
+            )
             .expect("the trigger indexed it");
         assert_eq!(
             via_trigger, want,
@@ -761,7 +1162,8 @@ mod tests {
         );
 
         // 2. The REINDEX path, over the same row.
-        conn.execute("DELETE FROM search_docs WHERE doc_id='prompt:1'", []).unwrap();
+        conn.execute("DELETE FROM search_docs WHERE doc_id='prompt:1'", [])
+            .unwrap();
         let sql = BACKFILL_SQL
             .iter()
             .find(|(etype, _)| *etype == "prompt")
@@ -769,7 +1171,11 @@ mod tests {
             .expect("the prompt family is in BACKFILL_SQL");
         conn.execute(sql, []).expect("backfill runs");
         let via_backfill: i64 = conn
-            .query_row("SELECT updated_at FROM search_docs WHERE doc_id='prompt:1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT updated_at FROM search_docs WHERE doc_id='prompt:1'",
+                [],
+                |r| r.get(0),
+            )
             .expect("the backfill indexed it");
         assert_eq!(
             via_backfill, via_trigger,
@@ -780,11 +1186,16 @@ mod tests {
         //    in it is millisecond-shaped. Asserted over the whole table rather
         //    than the one row, because the defect was one family among seven.
         let ms_shaped: i64 = conn
-            .query_row("SELECT COUNT(*) FROM search_docs WHERE updated_at > 100000000000", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM search_docs WHERE updated_at > 100000000000",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(ms_shaped, 0, "no row in search_docs.updated_at may be millisecond-shaped");
+        assert_eq!(
+            ms_shaped, 0,
+            "no row in search_docs.updated_at may be millisecond-shaped"
+        );
     }
 
     /// AF-547. A `types=` value the index does not hold returns a clean 200 with
@@ -809,23 +1220,41 @@ mod tests {
         .expect("seed");
 
         let have = types_in_index(&conn);
-        assert_eq!(have, vec!["prompt".to_string(), "task".to_string()], "read from the DATA, sorted");
+        assert_eq!(
+            have,
+            vec!["prompt".to_string(), "task".to_string()],
+            "read from the DATA, sorted"
+        );
 
         // The reported shape: a family name carried from another endpoint.
         let requested = vec!["kind".to_string()];
         let missing = types_missing_from(&requested, &have);
-        assert_eq!(missing, vec!["kind".to_string()], "an absent family must be NAMED, not silently empty");
+        assert_eq!(
+            missing,
+            vec!["kind".to_string()],
+            "an absent family must be NAMED, not silently empty"
+        );
 
         // CONTROL 1: a real family must NOT be reported missing. Without this the
         // rule is satisfiable by flagging everything, which would put a false
         // "not in index" on every correct query.
         let ok = types_missing_from(&["prompt".to_string()], &have);
-        assert!(ok.is_empty(), "a family the index holds is not missing: {ok:?}");
+        assert!(
+            ok.is_empty(),
+            "a family the index holds is not missing: {ok:?}"
+        );
 
         // CONTROL 2: mixed — the real one passes, only the bogus one is named.
-        let req: Vec<String> = ["prompt", "kind", "task"].iter().map(|s| s.to_string()).collect();
+        let req: Vec<String> = ["prompt", "kind", "task"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let mixed = types_missing_from(&req, &have);
-        assert_eq!(mixed, vec!["kind".to_string()], "only the absent one: {mixed:?}");
+        assert_eq!(
+            mixed,
+            vec!["kind".to_string()],
+            "only the absent one: {mixed:?}"
+        );
     }
 
     /// An EMPTY index must report an empty vocabulary rather than crashing or
@@ -834,14 +1263,16 @@ mod tests {
     #[test]
     fn an_empty_index_has_an_empty_vocabulary() {
         let conn = Connection::open_in_memory().expect("mem db");
-        conn.execute_batch(
-            "CREATE TABLE search_docs (doc_id TEXT, entity_type TEXT);",
-        ).expect("seed");
+        conn.execute_batch("CREATE TABLE search_docs (doc_id TEXT, entity_type TEXT);")
+            .expect("seed");
         assert!(types_in_index(&conn).is_empty());
         // And a missing TABLE must not panic — the helper is called on every
         // filtered search and an unreadable index is not a crash.
         let bare = Connection::open_in_memory().expect("mem db");
-        assert!(types_in_index(&bare).is_empty(), "no table -> empty, not a panic");
+        assert!(
+            types_in_index(&bare).is_empty(),
+            "no table -> empty, not a panic"
+        );
     }
 
     #[test]

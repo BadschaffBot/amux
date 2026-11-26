@@ -85,7 +85,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CLOUD_HOST: 34.121.177.76
+  CLOUD_HOST: ${{ vars.CLOUD_HOST }}
   IMAGE: ghcr.io/mixpeek/amux
 
 jobs:
@@ -220,12 +220,17 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ github.event.workflow_run.head_sha || github.sha }}
+          build-args: |
+            AMUX_SOURCE_COMMIT=${{ github.event.workflow_run.head_sha || github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
   # ── 3. Host: gateway + compose template + pull ─────────────────────────────
   deploy:
     needs: build
+    # No cloud host is configured while cloud.amux.io is offline (the GCP VM is
+    # deleted and its address released); skip instead of failing every run.
+    if: vars.CLOUD_HOST != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -237,7 +242,31 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
           chmod 600 ~/.ssh/amux_cloud
-          ssh-keyscan -H "$CLOUD_HOST" >> ~/.ssh/known_hosts
+          # REACHABILITY IS A DIFFERENT FAILURE FROM AUTHENTICATION, and this
+          # step could express neither. Against a host that does not answer,
+          # ssh-keyscan exits 1 and prints NOTHING on stdout and NOTHING on
+          # stderr, so under `bash -e` the step died here in silence: the log
+          # showed the script echoed, then "Process completed with exit code 1"
+          # five seconds later (ssh-keyscan's default timeout) with not one line
+          # in between. Ethos rule 4 — the instrument could not express the
+          # answer, so 13 consecutive failures all looked like the auth problem
+          # the comment below documents, and were read as one.
+          #
+          # Measured 2026-09-23: the then-current CLOUD_HOST refused port 22 and
+          # cloud.amux.io returned zero bytes through Cloudflare. The key was
+          # never the problem, and the one line that would have said so could
+          # not run because it sits AFTER this.
+          #
+          # So the failure is deferred rather than immediate: record it, let the
+          # key fingerprint below print, and exit at the end. The log then always
+          # carries BOTH facts, whichever one broke.
+          KEYSCAN_OK=1
+          if ssh-keyscan -H "$CLOUD_HOST" > /tmp/keyscan.out 2>/tmp/keyscan.err; then
+            cat /tmp/keyscan.out >> ~/.ssh/known_hosts
+            echo "CLOUD_HOST $CLOUD_HOST answered on port 22 ($(wc -l < /tmp/keyscan.out | tr -d ' ') host key line(s))"
+          else
+            KEYSCAN_OK=0
+          fi
           chmod 644 ~/.ssh/known_hosts
           # PRINT WHICH KEY WE OFFER. A fingerprint is not secret; the key is, and
           # is never echoed. This exists because "Permission denied (publickey)"
@@ -259,6 +288,11 @@ jobs:
           # authorize this key or replace the secret. No guessing which end is wrong.
           ssh-keygen -lf ~/.ssh/amux_cloud | sed 's/^/CI offers key: /' || \
             echo "CI offers key: UNREADABLE — secrets.CLOUD_SSH_KEY is empty or not a valid private key"
+          if [ "$KEYSCAN_OK" = 0 ]; then
+            echo "::error::CLOUD_HOST $CLOUD_HOST did not answer on port 22. This is a HOST REACHABILITY failure, not an auth failure: the VM is down, its address changed, or a firewall blocks the runner. CLOUD_HOST is hardcoded in this workflow, so a changed IP needs an edit here. The key fingerprint above is printed for completeness and is NOT implicated."
+            sed 's/^/  ssh-keyscan stderr: /' /tmp/keyscan.err || true
+            exit 1
+          fi
 
       - name: Snapshot gateway.py + gateway.env BEFORE any writes (restart only if they change)
         run: |
@@ -273,9 +307,11 @@ jobs:
           # restart; only gateway.py / gateway.env do.
           H=$(ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
             md5sum /opt/amux-cloud/gateway/gateway.py 2>/dev/null | cut -d" " -f1
-            md5sum /etc/amux/gateway.env 2>/dev/null | cut -d" " -f1')
+            md5sum /etc/amux/gateway.env 2>/dev/null | cut -d" " -f1
+            md5sum /opt/amux-cloud/gateway/chatgpt_front.py 2>/dev/null | cut -d" " -f1')
           echo "PRE_GW_PY=$(echo "$H" | sed -n 1p)" >> "$GITHUB_ENV"
           echo "PRE_GW_ENV=$(echo "$H" | sed -n 2p)" >> "$GITHUB_ENV"
+          echo "PRE_GW_FRONT=$(echo "$H" | sed -n 3p)" >> "$GITHUB_ENV"
           echo "pre-deploy: gateway.py md5=$(echo "$H" | sed -n 1p) gateway.env md5=$(echo "$H" | sed -n 2p)"
 
       - name: Gateway env — admin emails (idempotent, safe on every deploy)
@@ -385,6 +421,10 @@ jobs:
           if [ -n "${PRE_GW_PY:-}" ] && [ "$PRE_GW_PY" != "$SHIP" ]; then
             echo "::warning title=gateway.py overwrite::host gateway.py ($PRE_GW_PY) differs from the version being deployed ($SHIP). If the host copy was a hand-deploy ahead of origin, this rsync REVERTS it (AC-410) — confirm origin carries the intended gateway.py."
           fi
+          # chatgpt_front.py FIRST: gateway.py imports it (AMUX-5397), and a
+          # gateway restarted before its module landed would fail to start.
+          rsync -e "ssh -i ~/.ssh/amux_cloud" cloud/gateway/chatgpt_front.py \
+            "root@$CLOUD_HOST:/opt/amux-cloud/gateway/chatgpt_front.py"
           rsync --inplace -e "ssh -i ~/.ssh/amux_cloud" cloud/gateway/gateway.py \
             "root@$CLOUD_HOST:/opt/amux-cloud/gateway/gateway.py"
           rsync -e "ssh -i ~/.ssh/amux_cloud" cloud/docker/docker-compose.template.yml \
@@ -400,9 +440,10 @@ jobs:
           # (the blip then is a deploy someone meant to make).
           NOW=$(ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" '
             md5sum /opt/amux-cloud/gateway/gateway.py 2>/dev/null | cut -d" " -f1
-            md5sum /etc/amux/gateway.env 2>/dev/null | cut -d" " -f1')
-          NPY=$(echo "$NOW" | sed -n 1p); NENV=$(echo "$NOW" | sed -n 2p)
-          if [ "$NPY" != "${PRE_GW_PY:-}" ] || [ "$NENV" != "${PRE_GW_ENV:-}" ]; then
+            md5sum /etc/amux/gateway.env 2>/dev/null | cut -d" " -f1
+            md5sum /opt/amux-cloud/gateway/chatgpt_front.py 2>/dev/null | cut -d" " -f1')
+          NPY=$(echo "$NOW" | sed -n 1p); NENV=$(echo "$NOW" | sed -n 2p); NFRONT=$(echo "$NOW" | sed -n 3p)
+          if [ "$NPY" != "${PRE_GW_PY:-}" ] || [ "$NENV" != "${PRE_GW_ENV:-}" ] || [ "$NFRONT" != "${PRE_GW_FRONT:-}" ]; then
             echo "gateway changed (py ${PRE_GW_PY:-none}->$NPY, env ${PRE_GW_ENV:-none}->$NENV) — restarting (expect a ~2s blip)"
             ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" \
               'pip3 install -q stripe 2>/dev/null; systemctl restart amux-gateway && sleep 2 && systemctl is-active amux-gateway'
@@ -547,7 +588,7 @@ jobs:
   # ── 4. Recreate — explicit, never automatic ────────────────────────────────
   redeploy:
     needs: [build, deploy]
-    if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes'
+    if: github.event_name == 'workflow_dispatch' && inputs.recreate == 'yes' && vars.CLOUD_HOST != ''
     runs-on: ubuntu-latest
     steps:
       - name: Set up SSH
@@ -555,7 +596,31 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.CLOUD_SSH_KEY }}" > ~/.ssh/amux_cloud
           chmod 600 ~/.ssh/amux_cloud
-          ssh-keyscan -H "$CLOUD_HOST" >> ~/.ssh/known_hosts
+          # REACHABILITY IS A DIFFERENT FAILURE FROM AUTHENTICATION, and this
+          # step could express neither. Against a host that does not answer,
+          # ssh-keyscan exits 1 and prints NOTHING on stdout and NOTHING on
+          # stderr, so under `bash -e` the step died here in silence: the log
+          # showed the script echoed, then "Process completed with exit code 1"
+          # five seconds later (ssh-keyscan's default timeout) with not one line
+          # in between. Ethos rule 4 — the instrument could not express the
+          # answer, so 13 consecutive failures all looked like the auth problem
+          # the comment below documents, and were read as one.
+          #
+          # Measured 2026-09-23: the then-current CLOUD_HOST refused port 22 and
+          # cloud.amux.io returned zero bytes through Cloudflare. The key was
+          # never the problem, and the one line that would have said so could
+          # not run because it sits AFTER this.
+          #
+          # So the failure is deferred rather than immediate: record it, let the
+          # key fingerprint below print, and exit at the end. The log then always
+          # carries BOTH facts, whichever one broke.
+          KEYSCAN_OK=1
+          if ssh-keyscan -H "$CLOUD_HOST" > /tmp/keyscan.out 2>/tmp/keyscan.err; then
+            cat /tmp/keyscan.out >> ~/.ssh/known_hosts
+            echo "CLOUD_HOST $CLOUD_HOST answered on port 22 ($(wc -l < /tmp/keyscan.out | tr -d ' ') host key line(s))"
+          else
+            KEYSCAN_OK=0
+          fi
           chmod 644 ~/.ssh/known_hosts
           # PRINT WHICH KEY WE OFFER. A fingerprint is not secret; the key is, and
           # is never echoed. This exists because "Permission denied (publickey)"
@@ -577,6 +642,11 @@ jobs:
           # authorize this key or replace the secret. No guessing which end is wrong.
           ssh-keygen -lf ~/.ssh/amux_cloud | sed 's/^/CI offers key: /' || \
             echo "CI offers key: UNREADABLE — secrets.CLOUD_SSH_KEY is empty or not a valid private key"
+          if [ "$KEYSCAN_OK" = 0 ]; then
+            echo "::error::CLOUD_HOST $CLOUD_HOST did not answer on port 22. This is a HOST REACHABILITY failure, not an auth failure: the VM is down, its address changed, or a firewall blocks the runner. CLOUD_HOST is hardcoded in this workflow, so a changed IP needs an edit here. The key fingerprint above is printed for completeness and is NOT implicated."
+            sed 's/^/  ssh-keyscan stderr: /' /tmp/keyscan.err || true
+            exit 1
+          fi
 
       - name: Recreate running workspaces and prove the new server answers
         run: |

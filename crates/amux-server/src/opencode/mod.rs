@@ -9,9 +9,42 @@
 //! drive it deterministically. The OpenCode transport implementation lands
 //! against the RR-0028e spike's coverage matrix.
 
+pub mod acp;
+pub mod boundary_policy;
 pub mod events;
 pub mod mock;
+pub mod serve;
 pub mod structured;
+
+/// The model an OpenCode worker runs when neither the worker nor the fleet
+/// named one.
+///
+/// OpenCode's own default is not a fact amux can rely on. Measured 2026-10-25 on
+/// this fleet: an ACP session left on the agent's default answered every prompt
+/// with `503 Upstream request failed: Endpoint is unavailable` (reproduced with
+/// bare `opencode acp`, no amux in the loop), while
+/// `opencode/deepseek-v4.1-flash-free` finished a tool-calling turn in 12s.
+/// Pinning also makes two workers of the same provider comparable in cost and
+/// behaviour instead of silently running whatever the CLI chose today.
+///
+/// Two things override it, and both are meant to: the worker's own model
+/// (`amux register --model …`, `_amux_workers.model`) and the fleet-wide
+/// `AMUX_OPENCODE_MODEL`.
+pub const DEFAULT_MODEL: &str = "opencode/deepseek-v4.1-flash-free";
+
+/// The fleet default for OpenCode workers: `AMUX_OPENCODE_MODEL` when it is set
+/// and non-empty, else [`DEFAULT_MODEL`].
+///
+/// One function, because the structured transport, the interactive launch and
+/// the worker row must not be able to disagree about which model a worker runs
+/// (ethos rule 1: a view shares the predicate of the mechanism it describes).
+pub fn default_model() -> String {
+    std::env::var("AMUX_OPENCODE_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+}
 
 use amux_core::ids::{MessageId, TurnId, WorkerId};
 use amux_core::protocol::{ProgressReport, RateLimit, WorkerEvent};
@@ -37,7 +70,9 @@ pub enum AgentState {
     WaitingForInput,
     RateLimited(RateLimit),
     Paused,
-    Exited { code: Option<i32> },
+    Exited {
+        code: Option<i32>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +95,23 @@ pub trait AgentProtocol: Send + Sync {
     async fn pause(&self, worker: &WorkerId) -> Result<()>;
     async fn resume(&self, worker: &WorkerId) -> Result<()>;
     async fn state(&self, worker: &WorkerId) -> Result<AgentState>;
+    /// Switch the model used by SUBSEQUENT turns, without ending the session.
+    ///
+    /// Returns `true` when a LIVE session was told (so the next turn on it uses
+    /// the new model), `false` when there was no live session and the switch was
+    /// only recorded for the next one. The caller must report which of the two
+    /// happened: a bare `Ok` made the HTTP door answer `live: true` for a switch
+    /// that had not been applied to anything (measured 2026-11-03).
+    ///
+    /// Default: unsupported, and it says so — a silent `Ok` would look like a
+    /// model change that never happened. Providers that can answer it override
+    /// this; OpenCode does on both structured transports.
+    async fn set_model(&self, worker: &WorkerId, model: &str) -> Result<bool> {
+        let _ = (worker, model);
+        Err(ProtocolError::Rejected(
+            "this protocol cannot switch a model on a live worker".to_string(),
+        ))
+    }
     /// Subscribe to this worker's event stream. Events arrive in order;
     /// a lagged subscriber is told so (broadcast semantics match the SSE
     /// contract — Invariant 26).
@@ -67,7 +119,8 @@ pub trait AgentProtocol: Send + Sync {
 }
 
 // The same protocol instance drives the command pump and lifecycle API.
-static PROCESS_PROTOCOL: std::sync::RwLock<Option<std::sync::Arc<dyn AgentProtocol>>> = std::sync::RwLock::new(None);
+static PROCESS_PROTOCOL: std::sync::RwLock<Option<std::sync::Arc<dyn AgentProtocol>>> =
+    std::sync::RwLock::new(None);
 pub fn set_process_protocol(protocol: std::sync::Arc<dyn AgentProtocol>) {
     *PROCESS_PROTOCOL.write().unwrap() = Some(protocol);
 }

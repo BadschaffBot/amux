@@ -25,7 +25,8 @@ for (const mode of ['send', 'steer'] as const) {
     try {
       await page.goto('/');
       const card = page.locator(`#cards .card[data-session="${name}"]`).locator('visible=true').first();
-      await card.locator('.card-name').click();
+      // The name opens the worker (#491); the header beside it unfolds the card.
+      await card.locator('.card-header-top').click({ position: { x: 2, y: 2 }, force: true });
       const input = card.locator('textarea.send-input');
       const send = card.locator('.send-split-main');
       await expect(input).toBeVisible();
@@ -44,7 +45,10 @@ for (const mode of ['send', 'steer'] as const) {
       expect(JSON.parse((await entries())[0].options.body)).toEqual(payloads[0]);
       accepted = true;
       pending = new Promise<void>(resolve => { release = resolve; });
-      await page.locator('[onclick="forceRetry()"]').locator('visible=true').first().click();
+      // Failed changes are retried from the status modal (07b42586): tap the
+      // "N failed" pill, then Retry now.
+      await page.locator('#conn-status').click();
+      await page.locator('#conn-retry-now').click();
       await expect.poll(() => calls).toBe(2);
       expect(payloads[1]).toEqual(payloads[0]);
       release();

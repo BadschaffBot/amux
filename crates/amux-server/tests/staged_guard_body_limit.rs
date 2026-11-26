@@ -25,13 +25,13 @@ use tower::ServiceExt;
 fn app() -> axum::Router {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("t.db")).unwrap();
-    std::mem::forget(dir); // keep the tempdir alive for the test's duration
+    amux_server::test_tempdirs::keep(dir); // keep the tempdir alive for the test's duration
     router(AppState {
         store: std::sync::Arc::new(store),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
         auth_token: None,
-    reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     })
 }
 

@@ -6,11 +6,27 @@ private let logger = Logger(subsystem: "io.amux.app", category: "WebView")
 
 struct WebView: UIViewRepresentable {
     let url: URL
+    /// This server's page is the one on screen (ServerPanes.swift). Only that web view owns
+    /// the recorder and notification bridges, which talk to one page at a time.
+    var isActive: Bool = true
     @Binding var isLoading: Bool
     @Binding var canGoBack: Bool
     @Binding var canGoForward: Bool
     @Binding var loadError: String?
+    /// True while the page shown is not the dashboard (DashboardPage), so
+    /// ContentView can offer the way back.
+    @Binding var offDashboard: Bool
+    /// Non-nil while the page on screen cannot reach the server: either the
+    /// saved copy loaded offline, or a live page that lost its connection
+    /// (OfflineCopy.swift). ContentView shows the offline badge from it.
+    @Binding var offline: OfflineCopy.Badge?
+    /// Hands ContentView the web view, for its back button.
+    var onWebView: (WKWebView) -> Void = { _ in }
     let onNavigationAction: (WKNavigationAction) -> WKNavigationActionPolicy
+    var onLongPress: () -> Void = {}
+    /// The dashboard asked the app for something (`amuxApp` bridge, app.js `_appBridge`):
+    /// "switch-server" or "settings".
+    var onAppBridge: (String) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -26,9 +42,30 @@ struct WebView: UIViewRepresentable {
         webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
         webView.customUserAgent = (webView.value(forKey: "userAgent") as? String ?? "") + " AmuxApp"
-        webView.scrollView.contentInsetAdjustmentBehavior = .automatic
+        // .never, NOT .automatic. The dashboard ships `viewport-fit=cover` and
+        // 39 `env(safe-area-inset-*)` rules, so it already carves the notch and
+        // the home indicator itself. `.automatic` makes UIKit inset the scroll
+        // view by the SAME safe area, and the two stack: measured on an
+        // iPhone 17 simulator, a dead band above the worker header and another
+        // below the composer, both far larger than the 59pt/34pt insets that
+        // explain them.
+        //
+        // The page is the right owner of that decision, because it is the only
+        // side that knows which of its elements are pinned to an edge.
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.isOpaque = false
         webView.backgroundColor = UIColor(red: 0.051, green: 0.067, blue: 0.09, alpha: 1) // #0d1117
+
+        // Long-press opens Settings. It must never take a touch from the page:
+        // cancelsTouchesInView and delaysTouchesBegan stay false, and it
+        // recognizes alongside WebKit's own recognizers.
+        let press = UILongPressGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleLongPress(_:)))
+        press.minimumPressDuration = 0.6
+        press.cancelsTouchesInView = false
+        press.delaysTouchesBegan = false
+        press.delaysTouchesEnded = false
+        press.delegate = context.coordinator
+        webView.addGestureRecognizer(press)
 
         // Pull-to-refresh
         let refresh = UIRefreshControl()
@@ -36,6 +73,7 @@ struct WebView: UIViewRepresentable {
         webView.scrollView.addSubview(refresh)
         context.coordinator.refreshControl = refresh
         context.coordinator.webView = webView
+        DispatchQueue.main.async { onWebView(webView) }
 
         // Capture JS console.log/error/warn into os_log
         let script = WKUserScript(source: """
@@ -58,32 +96,336 @@ struct WebView: UIViewRepresentable {
             })();
             """, injectionTime: .atDocumentStart, forMainFrameOnly: false)
         config.userContentController.add(context.coordinator, name: "consoleLog")
+        // Map > Location history talks to the native recorder through this
+        // bridge (AMUX-5458): status, enable, disable, upload.
+        config.userContentController.add(context.coordinator, name: "amuxLocation")
+        // The Record tab drives the native recorder, which keeps recording
+        // while the app is hidden (RecorderBridge.swift).
+        config.userContentController.add(context.coordinator, name: "amuxRecorder")
+        // Messages notifications (NotifyBridge.swift).
+        config.userContentController.add(context.coordinator, name: "amuxNotify")
+        // Teleprompter selfie takes go to Photos through this bridge (AA-39).
+        config.userContentController.addScriptMessageHandler(MediaBridge(), contentWorld: .page, name: "amuxMedia")
+        // The dashboard's Switch server and amux Cloud account buttons (app.js _appBridge).
+        // The page called this bridge for weeks before the app registered it, so in the app
+        // both buttons were hidden or did nothing.
+        config.userContentController.add(context.coordinator, name: "amuxApp")
         config.userContentController.addUserScript(script)
 
-        webView.load(URLRequest(url: url))
+        context.coordinator.requestedURL = url
+        if isActive { context.coordinator.takeBridges(webView) }
+        context.coordinator.loadFromServer(webView, url)
         logger.info("Loading URL: \(url.absoluteString)")
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        // Re-load if the URL changed (server switch)
-        if webView.url?.host != url.host || webView.url?.port != url.port {
-            webView.load(URLRequest(url: url))
+        // Reload only when the REQUESTED server changed.
+        //
+        // This used to compare the WEBVIEW'S CURRENT url against the target,
+        // and that is an infinite loop whenever the server cannot be reached.
+        // WebKit parks an unreachable navigation on `about:blank`, whose host
+        // and port never match, so this reloaded; the reload flips isLoading,
+        // SwiftUI re-renders, updateUIView runs again, and it reloads again.
+        // Measured against an unreachable host: "Navigation started" ->
+        // "Navigation finished: about:blank" repeating every ~3ms, 3327 commits
+        // in 18 seconds.
+        //
+        // It is also why no error could ever appear. Each spurious didFinish
+        // set loadError = nil and isLoading = false, so the overlay was cleared
+        // thousands of times a second and the user saw an unexplained dark
+        // screen while the phone burned battery.
+        //
+        // Comparing against what we ASKED for is stable: about:blank is not a
+        // server switch, so it no longer triggers one.
+        // The coordinator reads the server from `parent`, so it must see this
+        // view's values: a switched server kept `parent.url` on the old one,
+        // and an unreachable new server fell back to the old server's page
+        // (land-gate review, 2026-11-12).
+        let previous = context.coordinator.parent.url
+        let wasActive = context.coordinator.parent.isActive
+        context.coordinator.parent = self
+        if isActive && !wasActive { context.coordinator.takeBridges(webView) }
+        if context.coordinator.requestedURL != url {
+            context.coordinator.requestedURL = url
+            if DashboardPage.root(of: previous) != DashboardPage.root(of: url) {
+                context.coordinator.serverChanged()
+            }
+            context.coordinator.loadFromServer(webView, url)
         }
     }
 
+    /// A server's pane closed (ServerPanes.limit, a removed server): stop its page, so its
+    /// live connection to the server ends with it.
+    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
+        webView.stopLoading()
+        webView.configuration.userContentController.removeAllScriptMessageHandlers()
+        coordinator.disarmWatchdog()
+        coordinator.stopReconnectProbe()
+        logger.info("ios_server_pane verdict=closed host=\(coordinator.parent.url.host ?? "-", privacy: .public)")
+    }
+
     // MARK: - Coordinator
-    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+    class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIGestureRecognizerDelegate {
         var parent: WebView
         weak var webView: WKWebView?
         var refreshControl: UIRefreshControl?
+        /// The URL we last ASKED the web view to load. Compared against the
+        /// desired URL in updateUIView; see the note there for why the web
+        /// view's own `url` is the wrong thing to compare.
+        var requestedURL: URL?
+
+        // MARK: - Offline (OfflineCopy.swift)
+
+        /// A dashboard page is committed in the web view. A failed reload or
+        /// pull-to-refresh leaves it on screen, so it is kept and marked
+        /// offline instead of being covered by the error screen.
+        var showingDashboard = false
+        /// The current attempt is the load from WebKit's cache. Reset by every
+        /// load that goes to the server, so each one gets one fallback.
+        var triedSavedCopy = false
+        private var savedCopyNavigation: WKNavigation?
+        private var reconnectTimer: Timer?
+        private lazy var probeSession = URLSession(configuration: .ephemeral,
+                                                   delegate: SelfHostedTrust(), delegateQueue: nil)
 
         init(_ parent: WebView) {
             self.parent = parent
+            super.init()
+            NotificationCenter.default.addObserver(forName: LocationRecorder.statusChanged,
+                                                   object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.pushLocationStatus() }
+            }
+            // Back in the foreground while offline: look for the server now
+            // rather than at the next tick of the reconnect timer.
+            NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                                   object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.parent.offline != nil else { return }
+                self.probeServer(reason: "foreground")
+            }
+        }
+
+        deinit {
+            reconnectTimer?.invalidate()
+            watchdog?.cancel()
+        }
+
+        /// Another server: the page on screen and its offline state belong to
+        /// the old one, so neither may stand in for the new one.
+        func serverChanged() {
+            showingDashboard = false
+            stopReconnectProbe()
+            DispatchQueue.main.async { [weak self] in self?.parent.offline = nil }
+        }
+
+        /// Every load that should reach the server goes through here.
+        func loadFromServer(_ webView: WKWebView, _ url: URL) {
+            triedSavedCopy = false
+            savedCopyNavigation = nil
+            webView.load(URLRequest(url: url))
+            armWatchdog(host: url.host)
+        }
+
+        /// A navigation failed, or never answered (`error` nil: the watchdog).
+        /// Returns true when the offline path handled it, false when the
+        /// error screen should show.
+        func handleFailure(_ webView: WKWebView, navigation: WKNavigation?, error: NSError?) -> Bool {
+            let server = parent.url
+            let defaults = AmuxStore.defaults
+            let unreachable = error.map(OfflineCopy.isUnreachable) ?? true
+            let wasSavedCopy = triedSavedCopy
+            let savedAt = OfflineCopy.savedAt(server: server, defaults: defaults)
+            let decision = OfflineCopy.decide(unreachable: unreachable, showingDashboard: showingDashboard,
+                                              savedAt: savedAt, triedSavedCopy: triedSavedCopy)
+            let why = error.map { "\($0.domain)/\($0.code)" } ?? "watchdog"
+            let host = server.host ?? "-"
+            switch decision {
+            case .keepPage:
+                webView.stopLoading()
+                if parent.offline == nil {
+                    parent.offline = OfflineCopy.Badge(savedAt: nil, since: Date())
+                }
+                logger.info("offline_load verdict=kept_page host=\(host, privacy: .public) error=\(why, privacy: .public)")
+                startReconnectProbe()
+                return true
+            case .loadSavedCopy:
+                triedSavedCopy = true
+                let url = OfflineCopy.cachedURL(for: requestedURL ?? server, server: server)
+                var req = URLRequest(url: url)
+                req.cachePolicy = .returnCacheDataElseLoad
+                savedCopyNavigation = webView.load(req)
+                armWatchdog(host: url.host)
+                logger.info("offline_load verdict=loading_saved_copy host=\(host, privacy: .public) error=\(why, privacy: .public) saved_at=\(savedAt?.description ?? "-", privacy: .public)")
+                return true
+            case .showError:
+                if wasSavedCopy && savedAt != nil && unreachable {
+                    // The record said a copy existed and WebKit had none (its
+                    // cache was cleared), so stop promising one.
+                    OfflineCopy.forget(server: server, defaults: defaults)
+                    logger.error("offline_load verdict=saved_copy_missing host=\(host, privacy: .public)")
+                } else if unreachable {
+                    logger.error("offline_load verdict=no_saved_copy host=\(host, privacy: .public) error=\(why, privacy: .public)")
+                }
+                return false
+            }
+        }
+
+        /// The error-screen text for an unreachable server with nothing saved.
+        func noCopySuffix(_ error: NSError?) -> String {
+            let unreachable = error.map(OfflineCopy.isUnreachable) ?? true
+            return unreachable ? "\n\n" + OfflineCopy.noCopyMessage : ""
+        }
+
+        private func startReconnectProbe() {
+            guard reconnectTimer == nil else { return }
+            let t = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+                self?.probeServer(reason: "timer")
+            }
+            RunLoop.main.add(t, forMode: .common)
+            reconnectTimer = t
+        }
+
+        func stopReconnectProbe() {
+            reconnectTimer?.invalidate()
+            reconnectTimer = nil
+        }
+
+        /// Ask the server whether it answers. Any HTTP reply counts: the
+        /// dashboard's own reads say whether it is healthy.
+        func probeServer(reason: String) {
+            var req = URLRequest(url: DashboardPage.root(of: parent.url).appendingPathComponent("health"),
+                                 cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
+            req.httpMethod = "GET"
+            probeSession.dataTask(with: req) { [weak self] _, response, _ in
+                guard response is HTTPURLResponse else { return }
+                DispatchQueue.main.async { self?.reconnected(reason: reason) }
+            }.resume()
+        }
+
+        /// The server answers again. The dashboard catches up by itself (its
+        /// polling, and the `online` handler that drains the outbox); the
+        /// event is dispatched because a stopped server or a dead Tailscale
+        /// route never fire it, while airplane mode does.
+        private func reconnected(reason: String) {
+            guard let badge = parent.offline else { return }
+            stopReconnectProbe()
+            parent.offline = nil
+            let offlineS = Int(Date().timeIntervalSince(badge.since))
+            let fromCopy = badge.savedAt != nil
+            logger.info("offline_load verdict=reconnected via=\(reason, privacy: .public) offline_s=\(offlineS) saved_copy=\(fromCopy)")
+            let beacon: [String: Any] = ["kind": "ios-offline", "verdict": "reconnected", "via": reason,
+                                         "offline_s": offlineS, "saved_copy": fromCopy,
+                                         "measured": true, "n_considered": 1]
+            let json = (try? JSONSerialization.data(withJSONObject: beacon))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            let js = "(function(){try{window.dispatchEvent(new Event('online'));}catch(e){}"
+                + "try{fetch((typeof API!=='undefined'?API:'')+'/api/client-debug',{method:'POST',"
+                + "headers:{'Content-Type':'application/json'},keepalive:true,body:JSON.stringify(\(json))})"
+                + ".catch(function(){});}catch(e){}})()"
+            webView?.evaluateJavaScript(js)
+        }
+
+        /// Hand the recorder's status to the dashboard's Location history tab.
+        @MainActor
+        func pushLocationStatus() {
+            guard let webView,
+                  let data = try? JSONSerialization.data(withJSONObject: LocationRecorder.shared.status),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            webView.evaluateJavaScript("window.__amuxNativeLocation && window.__amuxNativeLocation(\(json))")
+        }
+
+        // MARK: - Load watchdog
+        //
+        // THE ERROR OVERLAY ONLY EXISTS FOR NAVIGATIONS THAT FAIL, and a
+        // navigation can do neither. `loadError` is set exclusively by
+        // `didFail` and `didFailProvisionalNavigation`, so a load that starts
+        // and never resolves leaves `loadError` nil and the view blank.
+        // ContentView then renders the WebView and nothing else, which is a
+        // dark empty screen with no message and no retry.
+        //
+        // That is the reported symptom, and the owner's screenshot pins WHICH
+        // variant it was: a thin linear bar under the status bar, which is
+        // ContentView's `if isLoading { ProgressView(.linear) }`. isLoading
+        // true with loadError nil means the navigation had started and never
+        // finished or failed. Reproduced here against an unreachable host: two
+        // minutes, no overlay, no progress, nothing.
+        //
+        // Deliberately distinct from the dashboard-side fix (a7eca7d3), which
+        // handles a page that LOADED and then failed to read sessions. That
+        // one cannot help here, because when the page never loads none of its
+        // JavaScript runs.
+        //
+        // Armed where the load is ISSUED rather than only in
+        // didStartProvisionalNavigation, because a request that never reaches
+        // the network may not produce that callback either.
+        static let loadTimeout: TimeInterval = 25
+        private var watchdog: DispatchWorkItem?
+
+        func armWatchdog(host: String?) {
+            watchdog?.cancel()
+            let where_ = host ?? "the server"
+            let item = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                // Only speak if nothing else already did. A real failure or a
+                // successful load both resolve this more accurately.
+                guard self.parent.loadError == nil, self.parent.isLoading || self.webView?.url == nil
+                else { return }
+                self.parent.isLoading = false
+                logger.error("Load watchdog fired after \(Int(Coordinator.loadTimeout))s for \(where_)")
+                if let webView = self.webView, self.handleFailure(webView, navigation: nil, error: nil) { return }
+                self.parent.loadError =
+                    "No response from \(where_) after \(Int(Coordinator.loadTimeout))s. "
+                    + "The server may be down, or this device may have lost its VPN or "
+                    + "Tailscale route to it." + self.noCopySuffix(nil)
+            }
+            watchdog = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + Coordinator.loadTimeout, execute: item)
+        }
+
+        func disarmWatchdog() {
+            watchdog?.cancel()
+            watchdog = nil
+        }
+
+        /// The page on screen gets the recorder and notification bridges.
+        func takeBridges(_ webView: WKWebView) {
+            RecorderBridge.shared.setUp(webView: webView)
+            NotifyBridge.shared.setUp(webView: webView)
         }
 
         // JS console → os_log bridge
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+            if message.name == "amuxApp" {
+                let op = (message.body as? [String: Any])?["op"] as? String ?? ""
+                logger.info("ios_app_bridge op=\(op, privacy: .public) active=\(self.parent.isActive)")
+                guard parent.isActive else { return }
+                parent.onAppBridge(op)
+                return
+            }
+            if message.name == "amuxNotify" {
+                NotifyBridge.shared.handle(message.body as? [String: Any] ?? [:])
+                return
+            }
+            if message.name == "amuxRecorder" {
+                RecorderBridge.shared.handle(message.body as? [String: Any] ?? [:])
+                return
+            }
+            if message.name == "amuxLocation" {
+                let op = (message.body as? [String: Any])?["op"] as? String ?? "status"
+                Task { @MainActor in
+                    let recorder = LocationRecorder.shared
+                    switch op {
+                    case "enable": recorder.setEnabled(true)
+                    case "disable": recorder.setEnabled(false)
+                    case "upload": await recorder.upload()
+                    case "full": recorder.setMode(.full)
+                    case "saver": recorder.setMode(.saver)
+                    default: break
+                    }
+                    self.pushLocationStatus()
+                }
+                return
+            }
             guard let body = message.body as? [String: String],
                   let level = body["level"], let msg = body["message"] else { return }
             switch level {
@@ -121,6 +463,66 @@ struct WebView: UIViewRepresentable {
             decisionHandler(parent.onNavigationAction(navigationAction))
         }
 
+        // Camera and microphone for the configured server (teleprompter
+        // recording, dictation). iOS already asked once through the Info.plist
+        // usage strings; WebKit's own per-page prompt on top of that would ask
+        // again on every load. Any other origin keeps WebKit's prompt.
+        func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                     initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
+                     decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+            let own = origin.host == parent.url.host
+            logger.info("Media capture \(type.rawValue) requested by \(origin.host): \(own ? "granted" : "prompt")")
+            decisionHandler(own ? .grant : .prompt)
+        }
+
+        // JavaScript alert / confirm / prompt. A WKUIDelegate that does not
+        // implement these makes WebKit skip the panel entirely: prompt() returns
+        // null, confirm() false, alert() nothing, with no error anywhere. Every
+        // dashboard "New folder" / "New file" in Files did nothing in the app
+        // while working in Safari (owner report 2026-10-18).
+        private func presenter(for webView: WKWebView) -> UIViewController? {
+            var vc = webView.window?.rootViewController
+            while let next = vc?.presentedViewController { vc = next }
+            return vc
+        }
+
+        func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
+                     initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
+            guard let vc = presenter(for: webView) else {
+                logger.error("JS alert dropped: no view controller to present from")
+                completionHandler(); return
+            }
+            let a = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+            a.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler() })
+            vc.present(a, animated: true)
+        }
+
+        func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String,
+                     initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+            guard let vc = presenter(for: webView) else {
+                logger.error("JS confirm dropped: no view controller to present from")
+                completionHandler(false); return
+            }
+            let a = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+            a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(false) })
+            a.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(true) })
+            vc.present(a, animated: true)
+        }
+
+        func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String,
+                     defaultText: String?, initiatedByFrame frame: WKFrameInfo,
+                     completionHandler: @escaping (String?) -> Void) {
+            guard let vc = presenter(for: webView) else {
+                logger.error("JS prompt dropped: no view controller to present from")
+                completionHandler(nil); return
+            }
+            let a = UIAlertController(title: nil, message: prompt, preferredStyle: .alert)
+            a.addTextField { $0.text = defaultText }
+            a.addAction(UIAlertAction(title: "Cancel", style: .cancel) { _ in completionHandler(nil) })
+            a.addAction(UIAlertAction(title: "OK", style: .default) { _ in completionHandler(a.textFields?.first?.text) })
+            vc.present(a, animated: true)
+        }
+
         // Handle window.open — navigate in same webview instead of dropping
         func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                      for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -133,37 +535,86 @@ struct WebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             parent.isLoading = true
             parent.loadError = nil
+            armWatchdog(host: webView.url?.host ?? parent.url.host)
             logger.debug("Navigation started: \(webView.url?.absoluteString ?? "nil")")
         }
 
+        // Every main-frame page change, including a back swipe, commits here.
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            let scheme = webView.url?.scheme?.lowercased()
+            showingDashboard = (scheme == "http" || scheme == "https")
+                && DashboardPage.isDashboard(webView.url, server: parent.url)
+            let off = !DashboardPage.isDashboard(webView.url, server: parent.url)
+            if off != parent.offDashboard {
+                logger.info("Page is \(off ? "off" : "back on") the dashboard: \(webView.url?.absoluteString ?? "nil")")
+            }
+            parent.offDashboard = off
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            disarmWatchdog()
             parent.isLoading = false
+            // A navigation that "finishes" on about:blank did NOT reach the
+            // server; WebKit parks unreachable loads there. Reporting success
+            // is what left the screen blank and silent, so say it plainly and
+            // reuse the overlay that already exists for unreachable servers.
+            if webView.url.map({ $0.absoluteString == "about:blank" }) == true,
+               parent.url.absoluteString != "about:blank" {
+                if handleFailure(webView, navigation: navigation, error: nil) {
+                    refreshControl?.endRefreshing()
+                    return
+                }
+                parent.loadError =
+                    "Could not load \(parent.url.host ?? "the server"). The server may be "
+                    + "down, or this device may have lost its VPN or Tailscale route to it."
+                logger.error("Navigation parked on about:blank for \(self.parent.url.absoluteString)")
+                refreshControl?.endRefreshing()
+                return
+            }
             parent.loadError = nil
             parent.canGoBack = webView.canGoBack
             parent.canGoForward = webView.canGoForward
             refreshControl?.endRefreshing()
             logger.info("Navigation finished: \(webView.url?.absoluteString ?? "nil")")
+            if navigation != nil && navigation === savedCopyNavigation {
+                let savedAt = OfflineCopy.savedAt(server: parent.url, defaults: AmuxStore.defaults)
+                parent.offline = OfflineCopy.Badge(savedAt: savedAt, since: Date())
+                logger.info("offline_load verdict=saved_copy_shown host=\(self.parent.url.host ?? "-", privacy: .public) saved_at=\(savedAt?.description ?? "-", privacy: .public)")
+                startReconnectProbe()
+                probeServer(reason: "loaded")
+            } else if showingDashboard {
+                // Reached the server: this is the copy WebKit now holds.
+                OfflineCopy.recordOnlineLoad(server: parent.url, at: Date(), defaults: AmuxStore.defaults)
+                if parent.offline != nil {
+                    stopReconnectProbe()
+                    parent.offline = nil
+                }
+            }
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            disarmWatchdog()
             parent.isLoading = false
             refreshControl?.endRefreshing()
             let nsError = error as NSError
-            // Don't show cancellation errors (e.g. user tapped a link before page loaded)
-            if nsError.code != NSURLErrorCancelled {
-                parent.loadError = error.localizedDescription
-            }
             logger.error("Navigation failed: \(error.localizedDescription)")
+            // Don't show cancellation errors (e.g. user tapped a link before page loaded)
+            if nsError.code != NSURLErrorCancelled,
+               !handleFailure(webView, navigation: navigation, error: nsError) {
+                parent.loadError = error.localizedDescription + noCopySuffix(nsError)
+            }
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            disarmWatchdog()
             parent.isLoading = false
             refreshControl?.endRefreshing()
             let nsError = error as NSError
-            if nsError.code != NSURLErrorCancelled {
-                parent.loadError = error.localizedDescription
-            }
             logger.error("Provisional navigation failed: \(error.localizedDescription) url=\(webView.url?.absoluteString ?? "nil")")
+            if nsError.code != NSURLErrorCancelled,
+               !handleFailure(webView, navigation: navigation, error: nsError) {
+                parent.loadError = error.localizedDescription + noCopySuffix(nsError)
+            }
         }
 
         func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
@@ -172,11 +623,44 @@ struct WebView: UIViewRepresentable {
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             logger.fault("WebContent process terminated — reloading")
+            // The page is gone, so an offline reload falls back to the saved
+            // copy instead of keeping a page that no longer exists.
+            showingDashboard = false
+            triedSavedCopy = false
+            savedCopyNavigation = nil
             webView.reload()
+            armWatchdog(host: webView.url?.host ?? parent.url.host)
         }
 
+        @objc func handleLongPress(_ sender: UILongPressGestureRecognizer) {
+            guard sender.state == .began else { return }
+            logger.info("long-press: opening Settings")
+            parent.onLongPress()
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
         @objc func handleRefresh(_ sender: UIRefreshControl) {
+            triedSavedCopy = false
             webView?.reload()
+            armWatchdog(host: webView?.url?.host ?? parent.url.host)
+        }
+    }
+}
+
+/// Trusts a self-hosted server's certificate for the reconnect probe, by the
+/// same rule the web view's own challenge handler uses: anything that is not
+/// an amux.io host (Tailscale, LAN, a custom domain) may be self-signed.
+final class SelfHostedTrust: NSObject, URLSessionDelegate {
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           !challenge.protectionSpace.host.hasSuffix("amux.io"),
+           let trust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.performDefaultHandling, nil)
         }
     }
 }

@@ -33,7 +33,7 @@ use amux_core::protocol::{DeliveryTiming, WorkerCommand};
 use amux_core::revision::{EntityType, MutationKind};
 use amux_core::search::PagedResponse;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -109,6 +109,67 @@ pub(crate) fn message_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Opt
     .optional()
 }
 
+/// `ask_owner`: raise the owner's grant ask on a group refusal. True only where
+/// a message is CREATED; the delivery re-check of a queued message passes false,
+/// or every pump tick re-asks (582 counted in minutes on 2026-11-16).
+pub(crate) fn native_peer_input_refusal(
+    conn: &Connection, origin: &str, target: &str, ask_owner: bool,
+) -> rusqlite::Result<Option<super::session_verbs::PeerInputRefusal>> {
+    if origin.is_empty() || origin == target { return Ok(None); }
+    let Some(source) = queries::get_worker(conn, origin)? else {
+        return Ok(Some(super::session_verbs::PeerInputRefusal { code:"worker_identity_refused",
+            reason:"Pending worker input has no registered sender identity; membership cannot be verified.".into() }));
+    };
+    let Some(receiver) = queries::get_worker(conn, target)? else { return Ok(None); };
+    if super::session_verbs::speaks_for_owner(&source.display_name) { return Ok(None); }
+    if let Some(reason) = super::session_verbs::peer_receive_refusal(&source.display_name, &receiver.display_name) {
+        return Ok(Some(super::session_verbs::PeerInputRefusal { code:"peer_receive_denied", reason }));
+    }
+    if source.group_id.is_none() && receiver.group_id.is_none() {
+        let refusal = super::session_verbs::peer_input_refusal(&source.display_name, &receiver.display_name);
+        if let (true, Some(r)) = (ask_owner, &refusal) {
+            super::session_verbs::ask_owner_for_refused_message(&source.display_name, &receiver.display_name, r);
+        }
+        return Ok(refusal);
+    }
+    if super::session_verbs::owner_mention_grant_allows(&source.display_name, &receiver.display_name) {
+        return Ok(None);
+    }
+    let source_groups = source.group_id.into_iter().collect();
+    let receiver_groups: std::collections::BTreeSet<String> = receiver.group_id.into_iter().collect();
+    if super::capabilities::message_granted(&crate::config::amux_home(), &source.display_name,
+        &receiver.display_name, &receiver_groups).is_some() {
+        return Ok(None);
+    }
+    let home = crate::config::amux_home();
+    let open = super::worker_messaging::open_inbound_groups(&home, &receiver_groups);
+    let refusal = super::session_verbs::worker_group_refusal(&source.id, &receiver.id, &source_groups, &receiver_groups, &open);
+    // The same ask `amux send` raises (session_verbs): refused outside a shared
+    // group, the owner is asked whether to grant it (land review, 2026-11-16:
+    // this path refused and asked nobody).
+    if ask_owner && refusal.is_some() {
+        super::capabilities::existing_refusal(&home, &source.display_name, "message",
+            &format!("worker {}", receiver.display_name), &receiver.display_name);
+    }
+    Ok(refusal)
+}
+
+/// Recheck current group membership before a pending native message delivery.
+pub(crate) fn pending_receive_refusal(conn: &Connection, message: &str, target: &str) -> rusqlite::Result<Option<String>> {
+    let actor: Option<String> = conn.query_row("SELECT from_actor FROM _amux_messages WHERE id=?1",[message],|r|r.get(0)).optional()?;
+    let Some(actor) = actor else { return Ok(None); };
+    let actor: Actor = match serde_json::from_str(&actor) {
+        Ok(actor) => actor,
+        Err(_) => {
+            tracing::warn!(message, target, verdict="message_origin_unreadable", measured=true,n_considered=1,
+                "pending native message has no verifiable sender identity");
+            return Ok(Some("message origin unreadable: pending input cannot be attributed to an owner or a registered worker".into()));
+        }
+    };
+    let Actor::Worker { id } = actor else { return Ok(None); };
+    Ok(native_peer_input_refusal(conn, id.as_str(), target, false)?.map(|refusal| refusal.reason))
+}
+
 /// Queue the AtTurnBoundary delivery command for one recipient. The
 /// idempotency key derives from the MessageId, so a replayed create can
 /// never double-queue a delivery (Invariant 9). Human-authored messages
@@ -158,7 +219,10 @@ fn err(status: StatusCode, body: Value) -> Response {
 use super::internal;
 
 fn no_write() -> WriteOutcome {
-    WriteOutcome { applied: false, events: Vec::new() }
+    WriteOutcome {
+        applied: false,
+        events: Vec::new(),
+    }
 }
 
 fn finish<T>(
@@ -171,7 +235,12 @@ fn finish<T>(
 }
 
 fn ev(entity_type: EntityType, id: &str, mutation: MutationKind) -> PendingEvent {
-    PendingEvent { entity_type, entity_id: id.to_string(), mutation, payload: None }
+    PendingEvent {
+        entity_type,
+        entity_id: id.to_string(),
+        mutation,
+        payload: None,
+    }
 }
 
 fn message_body(m: &Message) -> Value {
@@ -194,7 +263,11 @@ pub(crate) fn resolve_recipient(
         Ok(Some(MessageTarget::Human))
     } else {
         queries::get_worker(conn, key)?
-            .map(|row| WorkerId::parse(&row.id).map(MessageTarget::Worker).map_err(corrupt))
+            .map(|row| {
+                WorkerId::parse(&row.id)
+                    .map(MessageTarget::Worker)
+                    .map_err(corrupt)
+            })
             .transpose()
     }
 }
@@ -222,7 +295,11 @@ pub(crate) fn insert_message_and_deliver(
         now,
     );
     insert_message(conn, &parent)?;
-    let mut events = vec![ev(EntityType::Message, parent.id.as_str(), MutationKind::Created)];
+    let mut events = vec![ev(
+        EntityType::Message,
+        parent.id.as_str(),
+        MutationKind::Created,
+    )];
     let mut children_ids = Vec::new();
     let mut commands_enqueued = 0usize;
     match &target {
@@ -237,7 +314,11 @@ pub(crate) fn insert_message_and_deliver(
             let mut mint = || MessageId::from_ulid(ulid::Ulid::new());
             for child in fan_out(&parent, &members, &mut mint) {
                 insert_message(conn, &child)?;
-                events.push(ev(EntityType::Message, child.id.as_str(), MutationKind::Created));
+                events.push(ev(
+                    EntityType::Message,
+                    child.id.as_str(),
+                    MutationKind::Created,
+                ));
                 if let MessageTarget::Worker(w) = &child.to {
                     enqueue_delivery(conn, w, &child.id, now)?;
                     commands_enqueued += 1;
@@ -271,26 +352,34 @@ pub struct CreateMessageBody {
     /// Parent message id, for replies.
     #[serde(default)]
     pub thread: Option<String>,
-    /// Sender as an `Actor` object. Defaults to the owner: the bearer token
-    /// IS the owner's identity on this single-user API. A worker relaying a
-    /// message must pass its own actor — per-caller identity stamping lands
-    /// with auth identities, and until then the default is the honest
-    /// reading of an authenticated request.
+    /// Owner-supplied actor metadata. Worker-origin requests are stamped from
+    /// their authenticated header identity and cannot claim to be the owner.
     #[serde(default)]
     pub from: Option<Value>,
 }
 
 enum CreateOutcome {
-    NotFound { what: String },
-    Created { message: Value, fan_out: Vec<String>, commands_enqueued: usize },
+    Refused { code: &'static str, why: String },
+    NotFound {
+        what: String,
+    },
+    Created {
+        message: Value,
+        fan_out: Vec<String>,
+        commands_enqueued: usize,
+    },
 }
 
 pub async fn create_message(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateMessageBody>,
 ) -> Response {
     if body.body.trim().is_empty() {
-        return err(StatusCode::BAD_REQUEST, json!({ "error": "body is required" }));
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "body is required" }),
+        );
     }
     let to_spec = match body.to {
         Value::String(s) => ToSpec::Key(s),
@@ -320,7 +409,9 @@ pub async fn create_message(
                 )
             }
         },
-        None => Actor::Human { name: "owner".into() },
+        None => Actor::Human {
+            name: "owner".into(),
+        },
     };
     let thread: Option<MessageId> = match &body.thread {
         Some(t) => match MessageId::parse(t) {
@@ -335,6 +426,8 @@ pub async fn create_message(
         None => None,
     };
     let text = body.body;
+    let origin = if super::org::local_member_actor(&headers).is_some() { String::new() }
+        else { super::session_verbs::hdr_worker(&headers) };
 
     let slot: Arc<Mutex<Option<CreateOutcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
@@ -342,6 +435,12 @@ pub async fn create_message(
     let write = state
         .store
         .write_async(move |conn| {
+            let (from, origin) = if origin.is_empty() { (from, origin) } else {
+                let Some(worker) = queries::get_worker(conn, &origin)? else {
+                    return finish(&slot_w, CreateOutcome::Refused { code:"worker_identity_refused", why: "worker sender identity is not registered; use the worker session send route".into() }, no_write());
+                };
+                (Actor::Worker { id: WorkerId::parse(&worker.id).map_err(corrupt)? }, worker.display_name)
+            };
             // Resolve the recipient against current state, inside the writer
             // transaction so it cannot race a delete — through the SAME resolver
             // /api/env/apply uses (ethos D6).
@@ -352,7 +451,9 @@ pub async fn create_message(
                     None => {
                         return finish(
                             &slot_w,
-                            CreateOutcome::NotFound { what: format!("worker '{s}'") },
+                            CreateOutcome::NotFound {
+                                what: format!("worker '{s}'"),
+                            },
                             no_write(),
                         )
                     }
@@ -364,9 +465,25 @@ pub async fn create_message(
                 if queries::get_worker(conn, w.as_str())?.is_none() {
                     return finish(
                         &slot_w,
-                        CreateOutcome::NotFound { what: format!("worker {}", w.as_str()) },
+                        CreateOutcome::NotFound {
+                            what: format!("worker {}", w.as_str()),
+                        },
                         no_write(),
                     );
+                }
+            }
+            let recipients = match &target {
+                MessageTarget::Worker(worker) => vec![worker.clone()],
+                MessageTarget::Group(group) => group_members(conn, group)?,
+                MessageTarget::Human => Vec::new(),
+            };
+            // Check the actual recipients before writing the parent or any
+            // fan-out child. Body actor metadata cannot bypass receive policy.
+            for recipient in recipients {
+                if let Some(worker) = queries::get_worker(conn, recipient.as_str())? {
+                    if let Some(refusal) = native_peer_input_refusal(conn, &origin, &worker.id, true)? {
+                        return finish(&slot_w, CreateOutcome::Refused { code:refusal.code, why:refusal.reason }, no_write());
+                    }
                 }
             }
             if let Some(t) = &thread {
@@ -382,8 +499,14 @@ pub async fn create_message(
             }
 
             let now = Utc::now();
-            let (parent, children_ids, commands_enqueued, events) =
-                insert_message_and_deliver(conn, from.clone(), target, text.clone(), thread.clone(), now)?;
+            let (parent, children_ids, commands_enqueued, events) = insert_message_and_deliver(
+                conn,
+                from.clone(),
+                target,
+                text.clone(),
+                thread.clone(),
+                now,
+            )?;
 
             finish(
                 &slot_w,
@@ -392,7 +515,10 @@ pub async fn create_message(
                     fan_out: children_ids,
                     commands_enqueued,
                 },
-                WriteOutcome { applied: true, events },
+                WriteOutcome {
+                    applied: true,
+                    events,
+                },
             )
         })
         .await;
@@ -404,11 +530,17 @@ pub async fn create_message(
     let outcome = slot.lock().expect("outcome slot poisoned").take();
     match outcome {
         None => internal("create produced no outcome"),
+        Some(CreateOutcome::Refused { code, why }) => err(StatusCode::FORBIDDEN,
+            json!({"ok":false,"code":code,"error":why,"submitted":false})),
         Some(CreateOutcome::NotFound { what }) => err(
             StatusCode::NOT_FOUND,
             json!({ "error": "recipient not found", "missing": what }),
         ),
-        Some(CreateOutcome::Created { message, fan_out, commands_enqueued }) => (
+        Some(CreateOutcome::Created {
+            message,
+            fan_out,
+            commands_enqueued,
+        }) => (
             StatusCode::CREATED,
             Json(json!({
                 "message": message,
@@ -437,10 +569,7 @@ fn default_limit() -> u64 {
 
 /// Newest first, PagedResponse-shaped (Invariant 40: `total`/`truncated`
 /// announce what the page omits).
-pub async fn list_messages(
-    State(state): State<AppState>,
-    Query(p): Query<ListParams>,
-) -> Response {
+pub async fn list_messages(State(state): State<AppState>, Query(p): Query<ListParams>) -> Response {
     let offset = p.offset;
     let limit = p.limit.clamp(1, 1000);
     let store = state.store.clone();
@@ -524,16 +653,19 @@ pub(crate) fn compute_rollup(conn: &Connection, since_h: u64) -> rusqlite::Resul
     #[derive(Default)]
     struct Row {
         msgs: u64,
+        actionable: u64,
         linked: u64,
         latest_ts_ms: i64,
         latest_snippet: String,
+        latest_actionable_ts_ms: i64,
+        latest_actionable_snippet: String,
         created: u64,
         moved: u64,
     }
     let mut rows: std::collections::BTreeMap<String, Row> = std::collections::BTreeMap::new();
 
     let mut stmt = conn.prepare(
-        "SELECT session, ts, card_id, substr(text,1,80) \
+        "SELECT session, ts, card_id, text \
          FROM cmd_history \
          WHERE type='user' AND origin='' AND ts >= ?1 \
          ORDER BY ts DESC",
@@ -548,7 +680,8 @@ pub(crate) fn compute_rollup(conn: &Connection, since_h: u64) -> rusqlite::Resul
         }
         let ts: i64 = r.get(1)?;
         let card_id: Option<String> = r.get(2)?;
-        let snippet: String = r.get::<_, String>(3)?.replace(['\n', '\r'], " ");
+        let message: String = r.get(3)?;
+        let snippet: String = message.chars().take(80).collect::<String>().replace(['\n', '\r'], " ");
         let e = rows.entry(session).or_default();
         e.msgs += 1;
         if card_id.as_deref().map(|c| !c.is_empty()).unwrap_or(false) {
@@ -557,6 +690,21 @@ pub(crate) fn compute_rollup(conn: &Connection, since_h: u64) -> rusqlite::Resul
         if ts > e.latest_ts_ms {
             e.latest_ts_ms = ts;
             e.latest_snippet = snippet;
+        }
+        // A delivered answer-only message or explicit [no-board] control does
+        // not owe the worker a task. The board capture path uses this same
+        // predicate; the accountability nudge must not contradict it by
+        // demanding a new card for a prompt the harness intentionally left
+        // cardless.
+        if amux_core::board::title_from_prompt(&message).is_some()
+            && !amux_core::board::is_informational_query(&message)
+            && !amux_core::board::is_conversational_ack(&message)
+        {
+            e.actionable += 1;
+            if ts > e.latest_actionable_ts_ms {
+                e.latest_actionable_ts_ms = ts;
+                e.latest_actionable_snippet = message.chars().take(80).collect::<String>().replace(['\n', '\r'], " ");
+            }
         }
     }
 
@@ -572,7 +720,9 @@ pub(crate) fn compute_rollup(conn: &Connection, since_h: u64) -> rusqlite::Resul
     while let Some(r) = bq.next()? {
         // issues.session is nullable — a NULL here is what 500'd the first live
         // call. Skip it: an ownerless card is not a worker's tracked work.
-        let Some(session) = r.get::<_, Option<String>>(0)? else { continue };
+        let Some(session) = r.get::<_, Option<String>>(0)? else {
+            continue;
+        };
         if let Some(e) = rows.get_mut(&session) {
             e.created = r.get::<_, i64>(1)? as u64;
             e.moved = r.get::<_, i64>(2)? as u64;
@@ -594,26 +744,35 @@ pub(crate) fn compute_rollup(conn: &Connection, since_h: u64) -> rusqlite::Resul
         workers.push(json!({
             "worker": session,
             "human_messages": e.msgs,
+            "actionable_messages": e.actionable,
             "messages_linked_to_a_card": e.linked,
             "cards_created_in_window": e.created,
             "cards_moved_in_window": e.moved,
             "latest_message_snippet": e.latest_snippet,
-            "verdict": if accounted { "tracking" } else { "no-board-activity" },
+            "verdict": if accounted { "tracking" } else if e.actionable == 0 { "message-only" } else { "no-board-activity" },
         }));
-        if !accounted {
+        if !accounted && e.actionable > 0 {
             unaccounted.push(Unaccounted {
                 worker: session.clone(),
-                human_messages: e.msgs,
-                latest_snippet: e.latest_snippet.clone(),
+                human_messages: e.actionable,
+                latest_snippet: e.latest_actionable_snippet.clone(),
             });
         }
     }
     workers.sort_by(|a, b| {
-        b["human_messages"].as_u64().unwrap_or(0).cmp(&a["human_messages"].as_u64().unwrap_or(0))
+        b["human_messages"]
+            .as_u64()
+            .unwrap_or(0)
+            .cmp(&a["human_messages"].as_u64().unwrap_or(0))
     });
     unaccounted.sort_by_key(|b| std::cmp::Reverse(b.human_messages));
 
-    Ok(Rollup { total_human_messages, total_linked, workers, unaccounted })
+    Ok(Rollup {
+        total_human_messages,
+        total_linked,
+        workers,
+        unaccounted,
+    })
 }
 
 pub async fn accountability(
@@ -628,8 +787,10 @@ pub async fn accountability(
         let unaccounted: Vec<Value> = r
             .unaccounted
             .iter()
-            .map(|u| json!({"worker": u.worker, "human_messages": u.human_messages,
-                "latest_message_snippet": u.latest_snippet}))
+            .map(|u| {
+                json!({"worker": u.worker, "human_messages": u.human_messages,
+                "latest_message_snippet": u.latest_snippet})
+            })
             .collect();
         Ok(json!({
             "since_h": since_h,
@@ -665,7 +826,10 @@ pub async fn accountability(
 const NUDGE_PREFS_KEY: &str = "accountability_nudged";
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 /// One sweep: nudge every lane that has been unaccounted longer than the
@@ -676,16 +840,16 @@ pub(crate) async fn accountability_tick(state: &AppState) {
     let now = Utc::now().timestamp();
 
     let store = state.store.clone();
-    let gaps = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, u64, String)>> {
-        let conn = store.read()?;
-        let r = compute_rollup(&conn, since_h)?;
-        Ok(r
-            .unaccounted
-            .into_iter()
-            .map(|u| (u.worker, u.human_messages, u.latest_snippet))
-            .collect())
-    })
-    .await;
+    let gaps =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(String, u64, String)>> {
+            let conn = store.read()?;
+            let r = compute_rollup(&conn, since_h)?;
+            Ok(r.unaccounted
+                .into_iter()
+                .map(|u| (u.worker, u.human_messages, u.latest_snippet))
+                .collect())
+        })
+        .await;
     let gaps = match gaps {
         Ok(Ok(g)) => g,
         Ok(Err(e)) => {
@@ -730,7 +894,11 @@ pub(crate) async fn accountability_tick(state: &AppState) {
         // has no session/URL to open a card, so the accountability nudge would be
         // both impossible to satisfy and harness noise inside a lane meant to run
         // untouched. Skip it, reading the same source of truth the spawn path reads.
-        if crate::api::session_verbs::session_is_isolated(&worker) {
+        if crate::api::session_verbs::session_is_isolated(&worker)
+            || crate::api::session_verbs::is_chat_companion(&worker)
+        {
+            // A Chat-tab companion is the owner's conversation: a nudge typed
+            // into it lands as a chat message (AMHC-1 was opened that way).
             continue;
         }
         let last = nudged.get(&worker).copied().unwrap_or(0);
@@ -742,7 +910,9 @@ pub(crate) async fn accountability_tick(state: &AppState) {
              no board card created or moved — the work isn't tracked yet. Please open a board card \
              for the ask (owned by you) and pursue it. Most recent: \"{snippet}\"",
         );
-        let _ = crate::api::session_verbs::steer_enqueue(state, &worker, &text, "accountability", "").await;
+        let _ =
+            crate::api::session_verbs::steer_enqueue(state, &worker, &text, "accountability", "")
+                .await;
         nudged.insert(worker.clone(), now);
         sent += 1;
         tracing::info!(worker=%worker, human_messages=msgs, "[accountability] nudged unaccounted lane");
@@ -761,10 +931,16 @@ pub(crate) async fn accountability_tick(state: &AppState) {
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![NUDGE_PREFS_KEY, body],
             )?;
-            Ok(WriteOutcome { applied: true, events: vec![] })
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await;
-    tracing::info!(nudged = sent, "[accountability] sweep nudged unaccounted lanes");
+    tracing::info!(
+        nudged = sent,
+        "[accountability] sweep nudged unaccounted lanes"
+    );
 }
 
 /// Register the periodic sweep. Interval default 30m; the per-lane cooldown
@@ -818,15 +994,16 @@ pub struct ActedBody {
 enum AdvanceOutcome {
     NotFound,
     /// Backwards/sideways move refused by the core (forward-only record).
-    Refused { from: &'static str, to: &'static str },
-    Applied { delivery: Value },
+    Refused {
+        from: &'static str,
+        to: &'static str,
+    },
+    Applied {
+        delivery: Value,
+    },
 }
 
-async fn advance(
-    state: AppState,
-    key: String,
-    next: DeliveryState,
-) -> Response {
+async fn advance(state: AppState, key: String, next: DeliveryState) -> Response {
     let slot: Arc<Mutex<Option<AdvanceOutcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
     let key_w = key.clone();
@@ -840,7 +1017,10 @@ async fn advance(
             match msg.advance_delivery(next) {
                 Err(e) => finish(
                     &slot_w,
-                    AdvanceOutcome::Refused { from: e.from, to: e.to },
+                    AdvanceOutcome::Refused {
+                        from: e.from,
+                        to: e.to,
+                    },
                     no_write(),
                 ),
                 Ok(()) => {
@@ -862,10 +1042,12 @@ async fn advance(
                     finish(
                         &slot_w,
                         AdvanceOutcome::Applied {
-                            delivery: serde_json::to_value(&msg.delivery)
-                                .unwrap_or(Value::Null),
+                            delivery: serde_json::to_value(&msg.delivery).unwrap_or(Value::Null),
                         },
-                        WriteOutcome { applied: true, events },
+                        WriteOutcome {
+                            applied: true,
+                            events,
+                        },
                     )
                 }
             }
@@ -920,7 +1102,15 @@ pub async fn acted_message(
         },
         None => None,
     };
-    advance(state, key, DeliveryState::ActedOn { at: Utc::now(), task }).await
+    advance(
+        state,
+        key,
+        DeliveryState::ActedOn {
+            at: Utc::now(),
+            task,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -943,7 +1133,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         (router(state), store, dir)
     }
@@ -964,7 +1154,9 @@ mod tests {
         };
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v = if bytes.is_empty() {
             Value::Null
         } else {
@@ -1007,6 +1199,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_input_with_an_unknown_or_malformed_actor_is_a_refusal_not_a_pump_error() {
+        let (app,store,dir)=app();
+        let _guard=crate::api::settings::test_env::set_home(dir.path());
+        let target=create_worker(&app,"receiver",None).await;
+        let (status,response)=send(&app,"POST","/api/messages",Some(json!({"to":target,"body":"preserved uncertain origin"}))).await;
+        assert_eq!(status,StatusCode::CREATED);
+        let message=response["message"]["id"].as_str().unwrap().to_string();
+        let lost=WorkerId::from_ulid(ulid::Ulid::new());
+        for actor in [serde_json::to_string(&Actor::Worker {id:lost}).unwrap(),"malformed historical actor".to_string()] {
+            let mid=message.clone();
+            store.write(move |conn| {
+                conn.execute("UPDATE _amux_messages SET from_actor=?1 WHERE id=?2",params![actor,mid])?;
+                Ok(WriteOutcome {applied:true,events:vec![]})
+            }).unwrap();
+            assert!(pending_receive_refusal(&store.read().unwrap(),&message,&target).unwrap().is_some());
+        }
+        let protocol=Arc::new(MockProtocol::new());
+        protocol.register(WorkerId::parse(&target).unwrap(),AgentState::Idle);
+        let runtime=pump_runtime(store.clone(),protocol.clone());
+        runtime.pump_commands(Utc::now(),&std::collections::BTreeMap::new()).await.unwrap();
+        assert!(protocol.calls().is_empty());
+        let conn=store.read().unwrap();
+        let state:String=conn.query_row("SELECT state FROM _amux_commands",[],|r|r.get(0)).unwrap();
+        assert!(state.contains("failed") && state.contains("message origin unreadable"),"{state}");
+        let body:String=conn.query_row("SELECT body FROM _amux_messages",[],|r|r.get(0)).unwrap();
+        assert_eq!(body,"preserved uncertain origin");
+    }
+
+    #[tokio::test]
+    async fn native_worker_group_fanout_is_atomic_and_body_identity_cannot_widen_it() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let own = GroupId::from_ulid(ulid::Ulid::new());
+        let other = GroupId::from_ulid(ulid::Ulid::new());
+        let peer = create_worker(&app, "source", Some(own.as_str())).await;
+        let target = create_worker(&app, "target", Some(other.as_str())).await;
+        let _second = create_worker(&app, "second", Some(other.as_str())).await;
+        let (status, _) = send(&app,"POST","/api/messages",Some(json!({"to":target,"body":"owner control"}))).await;
+        assert_eq!(status,StatusCode::CREATED);
+        let count = || store.read().unwrap().query_row("SELECT count(*) FROM _amux_messages",[],|r|r.get::<_,i64>(0)).unwrap();
+        let before = count();
+        let asked = || crate::api::capabilities::counters::snapshot().iter()
+            .filter(|(k, _)| k.starts_with("message.") && (k.ends_with("existing_refusal_uncarded") || k.ends_with(".refused")))
+            .map(|(_, v)| *v).sum::<u64>();
+        let asked_before = asked();
+        for to in [json!(target),json!({"kind":"group","data":other.as_str()})] {
+            let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/messages")
+                .header(header::CONTENT_TYPE,"application/json").header("X-Amux-Session",&peer)
+                .body(Body::from(json!({"to":to,"body":"forbidden fanout","from":{"type":"human","name":"owner"}}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(),StatusCode::FORBIDDEN);
+            assert_eq!(count(),before,"no partial parent/child persistence");
+        }
+        assert!(asked() >= asked_before + 2, "each refusal raises the owner's message ask, as amux send does");
+        // The delivery re-check of a queued message refuses without asking again.
+        let rechecked = asked();
+        for _ in 0..50 {
+            assert!(native_peer_input_refusal(&store.read().unwrap(), &peer, &target, false).unwrap().is_some());
+        }
+        assert!(asked() < rechecked + 50, "a re-check must not raise the ask on every pump tick");
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/messages")
+            .header(header::CONTENT_TYPE,"application/json").header("X-Amux-Session",&peer)
+            .body(Body::from(json!({"to":{"kind":"group","data":own.as_str()},"body":"same group control"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::CREATED);
+        assert_eq!(count(),before+2,"group parent and one member child");
+    }
+
+    #[tokio::test]
+    async fn native_membership_changes_fence_queued_input_and_preserve_owner_fifo() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        let own = GroupId::from_ulid(ulid::Ulid::new());
+        let other = GroupId::from_ulid(ulid::Ulid::new());
+        let peer = create_worker(&app,"source",Some(own.as_str())).await;
+        let target = create_worker(&app,"target",Some(own.as_str())).await;
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/messages")
+            .header(header::CONTENT_TYPE,"application/json").header("X-Amux-Session",&peer)
+            .body(Body::from(json!({"to":target,"body":"old peer input"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(),StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
+        let response: Value = serde_json::from_slice(&bytes).unwrap();
+        let message = response["message"]["id"].as_str().unwrap();
+        let (status, _) = send(&app,"POST","/api/messages",Some(json!({"to":target,"body":"owner FIFO control"}))).await;
+        assert_eq!(status,StatusCode::CREATED);
+        let changed_target=target.clone();
+        store.write(move |conn| {
+            conn.execute("UPDATE _amux_workers SET group_id=?1 WHERE id=?2",params![other.as_str(),changed_target])?;
+            Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+        }).unwrap();
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(WorkerId::parse(&target).unwrap(),AgentState::Idle);
+        let runtime = pump_runtime(store.clone(),protocol.clone());
+        runtime.pump_commands(Utc::now(),&std::collections::BTreeMap::new()).await.unwrap();
+        assert!(protocol.calls().is_empty());
+        {
+            let conn=store.read().unwrap();
+            let state:String=conn.query_row("SELECT state FROM _amux_commands WHERE command LIKE ?1",[format!("%{message}%")],|r|r.get(0)).unwrap();
+            assert!(state.contains("failed") && state.contains("worker group boundary"),"{state}");
+            assert_eq!(message_by_id(&conn,message).unwrap().unwrap().delivery,DeliveryState::Queued);
+        }
+        runtime.pump_commands(Utc::now(),&std::collections::BTreeMap::new()).await.unwrap();
+        assert!(matches!(&protocol.calls()[..],[RecordedCall::DeliverMessage {body,..}] if body=="owner FIFO control"));
+    }
+
+    #[tokio::test]
+    async fn worker_header_cannot_bypass_receive_policy_with_a_human_body_actor() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/product-peer.env"), "CC_TAGS=product\n").unwrap();
+        std::fs::write(dir.path().join("sessions/harness-peer.env"), "CC_TAGS=product\nCC_RECEIVE_ANY=1\nCC_RECEIVE_DENY=product\n").unwrap();
+        let peer = create_worker(&app, "product-peer", None).await;
+        let target = create_worker(&app, "harness-peer", None).await;
+        let body = json!({"to":target,"body":"forbidden injected command","from":{"type":"human","name":"owner"}});
+        let res = app.clone().oneshot(Request::builder().method("POST").uri("/api/messages")
+            .header(header::CONTENT_TYPE,"application/json").header("X-Amux-Session",&peer)
+            .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let conn = store.read().unwrap();
+        let n: i64 = conn.query_row("SELECT count(*) FROM _amux_messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "refusal precedes persistence and command enqueue");
+        drop(conn);
+        let (status, response) = send(&app,"POST","/api/messages",Some(body)).await;
+        assert_eq!(status,StatusCode::CREATED,"owner input remains permitted: {response}");
+    }
+
+    #[tokio::test]
+    async fn changed_receive_policy_fences_pending_commands_without_blocking_owner_input() {
+        let (app, store, dir) = app();
+        let _guard = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+        std::fs::write(dir.path().join("sessions/product-peer.env"), "CC_TAGS=product\n").unwrap();
+        let receiver_env = dir.path().join("sessions/harness-peer.env");
+        std::fs::write(&receiver_env, "CC_TAGS=product\nCC_RECEIVE_ANY=1\n").unwrap();
+        let peer = create_worker(&app, "product-peer", None).await;
+        let target = create_worker(&app, "harness-peer", None).await;
+        let body = json!({"to":target,"body":"pre-policy peer input"});
+        let res = app.clone().oneshot(Request::builder().method("POST").uri("/api/messages")
+            .header(header::CONTENT_TYPE,"application/json").header("X-Amux-Session",&peer)
+            .body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let created: Value = serde_json::from_slice(&bytes).unwrap();
+        let message = created["message"]["id"].as_str().unwrap();
+        let (status, _) = send(&app,"POST","/api/messages",Some(json!({"to":target,"body":"retained owner input"}))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        std::fs::write(&receiver_env, "CC_TAGS=product\nCC_RECEIVE_ANY=1\nCC_RECEIVE_DENY=product\n").unwrap();
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(WorkerId::parse(&target).unwrap(), AgentState::Idle);
+        let runtime = pump_runtime(store.clone(), protocol.clone());
+        runtime.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
+        assert!(protocol.calls().is_empty(), "pending peer message must not reach the provider");
+        {
+            let conn = store.read().unwrap();
+            let state: String = conn.query_row("SELECT state FROM _amux_commands WHERE command LIKE ?1", [format!("%{message}%")], |r| r.get(0)).unwrap();
+            assert!(state.contains("failed") && state.contains("peer receive policy refused"), "durable refusal: {state}");
+            let saved = message_by_id(&conn, message).unwrap().unwrap();
+            assert_eq!(saved.body, "pre-policy peer input");
+            assert_eq!(saved.delivery, DeliveryState::Queued, "no false delivery receipt");
+        }
+        runtime.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
+        assert!(matches!(&protocol.calls()[..], [RecordedCall::DeliverMessage { body, .. }] if body == "retained owner input"));
+    }
+
+    #[tokio::test]
     async fn post_to_worker_enqueues_and_pump_delivers_the_real_body() {
         let (app, store, _dir) = app();
         let wid = create_worker(&app, "w", None).await;
@@ -1045,11 +1401,17 @@ mod tests {
         let protocol = Arc::new(MockProtocol::new());
         protocol.register(worker.clone(), AgentState::Idle);
         let rt = pump_runtime(store.clone(), protocol.clone());
-        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new())
+            .await
+            .unwrap();
         let calls = protocol.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
         match &calls[0] {
-            RecordedCall::DeliverMessage { worker: w, msg, body } => {
+            RecordedCall::DeliverMessage {
+                worker: w,
+                msg,
+                body,
+            } => {
                 assert_eq!(w, &worker);
                 assert_eq!(msg.as_str(), msg_id);
                 assert_eq!(body, text, "the durable body, byte-identical");
@@ -1081,14 +1443,19 @@ mod tests {
                         None,
                         Utc::now(),
                     )?;
-                    Ok(WriteOutcome { applied: true, events: vec![] })
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         }
         let protocol = Arc::new(MockProtocol::new());
         protocol.register(worker.clone(), AgentState::Idle);
         let rt = pump_runtime(store.clone(), protocol.clone());
-        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new())
+            .await
+            .unwrap();
 
         assert!(protocol.calls().is_empty(), "nothing must reach the agent");
         let conn = store.read().unwrap();
@@ -1126,15 +1493,22 @@ mod tests {
         // and each member worker has a queued DeliverMessage.
         let conn = store.read().unwrap();
         for child_id in children {
-            let m = message_by_id(&conn, child_id.as_str().unwrap()).unwrap().unwrap();
-            assert_eq!(m.thread.as_ref().map(|t| t.as_str()), Some(parent_id.as_str()));
+            let m = message_by_id(&conn, child_id.as_str().unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                m.thread.as_ref().map(|t| t.as_str()),
+                Some(parent_id.as_str())
+            );
             assert_eq!(m.body, "standup in 5");
             assert_eq!(m.delivery, DeliveryState::Queued);
         }
         for w in [&w1, &w2] {
             let worker = WorkerId::parse(w).unwrap();
             assert!(
-                crate::db::commands::next_deliverable(&conn, &worker).unwrap().is_some(),
+                crate::db::commands::next_deliverable(&conn, &worker)
+                    .unwrap()
+                    .is_some(),
                 "member {w} has a queued delivery"
             );
         }
@@ -1214,7 +1588,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let now_s = Utc::now().timestamp();
         let now_ms = now_s * 1000;
@@ -1225,7 +1599,11 @@ mod tests {
         let _home = crate::api::settings::test_env::set_home(_dir.path());
         std::fs::create_dir_all(_dir.path().join("sessions")).unwrap();
         for w in ["w-gap", "w-cooled"] {
-            std::fs::write(_dir.path().join(format!("sessions/{w}.env")), "CC_DIR=/tmp\n").unwrap();
+            std::fs::write(
+                _dir.path().join(format!("sessions/{w}.env")),
+                "CC_DIR=/tmp\nCC_AUTO_PICKUP=1\n",
+            )
+            .unwrap();
         }
         // Both lanes are unaccounted (a human message, no board card). w-cooled
         // was "already nudged just now" via the prefs stamp; w-gap never was.
@@ -1260,8 +1638,16 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(steers("w-gap"), 1, "an un-nudged unaccounted lane must be steered");
-        assert_eq!(steers("w-cooled"), 0, "a lane nudged within the cooldown must be skipped");
+        assert_eq!(
+            steers("w-gap"),
+            1,
+            "an un-nudged unaccounted lane must be steered"
+        );
+        assert_eq!(
+            steers("w-cooled"),
+            0,
+            "a lane nudged within the cooldown must be skipped"
+        );
     }
 
     #[tokio::test]
@@ -1284,6 +1670,7 @@ mod tests {
                 ins_msg("w-gap", "", "user", now_ms - 1000);
                 ins_msg("w-ok", "", "user", now_ms - 1000);
                 ins_msg("w-sched", "Daily thing", "user", now_ms - 1000); // origin set -> not human
+                conn.execute("INSERT INTO cmd_history(text,type,session,ts,origin,delivery,delivered_at) VALUES('[11:17 AM] [no-board] Reply with ACK only','user','w-message-only',?1,'','direct',?1)",params![now_ms-1000]).unwrap();
                 // A board card w-ok created just now; w-gap has none.
                 conn.execute(
                     "INSERT INTO issues (id,title,status,session,created,updated) VALUES ('I-OK','t','todo','w-ok',?1,?1)",
@@ -1304,15 +1691,21 @@ mod tests {
 
         let (st, v) = send(&app, "GET", "/api/messages/accountability?since_h=24", None).await;
         assert_eq!(st, StatusCode::OK, "{v}");
-        // Only the two human messages count; the scheduler one is excluded.
-        assert_eq!(v["total_human_messages"], json!(2), "{v}");
+        // The no-board prompt remains a human message, but cannot trigger a
+        // work-card nudge; the scheduler is excluded from human messages.
+        assert_eq!(v["total_human_messages"], json!(3), "{v}");
         let unacc: Vec<&str> = v["unaccounted"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|u| u["worker"].as_str())
             .collect();
-        assert_eq!(unacc, vec!["w-gap"], "only the worker with no board activity is flagged: {v}");
+        assert_eq!(
+            unacc,
+            vec!["w-gap"],
+            "only the worker with no board activity is flagged: {v}"
+        );
+        assert_eq!(v["workers"].as_array().unwrap().iter().find(|w|w["worker"]=="w-message-only").unwrap()["verdict"],json!("message-only"));
         // And w-ok reads as tracking, not flagged.
         let ok_row = v["workers"]
             .as_array()

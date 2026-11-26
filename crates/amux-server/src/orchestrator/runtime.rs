@@ -16,6 +16,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::params;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// The L4 heartbeat: "is progress continuing?" answered as data, not
@@ -82,8 +83,27 @@ pub fn hydrate_workers(conn: &rusqlite::Connection) -> anyhow::Result<Vec<Worker
         .collect())
 }
 
+/// One WARN per key per PROCESS. The orchestrator is level-triggered (a tick
+/// every ~3s), so anything it reports about a steady state must be said once —
+/// 25k identical lines is the same as silence, and this file already has a
+/// breaker that prints its verdict every other tick (the shape to avoid).
+///
+/// The set is bounded by the number of distinct (kind, task, worker) tuples a
+/// process ever sees; keys are only inserted on the first warning.
+fn warn_once(key: String) -> bool {
+    static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    let said = SAID.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    match said.lock() {
+        Ok(mut set) => set.insert(key),
+        // A poisoned lock must not silence the warning it guards: report it.
+        Err(_) => true,
+    }
+}
+
 pub struct Runtime {
     pub store: SharedStore,
+
     pub backends: Vec<Arc<dyn SessionBackend>>,
     pub tick_secs: u64,
     /// Heartbeat cadence in ticks (heartbeat every Nth tick).
@@ -112,7 +132,6 @@ pub struct Runtime {
     /// `reset_at + i * stagger`.
     pub resume_stagger_secs: u64,
 }
-
 
 /// True when a board status is outside the closed `TaskStatus` vocabulary.
 ///
@@ -143,6 +162,88 @@ fn agent_accepts_boundary_delivery(
     }
 }
 
+/// WHICH SECTION OF A SLOW TICK BLOCKED (AMUX-4955).
+///
+/// `runtime_job_blocking_poll` names the JOB and how long one poll held a
+/// worker; it cannot say which operation inside the tick did the holding. That
+/// gap is why this card could measure an 849s poll with 8s of CPU and still not
+/// say what to fix — and why the card's earlier claim that "the instrument is
+/// already right and needs nothing" was wrong for this step.
+///
+/// Wall time per section, not CPU: the whole finding is that these threads are
+/// blocked rather than computing, so CPU would read ~0 everywhere and name
+/// nothing.
+///
+/// Reports only when the tick is actually slow. A per-tick line at this
+/// frequency would be its own noise, and the sections of a fast tick are not a
+/// question anyone is asking.
+pub(crate) struct TickSections {
+    marks: Vec<(&'static str, std::time::Duration)>,
+    last: std::time::Instant,
+    started: std::time::Instant,
+}
+
+impl TickSections {
+    pub(crate) fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            marks: Vec::new(),
+            last: now,
+            started: now,
+        }
+    }
+
+    pub(crate) fn mark(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        self.marks.push((name, now.duration_since(self.last)));
+        self.last = now;
+    }
+
+    /// Slow-tick threshold. Env-tunable because the default is a judgement from
+    /// one box's numbers, and the whole point of this is to be re-pointed.
+    fn slow_ms() -> u128 {
+        std::env::var("AMUX_TICK_SECTION_WARN_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000)
+    }
+
+    /// The slowest section and the full breakdown.
+    ///
+    /// Pure and separate from the logging so the thing a reader ACTS on — which
+    /// section to go open — is pinned by a test rather than by reading a WARN
+    /// and trusting it.
+    fn summarize(marks: &[(&'static str, std::time::Duration)]) -> ((&'static str, u64), String) {
+        let worst = marks
+            .iter()
+            .max_by_key(|(_, d)| *d)
+            .map(|(n, d)| (*n, d.as_millis() as u64))
+            .unwrap_or(("none", 0));
+        let breakdown: Vec<String> = marks
+            .iter()
+            .map(|(n, d)| format!("{n}={}ms", d.as_millis()))
+            .collect();
+        (worst, breakdown.join(" "))
+    }
+
+    pub(crate) fn report(mut self, job: &'static str) {
+        let total = self.started.elapsed();
+        if total.as_millis() < Self::slow_ms() {
+            return;
+        }
+        self.mark("tail");
+        let (worst, breakdown) = Self::summarize(&self.marks);
+        tracing::warn!(
+            target: "runtime", verdict = "tick_section_slow", job,
+            total_ms = total.as_millis() as u64,
+            worst_section = worst.0, worst_ms = worst.1,
+            measured = true, n_considered = self.marks.len(),
+            sections = %breakdown,
+            "slow tick: naming the section that held the thread, which \
+             runtime_job_blocking_poll cannot (AMUX-4955)"
+        );
+    }
+}
 
 impl Runtime {
     /// Startup reconciliation (Invariant 9): the DB's picture of live
@@ -165,7 +266,9 @@ impl Runtime {
                     // silently — its sessions would all read as "missing"
                     // and mass-ending them on a flaky probe would be the
                     // reaper incident all over again.
-                    report.backend_probe_failures.push(format!("{}: {e}", b.name()));
+                    report
+                        .backend_probe_failures
+                        .push(format!("{}: {e}", b.name()));
                 }
             }
         }
@@ -178,16 +281,18 @@ impl Runtime {
                 "SELECT id, worker_id, backend_ref FROM _amux_sessions WHERE ended_at IS NULL",
             )?;
             let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })?;
             rows.collect::<Result<_, _>>()?
         };
 
         for (session_id, worker_id, backend_ref) in db_live {
-            let live_in_backend = matches!(
-                backend_refs.get(&backend_ref),
-                Some(BackendStatus::Running)
-            );
+            let live_in_backend =
+                matches!(backend_refs.get(&backend_ref), Some(BackendStatus::Running));
             if !live_in_backend && probe_ok {
                 // DB says running, backend says gone -> mark interrupted.
                 report.interrupted.push(worker_id.clone());
@@ -226,8 +331,8 @@ impl Runtime {
         // rule 8: it may be someone's live work — never auto-kill on sight).
         let db_refs: std::collections::BTreeSet<String> = {
             let conn = self.store.read()?;
-            let mut stmt = conn
-                .prepare("SELECT backend_ref FROM _amux_sessions WHERE ended_at IS NULL")?;
+            let mut stmt =
+                conn.prepare("SELECT backend_ref FROM _amux_sessions WHERE ended_at IS NULL")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.collect::<Result<_, _>>()?
         };
@@ -290,8 +395,9 @@ impl Runtime {
             Vec<(&Worker, DateTime<Utc>)>,
         > = BTreeMap::new();
         for worker in workers {
-            if let amux_core::worker::WorkerState::RateLimited { reset_at: Some(reset) } =
-                &worker.state
+            if let amux_core::worker::WorkerState::RateLimited {
+                reset_at: Some(reset),
+            } = &worker.state
             {
                 parked_by_provider
                     .entry(worker.config.provider.clone())
@@ -302,8 +408,10 @@ impl Runtime {
 
         let mut recovered = 0usize;
         for (provider, parked) in parked_by_provider {
-            let order: Vec<amux_core::ids::WorkerId> =
-                parked.iter().map(|(worker, _)| worker.id().clone()).collect();
+            let order: Vec<amux_core::ids::WorkerId> = parked
+                .iter()
+                .map(|(worker, _)| worker.id().clone())
+                .collect();
             for (worker, reset_at) in parked {
                 let eligible_at =
                     amux_core::provider_fleet::resume_schedule(&order, reset_at, stagger)
@@ -318,35 +426,42 @@ impl Runtime {
                 let worker_id = worker.id().to_string();
                 let state_at = now;
                 let updated_at = now.to_rfc3339();
-                let reply = self.store.write_async(move |conn| {
-                    let n = crate::db::queries::update_worker_state(
-                        conn,
-                        &worker_id,
-                        &amux_core::worker::WorkerState::Idle { since: state_at },
-                        &updated_at,
-                    )?;
-                    let payload = if n > 0 {
-                        crate::db::queries::get_worker(conn, &worker_id)?.map(|row| row.snapshot())
-                    } else {
-                        None
-                    };
-                    Ok(WriteOutcome {
-                        applied: n > 0,
-                        events: if n > 0 {
-                            vec![PendingEvent {
-                                entity_type: EntityType::Worker,
-                                entity_id: worker_id.clone(),
-                                mutation: MutationKind::StatusChanged {
-                                    from: "rate_limited".into(),
-                                    to: "idle".into(),
-                                },
-                                payload,
-                            }]
+                let reply = self
+                    .store
+                    .write_async(move |conn| {
+                        // Only while still rate limited: a stop or error that
+                        // landed since the reading is kept (#3).
+                        let n = crate::db::queries::update_worker_state_from(
+                            conn,
+                            &worker_id,
+                            "rate_limited",
+                            &amux_core::worker::WorkerState::Idle { since: state_at },
+                            &updated_at,
+                        )?;
+                        let payload = if n > 0 {
+                            crate::db::queries::get_worker(conn, &worker_id)?
+                                .map(|row| row.snapshot())
                         } else {
-                            vec![]
-                        },
+                            None
+                        };
+                        Ok(WriteOutcome {
+                            applied: n > 0,
+                            events: if n > 0 {
+                                vec![PendingEvent {
+                                    entity_type: EntityType::Worker,
+                                    entity_id: worker_id.clone(),
+                                    mutation: MutationKind::StatusChanged {
+                                        from: "rate_limited".into(),
+                                        to: "idle".into(),
+                                    },
+                                    payload,
+                                }]
+                            } else {
+                                vec![]
+                            },
+                        })
                     })
-                }).await?;
+                    .await?;
                 if reply.applied {
                     recovered += 1;
                     tracing::info!(
@@ -366,8 +481,10 @@ impl Runtime {
 
     /// One tick: load state, evaluate the circuit breaker, plan, execute.
     pub async fn tick_once(&self, heartbeat: bool) -> anyhow::Result<()> {
+        let mut sections = TickSections::new();
         let now = Utc::now();
         let (mut workers, leases, quarantined_total) = self.load_state()?;
+        sections.mark("load_state");
 
         // Recover BEFORE deriving provider state, pumping commands, or
         // planning. The old order wrote Idle to SQLite only after the pump had
@@ -383,7 +500,13 @@ impl Runtime {
         // Circuit breaker (RR-0048b): evaluate the rolling window BEFORE
         // planning. While open, reconciliation looks for runnable work and
         // auto-closes when it finds the fleet can actually move again.
-        let window = self.window_stats(now)?;
+        let window = {
+            let store = self.store.clone();
+            let window_secs = self.breaker.window_secs;
+            tokio::task::spawn_blocking(move || Self::window_stats(&store, window_secs, now))
+                .await??
+        };
+        sections.mark("window_stats");
         // Evaluate under the lock WITHOUT awaiting (the guard is not Send);
         // publish the change after the guard drops.
         let (fleet_state, changed) = {
@@ -427,58 +550,66 @@ impl Runtime {
         }
 
         let tasks = self.load_board_tasks(&workers).await?;
+        sections.mark("load_board_tasks");
         // Measure the queue the runtime actually sees, at the same seam that
         // feeds the scheduler. Each task contributes once, so repeated ticks
         // cannot manufacture evidence. Meaningful writer contention is also
         // recorded from the real wait for this transaction.
         let metric_tasks = tasks.clone();
         let metric_wait_started = std::time::Instant::now();
-        self.store.write_async(move |conn| {
-            let lock_wait_ms = metric_wait_started.elapsed().as_millis() as u64;
-            let observed =
-                crate::db::throughput_store::observe_runtime_queue(conn, &metric_tasks, now)?;
-            let lock_metric = if lock_wait_ms >= 100 {
-                Some(crate::db::throughput_store::record_metric(
-                    conn, "lock_wait", "runtime", Some(lock_wait_ms), None,
-                    Some("orchestrator writer queue"), now,
-                )?)
-            } else {
-                None
-            };
-            let before = crate::db::throughput_store::get_wip_state(conn)?;
-            let after = crate::db::throughput_store::evaluate_wip(conn, now)?;
-            let changed = before.current_limit != after.current_limit
-                || before.recommended != after.recommended;
-            let mut events = Vec::new();
-            if observed > 0 {
-                events.push(PendingEvent {
-                    entity_type: EntityType::Other("work_metric".into()),
-                    entity_id: format!("runtime-queue:{observed}"),
-                    mutation: MutationKind::Created,
-                    payload: None,
-                });
-            }
-            if let Some(id) = lock_metric {
-                events.push(PendingEvent {
-                    entity_type: EntityType::Other("work_metric".into()),
-                    entity_id: id,
-                    mutation: MutationKind::Created,
-                    payload: None,
-                });
-            }
-            if changed {
-                events.push(PendingEvent {
-                    entity_type: EntityType::Other("adaptive_wip".into()),
-                    entity_id: "singleton".into(),
-                    mutation: MutationKind::Updated,
-                    payload: serde_json::to_value(&after).ok(),
-                });
-            }
-            Ok(WriteOutcome {
-                applied: observed > 0 || lock_wait_ms >= 100 || changed,
-                events,
+        self.store
+            .write_async(move |conn| {
+                let lock_wait_ms = metric_wait_started.elapsed().as_millis() as u64;
+                let observed =
+                    crate::db::throughput_store::observe_runtime_queue(conn, &metric_tasks, now)?;
+                let lock_metric = if lock_wait_ms >= 100 {
+                    Some(crate::db::throughput_store::record_metric(
+                        conn,
+                        "lock_wait",
+                        "runtime",
+                        Some(lock_wait_ms),
+                        None,
+                        Some("orchestrator writer queue"),
+                        now,
+                    )?)
+                } else {
+                    None
+                };
+                let before = crate::db::throughput_store::get_wip_state(conn)?;
+                let after = crate::db::throughput_store::evaluate_wip(conn, now)?;
+                let changed = before.current_limit != after.current_limit
+                    || before.recommended != after.recommended;
+                let mut events = Vec::new();
+                if observed > 0 {
+                    events.push(PendingEvent {
+                        entity_type: EntityType::Other("work_metric".into()),
+                        entity_id: format!("runtime-queue:{observed}"),
+                        mutation: MutationKind::Created,
+                        payload: None,
+                    });
+                }
+                if let Some(id) = lock_metric {
+                    events.push(PendingEvent {
+                        entity_type: EntityType::Other("work_metric".into()),
+                        entity_id: id,
+                        mutation: MutationKind::Created,
+                        payload: None,
+                    });
+                }
+                if changed {
+                    events.push(PendingEvent {
+                        entity_type: EntityType::Other("adaptive_wip".into()),
+                        entity_id: "singleton".into(),
+                        mutation: MutationKind::Updated,
+                        payload: serde_json::to_value(&after).ok(),
+                    });
+                }
+                Ok(WriteOutcome {
+                    applied: observed > 0 || lock_wait_ms >= 100 || changed,
+                    events,
+                })
             })
-        }).await?;
+            .await?;
 
         // Command delivery pump (Invariant 34): drain each worker's queue
         // head through the agent protocol, honoring DeliveryTiming. Queue and
@@ -487,6 +618,7 @@ impl Runtime {
         if let Err(e) = self.pump_commands(now, &provider_states).await {
             tracing::warn!(error = %e, "command pump failed this tick");
         }
+        sections.mark("pump_commands");
         let hints = BTreeMap::new();
         // The attempt ledger (Invariant 49) feeds BOTH the planner (so
         // attempt N+1's prompt carries why 1..N failed) and enforce_limits
@@ -496,10 +628,23 @@ impl Runtime {
         // arrived with zero prior attempts, so no task could ever exhaust
         // its budget and quarantine never triggered.
         let attempts = self.load_attempts()?;
+        sections.mark("load_attempts");
         let wip_limit = {
             let conn = self.store.read()?;
             crate::db::throughput_store::effective_wip_limit(&conn)?
         };
+
+        // A todo card whose owner cannot run it is the shape a human reports
+        // as "the worker did not pick it up", and until this existed NOTHING
+        // said so: the planner simply produced no assignment (2026-10-25, a
+        // card sat for 20 minutes next to a stopped worker and the only trace
+        // was its absence). Said once per card+reason, because the loop ticks
+        // every few seconds.
+        self.warn_owners_that_cannot_run(&tasks, &workers);
+        // Cards whose assignment is already queued are not candidates: the
+        // queue is idempotent on the key, so planning them again mints
+        // nothing and only spends the worker's WIP budget.
+        let already_dispatched = self.already_dispatched(&tasks, &workers, &attempts)?;
 
         let plan = plan_tick(&TickInputs {
             now,
@@ -513,6 +658,7 @@ impl Runtime {
             lease_secs: 600,
             wip_limit,
             provider_states: &provider_states,
+            already_dispatched: &already_dispatched,
         });
 
         // Anti-livelock (RR-0048a): limits filter what actually executes.
@@ -521,10 +667,8 @@ impl Runtime {
             let mut proceed = Vec::new();
             let mut exhaustion = Vec::new();
             for assignment in plan.assignments.clone() {
-                let semantic = crate::orchestrator::context::issue_by_internal_id(
-                    &conn,
-                    &assignment.task,
-                )?;
+                let semantic =
+                    crate::orchestrator::context::issue_by_internal_id(&conn, &assignment.task)?;
                 let limits = match semantic.as_ref() {
                     Some(row) => crate::db::harness_store::get_budget(&conn, &row.id)?
                         .map(|(limits, _)| limits)
@@ -547,8 +691,12 @@ impl Runtime {
             }
             (proceed, exhaustion)
         };
-        let plan = TickPlan { assignments: proceed, ..plan };
+        let plan = TickPlan {
+            assignments: proceed,
+            ..plan
+        };
         self.execute(&plan).await?;
+        sections.mark("execute");
         for action in exhaustion {
             self.apply_exhaustion(action, now).await?;
         }
@@ -559,9 +707,7 @@ impl Runtime {
                 workers_total: workers.len(),
                 workers_active: workers
                     .iter()
-                    .filter(|w| {
-                        matches!(w.state, amux_core::worker::WorkerState::Active { .. })
-                    })
+                    .filter(|w| matches!(w.state, amux_core::worker::WorkerState::Active { .. }))
                     .count(),
                 live_leases: leases.iter().filter(|l| !l.is_expired(now)).count(),
                 reclaimed_last_tick: plan.reclaim.len(),
@@ -583,43 +729,83 @@ impl Runtime {
                 })
                 .await?;
         }
+        sections.report(crate::runtime_jobs::registry::ids::ORCH_RUNTIME);
         Ok(())
     }
 
     /// Rolling-window stats from the revisioned event journal — the same
     /// events every other consumer sees, so the breaker and the dashboard
     /// can never disagree about what happened (ethos rule 4).
-    fn window_stats(&self, now: DateTime<Utc>) -> anyhow::Result<amux_core::circuit::WindowStats> {
-        let conn = self.store.read()?;
-        let cutoff_at = now - chrono::Duration::seconds(self.breaker.window_secs as i64);
+    /// OFF THE ASYNC THREAD (AMUX-5027). This is eight synchronous SQLite
+    /// queries against a 4.7 GB database, run every `tick_secs` (3s), and it
+    /// was called straight from the async tick.
+    ///
+    /// Measured over the whole server log: `runtime_job_blocking_poll` fired
+    /// 15661 times, 6936 of them from orchestrator-runtime, and its worst
+    /// section was `window_stats` in 989 of 1674 samples, p50 1827 ms, max
+    /// 30622 ms. Meanwhile the queries themselves total ~180 ms on a warm idle
+    /// read, the read pool has NEVER waited (`read_pool_slow_acquire` 0,
+    /// `read_pool_exhausted` 0), and host load at those events is BELOW
+    /// baseline (0.40 vs 0.56 load_per_core). So the cost is real, variable by
+    /// two orders of magnitude, and not explained by contention this process
+    /// can see.
+    ///
+    /// Whatever the remaining cause, a blocking read has no business holding a
+    /// runtime thread while other jobs in the pool wait behind it. Taking an
+    /// `&SharedStore` rather than `&self` is what makes it movable onto the
+    /// blocking pool.
+    fn window_stats(
+        store: &crate::db::SharedStore,
+        window_secs: u64,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<amux_core::circuit::WindowStats> {
+        let conn = store.read()?;
+        let cutoff_at = now - chrono::Duration::seconds(window_secs as i64);
         let cutoff = cutoff_at.to_rfc3339();
         let cutoff_epoch = cutoff_at.timestamp();
         let completed: u32 = conn.query_row(
-            r#"SELECT COUNT(*) FROM _amux_state_events WHERE at > ?1
+            // INDEXED BY the time index (AMUX-5727): the planner chose
+            // idx_amux_state_events_entity and read EVERY task event, scattered
+            // through a 14 GB file, every 3 s, to count the last hour's few.
+            // Measured read-only: 185-231 ms warm via entity_type, 4.3 ms via at,
+            // and seconds cold under disk contention, overlapping the 10-40 s
+            // board and session GETs. The window is small; the time index wins.
+            r#"SELECT COUNT(*) FROM _amux_state_events INDEXED BY idx_amux_state_events_at WHERE at > ?1
              AND entity_type = 'task' AND mutation LIKE '%"to":"verified"%'"#,
-            params![cutoff], |r| r.get(0))?;
+            params![cutoff],
+            |r| r.get(0),
+        )?;
         let attempt_failures: u32 = conn.query_row(
             "SELECT COUNT(*) FROM _amux_attempts WHERE at > ?1",
-            params![cutoff], |r| r.get(0))?;
+            params![cutoff],
+            |r| r.get(0),
+        )?;
         let verification_failures: u32 = conn.query_row(
             "SELECT COUNT(*) FROM _amux_verifications WHERE created_at > ?1 AND verdict='failed'",
-            params![cutoff_epoch], |r| r.get(0))?;
+            params![cutoff_epoch],
+            |r| r.get(0),
+        )?;
         let tokens_spent: u64 = conn.query_row(
             "SELECT COALESCE(SUM(input+cache_read+cache_write+output),0)
              FROM token_ledger WHERE ts > ?1",
-            params![cutoff_epoch], |r| r.get(0))?;
+            params![cutoff_epoch],
+            |r| r.get(0),
+        )?;
         let has_live_work: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM issues WHERE deleted IS NULL AND COALESCE(archived,0)=0
              AND LOWER(status) IN ('backlog','todo','doing','in progress','review','needsyou',
                                    'needs you','blocked'))",
-            [], |r| r.get(0))?;
+            [],
+            |r| r.get(0),
+        )?;
         let runnable_or_assigned: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM issues WHERE deleted IS NULL AND COALESCE(archived,0)=0
              AND LOWER(status) IN ('todo','doing','in progress'))",
-            [], |r| r.get(0))?;
-        let earliest_event: Option<String> = conn.query_row(
-            "SELECT MIN(at) FROM _amux_state_events",
-            [], |r| r.get(0))?;
+            [],
+            |r| r.get(0),
+        )?;
+        let earliest_event: Option<String> =
+            conn.query_row("SELECT MIN(at) FROM _amux_state_events", [], |r| r.get(0))?;
         let earliest_event = earliest_event
             .map(|at| at.parse::<DateTime<Utc>>())
             .transpose()?;
@@ -633,7 +819,10 @@ impl Runtime {
         })
     }
 
-    async fn publish_fleet_state(&self, state: &amux_core::circuit::FleetState) -> anyhow::Result<()> {
+    async fn publish_fleet_state(
+        &self,
+        state: &amux_core::circuit::FleetState,
+    ) -> anyhow::Result<()> {
         let payload = serde_json::to_string(state)?;
         let persisted = payload.clone();
         self.store
@@ -680,6 +869,170 @@ impl Runtime {
     /// so the thread is held by computation with no wait in it to move. The
     /// projection above reduces that computation; this stops what remains
     /// blocking the other maintenance jobs sharing the pool.
+    /// Say, once per (card, reason), why a `todo` card's owner cannot run it.
+    ///
+    /// Two shapes, both silent before this:
+    /// - the owner is a DURABLE worker whose lifecycle is not drivable
+    ///   (paused, archived, deleted): the card is in `todo`, which claims it is
+    ///   next, and no mechanism can honour that;
+    /// - the owner is `Stopped`: the planner still counts it as available
+    ///   (`worker_available` accepts Stopped), so a command queues and waits
+    ///   for a process that is not running. The bounded recovery is the
+    ///   bootstrap `todo_owner_autostart` sweep, which restarts a `Stopped`
+    ///   worker its owner did NOT stop; an owner stop (a `session.stopped` from
+    ///   `api-stop` with no start after it) is held on purpose, so the only way
+    ///   forward there is a start (`amux start`). This line is the trace that
+    ///   says the wait was real, and which of the two it is.
+    ///
+    /// A card owned by a name with no durable row is a FLEET lane, not this
+    /// module's business (board_drive owns those), so it is deliberately not
+    /// reported here.
+    fn warn_owners_that_cannot_run(
+        &self,
+        tasks: &[amux_core::board::Task],
+        workers: &[Worker],
+    ) {
+        use amux_core::board::TaskStatus;
+        use amux_core::worker::WorkerState;
+
+        let by_id: std::collections::BTreeMap<&amux_core::ids::WorkerId, &Worker> =
+            workers.iter().map(|w| (w.id(), w)).collect();
+        // Owners absent from the drivable set: one store read for all of them.
+        let missing: Vec<String> = tasks
+            .iter()
+            .filter(|t| matches!(t.status, TaskStatus::Todo))
+            .filter_map(|t| t.worker.as_ref())
+            .filter(|w| !by_id.contains_key(w))
+            .map(|w| w.to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let stopped_or_gone: std::collections::BTreeMap<String, String> = {
+            let Ok(conn) = self.store.read() else {
+                return; // a warning about a read failure is a different report
+            };
+            missing
+                .into_iter()
+                .filter_map(|id| {
+                    crate::db::queries::get_worker(&conn, &id)
+                        .ok()
+                        .flatten()
+                        .filter(|row| !row.lifecycle.is_drivable())
+                        .map(|row| (id, row.lifecycle.as_str().to_string()))
+                })
+                .collect()
+        };
+
+        for task in tasks {
+            if !matches!(task.status, TaskStatus::Todo) {
+                continue;
+            }
+            let Some(owner) = &task.worker else { continue };
+            let (reason, detail) = match by_id.get(owner) {
+                Some(w) if matches!(w.state, WorkerState::Stopped) => (
+                    "owner_stopped",
+                    "the owning worker is stopped. If its owner stopped it on purpose \
+                     (session.stopped from api-stop, no start after it) the bootstrap sweep \
+                     leaves that decision alone: start it (amux start) to resume board work. \
+                     Otherwise the sweep restarts it, unless the host-admission gate refuses",
+                ),
+                Some(_) => continue,
+                None => match stopped_or_gone.get(&owner.to_string()) {
+                    Some(lifecycle) => (
+                        "owner_not_drivable",
+                        lifecycle.as_str(), // the refusal names the lifecycle it found
+                    ),
+                    // Not a durable worker: a fleet lane, which board_drive drives.
+                    None => continue,
+                },
+            };
+            if warn_once(format!("todo_owner_unavailable:{}:{owner}", task.id)) {
+                tracing::warn!(
+                    card = %task.id,
+                    worker = %owner,
+                    verdict = "todo_owner_unavailable",
+                    reason,
+                    "card is in todo, which claims it is next, and nothing can dispatch it: {detail}"
+                );
+            }
+        }
+    }
+
+    /// The cards whose exact assignment is ALREADY in the command queue.
+    ///
+    /// WHY A CARD IN `todo`/`done` CAN BE UNDISPATCHABLE (measured 2026-10-25):
+    /// `enqueue` is idempotent on `{card}:{worker}:{attempt}:{act}`, so once a
+    /// card's execution command exists, re-deriving that assignment mints
+    /// nothing. Pre-fix the plan still produced it, so it consumed the
+    /// worker's whole WIP budget (`wip_cap=1`) for the tick — and because the
+    /// planner picks the OLDEST card first, the finished card outranked every
+    /// new one, every tick, forever. `AMUX-65` sat `done` from 21:36 with its
+    /// lease refreshed every 10 minutes while a card filed at 22:30 behind it
+    /// was never dispatched and nothing logged a reason.
+    ///
+    /// The act is part of the key (`dispatch_act`), which is what lets a
+    /// `done` card's verification turn be delivered at all: same attempt, same
+    /// worker, different act.
+    ///
+    /// One WARN per card per process: the exclusion is a steady state, and a
+    /// line every 3 seconds is invisible. The line is what a sweep catches —
+    /// a card that stays here is waiting on a DELIVERY, not on a plan.
+    fn already_dispatched(
+        &self,
+        tasks: &[amux_core::board::Task],
+        workers: &[Worker],
+        attempts: &BTreeMap<amux_core::ids::TaskId, Vec<amux_core::limits::AttemptRecord>>,
+    ) -> anyhow::Result<BTreeSet<amux_core::ids::TaskId>> {
+        let known: BTreeSet<&amux_core::ids::WorkerId> = workers.iter().map(|w| w.id()).collect();
+        // Only cards whose owner can actually receive a command: an unowned
+        // card's worker is not known until the planner picks one, and a
+        // foreign owner can never be assigned.
+        let candidates: Vec<(&amux_core::board::Task, &amux_core::ids::WorkerId, u32)> = tasks
+            .iter()
+            .filter_map(|t| {
+                let owner = t.worker.as_ref()?;
+                if !known.contains(owner) {
+                    return None;
+                }
+                let attempt = attempts.get(&t.id).map(|a| a.len()).unwrap_or(0) as u32 + 1;
+                Some((t, owner, attempt))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let keys: BTreeSet<String> = {
+            let conn = self.store.read()?;
+            let mut stmt = conn.prepare("SELECT idempotency_key FROM _amux_commands")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<Result<BTreeSet<String>, _>>()?
+        };
+        let mut out = BTreeSet::new();
+        for (task, owner, attempt) in candidates {
+            let key = amux_core::orchestrator::assignment_key(task, owner, attempt);
+            if !keys.contains(&key) {
+                continue;
+            }
+            out.insert(task.id.clone());
+            if warn_once(format!("card_already_dispatched:{}", task.id)) {
+                tracing::warn!(
+                    card = %task.id,
+                    worker = %owner,
+                    attempt,
+                    act = amux_core::orchestrator::dispatch_act(task.status),
+                    status = ?task.status,
+                    key = %key,
+                    verdict = "card_already_dispatched",
+                    "this card's assignment is already in the command queue for this worker, so \
+                     re-planning it can only mint the same key: it is NOT a candidate this tick \
+                     (that is what stopped it pinning the worker's whole WIP budget). A card that \
+                     stays here is waiting on a DELIVERY or on the worker moving it, not on a plan"
+                );
+            }
+        }
+        Ok(out)
+    }
+
     async fn load_board_tasks(
         &self,
         workers: &[Worker],
@@ -691,7 +1044,9 @@ impl Runtime {
             for w in workers {
                 names.insert(w.config.display_name.to_lowercase(), w.id().clone());
                 for a in &w.config.name_aliases {
-                    names.entry(a.to_lowercase()).or_insert_with(|| w.id().clone());
+                    names
+                        .entry(a.to_lowercase())
+                        .or_insert_with(|| w.id().clone());
                 }
             }
             names
@@ -729,7 +1084,11 @@ impl Runtime {
             // name is a card that reads as a dependency wait and will be
             // debugged as one, so the raw status is named here where the row
             // still has it.
-            let crate::db::board_store::PlanningRow { mut task, raw_status, session } = row;
+            let crate::db::board_store::PlanningRow {
+                mut task,
+                raw_status,
+                session,
+            } = row;
             if amux_server_parse_status_is_unmodelled(&raw_status) {
                 tracing::warn!(
                     card = %task.id,
@@ -767,12 +1126,9 @@ impl Runtime {
     ) -> anyhow::Result<BTreeMap<amux_core::ids::TaskId, Vec<amux_core::limits::AttemptRecord>>>
     {
         let conn = self.store.read()?;
-        let mut stmt = conn.prepare(
-            "SELECT task_id, record FROM _amux_attempts ORDER BY at ASC, attempt ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let mut stmt = conn
+            .prepare("SELECT task_id, record FROM _amux_attempts ORDER BY at ASC, attempt ASC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut out: BTreeMap<amux_core::ids::TaskId, Vec<amux_core::limits::AttemptRecord>> =
             BTreeMap::new();
         for row in rows {
@@ -845,14 +1201,25 @@ impl Runtime {
                     )?;
                     let mut events = Vec::new();
                     if n > 0 {
+                        // The next claim continues from here (0145).
+                        conn.execute(
+                            "INSERT INTO _amux_lease_generations (task_id, generation) VALUES (?1, ?2)
+                             ON CONFLICT(task_id) DO UPDATE SET generation = MAX(generation, excluded.generation)",
+                            params![task, generation],
+                        )?;
                         let measured_at = Utc::now();
                         let recovery_ms = measured_at
                             .signed_duration_since(expired_at)
                             .num_milliseconds()
                             .max(0) as u64;
                         let id = crate::db::throughput_store::record_metric(
-                            conn, "recovery", "runtime", Some(recovery_ms), Some(&task),
-                            Some("expired lease reclaimed"), measured_at,
+                            conn,
+                            "recovery",
+                            "runtime",
+                            Some(recovery_ms),
+                            Some(&task),
+                            Some("expired lease reclaimed"),
+                            measured_at,
                         )?;
                         events.push(PendingEvent {
                             entity_type: EntityType::Other("work_metric".into()),
@@ -994,13 +1361,19 @@ impl Runtime {
                     let Some(task) =
                         crate::orchestrator::context::task_by_internal_id(conn, &task_id)?
                     else {
-                        return Ok(WriteOutcome { applied: false, events: vec![] });
+                        return Ok(WriteOutcome {
+                            applied: false,
+                            events: vec![],
+                        });
                     };
                     let handoff_recorded = crate::orchestrator::context::record_assignment_handoff(
                         conn, &worker_id, &task, &key,
                     )?;
                     let snap = crate::orchestrator::context::assemble_context_with_budget(
-                        conn, &worker_id, &task, context_budget,
+                        conn,
+                        &worker_id,
+                        &task,
+                        context_budget,
                     )?;
                     let recorded = crate::orchestrator::context::record_snapshot(
                         conn, &key, &task_id, &worker_id, &snap,
@@ -1032,12 +1405,26 @@ impl Runtime {
         // Assignments: lease + an ExecuteTask command the pump delivers
         // through the agent protocol — the full loop: board task -> lease
         // -> command -> headless CLI run.
+        // A lease is a CLAIM THAT A COMMAND IS IN FLIGHT. Track whether the
+        // enqueue actually created one: `commands::enqueue` is idempotent on
+        // the assignment key, so a card the planner keeps re-deriving gets
+        // `created=false` and NOTHING will be delivered for it. Leasing on
+        // that flag is what wedged a lane on 2026-10-25: a `done` card is
+        // `Runnable` for its verification turn (board::disposition), its
+        // command had already been delivered, and every later plan re-claimed
+        // it — so the worker's only WIP slot (wip_cap=1) stayed pinned by work
+        // that could not run, and the NEXT todo card was starved of dispatch
+        // with no log line anywhere. Measured on the live fleet: a second card
+        // sat in todo for 11 minutes beside a worker whose slot was held by
+        // the completed first one.
+        let mut enqueued: Vec<bool> = Vec::with_capacity(authorized_assignments.len());
         for asg in &authorized_assignments {
             let cmd_id = amux_core::ids::CommandId::from_ulid(ulid::Ulid::new());
             let worker_id = asg.worker.clone();
             let task_id = asg.task.clone();
             let key = asg.idempotency_key.clone();
-            self.store
+            let outcome = self
+                .store
                 .write_async(move |conn| {
                     let (_, created) = crate::db::commands::enqueue(
                         conn,
@@ -1049,13 +1436,35 @@ impl Runtime {
                         None,
                         Utc::now(),
                     )?;
-                    Ok(WriteOutcome { applied: created, events: vec![] })
+                    Ok(WriteOutcome {
+                        applied: created,
+                        events: vec![],
+                    })
                 })
                 .await?;
+            enqueued.push(outcome.applied);
         }
-        for asg in &authorized_assignments {
+        for (asg, created) in authorized_assignments.iter().zip(&enqueued) {
             let task = asg.task.to_string();
             let worker = asg.worker.to_string();
+            if !created {
+                // The command for this exact (task, worker, attempt) already
+                // exists, so there is nothing new to deliver and nothing to
+                // claim. Said once per key: a level-triggered loop that warns
+                // every 3 seconds is a log nobody reads.
+                if warn_once(format!("assignment_not_leased:{task}:{worker}")) {
+                    tracing::warn!(
+                        task = %task,
+                        worker = %worker,
+                        attempt = asg.attempt,
+                        verdict = "assignment_not_leased",
+                        "this assignment's ExecuteTask command already exists, so no lease was \
+                         taken — the card stays dispatchable instead of pinning the worker's WIP \
+                         slot on a command that was already delivered"
+                    );
+                }
+                continue;
+            }
             let acquired = asg.lease.acquired_at.to_rfc3339();
             let expires = asg.lease.expires_at.to_rfc3339();
             self.store
@@ -1066,7 +1475,7 @@ impl Runtime {
                         "INSERT OR IGNORE INTO _amux_leases
                          (task_id, worker_id, acquired_at, expires_at, generation)
                          VALUES (?1, ?2, ?3, ?4,
-                                 COALESCE((SELECT generation + 1 FROM _amux_leases WHERE task_id = ?1), 0))",
+                                 COALESCE((SELECT generation + 1 FROM _amux_lease_generations WHERE task_id = ?1), 0))",
                         params![task, worker, acquired, expires],
                     )?;
                     let mut events = Vec::new();
@@ -1456,13 +1865,24 @@ impl Runtime {
             rows.collect::<Result<_, _>>()?
         };
         for wid_str in worker_ids {
-            let row = { let conn = self.store.read()?; crate::db::queries::get_worker(&conn, &wid_str)? };
+            let row = {
+                let conn = self.store.read()?;
+                crate::db::queries::get_worker(&conn, &wid_str)?
+            };
             // Missing rows retain the ordinary delivery/failure path; only a
             // known inactive worker parks its queue without consuming retries.
-            let lock = crate::api::workers::lifecycle_lock(row.as_ref().map_or(&wid_str, |r| &r.display_name));
+            let lock = crate::api::workers::lifecycle_lock(
+                row.as_ref().map_or(&wid_str, |r| &r.display_name),
+            );
             let _guard = lock.lock().await;
-            let active = { let conn = self.store.read()?; crate::db::queries::get_worker(&conn, &wid_str)?.is_none_or(|r| r.lifecycle.is_drivable()) };
-            if !active { continue; }
+            let active = {
+                let conn = self.store.read()?;
+                crate::db::queries::get_worker(&conn, &wid_str)?
+                    .is_none_or(|r| r.lifecycle.is_drivable())
+            };
+            if !active {
+                continue;
+            }
             let Ok(worker) = amux_core::ids::WorkerId::parse(&wid_str) else {
                 continue;
             };
@@ -1476,6 +1896,33 @@ impl Runtime {
                 crate::db::commands::next_deliverable(&conn, &worker)?
             };
             let Some(cmd) = head else { continue };
+
+            // An owner receive-policy change also fences already queued native
+            // messages. Persist a refusal before timing/protocol calls; preserve
+            // the message body and let the next FIFO command progress.
+            if let amux_core::protocol::WorkerCommand::DeliverMessage(message) = &cmd.command {
+                let refused = {
+                    let conn = self.store.read()?;
+                    crate::api::messages::pending_receive_refusal(&conn, message.as_str(), &wid_str)?
+                };
+                if refused.is_some() {
+                    let (id, message, receiver) = (cmd.id.clone(), message.clone(), wid_str.clone());
+                    self.store.write_async(move |conn| {
+                        let Some(reason) = crate::api::messages::pending_receive_refusal(conn, message.as_str(), &receiver)? else {
+                            return Ok(WriteOutcome { applied: false, events: vec![] });
+                        };
+                        crate::db::commands::transition(conn, &id,
+                            amux_core::protocol::CommandTransition::Fail { reason }, 3)?;
+                        Ok(WriteOutcome { applied: true, events: vec![PendingEvent {
+                            entity_type: EntityType::Other("command_receive_refused".into()),
+                            entity_id: id.as_str().to_string(),
+                            mutation: MutationKind::StatusChanged { from: "queued".into(), to: "failed".into() },
+                            payload: None,
+                        }] })
+                    }).await?;
+                    continue;
+                }
+            }
 
             // Timing gate.
             let mut released_after_reset = false;
@@ -1535,7 +1982,10 @@ impl Runtime {
                                 },
                                 3,
                             )?;
-                            Ok(WriteOutcome { applied: true, events: vec![] })
+                            Ok(WriteOutcome {
+                                applied: true,
+                                events: vec![],
+                            })
                         })
                         .await?;
                     continue;
@@ -1554,7 +2004,10 @@ impl Runtime {
                             amux_core::protocol::CommandTransition::Dispatch,
                             3,
                         )?;
-                        Ok(WriteOutcome { applied: true, events: vec![] })
+                        Ok(WriteOutcome {
+                            applied: true,
+                            events: vec![],
+                        })
                     }
                 })
                 .await?;
@@ -1580,7 +2033,9 @@ impl Runtime {
                     match body {
                         Ok(body) => {
                             delivered_body = Some(body.clone());
-                            protocol.deliver_message(&worker, msg_id.clone(), body).await
+                            protocol
+                                .deliver_message(&worker, msg_id.clone(), body)
+                                .await
                         }
                         Err(e) => Err(crate::opencode::ProtocolError::Transport(format!(
                             "message body lookup failed for {}: {e}",
@@ -1595,10 +2050,7 @@ impl Runtime {
                     // dropping prior attempts entirely.
                     let snapshot = {
                         let conn = self.store.read()?;
-                        crate::orchestrator::context::load_snapshot(
-                            &conn,
-                            &cmd.idempotency_key,
-                        )?
+                        crate::orchestrator::context::load_snapshot(&conn, &cmd.idempotency_key)?
                     };
                     match snapshot {
                         Some(snapshot) => {
@@ -1621,6 +2073,27 @@ impl Runtime {
                             "immutable context snapshot missing for assignment {} (task {})",
                             cmd.idempotency_key, task_id
                         ))),
+                    }
+                }
+                amux_core::protocol::WorkerCommand::MemoryResupply { .. } => {
+                    // Durable memory re-supply (#73): resolve the worker's
+                    // live visible memories and send one bounded turn. The
+                    // store borrow ends before the send (`Connection` is
+                    // not `Sync`); a skip (no memories, or a start/resume
+                    // whose conversation already exists) is still Ok, and the
+                    // transition below advances the command instead of
+                    // wedging the queue head.
+                    let prepared = {
+                        let conn = self.store.read()?;
+                        crate::orchestrator::memory_resupply::prepare_resupply(
+                            &conn,
+                            &cmd,
+                            crate::orchestrator::memory_resupply::resupply_max_chars(),
+                        )?
+                    };
+                    match prepared {
+                        Some(prompt) => protocol.send_prompt(&worker, prompt).await,
+                        None => Ok(()),
                     }
                 }
                 other => {
@@ -1654,13 +2127,26 @@ impl Runtime {
                         }
                     }
                     let mid = msg_id.to_string();
-                    let delivered = serde_json::json!({"state": "delivered", "at": now.to_rfc3339()});
                     self.store
                         .write_async(move |conn| {
+                            // Through core's forward-only rule (advance_delivery),
+                            // and compare-and-swap on the stored value, instead of
+                            // hand-built JSON gated by `LIKE '%queued%'`
+                            // (implicit state machines inventory 2026-10-31, #12).
+                            let Some(mut msg) = crate::api::messages::message_by_id(conn, &mid)? else {
+                                return Ok(WriteOutcome { applied: false, events: vec![] });
+                            };
+                            let before: String = conn.query_row(
+                                "SELECT delivery FROM _amux_messages WHERE id = ?1", params![mid], |r| r.get(0))?;
+                            if let Err(e) = msg.advance_delivery(amux_core::message::DeliveryState::Delivered { at: now }) {
+                                tracing::info!(message = %mid, from = %e.from, verdict = "message_delivery_not_advanced",
+                                    "the message is already past queued; delivery left as it is");
+                                return Ok(WriteOutcome { applied: false, events: vec![] });
+                            }
+                            let after = serde_json::to_string(&msg.delivery).unwrap_or_default();
                             let n = conn.execute(
-                                "UPDATE _amux_messages SET delivery = ?2
-                                 WHERE id = ?1 AND delivery LIKE '%queued%'",
-                                params![mid, delivered.to_string()],
+                                "UPDATE _amux_messages SET delivery = ?2 WHERE id = ?1 AND delivery = ?3",
+                                params![mid, after, before],
                             )?;
                             Ok(WriteOutcome {
                                 applied: n > 0,
@@ -1725,7 +2211,10 @@ impl Runtime {
                             });
                         }
                     }
-                    Ok(WriteOutcome { applied: true, events })
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events,
+                    })
                 })
                 .await?;
         }
@@ -1766,152 +2255,40 @@ impl Runtime {
         body: &str,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        // Redact secret shapes before the prompt reaches the fleet-readable board
-        // — title AND desc both derive from `body` (AMUX-3384). Same helper the
-        // send-path capture uses, so the two sites cannot drift on what leaks.
-        let redacted = crate::api::session_verbs::redact_prompt_secrets(body);
-        let body = redacted.as_str();
-        let Some(title) = amux_core::board::title_from_prompt(body) else {
-            return Ok(()); // steering, not a task
-        };
-        if amux_core::board::is_informational_query(body) {
-            tracing::info!(
-                worker = %worker,
-                "ledger: informational prompt not carded by orchestrator (message retained)"
-            );
-            return Ok(());
-        }
-        // AMUX-2604: a prompt is spoken INTO a context capture cannot see, so
-        // "This should be one row" mints a card no one can dispatch later. The
-        // check is COMPUTED here (never a model call — ethos rule 2) and the
-        // REWRITE is asked of the worker at its next turn boundary, because
-        // the worker is the only party that ever held the missing referent.
-        let needs_self_desc = amux_core::board::title_needs_self_description(&title);
+        // All transports use the same receipt policy: redact, classify, deduplicate,
+        // and retain the current work claim when a distinct follow-up arrives.
         let wid = worker.to_string();
         let body = body.to_string();
-        let captured_desc = crate::api::session_verbs::format_captured_desc(&body);
-        // Carries (card id, session name) out of the writer so the nudge can
-        // be addressed AFTER the card exists — the consequence hangs off the
-        // write that already happens, with a named consumer and a durable
-        // dedupe key, rather than a new bus (CLAUDE.md's recorded decision).
-        let minted: std::sync::Arc<std::sync::Mutex<Option<(String, String)>>> =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let minted = std::sync::Arc::new(std::sync::Mutex::new(None));
         let minted_w = minted.clone();
-        self.store
-            .write_async(move |conn| {
-                let Some(wrow) = crate::db::queries::get_worker(conn, &wid)? else {
-                    // A card must be attributable; a worker the store cannot
-                    // name gets no invented attribution (Invariant 20).
-                    tracing::warn!(worker = %wid,
-                        "prompt delivered to a worker with no store row; no ledger card minted");
-                    return Ok(WriteOutcome { applied: false, events: vec![] });
-                };
-                let name = wrow.display_name;
-                if name.trim().is_empty() {
-                    tracing::warn!(worker = %wid,
-                        "worker has no display name; no ledger card minted");
-                    return Ok(WriteOutcome { applied: false, events: vec![] });
-                }
-                let mut row = crate::db::board_store::create_issue(
-                    conn,
-                    &crate::db::board_store::NewIssue {
-                        acceptance_criteria: None,
-                        next_action: None,
-                        title,
-                        desc: captured_desc,
-                        // In flight, not queued: see the doc comment — a
-                        // `todo` mint was re-dispatched by the planner,
-                        // double-running every direct prompt.
-                        status: "doing".into(),
-                        session: Some(name.clone()),
-                        // AF-699: a peer-relay REPLY carrying no ask is not
-                        // code work and cannot close on "implemented and
-                        // merged" -- reported by mixpeek-orchestrator, 11
-                        // accumulated un-closeable on one lane's board alone.
-                        item_type: amux_core::board::item_type_for_capture(&body).into(),
-                        creator: "amux".into(),
-                        owner_type: "agent".into(),
-                        due: None,
-                        due_time: None,
-                        reviewer: None,
-                        shepherd: None,
-                        gate: vec![],
-                        depends_on: vec![],
-                        // The tag is the durable half of the flag: the steer
-                        // below is delivered once and consumed, but a card
-                        // whose title was never repaired stays findable by
-                        // anyone querying the board (`needs-self-description`)
-                        // — a nudge with no residue is a nudge that silently
-                        // did not happen (ethos rule 4).
-                        tags: if needs_self_desc.is_some() {
-                            vec!["needs-self-description".to_string()]
-                        } else {
-                            vec![]
-                        },
-                        // Not an ask: this producer files ordinary cards, and a card
-                        // filed into needsyou without one is what AMUX-3929 is about.
-                        ask_type: None,
-                        ask_question: None,
-                        ask_unblocks: None,
-                        ask_actor: None,
-                        // AF-367: minted by the orchestrator runtime.
-                        source: Some("orchestrator".into()),
-                        requested_by: None,
-                        callback_session: None,
-                        callback_prompt: None,
-                    },
-                    now.timestamp(),
-                )?;
-                let stamp = chrono::Local::now().format("%H:%M").to_string();
-                row.log = Some(crate::db::board_store::append_log(
-                    row.log.as_deref(),
-                    &stamp,
-                    "capture: session prompt",
-                ));
-                if let Some(reason) = needs_self_desc {
-                    row.log = Some(crate::db::board_store::append_log(
-                        row.log.as_deref(),
-                        &stamp,
-                        &format!("capture: title needs self-description — {reason}"),
-                    ));
-                    *minted_w.lock().unwrap() = Some((row.id.clone(), name));
-                }
-                crate::db::board_store::save_patched(conn, &mut row)?;
-                // notified is deliberately outside save_patched's SET list
-                // (a Python-owned column); set it here so the assignment
-                // notifier never re-announces a prompt the worker already
-                // has in hand.
-                conn.execute(
-                    "UPDATE issues SET notified = 1 WHERE id = ?1",
-                    params![row.id],
-                )?;
-                Ok(WriteOutcome {
-                    applied: true,
-                    events: vec![PendingEvent {
-                        entity_type: EntityType::Task,
-                        entity_id: row.id.clone(),
-                        mutation: MutationKind::Created,
-                        payload: Some(row.snapshot()),
-                    }],
-                })
+        self.store.write_async(move |conn| {
+            let Some(worker) = crate::db::queries::get_worker(conn, &wid)? else {
+                tracing::warn!(worker = %wid, "capture: worker missing; receipt not minted");
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            let name = worker.display_name;
+            let Some(row) = crate::api::session_verbs::mint_capture_card(
+                conn, &name, &body, now.timestamp_millis(), false,
+            )? else {
+                return Ok(WriteOutcome { applied: false, events: vec![] });
+            };
+            if let Some(reason) = amux_core::board::title_needs_self_description(&row.title) {
+                *minted_w.lock().unwrap() = Some((row.id.clone(), name, reason));
+            }
+            tracing::info!(card = %row.id, verdict = "canonical_capture", "orchestrator used shared prompt capture");
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![PendingEvent {
+                    entity_type: EntityType::Task,
+                    entity_id: row.id.clone(),
+                    mutation: MutationKind::Created,
+                    payload: Some(row.snapshot()),
+                }],
             })
-            .await?;
+        }).await?;
 
-        // The consequence, hung off the write that already happened and
-        // addressed to a NAMED consumer: the worker that received the prompt.
-        //
-        // Delivery is `steer_enqueue`, the existing path, never a direct send
-        // — the steering loop applies the turn-boundary gate, so this cannot
-        // land mid-turn, and it arrives exactly when the worker has finished
-        // the prompt and therefore HOLDS the context the capture lacked.
-        //
-        // Asked once, not every turn: the enqueue is fired from the MINT, which
-        // happens once per card, and the guard key is the card id — so even a
-        // duplicate mint replaces the queued row instead of stacking a second
-        // copy (steer_enqueue dedupes on `guard`).
         let minted = minted.lock().unwrap().take();
-        if let Some((card_id, session)) = minted {
-            let reason = needs_self_desc.unwrap_or("it has no referent outside this conversation");
+        if let Some((card_id, session, reason)) = minted {
             let msg = format!(
                 "Board card {card_id} was captured from your last prompt, and its title \
                  cannot be dispatched by anyone who was not in this conversation: {reason}.\n\n\
@@ -1950,9 +2327,7 @@ pub struct ReconcileReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{
-        AttachInfo, BackendError, BackendSession, ProcessRef, SessionSpec,
-    };
+    use crate::backend::{AttachInfo, BackendError, BackendSession, ProcessRef, SessionSpec};
     use async_trait::async_trait;
 
     /// Scripted fake backend for reconciliation tests (Invariant 22).
@@ -2016,7 +2391,7 @@ mod tests {
         let path = dir.path().join("t.db");
         let s = Arc::new(crate::db::Store::open(&path).unwrap());
         // Leak tempdir so the DB survives the test body.
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         s
     }
 
@@ -2046,18 +2421,23 @@ mod tests {
     async fn reconcile_marks_vanished_sessions_interrupted() {
         let store = store();
         seed_live_session(&store, "ses_a", "wrk_a", "amux-wrk_a");
-        let rt = test_runtime(store.clone(), vec![Arc::new(FakeBackend {
-            hosted: vec![], // backend hosts nothing
-            fail_probe: false,
-        })]);
+        let rt = test_runtime(
+            store.clone(),
+            vec![Arc::new(FakeBackend {
+                hosted: vec![], // backend hosts nothing
+                fail_probe: false,
+            })],
+        );
         let report = rt.reconcile_on_startup().await.unwrap();
         assert_eq!(report.interrupted, vec!["wrk_a".to_string()]);
         // The session row is ended.
         let conn = store.read().unwrap();
         let ended: Option<String> = conn
-            .query_row("SELECT ended_at FROM _amux_sessions WHERE id='ses_a'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT ended_at FROM _amux_sessions WHERE id='ses_a'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(ended.is_some());
     }
@@ -2065,13 +2445,16 @@ mod tests {
     #[tokio::test]
     async fn reconcile_reports_stale_backend_refs_without_killing() {
         let store = store();
-        let rt = test_runtime(store, vec![Arc::new(FakeBackend {
-            hosted: vec![BackendSession {
-                backend_ref: "amux-wrk_ghost".into(),
-                status: BackendStatus::Running,
-            }],
-            fail_probe: false,
-        })]);
+        let rt = test_runtime(
+            store,
+            vec![Arc::new(FakeBackend {
+                hosted: vec![BackendSession {
+                    backend_ref: "amux-wrk_ghost".into(),
+                    status: BackendStatus::Running,
+                }],
+                fail_probe: false,
+            })],
+        );
         let report = rt.reconcile_on_startup().await.unwrap();
         assert_eq!(report.stale_backend, vec!["amux-wrk_ghost".to_string()]);
     }
@@ -2080,18 +2463,23 @@ mod tests {
     async fn failed_probe_never_mass_ends_sessions() {
         let store = store();
         seed_live_session(&store, "ses_b", "wrk_b", "amux-wrk_b");
-        let rt = test_runtime(store.clone(), vec![Arc::new(FakeBackend {
-            hosted: vec![],
-            fail_probe: true, // probe down != sessions gone
-        })]);
+        let rt = test_runtime(
+            store.clone(),
+            vec![Arc::new(FakeBackend {
+                hosted: vec![],
+                fail_probe: true, // probe down != sessions gone
+            })],
+        );
         let report = rt.reconcile_on_startup().await.unwrap();
         assert!(report.interrupted.is_empty(), "flaky probe must not reap");
         assert_eq!(report.backend_probe_failures.len(), 1);
         let conn = store.read().unwrap();
         let ended: Option<String> = conn
-            .query_row("SELECT ended_at FROM _amux_sessions WHERE id='ses_b'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT ended_at FROM _amux_sessions WHERE id='ses_b'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(ended.is_none(), "session must survive a failed probe");
     }
@@ -2125,7 +2513,10 @@ mod tests {
             kinds.push(format!("{:?}", ev.entity_type));
         }
         assert!(kinds.iter().any(|k| k.contains("lease")), "{kinds:?}");
-        assert!(kinds.iter().any(|k| k.contains("fleet_progress")), "{kinds:?}");
+        assert!(
+            kinds.iter().any(|k| k.contains("fleet_progress")),
+            "{kinds:?}"
+        );
     }
 }
 
@@ -2141,7 +2532,7 @@ mod pump_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.db");
         let s = Arc::new(crate::db::Store::open(&path).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         s
     }
 
@@ -2176,35 +2567,79 @@ mod pump_tests {
         protocol.register(wid(), AgentState::Idle);
         let cmd_id = CommandId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 504));
         let id = cmd_id.clone();
-        store.write(move |conn| {
-            let mut row = crate::db::queries::WorkerRow::new(&wid(), &WorkerConfig {
-                display_name: "paused-pump".into(), name_aliases: vec![], cwd: "/tmp".into(),
-                provider: amux_core::provider::ProviderId::new("claude"), model: None,
-                backend: amux_core::session::BackendId::herdr(), environment: Default::default(),
-                permissions: vec![], group: None,
-            }, "2026-09-14T00:00:00Z");
-            row.lifecycle = WorkerLifecycle::Paused;
-            crate::db::queries::insert_worker(conn, &row)?;
-            crate::db::commands::enqueue(conn, id, &wid(), &WorkerCommand::Continue,
-                "paused-immediate", &DeliveryTiming::Immediate, None, Utc::now())?;
-            Ok(WriteOutcome { applied: true, events: vec![] })
-        }).unwrap();
+        store
+            .write(move |conn| {
+                let mut row = crate::db::queries::WorkerRow::new(
+                    &wid(),
+                    &WorkerConfig {
+                        worker_type: Default::default(),
+                        display_name: "paused-pump".into(),
+                        name_aliases: vec![],
+                        cwd: "/tmp".into(),
+                        provider: amux_core::provider::ProviderId::new("claude"),
+                        model: None,
+                        backend: amux_core::session::BackendId::herdr(),
+                        environment: Default::default(),
+                        permissions: vec![],
+                        group: None,
+                    },
+                    "2026-09-14T00:00:00Z",
+                );
+                row.lifecycle = WorkerLifecycle::Paused;
+                crate::db::queries::insert_worker(conn, &row)?;
+                crate::db::commands::enqueue(
+                    conn,
+                    id,
+                    &wid(),
+                    &WorkerCommand::Continue,
+                    "paused-immediate",
+                    &DeliveryTiming::Immediate,
+                    None,
+                    Utc::now(),
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
         let rt = runtime_with(store.clone(), protocol.clone());
-        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
-        assert!(protocol.calls().is_empty(), "Pause must gate even Immediate delivery");
+        rt.pump_commands(Utc::now(), &BTreeMap::new())
+            .await
+            .unwrap();
+        assert!(
+            protocol.calls().is_empty(),
+            "Pause must gate even Immediate delivery"
+        );
         {
             let conn = store.read().unwrap();
             let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
             assert_eq!(cmd.state, CommandState::Queued);
             assert_eq!(cmd.attempts, 0);
         }
-        store.write(|conn| {
-            crate::db::queries::update_worker_lifecycle(conn, wid().as_str(),
-                &[WorkerLifecycle::Paused], WorkerLifecycle::Active, "2026-09-14T00:01:00Z")?;
-            Ok(WriteOutcome { applied: true, events: vec![] })
-        }).unwrap();
-        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
-        assert_eq!(protocol.calls().len(), 1, "Resume releases the same queued command once");
+        store
+            .write(|conn| {
+                crate::db::queries::update_worker_lifecycle(
+                    conn,
+                    wid().as_str(),
+                    &[WorkerLifecycle::Paused],
+                    WorkerLifecycle::Active,
+                    "2026-09-14T00:01:00Z",
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        rt.pump_commands(Utc::now(), &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            protocol.calls().len(),
+            1,
+            "Resume releases the same queued command once"
+        );
     }
 
     #[tokio::test]
@@ -2212,22 +2647,39 @@ mod pump_tests {
         let store = store();
         let protocol = Arc::new(MockProtocol::new());
         // Worker mid-turn: an AtTurnBoundary command must WAIT.
-        protocol.register(wid(), AgentState::Working { turn: None, progress: None });
+        protocol.register(
+            wid(),
+            AgentState::Working {
+                turn: None,
+                progress: None,
+            },
+        );
         let cmd_id = CommandId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 501));
         {
             let id = cmd_id.clone();
             store
                 .write(move |conn| {
                     crate::db::commands::enqueue(
-                        conn, id, &wid(), &WorkerCommand::Continue, "pump-k1",
-                        &DeliveryTiming::AtTurnBoundary, None, Utc::now(),
+                        conn,
+                        id,
+                        &wid(),
+                        &WorkerCommand::Continue,
+                        "pump-k1",
+                        &DeliveryTiming::AtTurnBoundary,
+                        None,
+                        Utc::now(),
                     )?;
-                    Ok(WriteOutcome { applied: true, events: vec![] })
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         }
         let rt = runtime_with(store.clone(), protocol.clone());
-        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new())
+            .await
+            .unwrap();
         assert!(protocol.calls().is_empty(), "mid-turn: nothing delivered");
         {
             let conn = store.read().unwrap();
@@ -2237,13 +2689,82 @@ mod pump_tests {
 
         // Turn ends -> delivery goes through and the state advances.
         protocol.set_state(&wid(), AgentState::Idle, None);
-        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new())
+            .await
+            .unwrap();
         let calls = protocol.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(matches!(&calls[0], RecordedCall::SendPrompt { worker, .. } if worker == &wid()));
         let conn = store.read().unwrap();
         let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
         assert_eq!(cmd.state, CommandState::Delivered);
+    }
+
+    /// #73: a queued memory re-supply flows through the real pump and
+    /// reaches the provider as one bounded turn carrying the worker's
+    /// live visible memories, the same text shape `prepare_resupply`
+    /// builds, delivered by the dispatch arm rather than asserted in
+    /// isolation.
+    #[tokio::test]
+    async fn pump_delivers_memory_resupply_with_live_memories() {
+        use amux_core::ids::MemoryId;
+        use amux_core::memory::{MemoryEntry, MemoryProvenance, MemoryType};
+        use amux_core::protocol::MemoryResupplyReason;
+        use amux_core::scope::Scope;
+        let store = store();
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(wid(), AgentState::Idle);
+        {
+            let w = wid();
+            store
+                .write(move |conn| {
+                    let e = MemoryEntry::new(
+                        MemoryId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 610)),
+                        Scope::Worker { id: w.clone() },
+                        "migration-plan",
+                        "move the sessions table first",
+                        MemoryType::Project,
+                        MemoryProvenance::HumanWritten,
+                        chrono::Utc::now(),
+                    );
+                    crate::db::memories::insert(conn, &e)?;
+                    let queued = crate::orchestrator::memory_resupply::enqueue_resupply(
+                        conn,
+                        &w,
+                        MemoryResupplyReason::PostCompaction,
+                        chrono::Utc::now(),
+                    )?;
+                    assert!(queued, "fresh resupply must queue");
+                    Ok(WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        }
+        let rt = runtime_with(store.clone(), protocol.clone());
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
+        let calls = protocol.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let RecordedCall::SendPrompt { worker, prompt } = &calls[0] else {
+            panic!("resupply must arrive as a prompt turn: {calls:?}");
+        };
+        assert_eq!(worker, &wid());
+        assert!(prompt.text.contains("migration-plan"), "{}", prompt.text);
+        assert!(prompt.text.contains("move the sessions table first"), "{}", prompt.text);
+        assert_eq!(
+            prompt.idempotency_key,
+            crate::orchestrator::memory_resupply::resupply_key(
+                &wid(),
+                MemoryResupplyReason::PostCompaction
+            )
+        );
+        let conn = store.read().unwrap();
+        let key = crate::orchestrator::memory_resupply::resupply_key(
+            &wid(),
+            MemoryResupplyReason::PostCompaction,
+        );
+        let cmd = crate::db::commands::by_idempotency_key(&conn, &wid(), &key)
+            .unwrap()
+            .expect("resupply row must exist");
+        assert_eq!(cmd.state, CommandState::Delivered, "pump transitioned the resupply");
     }
 
     /// RR-0044b: the fleet gate outranks the timing gate. The worker's own
@@ -2263,10 +2784,19 @@ mod pump_tests {
             store
                 .write(move |conn| {
                     crate::db::commands::enqueue(
-                        conn, id, &wid(), &WorkerCommand::Continue, "pump-k3",
-                        &DeliveryTiming::Immediate, None, Utc::now(),
+                        conn,
+                        id,
+                        &wid(),
+                        &WorkerCommand::Continue,
+                        "pump-k3",
+                        &DeliveryTiming::Immediate,
+                        None,
+                        Utc::now(),
                     )?;
-                    Ok(WriteOutcome { applied: true, events: vec![] })
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         }
@@ -2277,6 +2807,7 @@ mod pump_tests {
             let mut w = amux_core::worker::Worker::new(
                 id,
                 amux_core::worker::WorkerConfig {
+                    worker_type: Default::default(),
                     display_name: "w".into(),
                     name_aliases: vec![],
                     cwd: "/tmp".into(),
@@ -2296,19 +2827,29 @@ mod pump_tests {
         let sibling = WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, 78));
         let workers = vec![
             mk(wid(), amux_core::worker::WorkerState::Idle { since: now }),
-            mk(sibling, amux_core::worker::WorkerState::RateLimited {
-                reset_at: Some(now + chrono::Duration::hours(1)),
-            }),
+            mk(
+                sibling,
+                amux_core::worker::WorkerState::RateLimited {
+                    reset_at: Some(now + chrono::Duration::hours(1)),
+                },
+            ),
         ];
         let exhausted = amux_core::provider_fleet::derive(&workers, now, 5);
 
         let rt = runtime_with(store.clone(), protocol.clone());
         rt.pump_commands(now, &exhausted).await.unwrap();
-        assert!(protocol.calls().is_empty(), "exhausted provider: nothing delivered");
+        assert!(
+            protocol.calls().is_empty(),
+            "exhausted provider: nothing delivered"
+        );
         {
             let conn = store.read().unwrap();
             let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
-            assert_eq!(cmd.state, CommandState::Queued, "parked, not failed — nothing lost");
+            assert_eq!(
+                cmd.state,
+                CommandState::Queued,
+                "parked, not failed — nothing lost"
+            );
             assert_eq!(cmd.attempts, 0, "no retry budget spent while parked");
         }
 
@@ -2322,7 +2863,11 @@ mod pump_tests {
         ];
         let recovered = amux_core::provider_fleet::derive(&workers, now, 5);
         rt.pump_commands(now, &recovered).await.unwrap();
-        assert_eq!(protocol.calls().len(), 1, "recovered provider: delivery drains");
+        assert_eq!(
+            protocol.calls().len(),
+            1,
+            "recovered provider: delivery drains"
+        );
         let conn = store.read().unwrap();
         let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
         assert_eq!(cmd.state, CommandState::Delivered);
@@ -2339,20 +2884,32 @@ mod pump_tests {
             store
                 .write(move |conn| {
                     crate::db::commands::enqueue(
-                        conn, id, &wid(), &WorkerCommand::Continue, "pump-k2",
-                        &DeliveryTiming::Immediate, None, Utc::now(),
+                        conn,
+                        id,
+                        &wid(),
+                        &WorkerCommand::Continue,
+                        "pump-k2",
+                        &DeliveryTiming::Immediate,
+                        None,
+                        Utc::now(),
                     )?;
-                    Ok(WriteOutcome { applied: true, events: vec![] })
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         }
         let rt = runtime_with(store.clone(), protocol);
-        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &std::collections::BTreeMap::new())
+            .await
+            .unwrap();
         let conn = store.read().unwrap();
         let cmd = crate::db::commands::by_id(&conn, &cmd_id).unwrap().unwrap();
         assert!(
             matches!(&cmd.state, CommandState::Failed { reason } if reason.contains("delivery failed")),
-            "{:?}", cmd.state
+            "{:?}",
+            cmd.state
         );
         assert_eq!(cmd.attempts, 1, "failure recorded for the retry budget");
     }
@@ -2376,7 +2933,7 @@ mod adherence_tests {
     fn store() -> SharedStore {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         s
     }
 
@@ -2392,6 +2949,7 @@ mod adherence_tests {
                 let row = crate::db::queries::WorkerRow::new(
                     &idc,
                     &WorkerConfig {
+                        worker_type: Default::default(),
                         display_name: name.clone(),
                         name_aliases: vec![],
                         cwd: "/tmp".into(),
@@ -2411,15 +2969,17 @@ mod adherence_tests {
                     &WorkerState::Idle { since: Utc::now() },
                     "2026-01-01T00:00:00Z",
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         id
     }
 
     fn seed_issue(store: &SharedStore, title: &str, session: &str, status: &str) -> String {
-        let (title, session, status) =
-            (title.to_string(), session.to_string(), status.to_string());
+        let (title, session, status) = (title.to_string(), session.to_string(), status.to_string());
         let out: Arc<std::sync::Mutex<String>> = Arc::default();
         let out_w = out.clone();
         store
@@ -2456,7 +3016,10 @@ mod adherence_tests {
                     1_700_000_000,
                 )?;
                 *out_w.lock().unwrap() = row.id;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         let sem = out.lock().unwrap().clone();
@@ -2540,7 +3103,10 @@ mod adherence_tests {
 
         runtime.tick_once(false).await.unwrap();
         assert_eq!(issue_field(&store, &semantic, "status"), "blocked");
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_policy_receipts"), 1);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM _amux_policy_receipts"),
+            1
+        );
         assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_commands"), 0);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_leases"), 0);
 
@@ -2577,11 +3143,23 @@ mod adherence_tests {
         let mut rx = store.subscribe();
         rt.tick_once(true).await.unwrap();
 
-        assert!(protocol.calls().is_empty(), "no eligible card -> no prompt: {:?}", protocol.calls());
+        assert!(
+            protocol.calls().is_empty(),
+            "no eligible card -> no prompt: {:?}",
+            protocol.calls()
+        );
         assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_commands"), 0);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_leases"), 0);
-        assert_eq!(issue_field(&store, &sem_py, "status"), before_py.0, "python card untouched");
-        assert_eq!(issue_field(&store, &sem_py, "rev"), before_py.1, "python card rev unmoved");
+        assert_eq!(
+            issue_field(&store, &sem_py, "status"),
+            before_py.0,
+            "python card untouched"
+        );
+        assert_eq!(
+            issue_field(&store, &sem_py, "rev"),
+            before_py.1,
+            "python card rev unmoved"
+        );
         // Foreign/unowned cards are not this worker's stalls either.
         let mut stall_total = 0u64;
         while let Ok(ev) = rx.try_recv() {
@@ -2608,6 +3186,140 @@ mod adherence_tests {
             "positive control: unowned card assigned, python card still never"
         );
         assert_eq!(issue_field(&store, &sem_py, "rev"), before_py.1);
+    }
+
+    /// A lease is a claim that a command is IN FLIGHT, and `done` is
+    /// `Runnable` for its verification turn (`board::disposition`). So the
+    /// planner re-derives an assignment for a finished card on every tick —
+    /// and `commands::enqueue` is idempotent on the assignment key, so once
+    /// that key is queued it mints NOTHING. Pre-fix the re-derivation still
+    /// leased, so the card held the worker's entire WIP budget (`wip_cap=1`).
+    ///
+    /// Two defects, both measured on the live fleet 2026-10-25:
+    /// 1. the verification turn composed the SAME key as the execution turn
+    ///    (`{card}:{worker}:{attempt}` — attempts only increment on failure,
+    ///    and a card that succeeded records none), so no verification could
+    ///    ever be delivered: `AMUX-65` sat `done` from 21:36 with its lease
+    ///    refreshed every 10 minutes;
+    /// 2. because the planner picks the OLDEST card first, that finished card
+    ///    outranked every newer one on every tick, so a card filed at 22:30
+    ///    asking for a Telegram message was never dispatched and nothing
+    ///    logged a reason.
+    ///
+    /// This test walks the whole specimen and fails on either defect: the
+    /// verification turn must be deliverable, and once it IS delivered the
+    /// card must stop being a candidate so the card behind it runs.
+    #[tokio::test]
+    async fn a_finished_cards_replan_does_not_hold_the_workers_only_wip_slot() {
+        let store = store();
+        seed_worker(&store, 3, "alpha");
+        let first = seed_issue(&store, "first card", "alpha", "todo");
+        let first_task = bs::internal_id(&first).to_string();
+        let rt = runtime(store.clone(), None, false);
+
+        let leases_for = |task: &str| -> i64 {
+            let conn = store.read().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM _amux_leases WHERE task_id = ?1",
+                params![task],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let expire = |task: &str| {
+            let task = task.to_string();
+            store
+                .write(move |conn| {
+                    conn.execute(
+                        "UPDATE _amux_leases SET expires_at = ?1 WHERE task_id = ?2",
+                        params!["2026-01-01T00:00:00Z", task],
+                    )?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
+                })
+                .unwrap();
+        };
+
+        // PHASE 1 — the first card is dispatched.
+        rt.tick_once(false).await.unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_commands"), 1);
+        assert_eq!(leases_for(&first_task), 1, "the live assignment is leased");
+        let execute_key: String = {
+            let conn = store.read().unwrap();
+            conn.query_row(
+                "SELECT idempotency_key FROM _amux_commands",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            execute_key.ends_with(":execute"),
+            "the execution turn names its ACT: {execute_key}"
+        );
+
+        // The worker finishes it: the card is `done`, awaiting verification.
+        // It is also OLDER than anything filed next — which is the
+        // deterministic ordering that starved the live fleet.
+        let first_sem = first.clone();
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE issues SET status='done', created = created - 7200 WHERE id = ?1",
+                    params![first_sem],
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        assert_eq!(issue_field(&store, &first, "status"), "done");
+        expire(&first_task);
+
+        // PHASE 2 — the verification turn is a DIFFERENT ACT, so it is
+        // deliverable at all (defect 1).
+        rt.tick_once(false).await.unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM _amux_commands"),
+            2,
+            "a done card's verification turn must be deliverable — pre-fix it deduped against \
+             the execution command and could never be sent"
+        );
+        assert_eq!(leases_for(&first_task), 1, "the verification turn is leased");
+        let generation: i64 = store
+            .read()
+            .unwrap()
+            .query_row("SELECT generation FROM _amux_leases WHERE task_id = ?1", params![first_task], |r| r.get(0))
+            .unwrap();
+        assert_eq!(generation, 1, "a lease claimed after a reclaim is the next generation, not 0 again");
+
+        // The verification turn runs and leaves the card `done` (the worker
+        // made no claim about it); its lease reaches expiry.
+        expire(&first_task);
+
+        // A NEW card arrives for the same lane — the shape a human files and
+        // then waits on.
+        let second = seed_issue(&store, "send me a telegram message", "alpha", "todo");
+        let second_task = bs::internal_id(&second).to_string();
+
+        // PHASE 3 — the finished card is no longer a candidate (its act is
+        // queued), so it cannot hold the slot (defect 2).
+        rt.tick_once(false).await.unwrap();
+        assert_eq!(
+            leases_for(&first_task),
+            0,
+            "a card whose act is already queued cannot be delivered again, so it must not hold \
+             a lease — the lease is what pins the WIP slot"
+        );
+        assert_eq!(
+            leases_for(&second_task),
+            1,
+            "the card that CAN be delivered gets the slot instead of starving"
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_commands"), 3);
     }
 
     /// M2: with the attempt ledger wired into the tick, a task that has
@@ -2653,7 +3365,10 @@ mod adherence_tests {
                         ],
                     )?;
                 }
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
 
@@ -2678,7 +3393,11 @@ mod adherence_tests {
         let rev = issue_field(&store, &sem, "rev");
         rt.tick_once(false).await.unwrap();
         assert_eq!(issue_field(&store, &sem, "status"), "quarantined");
-        assert_eq!(issue_field(&store, &sem, "rev"), rev, "quarantine writes once");
+        assert_eq!(
+            issue_field(&store, &sem, "rev"),
+            rev,
+            "quarantine writes once"
+        );
     }
 
     /// M5: NO SILENT WORK. A prompt delivered directly to a Rust worker
@@ -2699,7 +3418,9 @@ mod adherence_tests {
         enqueue_deliver(&store, &w, &msg, "cap-k1");
 
         let rt = runtime(store.clone(), Some(protocol.clone()), false);
-        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &BTreeMap::new())
+            .await
+            .unwrap();
         assert!(
             matches!(&protocol.calls()[..], [RecordedCall::DeliverMessage { .. }]),
             "{:?}",
@@ -2708,7 +3429,13 @@ mod adherence_tests {
 
         let conn = store.read().unwrap();
         let (sem, title, status, session, owner_type, log, notified): (
-            String, String, String, String, String, String, i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
         ) = conn
             .query_row(
                 "SELECT id, title, status, session, owner_type, COALESCE(log,''), notified
@@ -2716,7 +3443,12 @@ mod adherence_tests {
                 [],
                 |r| {
                     Ok((
-                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
                         r.get(6)?,
                     ))
                 },
@@ -2729,9 +3461,63 @@ mod adherence_tests {
         );
         assert_eq!(session, "alpha", "attributed to the receiving worker");
         assert_eq!(owner_type, "agent");
-        assert!(log.contains("capture: session prompt"), "durable marker: {log}");
-        assert_eq!(notified, 1, "the worker already received this prompt; not news");
+        assert!(
+            log.contains("capture: session prompt"),
+            "durable marker: {log}"
+        );
+        assert_eq!(
+            notified, 1,
+            "the worker already received this prompt; not news"
+        );
         assert!(!sem.is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_transport_reuses_capture_and_preserves_active_work() {
+        let store = store();
+        let worker = seed_worker(&store, 34, "capture-retry");
+        let rt = runtime(store.clone(), None, false);
+        let now = Utc::now();
+        let body = "1. Fix the flaky parser\n2. Verify the regression";
+        rt.capture_prompt_card(&worker, body, now).await.unwrap();
+        rt.capture_prompt_card(&worker, body, now + chrono::Duration::minutes(20))
+            .await
+            .unwrap();
+        rt.capture_prompt_card(&worker, "Add a route for the archive endpoint", now)
+            .await
+            .unwrap();
+        rt.capture_prompt_card(&worker, "Thanks, looks good", now)
+            .await
+            .unwrap();
+        let conn = store.read().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM issues", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        let rows = conn
+            .prepare("SELECT title,status,source FROM issues ORDER BY created,id")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(rows.contains(&(
+            "Fix the flaky parser".into(),
+            "doing".into(),
+            "capture".into()
+        )));
+        assert!(rows.contains(&(
+            "Add a route for the archive endpoint".into(),
+            "backlog".into(),
+            "capture".into()
+        )));
     }
 
     #[tokio::test]
@@ -2768,6 +3554,11 @@ mod adherence_tests {
             1,
             "the source message remains durable when no task is minted"
         );
+        // Delivery advanced through core (#12): a parseable Delivered state.
+        let delivery: String = store.read().unwrap()
+            .query_row("SELECT delivery FROM _amux_messages", [], |r| r.get(0)).unwrap();
+        let parsed: amux_core::message::DeliveryState = serde_json::from_str(&delivery).unwrap();
+        assert!(matches!(parsed, amux_core::message::DeliveryState::Delivered { .. }), "{delivery}");
     }
 
     /// AMUX-2613 E2E regression: the ledger card minted from a delivered
@@ -2784,20 +3575,35 @@ mod adherence_tests {
         let rt = runtime(store.clone(), Some(protocol.clone()), false);
 
         let msg = MessageId::from_ulid(ulid::Ulid::new());
-        seed_message(&store, &msg, "please fix the flaky auth test. It only fails on CI.");
+        seed_message(
+            &store,
+            &msg,
+            "please fix the flaky auth test. It only fails on CI.",
+        );
         enqueue_deliver(&store, &w, &msg, "cap-k9");
-        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM issues"), 1, "ledger card minted");
+        rt.pump_commands(Utc::now(), &BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM issues"),
+            1,
+            "ledger card minted"
+        );
 
         // The tick that pre-fix re-dispatched the card as an ExecuteTask.
         rt.tick_once(false).await.unwrap();
-        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &BTreeMap::new())
+            .await
+            .unwrap();
 
         let execute_cmds = count(
             &store,
             "SELECT COUNT(*) FROM _amux_commands WHERE command LIKE '%execute_task%'",
         );
-        assert_eq!(execute_cmds, 0, "the ledger of a delivered prompt is not new work");
+        assert_eq!(
+            execute_cmds, 0,
+            "the ledger of a delivered prompt is not new work"
+        );
         assert!(
             matches!(&protocol.calls()[..], [RecordedCall::DeliverMessage { .. }]),
             "exactly ONE delivery ever reaches the worker: {:?}",
@@ -2827,7 +3633,7 @@ mod adherence_tests {
         let _home = tempfile::tempdir().unwrap();
         let _g = crate::api::settings::test_env::set_home(_home.path());
         std::fs::create_dir_all(_home.path().join("sessions")).unwrap();
-        std::fs::write(_home.path().join("sessions/alpha.env"), "CC_DIR=/tmp\n").unwrap();
+        std::fs::write(_home.path().join("sessions/alpha.env"), "CC_DIR=/tmp\nCC_AUTO_PICKUP=1\n").unwrap();
         let w = seed_worker(&store, 7, "alpha");
         let protocol = Arc::new(MockProtocol::new());
         protocol.register(w.clone(), AgentState::Idle);
@@ -2836,7 +3642,9 @@ mod adherence_tests {
         let msg = MessageId::from_ulid(ulid::Ulid::new());
         seed_message(&store, &msg, "this should be one row");
         enqueue_deliver(&store, &w, &msg, "cap-2604");
-        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &BTreeMap::new())
+            .await
+            .unwrap();
 
         let (id, title, tags, log): (String, String, String, String) = store
             .read()
@@ -2849,8 +3657,14 @@ mod adherence_tests {
             )
             .expect("the card is still minted — flagged, not suppressed");
         assert_eq!(title, "This should be one row");
-        assert!(tags.contains("needs-self-description"), "durable flag missing: {tags}");
-        assert!(log.contains("needs self-description"), "the log must say WHY: {log}");
+        assert!(
+            tags.contains("needs-self-description"),
+            "durable flag missing: {tags}"
+        );
+        assert!(
+            log.contains("needs self-description"),
+            "the log must say WHY: {log}"
+        );
 
         // The ask is queued for the worker, keyed to the card, once.
         let (n, session, guard, text): (i64, String, String, String) = store
@@ -2864,21 +3678,36 @@ mod adherence_tests {
             )
             .unwrap();
         assert_eq!(n, 1, "exactly one ask");
-        assert_eq!(session, "alpha", "addressed to the worker that got the prompt");
-        assert_eq!(guard, format!("self-describe:{id}"), "dedupe key is the card");
+        assert_eq!(
+            session, "alpha",
+            "addressed to the worker that got the prompt"
+        );
+        assert_eq!(
+            guard,
+            format!("self-describe:{id}"),
+            "dedupe key is the card"
+        );
         assert!(text.contains(&id), "the ask must name the card: {text}");
         // It must name a SANCTIONED next step, not leave the worker to
         // hand-roll a PATCH (which is how attribution gets lost).
-        assert!(text.contains("amux board retitle"), "no walkable next step: {text}");
+        assert!(
+            text.contains("amux board retitle"),
+            "no walkable next step: {text}"
+        );
 
         // A SECOND capture for the same card cannot stack a second ask — the
         // guard replaces. (A worker is asked once, not every turn.)
         let m2 = MessageId::from_ulid(ulid::Ulid::new());
         seed_message(&store, &m2, "this should be one row");
         enqueue_deliver(&store, &w, &m2, "cap-2604b");
-        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &BTreeMap::new())
+            .await
+            .unwrap();
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM steering_queue WHERE guard LIKE 'self-describe:%'"),
+            count(
+                &store,
+                "SELECT COUNT(*) FROM steering_queue WHERE guard LIKE 'self-describe:%'"
+            ),
             1,
             "the ask stacked — a worker must be asked once, not every turn"
         );
@@ -2896,9 +3725,15 @@ mod adherence_tests {
         let rt = runtime(store.clone(), Some(protocol.clone()), false);
 
         let msg = MessageId::from_ulid(ulid::Ulid::new());
-        seed_message(&store, &msg, "please fix the flaky auth test. It only fails on CI.");
+        seed_message(
+            &store,
+            &msg,
+            "please fix the flaky auth test. It only fails on CI.",
+        );
         enqueue_deliver(&store, &w, &msg, "cap-2604c");
-        rt.pump_commands(Utc::now(), &BTreeMap::new()).await.unwrap();
+        rt.pump_commands(Utc::now(), &BTreeMap::new())
+            .await
+            .unwrap();
 
         let tags: String = store
             .read()
@@ -2910,7 +3745,10 @@ mod adherence_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(!tags.contains("needs-self-description"), "false positive: {tags}");
+        assert!(
+            !tags.contains("needs-self-description"),
+            "false positive: {tags}"
+        );
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM steering_queue"),
             0,
@@ -2918,19 +3756,25 @@ mod adherence_tests {
         );
     }
 
-    /// M5 guards: steering words mint nothing, but every durable command cards
-    /// even while other work is open. Command/message idempotency owns transport
-    /// retries; text equality is not enough to erase an intentional repeat.
+    /// Commands remain deliverable even when their board receipt is reused.
+    /// Distinct work gets its own receipt; identical open work must not inflate
+    /// the backlog or replace the current execution claim.
     #[tokio::test]
-    async fn steering_skips_but_open_work_and_repeated_commands_still_card() {
+    async fn steering_skips_and_repeated_commands_reuse_open_board_receipts() {
         let store = store();
         let w = seed_worker(&store, 4, "alpha");
-        let rt = runtime(store.clone(), None, false);
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(w.clone(), AgentState::Idle);
+        let rt = runtime(store.clone(), Some(protocol.clone()), false);
 
         // Control word: retained as a message by the caller, but not a task.
         let now = Utc::now();
         rt.capture_prompt_card(&w, "continue", now).await.unwrap();
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM issues"), 0, "steering mints nothing");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM issues"),
+            0,
+            "steering mints nothing"
+        );
 
         // Open card: a DISTINCT prompt is still distinct work.
         seed_issue(&store, "already in flight", "alpha", "doing");
@@ -2947,20 +3791,62 @@ mod adherence_tests {
             "an open card must not absorb a different command before the model can classify it"
         );
 
-        // A second durable message with identical text may be intentional. The
-        // transport layer dedupes retries by message id, so capture must not add
-        // a second, capability-reducing text heuristic.
-        rt.capture_prompt_card(
-            &w,
-            "also handle the retry path in the same module please",
-            now + chrono::Duration::seconds(1),
-        )
-        .await
-        .unwrap();
+        // Two intentional repeats still reach the model and remain durable
+        // messages. Only the redundant board receipts are consolidated.
+        for key in ["repeat-one", "repeat-two"] {
+            let message = MessageId::from_ulid(ulid::Ulid::new());
+            seed_message(
+                &store,
+                &message,
+                "also handle the retry path in the same module please",
+            );
+            enqueue_deliver(&store, &w, &message, key);
+            rt.pump_commands(Utc::now(), &BTreeMap::new())
+                .await
+                .unwrap();
+            // The mock does not emit provider acknowledgements. Confirm this
+            // delivery through the command state machine before the next one.
+            store
+                .write(move |conn| {
+                    let id: String = conn.query_row(
+                        "SELECT id FROM _amux_commands WHERE idempotency_key=?1",
+                        [key],
+                        |r| r.get(0),
+                    )?;
+                    crate::db::commands::transition(
+                        conn,
+                        &CommandId::parse(&id).unwrap(),
+                        amux_core::protocol::CommandTransition::Confirm,
+                        3,
+                    )?;
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            protocol
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, RecordedCall::DeliverMessage { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM _amux_messages"), 2);
         assert_eq!(
             count(&store, "SELECT COUNT(*) FROM issues"),
-            3,
-            "a separate durable command must remain visible to the model"
+            2,
+            "repeated delivery must not duplicate the same unfinished board outcome"
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM issues WHERE status='doing'"),
+            1
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM issues WHERE status='backlog'"),
+            1
         );
     }
 
@@ -2973,8 +3859,8 @@ mod adherence_tests {
                      VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
                     params![
                         id,
-                        r#"{"kind":"human","name":"ethan"}"#,
-                        r#"{"kind":"worker","id":"wrk_x"}"#,
+                        serde_json::to_string(&amux_core::events::Actor::Human { name: "ethan".into() }).unwrap(),
+                        serde_json::to_string(&amux_core::message::MessageTarget::Worker(wid(1))).unwrap(),
                         body,
                         Utc::now().to_rfc3339(),
                         r#"{"state":"queued"}"#
@@ -2999,7 +3885,10 @@ mod adherence_tests {
                     None,
                     Utc::now(),
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
     }
@@ -3008,19 +3897,21 @@ mod adherence_tests {
 #[cfg(test)]
 mod rate_limit_recovery_tests {
     use super::*;
+    use crate::opencode::AgentState;
     use amux_core::protocol::{RateLimit, RateLimitKind};
     use amux_core::worker::{WorkerConfig, WorkerState};
-    use crate::opencode::AgentState;
 
     #[test]
     fn every_protocol_worker_becomes_deliverable_at_its_reported_reset() {
         let now = Utc::now();
-        let limited = |reset_at| AgentState::RateLimited(RateLimit {
-            kind: RateLimitKind::Weekly,
-            reset_at,
-            provider: amux_core::provider::ProviderId::new("claude-code"),
-            raw: None,
-        });
+        let limited = |reset_at| {
+            AgentState::RateLimited(RateLimit {
+                kind: RateLimitKind::Weekly,
+                reset_at,
+                provider: amux_core::provider::ProviderId::new("claude-code"),
+                raw: None,
+            })
+        };
 
         // "All" is the vector, not one convenient worker: every expired
         // Claude protocol state releases, while future and unknown clocks
@@ -3031,31 +3922,40 @@ mod rate_limit_recovery_tests {
             limited(Some(now - chrono::Duration::hours(5))),
         ];
         assert!(
-            expired_workers.iter().all(|state| agent_accepts_boundary_delivery(state, now)),
+            expired_workers
+                .iter()
+                .all(|state| agent_accepts_boundary_delivery(state, now)),
             "every worker at/past its provider reset must accept queued work"
         );
         assert!(!agent_accepts_boundary_delivery(
-            &limited(Some(now + chrono::Duration::seconds(1))), now
+            &limited(Some(now + chrono::Duration::seconds(1))),
+            now
         ));
         assert!(!agent_accepts_boundary_delivery(&limited(None), now));
         assert!(agent_accepts_boundary_delivery(&AgentState::Idle, now));
-        assert!(agent_accepts_boundary_delivery(&AgentState::WaitingForInput, now));
+        assert!(agent_accepts_boundary_delivery(
+            &AgentState::WaitingForInput,
+            now
+        ));
     }
 
     #[tokio::test]
     async fn expired_rate_limit_recovers_to_idle_and_unexpired_stays() {
         let dir = tempfile::tempdir().unwrap();
-        let store: SharedStore = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        let store: SharedStore =
+            Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        crate::test_tempdirs::keep(dir);
         let now = Utc::now();
         let seed = |n: u128, reset: Option<DateTime<Utc>>| {
-            let id = amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, n));
+            let id =
+                amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, n));
             let idc = id.clone();
             store
                 .write(move |conn| {
                     let row = crate::db::queries::WorkerRow::new(
                         &idc,
                         &WorkerConfig {
+                            worker_type: Default::default(),
                             display_name: format!("w{n}"),
                             name_aliases: vec![],
                             cwd: "/tmp".into(),
@@ -3075,7 +3975,10 @@ mod rate_limit_recovery_tests {
                         &WorkerState::RateLimited { reset_at: reset },
                         "2026-01-01T00:00:00Z",
                     )?;
-                    Ok(WriteOutcome { applied: true, events: vec![] })
+                    Ok(WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
             id
@@ -3112,7 +4015,11 @@ mod rate_limit_recovery_tests {
             .unwrap()
         };
         assert_eq!(state_of(&expired), "idle", "past reset -> recovered");
-        assert_eq!(state_of(&future), "rate_limited", "future reset stays parked");
+        assert_eq!(
+            state_of(&future),
+            "rate_limited",
+            "future reset stays parked"
+        );
         // No reset time: stays parked — inventing a retry would be guessing
         // (Inv 20), and Credit caps clear on payment, not clocks (AF-14).
         assert_eq!(state_of(&unknown), "rate_limited");
@@ -3130,6 +4037,7 @@ mod rate_limit_recovery_tests {
                 let row = crate::db::queries::WorkerRow::new(
                     &idc,
                     &WorkerConfig {
+                        worker_type: Default::default(),
                         display_name: format!("w{n}"),
                         name_aliases: vec![],
                         cwd: "/tmp".into(),
@@ -3149,7 +4057,10 @@ mod rate_limit_recovery_tests {
                     &WorkerState::RateLimited { reset_at: reset },
                     "2026-01-01T00:00:00Z",
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         id
@@ -3194,7 +4105,7 @@ mod rate_limit_recovery_tests {
         let dir = tempfile::tempdir().unwrap();
         let store: SharedStore =
             Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         let now = Utc::now();
         let shared_reset = Some(now - chrono::Duration::seconds(7));
         let w1 = seed_rate_limited(&store, 11, shared_reset);
@@ -3225,11 +4136,18 @@ mod rate_limit_recovery_tests {
                     },
                     "2026-01-01T00:00:00Z",
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         rt.tick_once(false).await.unwrap();
-        assert_eq!(db_state_of(&store, &w3), "idle", "own slot passed -> recovered");
+        assert_eq!(
+            db_state_of(&store, &w3),
+            "idle",
+            "own slot passed -> recovered"
+        );
     }
 
     /// RR-0044b: redistribution is a RECOMMENDATION event, deduped per
@@ -3240,7 +4158,7 @@ mod rate_limit_recovery_tests {
         let dir = tempfile::tempdir().unwrap();
         let store: SharedStore =
             Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         let now = Utc::now();
         seed_rate_limited(&store, 21, Some(now + chrono::Duration::hours(2)));
 
@@ -3291,19 +4209,30 @@ mod tick_bracket_guard {
         // BOUND THE SLICE TO THE FUNCTION. A fixed window sweeps into this test,
         // whose assertions contain the literal being searched for, and the guard
         // then matches its own source. That trap has fired repeatedly here.
-        let start = src.find("pub async fn run(self: Arc<Self>)").expect("run exists");
+        let start = src
+            .find("pub async fn run(self: Arc<Self>)")
+            .expect("run exists");
         let rest = &src[start..];
-        let body = &rest[..rest.find("\n    }\n").map(|i| i + 6).expect("run is closed")];
+        let body = &rest[..rest
+            .find("\n    }\n")
+            .map(|i| i + 6)
+            .expect("run is closed")];
         let code: String = body
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
 
-        let start_at = code.find("tick_start(").expect("the pass is bracketed with tick_start");
-        let work_at = code.find("self.tick_once(").expect("the loop runs the pass");
+        let start_at = code
+            .find("tick_start(")
+            .expect("the pass is bracketed with tick_start");
+        let work_at = code
+            .find("self.tick_once(")
+            .expect("the loop runs the pass");
         let end_at = code.find("tick_end(").expect("the loop records a tick_end");
-        let ok_at = code.find("Ok(()) =>").expect("the completed arm is matched explicitly");
+        let ok_at = code
+            .find("Ok(()) =>")
+            .expect("the completed arm is matched explicitly");
         assert!(start_at < work_at, "tick_start must precede the pass");
         assert!(
             work_at < end_at,
@@ -3319,5 +4248,108 @@ mod tick_bracket_guard {
             "the one-shot cannot express a duration, which is what made this job's slowness \
              indistinguishable from death"
         );
+    }
+}
+
+#[cfg(test)]
+mod tick_section_tests {
+    use super::TickSections;
+    use std::time::Duration;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// AMUX-5027. `window_stats` must stay OFF the async runtime thread.
+    ///
+    /// It is eight synchronous SQLite queries against a 4.7 GB database, run
+    /// every tick. Measured before the fix: `runtime_job_blocking_poll` fired
+    /// 15661 times across the log, 6936 from this job, and `window_stats` was
+    /// the worst section in 989 of 1674 samples at p50 1827 ms / max 30622 ms.
+    ///
+    /// A SOURCE GUARD, deliberately. What regresses here is the WIRING — a
+    /// later edit calling `Self::window_stats(...)` directly again — and no
+    /// unit test can observe which pool a future call runs on. The signature
+    /// change is what makes the mistake hard: taking `&SharedStore` rather than
+    /// `&self` means a direct call from the tick does not even have a receiver
+    /// to hand, so this guard is the second line rather than the only one.
+    #[test]
+    fn window_stats_is_not_called_on_the_async_thread() {
+        let src = include_str!("runtime.rs");
+        let at = src
+            .find("sections.mark(\"window_stats\")")
+            .expect("the window_stats section mark is gone; this guard has lost its subject");
+        // The call sits immediately above its own mark.
+        let before = &src[at.saturating_sub(400)..at];
+        assert!(
+            before.contains("spawn_blocking"),
+            "window_stats is invoked without spawn_blocking; it holds a runtime \
+             thread for a median 1827 ms every tick. Preceding source was:\n{before}"
+        );
+        assert!(
+            before.contains("Self::window_stats("),
+            "the guard no longer sees the call it is guarding, so it would pass \
+             whatever the tick does. Preceding source was:\n{before}"
+        );
+        // And the blocking form must be the ONLY form: a receiver-style call
+        // anywhere is the exact regression.
+        //
+        // THE NEEDLE IS BUILT, NOT WRITTEN. Spelling it as a literal here puts
+        // it in this file, and `include_str!` then finds the test's own prose
+        // and fails on it. That is not hypothetical: the first draft of this
+        // assertion did exactly that, which is the third self-matching test I
+        // have hit today.
+        let receiver_call = format!("self{}window_stats(", ".");
+        assert!(
+            !src.contains(&receiver_call),
+            "a receiver-style call to window_stats is back; that form runs on the \
+             async thread"
+        );
+    }
+
+    /// AMUX-4955. The verdict has to name the section a reader should go open.
+    #[test]
+    fn the_slowest_section_is_named_and_every_section_is_reported() {
+        let marks = [
+            ("load_state", ms(12)),
+            ("window_stats", ms(4)),
+            ("load_board_tasks", ms(8_400)),
+            ("pump_commands", ms(120)),
+        ];
+        let ((worst, worst_ms), breakdown) = TickSections::summarize(&marks);
+        assert_eq!(worst, "load_board_tasks");
+        assert_eq!(worst_ms, 8_400);
+        // The WHOLE breakdown travels, not just the winner: "load_board_tasks
+        // dominated" and "load_board_tasks dominated while everything else was
+        // also slow" are different findings and only the second rules out a
+        // fleet-wide stall.
+        for name in [
+            "load_state",
+            "window_stats",
+            "load_board_tasks",
+            "pump_commands",
+        ] {
+            assert!(breakdown.contains(name), "{name} missing from {breakdown}");
+        }
+    }
+
+    /// No sections is a real state (a tick that returned early), and it must
+    /// not be reported as a section called "" taking 0ms.
+    #[test]
+    fn an_empty_tick_names_nothing_rather_than_inventing_a_section() {
+        let ((worst, worst_ms), breakdown) = TickSections::summarize(&[]);
+        assert_eq!(worst, "none");
+        assert_eq!(worst_ms, 0);
+        assert_eq!(breakdown, "");
+    }
+
+    /// Ties must not silently pick a section by declaration order and present
+    /// it as the finding; assert the reported ms matches whatever was chosen.
+    #[test]
+    fn a_tie_still_reports_a_duration_that_matches_the_named_section() {
+        let marks = [("a", ms(500)), ("b", ms(500))];
+        let ((worst, worst_ms), _) = TickSections::summarize(&marks);
+        assert!(worst == "a" || worst == "b");
+        assert_eq!(worst_ms, 500);
     }
 }

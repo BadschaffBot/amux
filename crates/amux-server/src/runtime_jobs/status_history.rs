@@ -110,47 +110,126 @@ pub fn tick_secs() -> u64 {
 /// would be wiped by each adoption and re-record every lane's unchanged status
 /// as a change — turning a deploy into a fleet-wide burst of false transitions,
 /// which is the D1 lesson learned the expensive way on the report table.
+///
+/// The DB stays the source of truth: the cache below is rebuilt from it on the
+/// first tick of each process image, then reads only rows past the highest id it
+/// has seen (Mac hog RCA 20261014-112244, AMUX-5999: the GROUP BY over every
+/// status_decided row took 9.5s per tick on the live DB).
+type LastSeen = (i64, std::collections::HashMap<String, (String, String)>);
+static LAST_RECORDED: std::sync::Mutex<Option<(String, LastSeen)>> = std::sync::Mutex::new(None);
+
 fn last_recorded(conn: &Connection) -> std::collections::HashMap<String, (String, String)> {
-    let mut out = std::collections::HashMap::new();
-    let sql = format!(
-        "SELECT e.session, e.data FROM session_events e \
-         JOIN (SELECT session, MAX(id) AS mid FROM session_events \
-               WHERE type='{EVENT}' GROUP BY session) m ON e.id = m.mid"
-    );
-    if let Ok(mut st) = conn.prepare(&sql) {
-        if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        {
-            for (s, d) in rows.flatten() {
-                let v: serde_json::Value = serde_json::from_str(&d).unwrap_or(json!({}));
-                out.insert(
-                    s,
-                    (
-                        v["status"].as_str().unwrap_or("").to_string(),
-                        v["decided_by"].as_str().unwrap_or("").to_string(),
-                    ),
-                );
-            }
+    let db = conn.path().unwrap_or("").to_string();
+    let Ok(max_id) = conn.query_row("SELECT coalesce(max(id),0) FROM session_events", [], |r| r.get::<_, i64>(0)) else {
+        return Default::default();
+    };
+    let (since, mut out) = {
+        let g = LAST_RECORDED.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_ref() {
+            Some((path, (seen, m))) if !db.is_empty() && *path == db && *seen <= max_id => (*seen, m.clone()),
+            _ => (0, Default::default()),
         }
+    };
+    let started = std::time::Instant::now();
+    let Ok(mut st) = conn.prepare(
+        "SELECT session, data FROM session_events WHERE type=?1 AND id > ?2 AND id <= ?3 ORDER BY id",
+    ) else {
+        return out;
+    };
+    let Ok(rows) = st.query_map(rusqlite::params![EVENT, since, max_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) else {
+        return out;
+    };
+    for (s, d) in rows.flatten() {
+        let v: serde_json::Value = serde_json::from_str(&d).unwrap_or(json!({}));
+        out.insert(
+            s,
+            (
+                v["status"].as_str().unwrap_or("").to_string(),
+                v["decided_by"].as_str().unwrap_or("").to_string(),
+            ),
+        );
     }
+    let ms = started.elapsed().as_millis() as u64;
+    if ms > 2000 {
+        tracing::warn!(verdict = "status_history_last_recorded_slow", elapsed_ms = ms, rows_from = since,
+            measured = true, n_considered = out.len(), "last-recorded status read was slow");
+    }
+    *LAST_RECORDED.lock().unwrap_or_else(|e| e.into_inner()) = Some((db, (max_id, out.clone())));
     out
 }
 
-/// Does this pair differ from what was last recorded? Split out so the change
-/// rule is one testable thing rather than an `if` buried in the loop.
+/// What one sampled decision does to the table. Split out so the change rule
+/// is one testable thing rather than an `if` buried in the loop.
 ///
 /// A FIRST SIGHTING IS A CHANGE. Otherwise a lane that has been stable since
 /// before this job existed never appears at all, and its empty history reads as
 /// "nothing to see" rather than "never sampled" — the failure this whole module
 /// is about, reproduced inside it.
-pub fn is_change(prev: Option<&(String, String)>, status: &str, decided_by: &str) -> bool {
+#[derive(Debug, PartialEq, Eq)]
+pub enum Write {
+    /// Same status, same rule: nothing.
+    Skip,
+    /// A first sighting or a new STATUS: a new row.
+    Insert,
+    /// Same status reached by a different rule: fold into the lane's latest
+    /// row (its `decided_by` moves, `repeats` and `last_seen_ts` advance, and
+    /// `rules_seen` counts each rule).
+    ///
+    /// The gs12 review measured 7,141 rows for one lane over 232 h, of which
+    /// 5,740 (80%) re-recorded the status the row before already held, mostly
+    /// `contradiction_provider_background_working` trading places with
+    /// `report`. A row per rule flip made the history a list of the same
+    /// badge; one row per status run keeps every rule that decided it.
+    Coalesce,
+}
+
+pub fn decide(prev: Option<&(String, String)>, status: &str, decided_by: &str) -> Write {
     match prev {
-        None => true,
-        Some((s, d)) => s != status || d != decided_by,
+        None => Write::Insert,
+        Some((s, _)) if s != status => Write::Insert,
+        Some((_, d)) if d != decided_by => Write::Coalesce,
+        Some(_) => Write::Skip,
     }
+}
+
+/// Fold a same-status decision into the lane's newest status row. Returns
+/// whether a row was updated (false: the lane has no row yet, so the caller's
+/// cache was stale and the next tick inserts).
+fn coalesce_row(c: &Connection, session: &str, decided_by: &str, now: f64) -> rusqlite::Result<bool> {
+    let row: Option<(i64, String)> = c
+        .query_row(
+            "SELECT id, data FROM session_events WHERE type=?1 AND session=?2 ORDER BY id DESC LIMIT 1",
+            rusqlite::params![EVENT, session],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let Some((id, data)) = row else { return Ok(false) };
+    let mut v: serde_json::Value = serde_json::from_str(&data).unwrap_or(json!({}));
+    let Some(o) = v.as_object_mut() else { return Ok(false) };
+    let first_rule = o.get("decided_by").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let rules = o.entry("rules_seen").or_insert_with(|| json!({}));
+    if let Some(r) = rules.as_object_mut() {
+        if r.is_empty() && !first_rule.is_empty() {
+            r.insert(first_rule, json!(1));
+        }
+        let n = r.get(decided_by).and_then(|x| x.as_u64()).unwrap_or(0) + 1;
+        // Bounded: a pathological rule name churn cannot grow one row forever.
+        if r.len() < 32 || r.contains_key(decided_by) {
+            r.insert(decided_by.to_string(), json!(n));
+        }
+    }
+    let repeats = o.get("repeats").and_then(|x| x.as_u64()).unwrap_or(0) + 1;
+    o.insert("decided_by".into(), json!(decided_by));
+    o.insert("repeats".into(), json!(repeats));
+    o.insert("last_seen_ts".into(), json!(now));
+    Ok(c.execute("UPDATE session_events SET data=?1 WHERE id=?2", rusqlite::params![v.to_string(), id])? > 0)
 }
 
 /// One pass. Returns (lanes seen, rows recorded, rows pruned).
 pub fn tick(state: &AppState) -> (u32, u32, u32) {
+    crate::api::native_status::replay(state);
     let Ok(conn) = state.store.read() else {
         return (0, 0, 0);
     };
@@ -166,8 +245,15 @@ pub fn tick(state: &AppState) -> (u32, u32, u32) {
     // status from signals the dashboard does not have, and record a history
     // that disagrees with the thing it exists to explain.
     signals.capture_panes();
+    // These are exactly the signals the board's `stale` flag needs. Publish
+    // the active set so a board read reuses it instead of re-running every
+    // fleet probe itself (AMUX-5374: 1.9s of a 2.2s board read).
+    crate::api::sessions_legacy::publish_active_set(
+        crate::api::sessions_legacy::active_set_from_signals(&signals),
+    );
 
     let mut rows: Vec<(String, String)> = Vec::new();
+    let mut folds: Vec<(String, String)> = Vec::new();
     let mut lanes = 0u32;
     for name in crate::api::session_verbs::all_lane_names() {
         let running = signals.agent_running(&format!("amux-{name}"));
@@ -177,8 +263,13 @@ pub fn tick(state: &AppState) -> (u32, u32, u32) {
         lanes += 1;
         let (status, explain) = signals.derive_status_explain(&name, running);
         let decided_by = explain["decided_by"].as_str().unwrap_or("").to_string();
-        if !is_change(prev.get(&name), &status, &decided_by) {
-            continue;
+        match decide(prev.get(&name), &status, &decided_by) {
+            Write::Skip => continue,
+            Write::Coalesce => {
+                folds.push((name, decided_by));
+                continue;
+            }
+            Write::Insert => {}
         }
         let (ps, pd) = prev
             .get(&name)
@@ -215,9 +306,10 @@ pub fn tick(state: &AppState) -> (u32, u32, u32) {
     }
 
     let recorded = rows.len() as u32;
-    // PRUNE ON A CLOCK, NOT EVERY TICK. The delete predicate is on `ts` and
-    // `type`, and no index covers both, so running it every 20s would scan for
-    // rows that are almost never there. Once an hour keeps the table bounded at
+    // PRUNE ON A CLOCK, NOT EVERY TICK. The predicate is on `ts` and `type`,
+    // and no index covers both, so running it every 20s would scan for rows
+    // that are almost never there (and see `prune` for why the scan now runs
+    // off the writer). Once an hour keeps the table bounded at
     // a cost nobody has to think about.
     let due = {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -226,9 +318,7 @@ pub fn tick(state: &AppState) -> (u32, u32, u32) {
         n.is_multiple_of((3600 / tick_secs()).max(1))
     };
     let cutoff = crate::config::now_f64() - retention_days() * 86400.0;
-    let pruned_cell = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let cell = pruned_cell.clone();
-    if recorded > 0 || due {
+    if recorded > 0 {
         let _ = state.store.write(move |c| {
             let now = crate::config::now_f64();
             for (session, data) in &rows {
@@ -238,23 +328,97 @@ pub fn tick(state: &AppState) -> (u32, u32, u32) {
                     rusqlite::params![now, session, EVENT, data, JOB],
                 )?;
             }
-            if due {
-                let n = c.execute(
-                    "DELETE FROM session_events WHERE type=?1 AND ts < ?2",
-                    rusqlite::params![EVENT, cutoff],
-                )?;
-                cell.store(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         });
     }
-    let pruned = pruned_cell.load(std::sync::atomic::Ordering::Relaxed);
+    let coalesced = if folds.is_empty() { 0 } else { fold(state, folds) };
+    let pruned = if due { prune(state, cutoff) } else { 0 };
 
     // ALWAYS logged. A tick that only speaks when something changed makes "the
     // fleet was stable" and "the job is wedged" the same silence.
-    tracing::info!(job = JOB, lanes, recorded, "status-history census");
+    tracing::info!(job = JOB, lanes, recorded, coalesced, measured = true, n_considered = lanes,
+        "status-history census");
     (lanes, recorded, pruned)
 }
+
+/// Apply same-status rule changes in one write and move the cache to match:
+/// an UPDATE keeps the row's id, so `last_recorded`'s id-cursor would never
+/// see the new rule and every tick would fold the same flip again.
+fn fold(state: &AppState, folds: Vec<(String, String)>) -> u32 {
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cell = n.clone();
+    let applied = folds.clone();
+    let wrote = state.store.write(move |c| {
+        let now = crate::config::now_f64();
+        for (session, rule) in &folds {
+            if coalesce_row(c, session, rule, now)? {
+                cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+    });
+    if let Err(error) = wrote {
+        tracing::warn!(job = JOB, %error, measured = false, n_considered = applied.len(),
+            verdict = "status_history_coalesce_failed", "same-status rule changes were not folded");
+        return 0;
+    }
+    if let Some((_, (_, m))) = LAST_RECORDED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        for (session, rule) in applied {
+            if let Some(entry) = m.get_mut(&session) {
+                entry.1 = rule;
+            }
+        }
+    }
+    n.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Delete expired status rows WITHOUT holding the writer for the search.
+/// No index covers (type, ts), so finding them walks every
+/// `session.native_status` row: done inside the write that cost 34 s of the
+/// single writer once an hour (2026-10-06, 323k rows), and every board write
+/// in the fleet queued behind it. The search now runs on a read connection
+/// (WAL readers do not block the writer) and the delete goes by id in chunks,
+/// each its own short write.
+fn prune(state: &AppState, cutoff: f64) -> u32 {
+    let ids: Vec<i64> = match state.store.read() {
+        Ok(conn) => conn
+            .prepare("SELECT id FROM session_events WHERE type IN (?1, 'session.native_status') AND ts < ?2")
+            .and_then(|mut st| {
+                st.query_map(rusqlite::params![EVENT, cutoff], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<i64>>>()
+            })
+            .unwrap_or_default(),
+        Err(_) => return 0,
+    };
+    let mut pruned = 0u32;
+    for chunk in ids.chunks(PRUNE_CHUNK) {
+        let chunk = chunk.to_vec();
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cell = n.clone();
+        let ok = state.store.write(move |c| {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let k = c.execute(
+                &format!("DELETE FROM session_events WHERE id IN ({placeholders})"),
+                rusqlite::params_from_iter(chunk.iter()),
+            )?;
+            cell.store(k as u32, std::sync::atomic::Ordering::Relaxed);
+            Ok(crate::db::WriteOutcome { applied: k > 0, events: vec![] })
+        });
+        if ok.is_err() {
+            break;
+        }
+        pruned += n.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    tracing::info!(job = JOB, pruned, candidates = ids.len(), measured = true, n_considered = ids.len(),
+        verdict = "status_history_pruned", "expired status rows pruned in chunks, off the writer's search");
+    pruned
+}
+
+/// Rows per prune write: small enough that each write is milliseconds.
+const PRUNE_CHUNK: usize = 500;
 
 pub fn spawn(state: AppState) -> super::PeriodicTask {
     super::spawn_periodic(JOB, tick_secs(), move || {
@@ -272,28 +436,111 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
 mod tests {
     use super::*;
 
+    /// The prune finds expired rows off the writer and deletes them by id in
+    /// chunks; it removes only expired status rows, across chunk boundaries.
+    #[test]
+    fn last_recorded_reads_new_rows_and_keeps_the_latest_per_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("h.db")).unwrap();
+        c.execute_batch("CREATE TABLE session_events(id INTEGER PRIMARY KEY, ts REAL, session TEXT, type TEXT, data TEXT);").unwrap();
+        let add = |lane: &str, status: &str| {
+            c.execute("INSERT INTO session_events(ts,session,type,data) VALUES(1,?1,?2,?3)",
+                rusqlite::params![lane, EVENT, json!({"status":status,"decided_by":"hook"}).to_string()]).unwrap();
+        };
+        add("a", "idle");
+        add("b", "working");
+        assert_eq!(last_recorded(&c)["a"].0, "idle");
+        add("a", "working");
+        let m = last_recorded(&c);
+        assert_eq!(m["a"].0, "working", "a newer row replaces the cached one");
+        assert_eq!(m["b"].0, "working", "a lane with no new rows keeps its last decision");
+    }
+
+    #[test]
+    fn the_prune_deletes_only_expired_status_rows_in_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(crate::db::Store::open(&dir.path().join("h.db")).unwrap()),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let old = PRUNE_CHUNK + 7; // spans two chunks
+        state.store.write(move |c| {
+            for i in 0..old {
+                let t = if i % 2 == 0 { EVENT } else { "session.native_status" };
+                c.execute("INSERT INTO session_events (ts, session, type, data, source) VALUES (100.0, 'l', ?1, '{}', 't')", [t])?;
+            }
+            c.execute("INSERT INTO session_events (ts, session, type, data, source) VALUES (100.0, 'l', 'session.idle', '{}', 't')", [])?;
+            c.execute("INSERT INTO session_events (ts, session, type, data, source) VALUES (9000.0, 'l', ?1, '{}', 't')", [EVENT])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).unwrap();
+        assert_eq!(prune(&state, 5000.0) as usize, old);
+        let left: Vec<(String, f64)> = {
+            let conn = state.store.read().unwrap();
+            let mut st = conn.prepare("SELECT type, ts FROM session_events ORDER BY id").unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect()
+        };
+        assert_eq!(left, vec![("session.idle".to_string(), 100.0), (EVENT.to_string(), 9000.0)],
+            "another type and a fresh row survive");
+    }
+
     /// The change rule, including the cell that makes an empty history honest.
     #[test]
     fn a_first_sighting_counts_as_a_change_and_a_repeat_does_not() {
-        assert!(is_change(None, "idle", "report"), "a lane never recorded must be recorded");
+        assert_eq!(decide(None, "idle", "report"), Write::Insert, "a lane never recorded must be recorded");
         let prev = ("idle".to_string(), "report".to_string());
-        assert!(!is_change(Some(&prev), "idle", "report"), "an unchanged lane writes nothing");
-        assert!(
-            is_change(Some(&prev), "active", "report"),
-            "the STATUS changing is a change"
+        assert_eq!(decide(Some(&prev), "idle", "report"), Write::Skip, "an unchanged lane writes nothing");
+        assert_eq!(decide(Some(&prev), "active", "report"), Write::Insert, "the STATUS changing is a change");
+        assert_eq!(
+            decide(Some(&prev), "idle", "activity_fallback"),
+            Write::Coalesce,
+            "the same status reached by a DIFFERENT RULE is kept, folded into the status row \
+             rather than written as another row reading the same badge"
         );
-        assert!(
-            is_change(Some(&prev), "idle", "activity_fallback"),
-            "the same status reached by a DIFFERENT RULE is the interesting case: the badge \
-             reads identically and the reason it reads that way has moved"
-        );
+    }
+
+    /// gs12 review: 80% of one lane's 7,141 rows repeated the status before.
+    #[test]
+    fn a_same_status_rule_flip_folds_into_the_latest_row_with_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Connection::open(dir.path().join("h.db")).unwrap();
+        c.execute_batch("CREATE TABLE session_events(id INTEGER PRIMARY KEY, ts REAL, session TEXT, type TEXT, data TEXT);").unwrap();
+        c.execute("INSERT INTO session_events(ts,session,type,data) VALUES(1,'a',?1,?2)",
+            rusqlite::params![EVENT, json!({"status":"active","decided_by":"report"}).to_string()]).unwrap();
+        c.execute("INSERT INTO session_events(ts,session,type,data) VALUES(1,'b',?1,?2)",
+            rusqlite::params![EVENT, json!({"status":"idle","decided_by":"report"}).to_string()]).unwrap();
+        for (rule, at) in [("contradiction_provider_background_working", 10.0), ("report", 20.0),
+                           ("contradiction_provider_background_working", 30.0)] {
+            assert!(coalesce_row(&c, "a", rule, at).unwrap());
+        }
+        assert!(!coalesce_row(&c, "nobody", "report", 40.0).unwrap(), "no row to fold into");
+        let rows: i64 = c.query_row("SELECT count(*) FROM session_events", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2, "folding never adds rows");
+        let a: serde_json::Value = serde_json::from_str(&c.query_row(
+            "SELECT data FROM session_events WHERE session='a'", [], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        assert_eq!(a["status"], "active");
+        assert_eq!(a["decided_by"], "contradiction_provider_background_working", "the latest rule decides");
+        assert_eq!(a["repeats"], 3);
+        assert_eq!(a["last_seen_ts"], 30.0);
+        assert_eq!(a["rules_seen"], json!({"report": 2, "contradiction_provider_background_working": 2}));
+        let b: serde_json::Value = serde_json::from_str(&c.query_row(
+            "SELECT data FROM session_events WHERE session='b'", [], |r| r.get::<_, String>(0)).unwrap()).unwrap();
+        assert!(b.get("repeats").is_none(), "another lane's row is untouched");
     }
 
     /// Retention and cadence are config, and their floors hold. A tick under 5s
     /// would turn a sampler into a hot loop over 52 pane captures.
     #[test]
     fn the_cadence_and_retention_floors_hold() {
-        assert!(tick_secs() >= 5, "a sub-5s tick captures panes faster than they paint");
-        assert!(retention_days() > 0.0, "a zero retention would delete every row it just wrote");
+        assert!(
+            tick_secs() >= 5,
+            "a sub-5s tick captures panes faster than they paint"
+        );
+        assert!(
+            retention_days() > 0.0,
+            "a zero retention would delete every row it just wrote"
+        );
     }
 }

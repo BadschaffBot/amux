@@ -97,7 +97,10 @@ async fn verify_task(
             }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         };
-        if !matches!(board_store::parse_status(&row.status), Some(amux_core::board::TaskStatus::Done | amux_core::board::TaskStatus::Verified)) {
+        if !matches!(
+            board_store::parse_status(&row.status),
+            Some(amux_core::board::TaskStatus::Done | amux_core::board::TaskStatus::Verified)
+        ) {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({"error": "verification runs against done or previously verified tasks", "item": id, "status": row.status})),
@@ -157,19 +160,30 @@ async fn verify_task(
             )
                 .into_response();
         }
-        let groups = row.session.as_deref().map(super::session_verbs::lane_groups).unwrap_or_default();
-        let gate = board_store::effective_gate_trail(&conn, &row, amux_core::board::TaskStatus::Verified, &groups);
-        if gate.source != board_store::GateSource::TypeDefault && gate.criteria.iter().any(|c| !req.gate_checked.contains(c)) {
+        let groups = row
+            .session
+            .as_deref()
+            .map(super::session_verbs::lane_groups)
+            .unwrap_or_default();
+        let gate = board_store::effective_gate_trail(
+            &conn,
+            &row,
+            amux_core::board::TaskStatus::Verified,
+            &groups,
+        );
+        if gate.source != board_store::GateSource::TypeDefault
+            && gate.criteria.iter().any(|c| !req.gate_checked.contains(c))
+        {
             return (StatusCode::CONFLICT, Json(json!({"error":"custom verified gate requires the current checklist", "gate":gate.criteria,
                 "source":gate.source.token(), "how_to_ack":{"gate_checked":gate.criteria}}))).into_response();
         }
-        let sensor_profile = match crate::db::harness_store::get_sensor_profile(
-            &conn,
-            &row.item_type,
-        ) {
-            Ok(profile) => profile,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
+        let sensor_profile =
+            match crate::db::harness_store::get_sensor_profile(&conn, &row.item_type) {
+                Ok(profile) => profile,
+                Err(e) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
+            };
         if let Some(profile) = sensor_profile {
             let actual: std::collections::BTreeSet<_> = criteria
                 .criteria
@@ -224,11 +238,11 @@ async fn verify_task(
             required: criterion.required,
         })
         .collect();
-    let execution =
-        match crate::orchestrator::verify::run_verification_async(executable, cwd).await {
-            Ok(run) => run,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
+    let execution = match crate::orchestrator::verify::run_verification_async(executable, cwd).await
+    {
+        Ok(run) => run,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
     let passed = matches!(execution.run.verdict, VerificationResult::Passed)
         && !execution.evidence.is_empty();
     let target = if passed { "verified" } else { "doing" };
@@ -298,8 +312,13 @@ async fn verify_task(
                 tracing::warn!(target:"amux::verification", card=%id2, "gate changed during verification; result not applied");
                 return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other("gate changed during verification"))));
             }
+            // A failed re-check of a VERIFIED card reopens it: that leaves a
+            // terminal status, which the transition engine allows only by an
+            // attributed force (implicit state machines inventory #6). Every
+            // other verification transition keeps its gates.
+            let reopen = !passed && board_store::parse_status(&expected_status).is_some_and(|s| s.is_terminal());
             let opts = crate::db::advance::AdvanceOpts {
-                force: false,
+                force: reopen,
                 gate_ack: true,
                 expected_from: Some(expected_status.clone()),
                 log_line: Some(summary.clone()),

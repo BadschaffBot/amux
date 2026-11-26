@@ -32,7 +32,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,6 +44,28 @@ const MEMBER_SCOPE_NAME_HEADER: &str = "x-amux-local-member-scope-name";
 const MEMBER_ACTOR_HEADER: &str = "x-amux-local-member-actor";
 const MEMBER_TEAM_ID_HEADER: &str = "x-amux-local-member-team-id";
 const MEMBER_TEAM_NAME_B64_HEADER: &str = "x-amux-local-member-team-name-b64";
+/// A verified member whose stored role is `admin` (and whose scope is global):
+/// set only by [`local_member_identity`] from the database, stripped from every
+/// inbound request with the other markers. Ethan, 2026-10-26: the people he
+/// invites to run a server with him must manage its vault without signing in
+/// as the anonymous host owner.
+const MEMBER_ADMIN_HEADER: &str = "x-amux-local-member-admin";
+/// A verified member whose stored role is `auditor` (governance PR 19): reads
+/// the record (ledger, traces, approvals, at-rest report, audit export) and can
+/// change nothing. Set only by [`local_member_identity`]; stripped inbound.
+const MEMBER_AUDITOR_HEADER: &str = "x-amux-local-member-auditor";
+/// The member's session has proved a second factor (governance PR 20,
+/// mfa.rs): set only by [`local_member_identity`] from `org_invites.mfa_at`
+/// (or an SSO sign-in whose `amr` said so); stripped inbound.
+const MEMBER_SESSION_MFA_HEADER: &str = "x-amux-local-member-session-mfa";
+/// Names an automated owner-configured policy (the needs-input auto-approver)
+/// as the actor of an INTERNAL call. Stripped from inbound requests below with
+/// the member markers, so only server code can produce it. Before it existed
+/// the policy's board writes carried no header and logged as `api-anonymous`,
+/// the same name an owner's dashboard click gets on a box with no auth token:
+/// 87 of 201 needsyou exits on GS-12 cards could not say whether Ethan or the
+/// policy decided (MG-2029, a customer price change, was the policy).
+const POLICY_ACTOR_HEADER: &str = "x-amux-internal-policy-actor";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -72,7 +93,10 @@ pub fn public_routes() -> Router<AppState> {
 /// The middleware removes an inbound copy before doing its database lookup, so
 /// this cannot be asserted by a Tailscale/LAN client itself.
 pub(crate) fn is_verified_local_member(headers: &HeaderMap) -> bool {
-    headers.get(VERIFIED_MEMBER_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
+    headers
+        .get(VERIFIED_MEMBER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some("1")
 }
 
 /// Server-verified author for an invited human. The marker and value are both
@@ -87,6 +111,40 @@ pub(crate) fn local_member_actor(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// The automated policy that made this internal call, if one did.
+pub(crate) fn policy_actor(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(POLICY_ACTOR_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Headers for an internal call made BY an automated policy, never by a person.
+pub(crate) fn policy_headers(actor: &'static str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(POLICY_ACTOR_HEADER, axum::http::HeaderValue::from_static(actor));
+    headers
+}
+
+/// Stamp a verified member identity onto headers for an INTERNAL call made on
+/// that member's behalf (a Messages post delivered to a worker). Inbound copies
+/// of these headers are stripped by the middleware, so only server code can
+/// produce them.
+pub(crate) fn stamp_member_headers(headers: &mut HeaderMap, email: &str, scope: &MemberScope) {
+    use axum::http::HeaderValue;
+    let mut put = |k: &'static str, v: &str| {
+        if let Ok(v) = HeaderValue::from_str(v) {
+            headers.insert(k, v);
+        }
+    };
+    put(VERIFIED_MEMBER_HEADER, "1");
+    put(MEMBER_ACTOR_HEADER, &format!("member:{email}"));
+    put(MEMBER_SCOPE_LEVEL_HEADER, scope.level());
+    put(MEMBER_SCOPE_NAME_HEADER, scope.name());
+    put("x-amux-session", &format!("member:{email}"));
 }
 
 /// The resource boundary granted to a local/Tailscale member.
@@ -130,7 +188,7 @@ impl MemberScope {
     }
 }
 
-fn parse_member_scope(level: &str, name: &str) -> Option<MemberScope> {
+pub(crate) fn parse_member_scope(level: &str, name: &str) -> Option<MemberScope> {
     match level.trim().to_ascii_lowercase().as_str() {
         "global" if name.trim().is_empty() => Some(MemberScope::Global),
         "group" if !name.trim().is_empty() => {
@@ -181,23 +239,23 @@ pub(crate) fn scoped_worker_names(scope: &MemberScope) -> Vec<String> {
         MemberScope::Worker(worker) => vec![worker.clone()],
         MemberScope::Group(group) => {
             let blocked = super::groups::blocked_names(&super::groups::amux_home());
-            let mut workers: Vec<String> = std::fs::read_dir(
-                super::groups::amux_home().join("sessions"),
-            )
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let path = entry.path();
-                (path.extension().and_then(|ext| ext.to_str()) == Some("env"))
-                    .then(|| path.file_stem()?.to_str().map(str::to_string))
+            let mut workers: Vec<String> =
+                std::fs::read_dir(super::groups::amux_home().join("sessions"))
+                    .ok()
+                    .into_iter()
                     .flatten()
-            })
-            .filter(|worker| {
-                !blocked.contains(worker) && super::session_verbs::lane_groups(worker).contains(group)
-            })
-            .collect();
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        (path.extension().and_then(|ext| ext.to_str()) == Some("env"))
+                            .then(|| path.file_stem()?.to_str().map(str::to_string))
+                            .flatten()
+                    })
+                    .filter(|worker| {
+                        !blocked.contains(worker)
+                            && super::session_verbs::lane_groups(worker).contains(group)
+                    })
+                    .collect();
             workers.sort();
             workers.dedup();
             workers
@@ -247,16 +305,72 @@ pub(crate) fn authorize_local_member_request(
     let scope = local_member_scope(headers)?;
     let path = uri.path();
 
+    // A person's own second factor (mfa.rs): every handler acts on the caller
+    // alone, so any member, auditors and scoped members included, reaches it.
+    if path == "/api/mfa" || path.starts_with("/api/mfa/") {
+        return None;
+    }
+
+    // An auditor reads the record and nothing else, whatever their scope.
+    if local_member_is_auditor(headers) {
+        return (!auditor_may(method, path)).then(|| {
+            super::governance::counters::bump(&super::governance::counters::AUDITOR_REFUSED, 1);
+            tracing::warn!(path, method = %method, verdict = "auditor_refused", measured = true, n_considered = 1,
+                "an auditor asked for something outside the audit record");
+            err(StatusCode::FORBIDDEN, json!({
+                "error": "an auditor reads the audit record and changes nothing",
+                "code": "auditor_read_only",
+                "resource": path,
+            }))
+        });
+    }
+
     // Membership and invite administration is an owner capability, not a
     // consequence of seeing the whole workspace.
     if path == "/api/org" || path.starts_with("/api/org/") {
         return Some(forbidden(&scope, "organization administration"));
     }
+    // Moving a whole server (every card, contact and memory out, or rows in)
+    // is the host owner's alone, whatever the member's scope.
+    if path == "/api/move" || path.starts_with("/api/move/") {
+        return Some(forbidden(&scope, "server move (export/import)"));
+    }
     if scope.is_global() {
+        // Global members created before AMUX-5334 got host-level access by
+        // default. Say so once per process, where an operator will see it.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(verdict = "global_member_active",
+                "a Global-scope member is using this instance: Global includes every worker and /api/fs/* \
+                 on the host filesystem. Review members in Settings > Workspace access (AMUX-5334)");
+        }
         return None;
     }
 
     if path == "/api/identity" || path == "/api/events" {
+        return None;
+    }
+    // Realtime rooms (api/rt.rs) check every join against the file rules and
+    // this member's grant, and refuse a scoped member's ops (read-only), so
+    // the transport itself is admitted here. /api/debug/rt is not.
+    if path == "/api/rt" || path == "/api/rt/events" || path == "/api/rt/send" {
+        return None;
+    }
+    // Held external email (governance PR 6, email_scope.rs): the list and the
+    // two decisions are admitted, and each handler filters and refuses by this
+    // member's scope. Every other /api/email/ route stays refused below.
+    // AMUX_EMAIL_APPROVAL_SCOPE=off keeps the previous refusal.
+    if super::email_scope::mode() != super::worker_identity::Mode::Off {
+        let held = (path == "/api/email/approvals" && *method == Method::GET)
+            || ((path.starts_with("/api/email/approve/") || path.starts_with("/api/email/reject/"))
+                && *method == Method::POST);
+        if held {
+            return None;
+        }
+    }
+    // Messages (conversations.rs): every handler checks the conversation
+    // against this member's scope before reading or writing.
+    if path == "/api/conversations" || path.starts_with("/api/conversations/") {
         return None;
     }
     if path == "/api/sessions" {
@@ -290,6 +404,7 @@ pub(crate) fn authorize_local_member_request(
         "/api/board/statuses"
             | "/api/board/session-gates"
             | "/api/board/contract"
+            | "/api/board/orchestrations"
             | "/api/board/themes"
     ) && *method == Method::GET
     {
@@ -334,13 +449,82 @@ pub(crate) fn authorize_local_member_request(
             None => None,
         };
     }
-    if matches!(path, "/api/groups" | "/api/groups/" | "/api/tags" | "/api/tags/")
-        && *method == Method::GET
+    if matches!(
+        path,
+        "/api/groups" | "/api/groups/" | "/api/tags" | "/api/tags/"
+    ) && *method == Method::GET
     {
         return None;
     }
+    // Scope writes (the Chat toggle writes a worker's env): scope.rs checks the
+    // body against the member's grant (worker level, inside the grant only).
+    if path == "/api/scope" && *method == Method::PUT {
+        return None;
+    }
+    // READ access to files under the working directories of the workers the
+    // grant covers (AC-482): a group member ("Elliot sees everything in the
+    // wexus group", Ethan 2026-10-07) needs the group's documents, not only
+    // its workers and cards. GET only; uploads, renames and deletes stay
+    // denied below. The path is canonicalized, so ".." cannot climb out.
+    if *method == Method::GET {
+        if let Some(target) = member_file_target(path, uri) {
+            let allowed = scoped_worker_dirs(&scope);
+            let ok = canonical_or_lexical(&target)
+                .is_some_and(|t| allowed.iter().any(|d| t.starts_with(d)));
+            if ok {
+                return None;
+            }
+            tracing::warn!(path = %target.display(), scope_level = scope.level(), scope_name = scope.name(),
+                verdict = "member_file_outside_grant", "scoped member file read refused");
+            return Some(forbidden(&scope, "a file outside your workers' folders"));
+        }
+    }
 
     Some(forbidden(&scope, path))
+}
+
+/// The file a read route is about, for the scoped-member file rule.
+fn member_file_target(path: &str, uri: &Uri) -> Option<std::path::PathBuf> {
+    if let Some(rest) = path.strip_prefix("/api/file/raw-path/") {
+        let decoded = super::fs::parse_qs(&format!("p={}", rest.replace('+', "%2B")))
+            .into_iter().next().map(|(_, v)| v).unwrap_or_default();
+        return Some(std::path::PathBuf::from(format!("/{}", decoded.trim_start_matches('/'))));
+    }
+    let reads = ["/api/file", "/api/file/", "/api/file/raw", "/api/file/hls", "/api/file/xlsx", "/api/file/vtt", "/api/file/history",
+                 "/api/fs/read", "/api/fs/list"];
+    if !reads.contains(&path) {
+        return None;
+    }
+    let qs = super::fs::parse_qs(uri.query().unwrap_or(""));
+    qs.into_iter().find(|(k, _)| k == "path").map(|(_, v)| std::path::PathBuf::from(v))
+}
+
+fn canonical_or_lexical(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !p.is_absolute() {
+        return None;
+    }
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return Some(c);
+    }
+    // A path that does not exist yet: resolve lexically, refusing any "..".
+    if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
+    }
+    Some(p.to_path_buf())
+}
+
+/// Working directories (CC_DIR) of the workers a scope covers, canonicalized.
+pub(crate) fn scoped_worker_dirs(scope: &MemberScope) -> Vec<std::path::PathBuf> {
+    let sessions = super::groups::amux_home().join("sessions");
+    scoped_worker_names(scope)
+        .into_iter()
+        .filter_map(|w| {
+            let env = std::fs::read_to_string(sessions.join(format!("{w}.env"))).ok()?;
+            let dir = env.lines().find_map(|l| l.strip_prefix("CC_DIR="))?;
+            let dir = dir.trim().trim_matches('"').trim_matches('\'');
+            (!dir.is_empty() && dir != "/").then(|| canonical_or_lexical(std::path::Path::new(dir)))?
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -350,15 +534,82 @@ struct MemberIdentity {
     scope: MemberScope,
     team_id: String,
     team_name: String,
+    admin: bool,
+    auditor: bool,
+    session: super::mfa::SessionFacts,
+}
+
+#[cfg(test)]
+pub(crate) fn test_member_headers(email: &str, admin: bool) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    h.insert(VERIFIED_MEMBER_HEADER, HeaderValue::from_static("1"));
+    h.insert(MEMBER_ACTOR_HEADER, HeaderValue::from_str(&format!("member:{email}")).unwrap());
+    if admin {
+        h.insert(MEMBER_ADMIN_HEADER, HeaderValue::from_static("1"));
+    }
+    h
+}
+
+/// A verified member the host owner made an admin. An admin can do what only the
+/// owner could (managing vault secrets), and keeps their own name in every log.
+pub(crate) fn local_member_is_auditor(headers: &HeaderMap) -> bool {
+    is_verified_local_member(headers)
+        && headers.get(MEMBER_AUDITOR_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
+}
+
+/// What an auditor may reach: reads of the record, never a write.
+pub(crate) fn auditor_may(method: &Method, path: &str) -> bool {
+    if *method != Method::GET && *method != Method::HEAD {
+        return false;
+    }
+    path == "/api/identity"
+        || path == "/api/ledger"
+        || path.starts_with("/api/ledger/")
+        || path.starts_with("/api/trace/")
+        || path == "/api/approvals/cards"
+        || path == "/api/security/at-rest"
+        || path == "/api/audit"
+        || path.starts_with("/api/audit/")
+        || path == "/api/contract/counters"
+        // The compliance views (governance PR 21) are reads of the same record.
+        || path.starts_with("/api/compliance/")
+}
+
+/// Whether this member's session has proved a second factor (mfa.rs).
+pub(crate) fn local_member_session_mfa(headers: &HeaderMap) -> bool {
+    is_verified_local_member(headers)
+        && headers.get(MEMBER_SESSION_MFA_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
+}
+
+/// The session token a verified member's cookie carries, so a handler can mark
+/// that session (mfa.rs). `None` for a tailnet sign-in, which has no cookie.
+pub(crate) fn local_member_session_token(headers: &HeaderMap) -> Option<String> {
+    if !is_verified_local_member(headers) {
+        return None;
+    }
+    member_cookie(headers).map(str::to_string)
+}
+
+/// The cookie that signs a member in, for a session minted elsewhere (sso.rs).
+pub(crate) fn member_cookie_header(token: &str, max_age_secs: i64) -> String {
+    format!("{MEMBER_COOKIE}={token}; Path=/; Max-Age={max_age_secs}; HttpOnly; Secure; SameSite=Lax")
+}
+
+pub(crate) fn local_member_is_admin(headers: &HeaderMap) -> bool {
+    is_verified_local_member(headers)
+        && headers.get(MEMBER_ADMIN_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
 }
 
 fn member_cookie(headers: &HeaderMap) -> Option<&str> {
-    headers.get(header::COOKIE).and_then(|v| v.to_str().ok()).and_then(|cookies| {
-        cookies.split(';').find_map(|part| {
-            let (name, value) = part.trim().split_once('=')?;
-            (name == MEMBER_COOKIE && !value.is_empty()).then_some(value)
+    headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                (name == MEMBER_COOKIE && !value.is_empty()).then_some(value)
+            })
         })
-    })
 }
 
 /// A cookie with this name remains significant even after its backing member
@@ -387,10 +638,23 @@ pub async fn local_member_identity(
     req.headers_mut().remove(MEMBER_ACTOR_HEADER);
     req.headers_mut().remove(MEMBER_TEAM_ID_HEADER);
     req.headers_mut().remove(MEMBER_TEAM_NAME_B64_HEADER);
+    req.headers_mut().remove(MEMBER_ADMIN_HEADER);
+    req.headers_mut().remove(MEMBER_AUDITOR_HEADER);
+    req.headers_mut().remove(MEMBER_SESSION_MFA_HEADER);
+    req.headers_mut().remove(POLICY_ACTOR_HEADER);
+    req.headers_mut().remove(super::human_proof::OWNER_PROOF_HEADER);
+    // A published app's credential (governance PR 5): resolved here, before
+    // the request logger and auth, so both see `app:<id>` as the caller and
+    // no handler ever sees the token.
+    super::app_identity::resolve(req.headers_mut());
     req.headers_mut().remove("x-amux-user-id");
     req.headers_mut().remove("x-amux-user-email");
-    let Some(token) = member_cookie(req.headers()).map(str::to_string) else {
-        return next.run(req).await;
+    let token = match member_cookie(req.headers()).map(str::to_string) {
+        Some(token) => token,
+        None => match tailnet_member_token(&state, tailnet_request_facts(&req)).await {
+            Some(token) => token,
+            None => return next.run(req).await,
+        },
     };
     let store = state.store.clone();
     let identity = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemberIdentity>> {
@@ -401,15 +665,24 @@ pub async fn local_member_identity(
                          WHEN COALESCE(m.team_id,'')='' THEN m.scope_level ELSE 'worker' END, \
                     CASE WHEN t.id IS NOT NULL THEN t.scope_name \
                          WHEN COALESCE(m.team_id,'')='' THEN m.scope_name ELSE '__invalid_team_scope__' END, \
-                    COALESCE(t.id,''), COALESCE(t.name,'') \
+                    COALESCE(t.id,''), COALESCE(t.name,''), COALESCE(m.role,'member'), \
+                    COALESCE(i.via,'invite'), i.mfa_at IS NOT NULL, \
+                    EXISTS(SELECT 1 FROM mfa_factors f WHERE f.subject='member:'||m.email AND f.confirmed_at IS NOT NULL) \
              FROM org_invites i JOIN org_members m ON m.id=i.used_by \
              LEFT JOIN org_teams t ON t.id=m.team_id \
-             WHERE i.token=?1 AND i.used_at IS NOT NULL",
-            [&token],
+             WHERE i.token=?1 AND i.used_at IS NOT NULL \
+               AND (COALESCE(i.via,'invite')<>'sso' OR i.expires_at > ?2)",
+            rusqlite::params![&token, chrono::Utc::now().timestamp()],
             |row| {
                 let level: String = row.get(2)?;
                 let name: String = row.get(3)?;
+                let role: String = row.get(6)?;
+                // An admin with a narrowed scope is a contradiction: a group's
+                // member must not reach the whole server's secrets.
+                let admin = role == "admin" && level == "global";
                 Ok(MemberIdentity {
+                    admin,
+                    auditor: role == "auditor",
                     id: row.get(0)?,
                     email: row.get(1)?,
                     // Corrupt rows fail closed. Defaulting here to Global
@@ -419,6 +692,11 @@ pub async fn local_member_identity(
                         .unwrap_or(MemberScope::Worker("__invalid_member_scope__".into())),
                     team_id: row.get(4)?,
                     team_name: row.get(5)?,
+                    session: super::mfa::SessionFacts {
+                        via_sso: row.get::<_, String>(7)? == "sso",
+                        mfa_ok: row.get(8)?,
+                        enrolled: row.get(9)?,
+                    },
                 })
             },
         ).optional()?)
@@ -443,7 +721,23 @@ pub async fn local_member_identity(
         tracing::warn!(target: "amux::local_invite", verdict = "member_header_rejected", field = "email", member_id = %member.id, "stored local member identity is not a valid HTTP header");
         return next.run(req).await;
     };
-    req.headers_mut().insert(VERIFIED_MEMBER_HEADER, HeaderValue::from_static("1"));
+    // SSO required, or a second factor owed (governance PR 20, mfa.rs).
+    if let Some(refused) = super::mfa::member_gate(req.method(), req.uri().path(), member.session) {
+        tracing::info!(target: "amux::local_invite", verdict = "member_session_step_owed", member_id = %member.id,
+            path = %req.uri().path(), "a member session owes a sign-in step");
+        return refused;
+    }
+    req.headers_mut()
+        .insert(VERIFIED_MEMBER_HEADER, HeaderValue::from_static("1"));
+    if member.session.mfa_ok {
+        req.headers_mut().insert(MEMBER_SESSION_MFA_HEADER, HeaderValue::from_static("1"));
+    }
+    if member.admin {
+        req.headers_mut().insert(MEMBER_ADMIN_HEADER, HeaderValue::from_static("1"));
+    }
+    if member.auditor {
+        req.headers_mut().insert(MEMBER_AUDITOR_HEADER, HeaderValue::from_static("1"));
+    }
     req.headers_mut().insert(
         MEMBER_SCOPE_LEVEL_HEADER,
         HeaderValue::from_static(member.scope.level()),
@@ -453,7 +747,8 @@ pub async fn local_member_identity(
             tracing::warn!(target: "amux::local_invite", verdict = "member_header_rejected", field = "scope_name", member_id = %member.id, "stored local member scope is not a valid HTTP header");
             return next.run(req).await;
         };
-        req.headers_mut().insert(MEMBER_SCOPE_NAME_HEADER, scope_name);
+        req.headers_mut()
+            .insert(MEMBER_SCOPE_NAME_HEADER, scope_name);
     }
     req.headers_mut().insert("x-amux-user-id", id);
     req.headers_mut().insert("x-amux-user-email", email);
@@ -466,17 +761,140 @@ pub async fn local_member_identity(
             return next.run(req).await;
         };
         req.headers_mut().insert(MEMBER_TEAM_ID_HEADER, team_id);
-        req.headers_mut().insert(MEMBER_TEAM_NAME_B64_HEADER, team_name);
+        req.headers_mut()
+            .insert(MEMBER_TEAM_NAME_B64_HEADER, team_name);
     }
     if let Ok(actor) = HeaderValue::from_str(&format!("member:{}", member.email)) {
         req.headers_mut().insert(MEMBER_ACTOR_HEADER, actor);
     }
-    if !req.headers().contains_key("x-amux-worker") && !req.headers().contains_key("x-amux-session") {
+    if !req.headers().contains_key("x-amux-worker") && !req.headers().contains_key("x-amux-session")
+    {
         if let Ok(actor) = HeaderValue::from_str(&format!("member:{}", member.email)) {
             req.headers_mut().insert("x-amux-session", actor);
         }
     }
     next.run(req).await
+}
+
+// ---- tailnet sign-in (AC-439, MP-1) ---------------------------------------
+//
+// A person on the tailnet whose Tailscale login matches an accepted member
+// signs in as that member with no cookie. Off unless
+// AMUX_TAILNET_MEMBER_AUTH=1. The login comes from the local tailscaled
+// (`whois` on the socket peer), never from a header. No cookie is minted:
+// the answer is cached per address for TAILNET_LOGIN_TTL, so removing a
+// person from the tailnet revokes them within that window even where the
+// server is reachable another way. Deleting the member revokes at once,
+// because the token is looked up on every request.
+
+const TAILNET_LOGIN_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+type LoginCache = std::collections::HashMap<std::net::IpAddr, (std::time::Instant, Option<String>)>;
+
+fn login_cache() -> &'static Mutex<LoginCache> {
+    static CACHE: std::sync::OnceLock<Mutex<LoginCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(LoginCache::new()))
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    /// Test seam: (peer, login) as tailscaled would report them.
+    pub(crate) static TEST_TAILNET_LOGIN: (std::net::IpAddr, String);
+}
+
+/// `Some((peer, login, fresh))` when the request is a tailnet request and the
+/// lookup completed; `fresh` is false for a cache hit.
+/// What the tailnet sign-in needs from a request, read before any await so
+/// the middleware future does not hold the (non-Sync) request across one.
+struct TailnetFacts {
+    owner_credential: bool,
+    peer: Option<std::net::IpAddr>,
+}
+
+fn tailnet_request_facts(req: &Request) -> TailnetFacts {
+    let owner_query = req
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|kv| kv.starts_with("_token=")));
+    TailnetFacts {
+        owner_credential: req.headers().contains_key(header::AUTHORIZATION) || owner_query,
+        peer: req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|info| info.0.ip()),
+    }
+}
+
+async fn tailnet_login(facts: &TailnetFacts) -> Option<(std::net::IpAddr, Option<String>, bool)> {
+    #[cfg(test)]
+    if let Ok((peer, login)) = TEST_TAILNET_LOGIN.try_with(|v| v.clone()) {
+        return Some((peer, Some(login), true));
+    }
+    if !std::env::var("AMUX_TAILNET_MEMBER_AUTH").is_ok_and(|v| v == "1") {
+        return None;
+    }
+    let peer = facts.peer?;
+    if !super::static_files::tailnet_auth::tailnet_ip(peer) {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    let cached = login_cache().lock().ok()?.get(&peer).cloned();
+    if let Some((at, login)) = cached {
+        if now.duration_since(at) < TAILNET_LOGIN_TTL {
+            return Some((peer, login, false));
+        }
+    }
+    match super::static_files::tailnet_auth::peer_login(peer).await {
+        Ok(login) => {
+            if let Ok(mut cache) = login_cache().lock() {
+                cache.retain(|_, (at, _)| now.duration_since(*at) < TAILNET_LOGIN_TTL);
+                cache.insert(peer, (now, login.clone()));
+            }
+            Some((peer, login, true))
+        }
+        Err(reason) => {
+            tracing::warn!(target: "amux::local_invite", verdict = "tailnet_member_auth", outcome = "whois_failed", measured = false, %peer, %reason, "tailnet member sign-in could not ask tailscaled; ordinary sign-in still works");
+            None
+        }
+    }
+}
+
+/// The invite token of the accepted member whose email is this request's
+/// tailnet login. Owner credentials always stay the owner.
+async fn tailnet_member_token(state: &AppState, facts: TailnetFacts) -> Option<String> {
+    if facts.owner_credential {
+        return None;
+    }
+    let (peer, login, fresh) = tailnet_login(&facts).await?;
+    let Some(login) = login else {
+        if fresh {
+            tracing::info!(target: "amux::local_invite", verdict = "tailnet_member_auth", outcome = "no_person", measured = true, %peer, "tailnet device is tagged, expired or the server owner's; not a member sign-in");
+        }
+        return None;
+    };
+    let store = state.store.clone();
+    let email = login.clone();
+    let token = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let conn = store.read()?;
+        Ok(conn
+            .query_row(
+                "SELECT i.token FROM org_members m JOIN org_invites i ON i.used_by=m.id \
+                 WHERE lower(m.email)=?1 AND i.used_at IS NOT NULL \
+                 ORDER BY i.used_at DESC LIMIT 1",
+                [&email],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .flatten();
+    if fresh {
+        let outcome = if token.is_some() { "matched" } else { "unmatched" };
+        tracing::info!(target: "amux::local_invite", verdict = "tailnet_member_auth", outcome, measured = true, %peer, login = %login, "tailnet login checked against accepted members");
+    }
+    token
 }
 
 // ---- shared helpers -------------------------------------------------------
@@ -499,7 +917,7 @@ fn ev(entity: &str, id: &str, mutation: MutationKind) -> PendingEvent {
 /// `secrets.token_urlsafe(n)`: n CSPRNG bytes, base64url, no padding.
 fn token_urlsafe(nbytes: usize) -> String {
     let mut bytes = vec![0u8; nbytes];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("OS random source");
     base64url_nopad(&bytes)
 }
 
@@ -545,7 +963,9 @@ fn base_url(headers: &HeaderMap, uri: &Uri) -> String {
 /// Python `_get_org()`: SELECT-or-INSERT the singleton row. Returns whether
 /// the row was created (so the write's applied/events stay honest).
 fn ensure_org(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
-    let n: i64 = conn.query_row("SELECT COUNT(*) FROM org WHERE id='default'", [], |r| r.get(0))?;
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM org WHERE id='default'", [], |r| {
+        r.get(0)
+    })?;
     if n == 0 {
         conn.execute(
             "INSERT INTO org (id, name, created_at) VALUES ('default','My Workspace',?1)",
@@ -557,8 +977,12 @@ fn ensure_org(conn: &rusqlite::Connection) -> rusqlite::Result<bool> {
 }
 
 fn html_escape(value: &str) -> String {
-    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-        .replace('"', "&quot;").replace('\'', "&#39;")
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn valid_email(email: &str) -> bool {
@@ -566,29 +990,65 @@ fn valid_email(email: &str) -> bool {
         && !email.is_empty()
         && !email.chars().any(char::is_whitespace)
         && email.matches('@').count() == 1
-        && email.split_once('@').is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
+        && email
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
+}
+
+/// Global membership is host-level access, not "sees every card": a Global
+/// member passes the per-route guard (`authorize_local_member_request`), so
+/// they can drive every worker (which run with this machine's permissions)
+/// and use /api/fs/* on the whole host filesystem. So it is granted only on
+/// an explicit acknowledgment, never as a default.
+///
+/// Private security report to info@, 2026-09-19 (AMUX-5334): an invite with no
+/// scope silently became Global, and the dashboard preselected the Global
+/// "Everyone" team, so the ordinary invite flow handed a collaborator
+/// read/write/delete over the owner's filesystem.
+pub(crate) const HOST_ACCESS_ACK: &str = "grant_host_access";
+
+fn host_access_refusal(what: &str) -> Value {
+    json!({
+        "error": format!("{what} is Global scope, which grants host-level access; confirm it explicitly"),
+        "code": "global_scope_requires_host_access_ack",
+        "grants": "every worker (sending prompts, which run with this machine's permissions) and /api/fs/* on the whole host filesystem",
+        "how": format!("send \"{HOST_ACCESS_ACK}\": true to grant it, or choose a worker or group scope"),
+    })
+}
+
+fn host_access_acknowledged(body: &Value) -> bool {
+    body.get(HOST_ACCESS_ACK).and_then(Value::as_bool) == Some(true)
 }
 
 fn requested_scope(body: &Value) -> Result<MemberScope, Value> {
-    let level = body
-        .get("scope_level")
-        .and_then(Value::as_str)
-        .unwrap_or("global");
+    let Some(level) = body.get("scope_level").and_then(Value::as_str) else {
+        return Err(json!({
+            "error": "scope_level is required",
+            "valid_levels": ["worker", "group", "global"],
+            "why": "an access grant is never inferred: a missing scope used to default to global (host-level access)",
+        }));
+    };
     let name = body.get("scope_name").and_then(Value::as_str).unwrap_or("");
     let Some(scope) = parse_member_scope(level, name) else {
         return Err(json!({
-                "error": "invalid member scope",
-                "scope_level": level,
-                "scope_name": name,
-                "valid_levels": ["global", "group", "worker"],
-                "why": "group and worker scopes require a target; global must not carry one",
-            }));
+            "error": "invalid member scope",
+            "scope_level": level,
+            "scope_name": name,
+            "valid_levels": ["global", "group", "worker"],
+            "why": "group and worker scopes require a target; global must not carry one",
+        }));
     };
-    if matches!(scope, MemberScope::Worker(ref worker) if !super::session_verbs::valid_session_name(worker)) {
+    if scope.is_global() && !host_access_acknowledged(body) {
+        return Err(host_access_refusal("this grant"));
+    }
+    if matches!(scope, MemberScope::Worker(ref worker) if !super::session_verbs::valid_session_name(worker))
+    {
         return Err(json!({"error": "worker scope target is not a valid worker name"}));
     }
     if HeaderValue::from_str(scope.name()).is_err() || scope.name().len() > 128 {
-        return Err(json!({"error": "scope target must be a short HTTP-safe worker or group name"}));
+        return Err(
+            json!({"error": "scope target must be a short HTTP-safe worker or group name"}),
+        );
     }
     Ok(scope)
 }
@@ -597,15 +1057,10 @@ fn requested_scope(body: &Value) -> Result<MemberScope, Value> {
 /// Worker APIs accept either the registry id or display name, but every other
 /// access check operates on the display/session name; canonicalizing here
 /// keeps an id-shaped invite from becoming a valid grant that can see nothing.
-fn resolve_scope_target(
-    conn: &rusqlite::Connection,
-    scope: &MemberScope,
-) -> Option<MemberScope> {
+fn resolve_scope_target(conn: &rusqlite::Connection, scope: &MemberScope) -> Option<MemberScope> {
     match scope {
         MemberScope::Global => Some(MemberScope::Global),
-        MemberScope::Worker(worker) => {
-            resolved_worker_name(conn, worker).map(MemberScope::Worker)
-        }
+        MemberScope::Worker(worker) => resolved_worker_name(conn, worker).map(MemberScope::Worker),
         MemberScope::Group(group) => {
             let configured = conn
                 .query_row(
@@ -622,7 +1077,11 @@ fn resolve_scope_target(
                     .flatten()
                     .filter_map(Result::ok)
                     .filter_map(|entry| {
-                        entry.path().file_stem().and_then(|s| s.to_str()).map(str::to_string)
+                        entry
+                            .path()
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_string)
                     })
                     .any(|worker| super::session_verbs::lane_groups(&worker).contains(group)))
             .then(|| MemberScope::Group(group.clone()))
@@ -638,10 +1097,7 @@ struct TeamAssignment {
     exists: bool,
 }
 
-fn team_by_id(
-    conn: &rusqlite::Connection,
-    id: &str,
-) -> rusqlite::Result<Option<TeamAssignment>> {
+fn team_by_id(conn: &rusqlite::Connection, id: &str) -> rusqlite::Result<Option<TeamAssignment>> {
     conn.query_row(
         "SELECT id,name,scope_level,scope_name FROM org_teams WHERE id=?1",
         [id],
@@ -668,9 +1124,13 @@ fn assignment_from_body(
         if id.is_empty() {
             return Err(json!({"error":"team_id must not be empty"}));
         }
-        return team_by_id(conn, id)
+        let team = team_by_id(conn, id)
             .map_err(|e| json!({"error":e.to_string()}))?
-            .ok_or_else(|| json!({"error":"team not found","team_id":id}));
+            .ok_or_else(|| json!({"error":"team not found","team_id":id}))?;
+        if team.scope.is_global() && !host_access_acknowledged(body) {
+            return Err(host_access_refusal(&format!("team \"{}\"", team.name)));
+        }
+        return Ok(team);
     }
 
     // Compatibility for pre-team API callers: resolve their direct scope and
@@ -694,7 +1154,12 @@ fn assignment_from_body(
         .optional()
         .map_err(|e| json!({"error":e.to_string()}))?;
     if let Some((id, name)) = existing {
-        return Ok(TeamAssignment { id, name, scope, exists: true });
+        return Ok(TeamAssignment {
+            id,
+            name,
+            scope,
+            exists: true,
+        });
     }
     let suffix = ulid::Ulid::new().to_string().to_lowercase();
     let label = match &scope {
@@ -710,10 +1175,7 @@ fn assignment_from_body(
     })
 }
 
-fn ensure_assignment(
-    conn: &rusqlite::Connection,
-    team: &TeamAssignment,
-) -> rusqlite::Result<()> {
+fn ensure_assignment(conn: &rusqlite::Connection, team: &TeamAssignment) -> rusqlite::Result<()> {
     if !team.exists {
         conn.execute(
             "INSERT INTO org_teams (id,name,scope_level,scope_name,created_at) VALUES (?1,?2,?3,?4,?5)",
@@ -742,10 +1204,23 @@ struct InviteView {
     team_name: String,
 }
 
-type InviteRow = (Option<String>, i64, Option<i64>, String, String, String, String);
+type InviteRow = (
+    Option<String>,
+    i64,
+    Option<i64>,
+    String,
+    String,
+    String,
+    String,
+);
 
 #[derive(Debug)]
-enum InviteLookup { Live(InviteView), Missing, Used, Expired }
+enum InviteLookup {
+    Live(InviteView),
+    Missing,
+    Used,
+    Expired,
+}
 
 fn lookup_invite(conn: &rusqlite::Connection, token: &str) -> rusqlite::Result<InviteLookup> {
     let row: Option<InviteRow> = conn.query_row(
@@ -758,14 +1233,30 @@ fn lookup_invite(conn: &rusqlite::Connection, token: &str) -> rusqlite::Result<I
          FROM org_invites i LEFT JOIN org_teams t ON t.id=i.team_id WHERE i.token=?1", [token],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
     ).optional()?;
-    let Some((email, expires_at, used_at, scope_level, scope_name, _team_id, team_name)) = row else { return Ok(InviteLookup::Missing) };
-    if used_at.is_some() { return Ok(InviteLookup::Used); }
-    if expires_at <= chrono::Utc::now().timestamp() { return Ok(InviteLookup::Expired); }
-    let workspace = conn.query_row("SELECT name FROM org WHERE id='default'", [], |row| row.get(0))
-        .optional()?.unwrap_or_else(|| "My Workspace".to_string());
+    let Some((email, expires_at, used_at, scope_level, scope_name, _team_id, team_name)) = row
+    else {
+        return Ok(InviteLookup::Missing);
+    };
+    if used_at.is_some() {
+        return Ok(InviteLookup::Used);
+    }
+    if expires_at <= chrono::Utc::now().timestamp() {
+        return Ok(InviteLookup::Expired);
+    }
+    let workspace = conn
+        .query_row("SELECT name FROM org WHERE id='default'", [], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .unwrap_or_else(|| "My Workspace".to_string());
     let scope = parse_member_scope(&scope_level, &scope_name)
         .unwrap_or(MemberScope::Worker("__invalid_member_scope__".into()));
-    Ok(InviteLookup::Live(InviteView { workspace, email, scope, team_name }))
+    Ok(InviteLookup::Live(InviteView {
+        workspace,
+        email,
+        scope,
+        team_name,
+    }))
 }
 
 fn invite_error(status: StatusCode, title: &str, detail: &str) -> Response {
@@ -773,7 +1264,12 @@ fn invite_error(status: StatusCode, title: &str, detail: &str) -> Response {
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{}</style></head><body><main><div class=\"mark\">A</div><h1>{}</h1><p>{}</p></main></body></html>",
         html_escape(title), INVITE_CSS, html_escape(title), html_escape(detail),
     );
-    (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+    (
+        status,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }
 
 const INVITE_CSS: &str = r#"
@@ -797,11 +1293,16 @@ async fn invite_page(State(state): State<AppState>, Path(token): Path<String>) -
     let found = tokio::task::spawn_blocking(move || -> anyhow::Result<InviteLookup> {
         let conn = store.read()?;
         Ok(lookup_invite(&conn, &token_read)?)
-    }).await;
+    })
+    .await;
     match found {
         Ok(Ok(InviteLookup::Live(invite))) => {
             let email = invite.email.as_deref().unwrap_or("");
-            let readonly = if invite.email.is_some() { " readonly" } else { "" };
+            let readonly = if invite.email.is_some() {
+                " readonly"
+            } else {
+                ""
+            };
             let access = if invite.scope.is_global() {
                 "the whole workspace".to_string()
             } else {
@@ -811,19 +1312,36 @@ async fn invite_page(State(state): State<AppState>, Path(token): Path<String>) -
                 "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Join {workspace}</title><style>{css}</style></head><body><main><div class=\"mark\">A</div><h1>Join {workspace}</h1><p>You were invited to the <strong>{team}</strong> team with access to <strong>{access}</strong>.</p><form method=\"post\"><label for=\"email\">Email</label><input id=\"email\" name=\"email\" type=\"email\" maxlength=\"254\" required autocomplete=\"email\" value=\"{email}\"{readonly}><label for=\"name\">Name</label><input id=\"name\" name=\"name\" maxlength=\"80\" autocomplete=\"name\" placeholder=\"How teammates will see you\"><button type=\"submit\">Join workspace</button></form><div class=\"note\">This signs this browser into this local Amux instance. Access follows the team’s scope.</div></main></body></html>",
                 workspace = html_escape(&invite.workspace), css = INVITE_CSS, email = html_escape(email), access = html_escape(&access), team = html_escape(if invite.team_name.is_empty() { "Legacy access" } else { &invite.team_name }),
             );
-            (StatusCode::OK, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                body,
+            )
+                .into_response()
         }
         Ok(Ok(InviteLookup::Missing)) => {
             tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "missing", invite = %invite_fingerprint(&token), "local invite rejected");
-            invite_error(StatusCode::GONE, "Invite not found", "Ask the workspace owner for a new link.")
+            invite_error(
+                StatusCode::GONE,
+                "Invite not found",
+                "Ask the workspace owner for a new link.",
+            )
         }
         Ok(Ok(InviteLookup::Used)) => {
             tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "used", invite = %invite_fingerprint(&token), "local invite rejected");
-            invite_error(StatusCode::GONE, "Invite already used", "Ask the workspace owner for a new link.")
+            invite_error(
+                StatusCode::GONE,
+                "Invite already used",
+                "Ask the workspace owner for a new link.",
+            )
         }
         Ok(Ok(InviteLookup::Expired)) => {
             tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "expired", invite = %invite_fingerprint(&token), "local invite rejected");
-            invite_error(StatusCode::GONE, "Invite expired", "Ask the workspace owner for a new link.")
+            invite_error(
+                StatusCode::GONE,
+                "Invite expired",
+                "Ask the workspace owner for a new link.",
+            )
         }
         Ok(Err(e)) => {
             tracing::warn!(target: "amux::local_invite", verdict = "landing_failed", error = %e, "local invite landing failed");
@@ -838,23 +1356,35 @@ async fn invite_page(State(state): State<AppState>, Path(token): Path<String>) -
 
 #[derive(Debug, Deserialize)]
 struct InviteAcceptForm {
-    #[serde(default)] email: String,
-    #[serde(default)] name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Debug)]
 enum AcceptOutcome {
-    Accepted { member_id: String, email: String }, Missing, Used, Expired, EmailMismatch,
+    Accepted { member_id: String, email: String },
+    Missing,
+    Used,
+    Expired,
+    EmailMismatch,
 }
 
 async fn accept_invite(
-    State(state): State<AppState>, Path(token): Path<String>, Form(form): Form<InviteAcceptForm>,
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    Form(form): Form<InviteAcceptForm>,
 ) -> Response {
     let email = form.email.trim().to_lowercase();
     let name: String = form.name.trim().chars().take(80).collect();
     if !valid_email(&email) {
         tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "invalid_email", invite = %invite_fingerprint(&token), "local invite rejected");
-        return invite_error(StatusCode::BAD_REQUEST, "Valid email required", "Enter the email address you want teammates to see.");
+        return invite_error(
+            StatusCode::BAD_REQUEST,
+            "Valid email required",
+            "Enter the email address you want teammates to see.",
+        );
     }
     let member_id_candidate = ulid::Ulid::new().to_string().to_lowercase();
     let token_w = token.clone();
@@ -934,15 +1464,41 @@ async fn accept_invite(
     match verdict {
         Some(AcceptOutcome::Accepted { member_id, email }) => {
             tracing::info!(target: "amux::local_invite", verdict = "accepted", member_id = %member_id, email = %email, "local invite accepted");
-            let cookie = format!("{MEMBER_COOKIE}={token}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax");
-            (StatusCode::SEE_OTHER, [(header::LOCATION, "/"), (header::SET_COOKIE, cookie.as_str())], "").into_response()
+            let cookie = format!(
+                "{MEMBER_COOKIE}={token}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax"
+            );
+            (
+                StatusCode::SEE_OTHER,
+                [
+                    (header::LOCATION, "/"),
+                    (header::SET_COOKIE, cookie.as_str()),
+                ],
+                "",
+            )
+                .into_response()
         }
-        Some(AcceptOutcome::Missing) => invite_error(StatusCode::GONE, "Invite not found", "Ask the workspace owner for a new link."),
-        Some(AcceptOutcome::Used) => invite_error(StatusCode::GONE, "Invite already used", "Ask the workspace owner for a new link."),
-        Some(AcceptOutcome::Expired) => invite_error(StatusCode::GONE, "Invite expired", "Ask the workspace owner for a new link."),
+        Some(AcceptOutcome::Missing) => invite_error(
+            StatusCode::GONE,
+            "Invite not found",
+            "Ask the workspace owner for a new link.",
+        ),
+        Some(AcceptOutcome::Used) => invite_error(
+            StatusCode::GONE,
+            "Invite already used",
+            "Ask the workspace owner for a new link.",
+        ),
+        Some(AcceptOutcome::Expired) => invite_error(
+            StatusCode::GONE,
+            "Invite expired",
+            "Ask the workspace owner for a new link.",
+        ),
         Some(AcceptOutcome::EmailMismatch) => {
             tracing::warn!(target: "amux::local_invite", verdict = "rejected", reason = "email_mismatch", invite = %invite_fingerprint(&token), "local invite rejected");
-            invite_error(StatusCode::FORBIDDEN, "Different email required", "This invitation is tied to another email address.")
+            invite_error(
+                StatusCode::FORBIDDEN,
+                "Different email required",
+                "This invitation is tied to another email address.",
+            )
         }
         None => internal("invite acceptance completed without a verdict"),
     }
@@ -971,14 +1527,24 @@ pub async fn get_org(State(state): State<AppState>) -> Response {
             org["member_count"] = json!(members);
             org["invite_count"] = json!(invites);
             *slot_w.lock().expect("slot") = Some(org);
-            let events =
-                if created { vec![ev("org", "default", MutationKind::Created)] } else { vec![] };
-            Ok(WriteOutcome { applied: created, events })
+            let events = if created {
+                vec![ev("org", "default", MutationKind::Created)]
+            } else {
+                vec![]
+            };
+            Ok(WriteOutcome {
+                applied: created,
+                events,
+            })
         })
         .await;
     match write {
         Ok(_) => {
-            let org = slot.lock().expect("slot").take().unwrap_or_else(|| json!({}));
+            let org = slot
+                .lock()
+                .expect("slot")
+                .take()
+                .unwrap_or_else(|| json!({}));
             Json(org).into_response()
         }
         Err(e) => internal(e),
@@ -1049,6 +1615,34 @@ pub async fn patch_member(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
+    // {"role": "admin" | "member" | "auditor"}: the host owner makes a member an
+    // admin or an auditor (read-only, governance PR 19) or takes it back. Org routes refuse members (authorize_local_member_request),
+    // so only the owner reaches this.
+    if let Some(role) = body.get("role") {
+        let Some(role) = role.as_str().filter(|r| matches!(*r, "admin" | "member" | "auditor")).map(str::to_string) else {
+            return err(StatusCode::BAD_REQUEST, json!({"error": "role is \"admin\", \"member\" or \"auditor\""}));
+        };
+        let (id_w, role_w) = (id.clone(), role.clone());
+        let write = state
+            .store
+            .write_async(move |conn| {
+                let n = conn.execute("UPDATE org_members SET role=?1 WHERE id=?2", rusqlite::params![role_w, id_w])?;
+                Ok(WriteOutcome {
+                    applied: n > 0,
+                    events: (n > 0).then(|| ev("org_member", &id_w, MutationKind::Updated)).into_iter().collect(),
+                })
+            })
+            .await;
+        return match write {
+            Ok(outcome) if outcome.applied => {
+                tracing::warn!(member = %id, role = %role, measured = true, n_considered = 1,
+                    verdict = "org_member_role_set", "a member's role changed (admin manages the vault)");
+                Json(json!({"ok": true, "id": id, "role": role})).into_response()
+            }
+            Ok(_) => err(StatusCode::NOT_FOUND, json!({"error": "member not found"})),
+            Err(e) => internal(e),
+        };
+    }
     let conn = match state.store.read() {
         Ok(conn) => conn,
         Err(e) => return internal(e),
@@ -1069,7 +1663,10 @@ pub async fn patch_member(
                 |row| row.get(0),
             )?;
             if !exists {
-                return Ok(WriteOutcome { applied: false, events: vec![] });
+                return Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                });
             }
             ensure_assignment(conn, &team_w)?;
             let n = conn.execute(
@@ -1113,7 +1710,10 @@ pub async fn delete_member(State(state): State<AppState>, Path(id): Path<String>
             } else {
                 vec![]
             };
-            Ok(WriteOutcome { applied: n > 0, events })
+            Ok(WriteOutcome {
+                applied: n > 0,
+                events,
+            })
         })
         .await;
     match write {
@@ -1175,10 +1775,7 @@ fn team_definition(
     Ok((name, scope))
 }
 
-pub async fn create_team(
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Response {
+pub async fn create_team(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
     let conn = match state.store.read() {
         Ok(conn) => conn,
         Err(e) => return internal(e),
@@ -1210,13 +1807,23 @@ pub async fn create_team(
         Ok(_) => {
             tracing::info!(target:"amux::local_invite", verdict="team_created", team_id=%id,
                 scope_level=scope.level(), scope_name=scope.name(), "workspace team created");
-            (StatusCode::CREATED, Json(json!({
-                "id":id,"name":name,"scope_level":scope.level(),"scope_name":scope.name(),
-                "member_count":0,"pending_invite_count":0,
-            }))).into_response()
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "id":id,"name":name,"scope_level":scope.level(),"scope_name":scope.name(),
+                    "member_count":0,"pending_invite_count":0,
+                })),
+            )
+                .into_response()
         }
-        Err(e) if e.to_string().contains("UNIQUE constraint failed: org_teams.name") => {
-            err(StatusCode::CONFLICT, json!({"error":"team name already exists"}))
+        Err(e)
+            if e.to_string()
+                .contains("UNIQUE constraint failed: org_teams.name") =>
+        {
+            err(
+                StatusCode::CONFLICT,
+                json!({"error":"team name already exists"}),
+            )
         }
         Err(e) => internal(e),
     }
@@ -1228,12 +1835,23 @@ pub async fn patch_team(
     Json(body): Json<Value>,
 ) -> Response {
     if id == "team_global" {
-        return err(StatusCode::CONFLICT, json!({"error":"the Everyone team must remain global"}));
+        return err(
+            StatusCode::CONFLICT,
+            json!({"error":"the Everyone team must remain global"}),
+        );
     }
     let conn = match state.store.read() {
         Ok(conn) => conn,
         Err(e) => return internal(e),
     };
+    // Editing a team that is ALREADY Global grants nothing new; only a change
+    // to Global needs the host-access acknowledgment.
+    let mut body = body;
+    if team_by_id(&conn, &id).ok().flatten().is_some_and(|t| t.scope.is_global()) {
+        if let Some(m) = body.as_object_mut() {
+            m.entry(HOST_ACCESS_ACK).or_insert(json!(true));
+        }
+    }
     let (name, scope) = match team_definition(&conn, &body) {
         Ok(value) => value,
         Err(body) => return err(StatusCode::BAD_REQUEST, body),
@@ -1248,33 +1866,43 @@ pub async fn patch_team(
         .write_async(move |conn| {
             let n = conn.execute(
                 "UPDATE org_teams SET name=?1,scope_level=?2,scope_name=?3 WHERE id=?4",
-                rusqlite::params![name_w,level,target,id_w],
+                rusqlite::params![name_w, level, target, id_w],
             )?;
             if n > 0 {
                 // Keep the 0059 columns coherent for rolling binaries and
                 // forensic exports; current authorization reads the team.
                 conn.execute(
                     "UPDATE org_members SET scope_level=?1,scope_name=?2 WHERE team_id=?3",
-                    rusqlite::params![level,target,id_w],
+                    rusqlite::params![level, target, id_w],
                 )?;
                 conn.execute(
                     "UPDATE org_invites SET scope_level=?1,scope_name=?2 WHERE team_id=?3",
-                    rusqlite::params![level,target,id_w],
+                    rusqlite::params![level, target, id_w],
                 )?;
             }
             Ok(WriteOutcome {
                 applied: n > 0,
-                events: (n > 0).then(|| ev("org_team", &id_w, MutationKind::Updated)).into_iter().collect(),
+                events: (n > 0)
+                    .then(|| ev("org_team", &id_w, MutationKind::Updated))
+                    .into_iter()
+                    .collect(),
             })
         })
         .await;
     match write {
         Ok(outcome) if outcome.applied => Json(json!({
             "ok":true,"id":id,"name":name,"scope_level":scope.level(),"scope_name":scope.name(),
-        })).into_response(),
+        }))
+        .into_response(),
         Ok(_) => err(StatusCode::NOT_FOUND, json!({"error":"team not found"})),
-        Err(e) if e.to_string().contains("UNIQUE constraint failed: org_teams.name") => {
-            err(StatusCode::CONFLICT, json!({"error":"team name already exists"}))
+        Err(e)
+            if e.to_string()
+                .contains("UNIQUE constraint failed: org_teams.name") =>
+        {
+            err(
+                StatusCode::CONFLICT,
+                json!({"error":"team name already exists"}),
+            )
         }
         Err(e) => internal(e),
     }
@@ -1282,7 +1910,10 @@ pub async fn patch_team(
 
 pub async fn delete_team(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if id == "team_global" {
-        return err(StatusCode::CONFLICT, json!({"error":"the Everyone team cannot be deleted"}));
+        return err(
+            StatusCode::CONFLICT,
+            json!({"error":"the Everyone team cannot be deleted"}),
+        );
     }
     let id_w = id.clone();
     let verdict: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
@@ -1313,9 +1944,12 @@ pub async fn delete_team(State(state): State<AppState>, Path(id): Path<String>) 
     }
     let result = match *verdict.lock().expect("team delete verdict") {
         Some("deleted") => Json(json!({"ok":true})).into_response(),
-        Some("in_use") => err(StatusCode::CONFLICT, json!({
-            "error":"move members and revoke pending invites before deleting this team"
-        })),
+        Some("in_use") => err(
+            StatusCode::CONFLICT,
+            json!({
+                "error":"move members and revoke pending invites before deleting this team"
+            }),
+        ),
         _ => err(StatusCode::NOT_FOUND, json!({"error":"team not found"})),
     };
     result
@@ -1323,11 +1957,7 @@ pub async fn delete_team(State(state): State<AppState>, Path(id): Path<String>) 
 
 // ---- GET /api/org/invites -------------------------------------------------
 
-pub async fn list_invites(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    uri: Uri,
-) -> Response {
+pub async fn list_invites(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     let base = base_url(&headers, &uri);
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Value>> {
@@ -1344,7 +1974,11 @@ pub async fn list_invites(
             &[&now],
         )?;
         for r in &mut rows {
-            let tok = r.get("token").and_then(Value::as_str).unwrap_or("").to_string();
+            let tok = r
+                .get("token")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             r["url"] = json!(format!("{base}/invite/{tok}"));
         }
         Ok(rows)
@@ -1373,7 +2007,10 @@ pub async fn create_invite(
         .filter(|e| !e.is_empty());
     if email.as_deref().is_some_and(|value| !valid_email(value)) {
         tracing::warn!(target: "amux::local_invite", verdict = "create_rejected", reason = "invalid_email", "local invite creation rejected");
-        return err(StatusCode::BAD_REQUEST, json!({ "error": "valid email required" }));
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "valid email required" }),
+        );
     }
     let conn = match state.store.read() {
         Ok(conn) => conn,
@@ -1398,7 +2035,15 @@ pub async fn create_invite(
                 "INSERT INTO org_invites \
                  (token,email,created_at,expires_at,scope_level,scope_name,team_id) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![token_w,email_w,now,expires,team_w.scope.level(),team_w.scope.name(),team_w.id],
+                rusqlite::params![
+                    token_w,
+                    email_w,
+                    now,
+                    expires,
+                    team_w.scope.level(),
+                    team_w.scope.name(),
+                    team_w.id
+                ],
             )?;
             Ok(WriteOutcome {
                 applied: true,
@@ -1444,7 +2089,10 @@ pub async fn delete_invite(State(state): State<AppState>, Path(token): Path<Stri
             } else {
                 vec![]
             };
-            Ok(WriteOutcome { applied: n > 0, events })
+            Ok(WriteOutcome {
+                applied: n > 0,
+                events,
+            })
         })
         .await;
     match write {
@@ -1473,7 +2121,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let router = Router::new().nest("/api/org", routes()).with_state(state);
         (router, dir)
@@ -1499,7 +2147,9 @@ mod tests {
         };
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
         (status, v)
@@ -1519,15 +2169,31 @@ mod tests {
     }
 
     async fn raw_send(
-        app: &axum::Router, method: &str, path: &str, body: &str, headers: &[(&str, &str)],
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        body: &str,
+        headers: &[(&str, &str)],
     ) -> (StatusCode, HeaderMap, String) {
         let mut request = Request::builder().method(method).uri(path);
-        for (name, value) in headers { request = request.header(*name, *value); }
-        let response = app.clone().oneshot(request.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
         let status = response.status();
         let headers = response.headers().clone();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        (status, headers, String::from_utf8_lossy(&bytes).into_owned())
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
     }
 
     #[tokio::test]
@@ -1542,20 +2208,37 @@ mod tests {
         assert!(v["created_at"].as_i64().unwrap() > 0);
         // The row is persisted, not synthesized per-request.
         let conn = rusqlite::Connection::open(dir.path().join("org-api-test.db")).unwrap();
-        let n: i64 =
-            conn.query_row("SELECT COUNT(*) FROM org WHERE id='default'", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM org WHERE id='default'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(n, 1);
     }
 
     #[tokio::test]
     async fn patch_renames_with_python_validation_and_80_char_cap() {
         let (app, _dir) = app();
-        let (st, e) = send(&app, "PATCH", "/api/org", Some(json!({ "name": "  " })), &[]).await;
+        let (st, e) = send(
+            &app,
+            "PATCH",
+            "/api/org",
+            Some(json!({ "name": "  " })),
+            &[],
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert_eq!(e["error"], json!("name required"));
 
         let long = "x".repeat(100);
-        let (st, r) = send(&app, "PATCH", "/api/org", Some(json!({ "name": long })), &[]).await;
+        let (st, r) = send(
+            &app,
+            "PATCH",
+            "/api/org",
+            Some(json!({ "name": long })),
+            &[],
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(r["ok"], json!(true));
         assert_eq!(r["name"].as_str().unwrap().len(), 80);
@@ -1671,8 +2354,35 @@ mod tests {
         let url = inv2[0]["url"].as_str().unwrap();
         // Derived, not literal: the fallback follows this server's own port,
         // so hardcoding one here would pin the test to a deployment.
-        let want = format!("https://localhost:{}/invite/", crate::config::canonical_port());
+        let want = format!(
+            "https://localhost:{}/invite/",
+            crate::config::canonical_port()
+        );
         assert!(url.starts_with(&want), "{url} should start with {want}");
+    }
+
+    // AMUX-5334, private report 2026-09-19: the default invite granted host
+    // filesystem access. No grant is inferred, and Global needs an explicit ack.
+    #[tokio::test]
+    async fn global_scope_is_never_a_default_and_needs_an_explicit_host_access_ack() {
+        let (app, _dir) = app();
+        let post = |body: Value| send(&app, "POST", "/api/org/invites", Some(body), &[]);
+        // The reported path: no scope at all.
+        let (st, r) = post(json!({"email": "contractor@example.com"})).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{r}");
+        assert_eq!(r["error"], "scope_level is required");
+        // Global without the acknowledgment, directly or through the Everyone team.
+        let (st, r) = post(json!({"email": "c@example.com", "scope_level": "global"})).await;
+        assert_eq!((st, r["code"].as_str()), (StatusCode::BAD_REQUEST, Some("global_scope_requires_host_access_ack")), "{r}");
+        let (st, r) = post(json!({"email": "c@example.com", "team_id": "team_global"})).await;
+        assert_eq!((st, r["code"].as_str()), (StatusCode::BAD_REQUEST, Some("global_scope_requires_host_access_ack")), "{r}");
+        // A team cannot be made Global without it either.
+        let (st, r) = send(&app, "POST", "/api/org/teams", Some(json!({"name": "Ops", "scope_level": "global", "scope_name": ""})), &[]).await;
+        assert_eq!((st, r["code"].as_str()), (StatusCode::BAD_REQUEST, Some("global_scope_requires_host_access_ack")), "{r}");
+        // An explicit grant still works, and says what it is.
+        let (st, r) = post(json!({"email": "c@example.com", "team_id": "team_global", "grant_host_access": true})).await;
+        assert_eq!(st, StatusCode::CREATED, "{r}");
+        assert_eq!(r["scope_level"], "global");
     }
 
     #[tokio::test]
@@ -1683,7 +2393,7 @@ mod tests {
             &app,
             "POST",
             "/api/org/invites",
-            Some(json!({ "email": "  NewHire@X.Co " })),
+            Some(json!({ "email": "  NewHire@X.Co ", "scope_level": "global", "grant_host_access": true })),
             &[("Host", "myhost:9"), ("X-Forwarded-Proto", "https")],
         )
         .await;
@@ -1691,18 +2401,27 @@ mod tests {
         let token = r["token"].as_str().unwrap();
         // token_urlsafe(24) shape: 32 urlsafe chars, no padding.
         assert_eq!(token.len(), 32, "{token}");
-        assert!(token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert_eq!(r["url"], json!(format!("https://myhost:9/invite/{token}")));
         let exp = r["expires_at"].as_i64().unwrap();
-        assert!(exp >= before + 7 * 86400 && exp <= before + 7 * 86400 + 60, "{exp}");
+        assert!(
+            exp >= before + 7 * 86400 && exp <= before + 7 * 86400 + 60,
+            "{exp}"
+        );
 
         // Stored row: email lowercased; empty email stores NULL.
         let conn = rusqlite::Connection::open(dir.path().join("org-api-test.db")).unwrap();
         let email: Option<String> = conn
-            .query_row("SELECT email FROM org_invites WHERE token=?1", [token], |r| r.get(0))
+            .query_row(
+                "SELECT email FROM org_invites WHERE token=?1",
+                [token],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(email.as_deref(), Some("newhire@x.co"));
-        let (st, r2) = send(&app, "POST", "/api/org/invites", Some(json!({})), &[]).await;
+        let (st, r2) = send(&app, "POST", "/api/org/invites", Some(json!({"scope_level": "global", "grant_host_access": true})), &[]).await;
         assert_eq!(st, StatusCode::CREATED);
         let email2: Option<String> = conn
             .query_row(
@@ -1743,43 +2462,167 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(r["ok"], json!(true));
         let conn = rusqlite::Connection::open(dir.path().join("org-api-test.db")).unwrap();
-        let m: i64 = conn.query_row("SELECT COUNT(*) FROM org_members", [], |r| r.get(0)).unwrap();
-        let i: i64 = conn.query_row("SELECT COUNT(*) FROM org_invites", [], |r| r.get(0)).unwrap();
+        let m: i64 = conn
+            .query_row("SELECT COUNT(*) FROM org_members", [], |r| r.get(0))
+            .unwrap();
+        let i: i64 = conn
+            .query_row("SELECT COUNT(*) FROM org_invites", [], |r| r.get(0))
+            .unwrap();
         assert_eq!((m, i), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_tailnet_login_matching_an_accepted_member_signs_in_without_a_cookie() {
+        let (app, _dir) = full_app();
+        let (created, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/invites",
+            r#"{"email":"alice@example.com","scope_level":"global","grant_host_access":true}"#,
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
+        assert_eq!(created, StatusCode::CREATED, "{body}");
+        let token = serde_json::from_str::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let peer: std::net::IpAddr = "100.64.7.8".parse().unwrap();
+        // Before acceptance the login matches nobody.
+        let (status, _, _) = TEST_TAILNET_LOGIN
+            .scope((peer, "alice@example.com".into()), raw_send(&app, "GET", "/api/identity", "", &[]))
+            .await;
+        let before: Value = serde_json::from_str(
+            &TEST_TAILNET_LOGIN
+                .scope((peer, "alice@example.com".into()), raw_send(&app, "GET", "/api/identity", "", &[]))
+                .await
+                .2,
+        )
+        .unwrap_or(Value::Null);
+        assert_ne!(before["is_local_member"], true, "{status} {before}");
+        let (accepted, _, _) = raw_send(
+            &app,
+            "POST",
+            &format!("/invite/{token}"),
+            "email=alice%40example.com&name=Alice",
+            &[("content-type", "application/x-www-form-urlencoded")],
+        )
+        .await;
+        assert_eq!(accepted, StatusCode::SEE_OTHER);
+
+        // No cookie: the tailnet login alone is the credential.
+        let (status, headers, body) = TEST_TAILNET_LOGIN
+            .scope((peer, "alice@example.com".into()), raw_send(&app, "GET", "/api/identity", "", &[]))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let identity: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(identity["email"], "alice@example.com");
+        assert_eq!(identity["is_local_member"], true);
+        assert!(headers.get(header::SET_COOKIE).is_none(), "no long-lived cookie is minted");
+
+        // Another person's login is not Alice.
+        let (_, _, body) = TEST_TAILNET_LOGIN
+            .scope((peer, "mallory@example.com".into()), raw_send(&app, "GET", "/api/identity", "", &[]))
+            .await;
+        let identity: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        assert_ne!(identity["email"], "alice@example.com", "{identity}");
+
+        // The owner's bearer stays the owner even from Alice's device.
+        let (_, _, body) = TEST_TAILNET_LOGIN
+            .scope(
+                (peer, "alice@example.com".into()),
+                raw_send(&app, "GET", "/api/identity", "", &[("authorization", "Bearer owner-token")]),
+            )
+            .await;
+        let identity: Value = serde_json::from_str(&body).unwrap();
+        assert_ne!(identity["is_local_member"], true, "{identity}");
+
+        // Deleting the member revokes the tailnet sign-in at once.
+        let (_, _, members) = raw_send(&app, "GET", "/api/org/members", "", &[("authorization", "Bearer owner-token")]).await;
+        let members: Value = serde_json::from_str(&members).unwrap();
+        let list = members.get("members").unwrap_or(&members);
+        let id = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["email"] == "alice@example.com")
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (deleted, _, _) = raw_send(&app, "DELETE", &format!("/api/org/members/{id}"), "", &[("authorization", "Bearer owner-token")]).await;
+        assert_eq!(deleted, StatusCode::OK);
+        let (_, _, body) = TEST_TAILNET_LOGIN
+            .scope((peer, "alice@example.com".into()), raw_send(&app, "GET", "/api/identity", "", &[]))
+            .await;
+        let identity: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        assert_ne!(identity["is_local_member"], true, "{identity}");
     }
 
     #[tokio::test]
     async fn invite_acceptance_authenticates_attributes_and_revokes_a_local_member() {
         let (app, dir) = full_app();
-        let (created, _, body) = raw_send(&app, "POST", "/api/org/invites",
-            r#"{"email":"guest@example.com"}"#,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json"),
-              ("host", "tailnet-host:8824"), ("x-forwarded-proto", "https")]).await;
+        let (created, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/invites",
+            r#"{"email":"guest@example.com","scope_level":"global","grant_host_access":true}"#,
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+                ("host", "tailnet-host:8824"),
+                ("x-forwarded-proto", "https"),
+            ],
+        )
+        .await;
         assert_eq!(created, StatusCode::CREATED, "{body}");
         let invitation: Value = serde_json::from_str(&body).unwrap();
         let token = invitation["token"].as_str().unwrap();
-        assert_eq!(invitation["url"], json!(format!("https://tailnet-host:8824/invite/{token}")));
+        assert_eq!(
+            invitation["url"],
+            json!(format!("https://tailnet-host:8824/invite/{token}"))
+        );
 
         let (landing, _, html) = raw_send(&app, "GET", &format!("/invite/{token}"), "", &[]).await;
         assert_eq!(landing, StatusCode::OK, "{html}");
-        assert!(html.contains("guest@example.com") && html.contains("Join My Workspace"), "{html}");
+        assert!(
+            html.contains("guest@example.com") && html.contains("Join My Workspace"),
+            "{html}"
+        );
 
-        let (accepted, headers, _) = raw_send(&app, "POST", &format!("/invite/{token}"),
+        let (accepted, headers, _) = raw_send(
+            &app,
+            "POST",
+            &format!("/invite/{token}"),
             "email=guest%40example.com&name=Guest+User",
-            &[("content-type", "application/x-www-form-urlencoded")]).await;
+            &[("content-type", "application/x-www-form-urlencoded")],
+        )
+        .await;
         assert_eq!(accepted, StatusCode::SEE_OTHER);
         assert_eq!(headers[header::LOCATION], "/");
         let set_cookie = headers[header::SET_COOKIE].to_str().unwrap();
-        assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("Secure") && set_cookie.contains("SameSite=Lax"), "{set_cookie}");
+        assert!(
+            set_cookie.contains("HttpOnly")
+                && set_cookie.contains("Secure")
+                && set_cookie.contains("SameSite=Lax"),
+            "{set_cookie}"
+        );
         let cookie = set_cookie.split(';').next().unwrap();
 
-        let (identity_status, _, identity_body) = raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
+        let (identity_status, _, identity_body) =
+            raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
         assert_eq!(identity_status, StatusCode::OK, "{identity_body}");
         let identity: Value = serde_json::from_str(&identity_body).unwrap();
         assert_eq!(identity["email"], "guest@example.com");
         assert_eq!(identity["is_local_member"], true);
         assert_eq!(identity["is_cloud"], false);
-        assert_eq!(identity["access_scope"], json!({"level": "global", "name": ""}));
+        assert_eq!(
+            identity["access_scope"],
+            json!({"level": "global", "name": ""})
+        );
 
         // Authorship is derived from the verified invite cookie, not from a
         // caller-controlled creator field or ordinary worker/session header.
@@ -1827,24 +2670,35 @@ mod tests {
         let (shell_status, _, shell) = raw_send(&app, "GET", "/", "", &[("cookie", cookie)]).await;
         assert_eq!(shell_status, StatusCode::OK);
         assert!(shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{shell}");
-        assert!(!shell.contains("window._AMUX_AUTH_TOKEN=\"owner-token\""), "{shell}");
+        assert!(
+            !shell.contains("window._AMUX_AUTH_TOKEN=\"owner-token\""),
+            "{shell}"
+        );
 
-        let (members_status, _, members_body) = raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
+        let (members_status, _, members_body) =
+            raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
         assert_eq!(members_status, StatusCode::FORBIDDEN, "{members_body}");
-        assert!(members_body.contains("organization administration"), "{members_body}");
+        assert!(
+            members_body.contains("organization administration"),
+            "{members_body}"
+        );
 
         let db = dir.path().join("org-full-test.db");
         let mut actor = String::new();
-        for _ in 0..50 {
+        // The request log is written by a background batch task; on a loaded CI
+        // shard 500ms was not enough (#254 shard 8, twice). Poll up to 5s.
+        for _ in 0..500 {
             actor = rusqlite::Connection::open(&db).unwrap().query_row(
                 "SELECT amux_session FROM _amux_request_log WHERE path='/api/org/members' ORDER BY ts DESC LIMIT 1",
                 [], |row| row.get(0)).optional().unwrap().unwrap_or_default();
-            if !actor.is_empty() { break; }
+            if !actor.is_empty() {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(actor, "member:guest@example.com");
         let mut board_actor = String::new();
-        for _ in 0..50 {
+        for _ in 0..500 {
             board_actor = rusqlite::Connection::open(&db)
                 .unwrap()
                 .query_row(
@@ -1863,12 +2717,25 @@ mod tests {
         }
         assert_eq!(board_actor, "member:guest@example.com");
 
-        let member_id: String = rusqlite::Connection::open(&db).unwrap().query_row(
-            "SELECT id FROM org_members WHERE email='guest@example.com'", [], |row| row.get(0)).unwrap();
-        let (deleted, _, body) = raw_send(&app, "DELETE", &format!("/api/org/members/{member_id}"), "",
-            &[("authorization", "Bearer owner-token")]).await;
+        let member_id: String = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT id FROM org_members WHERE email='guest@example.com'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (deleted, _, body) = raw_send(
+            &app,
+            "DELETE",
+            &format!("/api/org/members/{member_id}"),
+            "",
+            &[("authorization", "Bearer owner-token")],
+        )
+        .await;
         assert_eq!(deleted, StatusCode::OK, "{body}");
-        let (revoked, _, _) = raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
+        let (revoked, _, _) =
+            raw_send(&app, "GET", "/api/org/members", "", &[("cookie", cookie)]).await;
         assert_eq!(revoked, StatusCode::UNAUTHORIZED);
         // Revocation must survive a page reload. The stale HttpOnly cookie is
         // still stored by the browser after its member row is deleted; the
@@ -1877,7 +2744,10 @@ mod tests {
         let (shell_status, _, revoked_shell) =
             raw_send(&app, "GET", "/", "", &[("cookie", cookie)]).await;
         assert_eq!(shell_status, StatusCode::OK);
-        assert!(revoked_shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{revoked_shell}");
+        assert!(
+            revoked_shell.contains("window._AMUX_AUTH_TOKEN=\"\""),
+            "{revoked_shell}"
+        );
         assert!(
             !revoked_shell.contains("window._AMUX_AUTH_TOKEN=\"owner-token\""),
             "{revoked_shell}"
@@ -1886,13 +2756,148 @@ mod tests {
         assert_eq!(replay, StatusCode::GONE);
     }
 
+    /// The SANDBOX shape: no owner token (AMUX_AUTH_TOKEN=none behind a front
+    /// door) must still bound a scoped member. require_bearer used to return
+    /// before the member guard when no token was configured, so a scoped
+    /// account reached any worker by name (sandbox.amux.io, 2026-10-07).
+    #[tokio::test]
+    async fn member_scope_is_enforced_when_no_owner_token_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("org-notoken.db");
+        let store = Store::open(&db).unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let app = crate::api::router(state);
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            for (id, name) in [("wrk_allowed", "allowed-worker"), ("wrk_other", "other-worker")] {
+                conn.execute(
+                    "INSERT INTO _amux_workers \
+                     (id,display_name,name_aliases,cwd,provider,backend,environment,permissions,state,version,created_at,updated_at) \
+                     VALUES (?1,?2,'[]','/tmp','claude','tmux','{}','[]','{\"state\":\"stopped\"}',0,'now','now')",
+                    rusqlite::params![id, name],
+                )
+                .unwrap();
+            }
+        }
+        let (created, _, body) = raw_send(&app, "POST", "/api/org/invites",
+            r#"{"email":"nt-guest@example.com","scope_level":"worker","scope_name":"allowed-worker"}"#,
+            &[("content-type", "application/json")]).await;
+        assert_eq!(created, StatusCode::CREATED, "{body}");
+        let token = serde_json::from_str::<Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+        let (accepted, headers, _) = raw_send(&app, "POST", &format!("/invite/{token}"),
+            "email=nt-guest%40example.com&name=Guest", &[("content-type", "application/x-www-form-urlencoded")]).await;
+        assert_eq!(accepted, StatusCode::SEE_OTHER);
+        let cookie = headers[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string();
+        let (allowed, _, _) = raw_send(&app, "GET", "/api/workers/wrk_allowed", "", &[("cookie", &cookie)]).await;
+        assert_ne!(allowed, StatusCode::FORBIDDEN);
+        let (denied, _, denied_body) = raw_send(&app, "GET", "/api/workers/wrk_other", "", &[("cookie", &cookie)]).await;
+        assert_eq!(denied, StatusCode::FORBIDDEN, "no owner token must not mean no member scope: {denied_body}");
+        let (admin, _, _) = raw_send(&app, "GET", "/api/org/members", "", &[("cookie", &cookie)]).await;
+        assert_eq!(admin, StatusCode::FORBIDDEN);
+    }
+
+    /// An admin member manages the vault as themselves (Ethan, 2026-10-26: "make
+    /// sure ethan and doron are admins i need to be able to create VAULT keys").
+    /// Only the owner sets the role; a forged marker, a plain member and a
+    /// group-scoped "admin" stay refused.
+    #[tokio::test]
+    async fn an_admin_member_manages_the_vault_and_nobody_else_becomes_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("org-admin.db");
+        let state = AppState {
+            store: Arc::new(Store::open(&db).unwrap()),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let app = crate::api::router(state);
+        rusqlite::Connection::open(&db).unwrap().execute(
+            "INSERT INTO _amux_workers \
+             (id,display_name,name_aliases,cwd,provider,backend,environment,permissions,state,version,created_at,updated_at) \
+             VALUES ('wrk_one','one-worker','[]','/tmp','claude','tmux','{}','[]','{\"state\":\"stopped\"}',0,'now','now')",
+            [],
+        ).unwrap();
+        let join = |email: &'static str, scope: &'static str| {
+            let app = app.clone();
+            async move {
+                let body = if scope == "global" {
+                    format!(r#"{{"email":"{email}","scope_level":"global","grant_host_access":true}}"#)
+                } else {
+                    format!(r#"{{"email":"{email}","scope_level":"worker","scope_name":"{scope}"}}"#)
+                };
+                let (st, _, b) = raw_send(&app, "POST", "/api/org/invites", &body, &[("content-type", "application/json")]).await;
+                assert_eq!(st, StatusCode::CREATED, "{b}");
+                let token = serde_json::from_str::<Value>(&b).unwrap()["token"].as_str().unwrap().to_string();
+                let form = format!("email={}&name=x", email.replace('@', "%40"));
+                let (st, h, _) = raw_send(&app, "POST", &format!("/invite/{token}"), &form,
+                    &[("content-type", "application/x-www-form-urlencoded")]).await;
+                assert_eq!(st, StatusCode::SEE_OTHER);
+                h[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap().to_string()
+            }
+        };
+        let ethan = join("admin-e@example.com", "global").await;
+        let grouped = join("admin-g@example.com", "one-worker").await;
+        let vault = |cookie: String, extra: Option<(&'static str, &'static str)>| {
+            let app = app.clone();
+            async move {
+                let mut h = vec![("content-type", "application/json"), ("cookie", cookie.as_str())];
+                if let Some(x) = extra { h.push(x); }
+                raw_send(&app, "POST", "/api/vault/secrets", r#"{"key":"ADMIN_TEST_KEY","value":"v"}"#, &h).await
+            }
+        };
+        let refused = |st: StatusCode, b: &str| st == StatusCode::FORBIDDEN && b.contains("only the owner");
+        let (st, _, b) = vault(ethan.clone(), None).await;
+        assert!(refused(st, &b), "a plain member managed the vault: {st} {b}");
+        let (st, _, b) = vault(ethan.clone(), Some(("x-amux-local-member-admin", "1"))).await;
+        assert!(refused(st, &b), "a forged admin marker was trusted: {st} {b}");
+
+        // A member cannot make themselves an admin; the owner can.
+        let id_of = |email: &'static str| {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.query_row("SELECT id FROM org_members WHERE email=?1", [email], |r| r.get::<_, String>(0)).unwrap()
+        };
+        let (eid, gid) = (id_of("admin-e@example.com"), id_of("admin-g@example.com"));
+        let (st, _, _) = raw_send(&app, "PATCH", &format!("/api/org/members/{eid}"), r#"{"role":"admin"}"#,
+            &[("content-type", "application/json"), ("cookie", ethan.as_str())]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "a member set their own role");
+        let (st, _, b) = raw_send(&app, "PATCH", &format!("/api/org/members/{eid}"), r#"{"role":"root"}"#,
+            &[("content-type", "application/json")]).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{b}");
+        for id in [&eid, &gid] {
+            let (st, _, b) = raw_send(&app, "PATCH", &format!("/api/org/members/{id}"), r#"{"role":"admin"}"#,
+                &[("content-type", "application/json")]).await;
+            assert_eq!(st, StatusCode::OK, "{b}");
+        }
+        let (st, _, b) = vault(ethan.clone(), None).await;
+        assert!(!refused(st, &b), "an admin member was refused the vault: {st} {b}");
+        let (st, _, b) = vault(grouped, None).await;
+        // Refused before the vault even looks (the scope guard), which is the point.
+        assert_eq!(st, StatusCode::FORBIDDEN, "a scoped admin reached the whole server's vault: {b}");
+
+        // Taken back by the owner, refused again.
+        raw_send(&app, "PATCH", &format!("/api/org/members/{eid}"), r#"{"role":"member"}"#,
+            &[("content-type", "application/json")]).await;
+        let (st, _, b) = vault(ethan, None).await;
+        assert!(refused(st, &b), "a former admin kept the vault: {st} {b}");
+    }
+
     #[tokio::test]
     async fn worker_scope_is_enforced_and_owner_rescope_reaches_the_existing_cookie() {
         let (app, dir) = full_app();
         let db = dir.path().join("org-full-test.db");
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
-            for (id, name) in [("wrk_allowed", "allowed-worker"), ("wrk_other", "other-worker")] {
+            for (id, name) in [
+                ("wrk_allowed", "allowed-worker"),
+                ("wrk_other", "other-worker"),
+            ] {
                 conn.execute(
                     "INSERT INTO _amux_workers \
                      (id,display_name,name_aliases,cwd,provider,backend,environment,permissions,state,version,created_at,updated_at) \
@@ -1910,7 +2915,10 @@ mod tests {
             // Team creation accepts a registry id but stores the canonical
             // display/session name used by fleet and board authorization.
             r#"{"name":"Équipe autorisée","scope_level":"worker","scope_name":"wrk_allowed"}"#,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(created, StatusCode::CREATED, "{body}");
@@ -1918,13 +2926,17 @@ mod tests {
         assert_eq!(team["scope_level"], "worker");
         assert_eq!(team["scope_name"], "allowed-worker");
         let team_id = team["id"].as_str().unwrap();
-        let invite_payload = json!({"email":"worker-guest@example.com","team_id":team_id}).to_string();
+        let invite_payload =
+            json!({"email":"worker-guest@example.com","team_id":team_id}).to_string();
         let (created, _, body) = raw_send(
             &app,
             "POST",
             "/api/org/invites",
             &invite_payload,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(created, StatusCode::CREATED, "{body}");
@@ -1940,7 +2952,12 @@ mod tests {
         )
         .await;
         assert_eq!(accepted, StatusCode::SEE_OTHER);
-        let cookie = headers[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
+        let cookie = headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
 
         let (identity_status, _, identity_body) =
             raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
@@ -1950,7 +2967,10 @@ mod tests {
             identity["access_scope"],
             json!({"level": "worker", "name": "allowed-worker"})
         );
-        assert_eq!(identity["team"], json!({"id":team_id,"name":"Équipe autorisée"}));
+        assert_eq!(
+            identity["team"],
+            json!({"id":team_id,"name":"Équipe autorisée"})
+        );
 
         let (allowed, _, _) = raw_send(
             &app,
@@ -1978,9 +2998,14 @@ mod tests {
 
         // Receipts describe workspace-wide commands. A scoped membership must
         // not read another worker's metadata through a caller-supplied filter.
-        for path in ["/api/interactions/recent", "/api/interactions/int_other",
-            "/api/interactions/int_other/effects", "/api/interactions/int_other/why",
-            "/api/debug/interactions", "/api/state/summary?scope=worker:other"] {
+        for path in [
+            "/api/interactions/recent",
+            "/api/interactions/int_other",
+            "/api/interactions/int_other/effects",
+            "/api/interactions/int_other/why",
+            "/api/debug/interactions",
+            "/api/state/summary?scope=worker:other",
+        ] {
             let (status, _, body) = raw_send(&app, "GET", path, "", &[("cookie", cookie)]).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
         }
@@ -1997,8 +3022,11 @@ mod tests {
             &app,
             "PATCH",
             &format!("/api/org/members/{member_id}"),
-            r#"{"team_id":"team_global"}"#,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            r#"{"team_id":"team_global","grant_host_access":true}"#,
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(rescoped, StatusCode::OK, "{rescope_body}");
@@ -2010,11 +3038,18 @@ mod tests {
             &[("cookie", cookie)],
         )
         .await;
-        assert_ne!(now_allowed, StatusCode::FORBIDDEN, "same cookie must observe the rescope");
+        assert_ne!(
+            now_allowed,
+            StatusCode::FORBIDDEN,
+            "same cookie must observe the rescope"
+        );
         let (_, _, identity_body) =
             raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
         let identity: Value = serde_json::from_str(&identity_body).unwrap();
-        assert_eq!(identity["access_scope"], json!({"level": "global", "name": ""}));
+        assert_eq!(
+            identity["access_scope"],
+            json!({"level": "global", "name": ""})
+        );
 
         rusqlite::Connection::open(&db)
             .unwrap()
@@ -2063,7 +3098,10 @@ mod tests {
             "POST",
             "/api/org/teams",
             r#"{"name":"Research","scope_level":"group","scope_name":"research"}"#,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(created, StatusCode::CREATED, "{body}");
@@ -2075,7 +3113,10 @@ mod tests {
             "POST",
             "/api/org/invites",
             &payload,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(created, StatusCode::CREATED, "{body}");
@@ -2090,12 +3131,20 @@ mod tests {
         )
         .await;
         assert_eq!(accepted, StatusCode::SEE_OTHER);
-        let cookie = headers[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
+        let cookie = headers[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
         let (_, _, identity_body) =
             raw_send(&app, "GET", "/api/identity", "", &[("cookie", cookie)]).await;
         let identity: Value = serde_json::from_str(&identity_body).unwrap();
         assert_eq!(identity["team"], json!({"id":team_id,"name":"Research"}));
-        assert_eq!(identity["access_scope"], json!({"level":"group","name":"research"}));
+        assert_eq!(
+            identity["access_scope"],
+            json!({"level":"group","name":"research"})
+        );
 
         let (allowed, _, _) = raw_send(
             &app,
@@ -2124,21 +3173,27 @@ mod tests {
             &app,
             "POST",
             "/api/org/teams",
-            r#"{"name":"Temporary","scope_level":"global","scope_name":""}"#,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            r#"{"name":"Temporary","scope_level":"global","scope_name":"","grant_host_access":true}"#,
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(created, StatusCode::CREATED, "{body}");
         let team: Value = serde_json::from_str(&body).unwrap();
         let team_id = team["id"].as_str().unwrap();
 
-        let payload = json!({"team_id":team_id}).to_string();
+        let payload = json!({"team_id":team_id,"grant_host_access":true}).to_string();
         let (invited, _, body) = raw_send(
             &app,
             "POST",
             "/api/org/invites",
             &payload,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(invited, StatusCode::CREATED, "{body}");
@@ -2168,7 +3223,10 @@ mod tests {
             "PATCH",
             &format!("/api/org/teams/{team_id}"),
             r#"{"name":"Temporary renamed","scope_level":"global","scope_name":""}"#,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(patched, StatusCode::OK, "{body}");
@@ -2191,7 +3249,10 @@ mod tests {
             "POST",
             "/api/org/invites",
             r#"{"scope_level":"group","scope_name":"not-a-real-group"}"#,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")],
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -2201,16 +3262,47 @@ mod tests {
     #[tokio::test]
     async fn email_bound_invite_refuses_a_different_email_without_consuming_it() {
         let (app, _dir) = full_app();
-        let (_, _, body) = raw_send(&app, "POST", "/api/org/invites",
-            r#"{"email":"right@example.com"}"#,
-            &[("authorization", "Bearer owner-token"), ("content-type", "application/json")]).await;
+        let (_, _, body) = raw_send(
+            &app,
+            "POST",
+            "/api/org/invites",
+            r#"{"email":"right@example.com","scope_level":"global","grant_host_access":true}"#,
+            &[
+                ("authorization", "Bearer owner-token"),
+                ("content-type", "application/json"),
+            ],
+        )
+        .await;
         let invitation: Value = serde_json::from_str(&body).unwrap();
         let token = invitation["token"].as_str().unwrap();
-        let (wrong, _, _) = raw_send(&app, "POST", &format!("/invite/{token}"),
+        let (wrong, _, _) = raw_send(
+            &app,
+            "POST",
+            &format!("/invite/{token}"),
             "email=wrong%40example.com&name=Wrong",
-            &[("content-type", "application/x-www-form-urlencoded")]).await;
+            &[("content-type", "application/x-www-form-urlencoded")],
+        )
+        .await;
         assert_eq!(wrong, StatusCode::FORBIDDEN);
         let (still_live, _, _) = raw_send(&app, "GET", &format!("/invite/{token}"), "", &[]).await;
         assert_eq!(still_live, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod member_file_tests {
+    use super::*;
+
+    #[test]
+    fn file_targets_come_from_the_right_place_and_dotdot_cannot_climb() {
+        let u: Uri = "/api/file/raw?path=%2Fhome%2Famux%2Fwexus%2Fa.md".parse().unwrap();
+        assert_eq!(member_file_target("/api/file/raw", &u).unwrap(), std::path::PathBuf::from("/home/amux/wexus/a.md"));
+        let u: Uri = "/api/file/raw-path/home/amux/wexus/a%20b+c.html".parse().unwrap();
+        assert_eq!(member_file_target("/api/file/raw-path/home/amux/wexus/a%20b+c.html", &u).unwrap(),
+            std::path::PathBuf::from("/home/amux/wexus/a b+c.html"));
+        let u: Uri = "/api/fs/delete?path=/x".parse().unwrap();
+        assert!(member_file_target("/api/fs/delete", &u).is_none(), "only read routes are file targets");
+        assert!(canonical_or_lexical(std::path::Path::new("/nonexistent-amux/wexus/../../etc/passwd")).is_none());
+        assert!(canonical_or_lexical(std::path::Path::new("relative/path")).is_none());
     }
 }

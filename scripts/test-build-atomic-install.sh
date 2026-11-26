@@ -4,6 +4,11 @@
 # reveal it with one rename; writing the watched path directly creates a window
 # where every client, including the Tailscale URL, can lose the server.
 set -euo pipefail
+# The deploy target directory comes from the environment (server.env reaches
+# every process the server starts); a test's fake cargo must never write there.
+unset AMUX_DEPLOY_TARGET_DIR
+# Their fake cargo writes a few-byte stand-in; the builder refuses those by default.
+export AMUX_DEPLOY_MIN_BIN_BYTES=0
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILDER="$ROOT/scripts/rust-auto-build.sh"
@@ -20,9 +25,12 @@ printf '[workspace]\n' > "$REPO/Cargo.toml"
 printf 'fixture\n' > "$REPO/crates/input.rs"
 cat > "$REPO/scripts/safe-cargo.sh" <<'EOF'
 #!/bin/sh
-mkdir -p "$CARGO_TARGET_DIR/release"
-printf '%s\n' '#!/bin/sh' 'printf "%s\\n" new-build' > "$CARGO_TARGET_DIR/release/amux-server"
-chmod 0755 "$CARGO_TARGET_DIR/release/amux-server"
+# Output dir the way cargo picks it: --profile NAME, else --release.
+out=release; prev=
+for a in "$@"; do [ "$prev" = --profile ] && out="$a"; prev="$a"; done
+mkdir -p "$CARGO_TARGET_DIR/$out"
+printf '%s\n' '#!/bin/sh' 'printf "%s\\n" new-build' > "$CARGO_TARGET_DIR/$out/amux-server"
+chmod 0755 "$CARGO_TARGET_DIR/$out/amux-server"
 EOF
 chmod +x "$REPO/scripts/safe-cargo.sh"
 (
@@ -45,6 +53,11 @@ EOF
 chmod +x "$FAKE_HOME/.cargo/bin/install" "$FAKE_HOME/.cargo/bin/mv"
 export TRACE
 
+# No server runs here, so two parts of the builder that talk to one are off:
+# the post-install health wait would roll the new build back after 300 s
+# (AMUX_ACTIVATION_ROLLBACK, 3fcc7cf91; main checks red on bf1494a6b, run
+# 40971800624), and on a Mac with amux running, a live shell schedule run
+# deferred the install (AMUX_RS_RUNS_URL points the check at nothing).
 printf '#!/bin/sh\nprintf old-build\\n\n' > "$INSTALL"
 chmod 0755 "$INSTALL"
 
@@ -56,6 +69,8 @@ AMUX_RS_BUILD_LOG="$TMP/build.log" \
 AMUX_RS_BUILD_LOCK="$TMP/build.lock" \
 AMUX_RS_BUILD_PROVENANCE="$TMP/provenance.json" \
 AMUX_RS_ACTIVATION_REF=HEAD \
+AMUX_ACTIVATION_ROLLBACK=0 \
+AMUX_RS_RUNS_URL=http://127.0.0.1:9/ \
 AMUX_BUILD_MIN_FREE_GB=0 \
 AMUX_BUILD_DEBUG_MAX_GB=999999 \
   bash "$BUILDER"
@@ -82,4 +97,24 @@ if ! "$INSTALL" | grep -q '^new-build$'; then
   exit 1
 fi
 
-echo "test-build-atomic-install: 5 passed, 0 failed"
+# With the default minimum (1 MB), the same few-byte build is refused and the
+# installed server stays as it was (a test's stand-in in the real deploy
+# directory, 2026-11-12).
+printf '#!/bin/sh\nprintf old-build\\n\n' > "$INSTALL"
+chmod 0755 "$INSTALL"
+HOME="$FAKE_HOME" AMUX_REPO="$REPO" AMUX_RS_INSTALL="$INSTALL" \
+AMUX_RS_BUILD_STAMP="$TMP/stamp2" AMUX_RS_BUILD_LOG="$TMP/build2.log" AMUX_RS_BUILD_LOCK="$TMP/build2.lock" \
+AMUX_RS_BUILD_PROVENANCE="$TMP/provenance2.json" AMUX_RS_ACTIVATION_REF=HEAD AMUX_ACTIVATION_ROLLBACK=0 \
+AMUX_RS_RUNS_URL=http://127.0.0.1:9/ AMUX_BUILD_MIN_FREE_GB=0 AMUX_BUILD_DEBUG_MAX_GB=999999 \
+AMUX_DEPLOY_MIN_BIN_BYTES=1048576 \
+  bash "$BUILDER" || true
+if ! "$INSTALL" | grep -q '^old-build'; then
+  echo "FAIL: a few-byte build was installed over the server (it prints: $("$INSTALL" 2>&1 | head -1))"
+  exit 1
+fi
+if ! grep -aq "verdict=deploy_binary_too_small" "$TMP/build2.log"; then
+  echo "FAIL: the refusal of a few-byte build was not logged"
+  exit 1
+fi
+
+echo "test-build-atomic-install: 7 passed, 0 failed"

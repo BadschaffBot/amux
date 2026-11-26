@@ -136,7 +136,23 @@ curl -sk $AMUX_URL/api/schedules/runs | python3 -m json.tool
 curl -sk -X POST $AMUX_URL/api/schedules/SCHED_ID/run
 ```
 
-**Fields:** `title`, `session` (target session name), `command` (text sent to session), `kind` (`tmux`), `sched_type` (`once`|`recurring`), `schedule_expr` (cron: `min hour dom month dow`), `run_at` (ISO datetime for one-time), `watch` (0/1 — watch output after send), `watch_timeout` (seconds), `done_pattern` (regex to detect completion), `done_action` (`disable`|`reschedule`)
+**Fields:** `title`, `session` (target session name), `command` (text sent to session), `kind` (`tmux`), `sched_type` (`once`|`recurring`), `schedule_expr` (cron: `min hour dom month dow`), `run_at` (ISO datetime for one-time), `watch` (0/1: watch output after send), `watch_timeout` (seconds), `done_pattern` (regex to detect completion), `done_action` (`disable`|`reschedule`), `once` (fire one time: a local `YYYY-MM-DDTHH:MM`, RFC 3339, or a delay like `in 20m`, `+90s`, `1h30m`; delays round UP to the next minute), `when` (a shell check run before each scheduled fire of a tmux schedule: exit 0 delivers, anything else skips the fire without spending `max_runs`), `when_once` (default true: disable after the first fire whose check passed).
+
+### Wake yourself later: `amux wake`
+
+Use this instead of Claude Code's ScheduleWakeup, `/loop` and Monitor until-loops.
+It creates a tmux schedule for `$AMUX_SESSION`; the prompt is read from stdin and never shell-evaluated.
+
+| Claude tool | amux equivalent |
+|---|---|
+| `ScheduleWakeup(1200, prompt)` | `amux wake 20m --stdin` |
+| `/loop 5m prompt` | `amux wake --every 5m --stdin` |
+| self-paced loop | end each turn with `amux wake <next delay> --stdin` |
+| Monitor until-loop, "wake me when X" | `amux wake --when '<check>' --stdin` (checks every 2m, fires once, stops after 24h unless `--until`) |
+| wake on a file or CI run | `amux watch add file\|ci ...` |
+| list / cancel wakeups | `amux wake --list`, `amux wake --cancel SCHED-N` |
+
+A busy worker gets the prompt at its next turn boundary. A `when` check that fails wakes nobody and costs nothing; Run now in the dashboard skips the check. `amux wake help` has the flags.
 
 ---
 
@@ -394,52 +410,31 @@ permanently and cannot legitimately succeed on retry where it just failed.
 
 ## Browser Automation
 
-**Live backend** — same verbs, executed in YOUR real Chrome (real logins, real IP). Opens a NEW tab (never touches existing tabs); first use needs one "Allow debugging?" click. Use when acting-as-you matters (SSO dashboards, bot-walled sites); the default profile backend is for parallel/unattended work.
+Start with `amux browser profiles` (or `--all` for synthetic QA and deprecated
+profiles). Every row explains identity, role, purpose, scope and cookie evidence.
+Choose the account matching the task, not merely the profile with the most cookies.
+Work, personal, customer and restricted identities are not interchangeable. QA
+personas are for testing; deprecated profiles are for recovery.
+
+`amux browser for https://example.com` recommends a profile and explains why.
+For a required account, query `/api/browser/profile-for?url=...&identity=...&role=...`
+with `X-Amux-Session: $AMUX_SESSION`. The response includes `selection` and `choices`
+so the worker can make the final choice. Unexpired cookies do not prove live auth;
+verify the account on the opened page before acting.
 
 ```bash
-curl -sk -X POST -H 'Content-Type: application/json' -d '{"backend":"live","url":"https://example.com"}' $AMUX_URL/api/browser/start
-# navigate/screenshot/state/action/stop then work identically; live click takes {"selector":"..."} or x,y.
+amux browser route start '{"profile":"<chosen-name>","url":"https://example.com"}'
+amux browser route state
+amux browser route shot  # inspect the PNG
+amux browser route action '{"action":"click","selector":"<observed-selector>"}'
+amux browser route stop
 ```
 
-Shared Playwright instance with saved auth profiles.
-
-```bash
-# Start browser
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"profile":"default","url":"https://example.com"}' \
-  $AMUX_URL/api/browser/start
-
-# Navigate
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.com"}' $AMUX_URL/api/browser/navigate
-
-# Screenshot (returns JSON with path — use Read tool to view)
-curl -sk $AMUX_URL/api/browser/screenshot
-
-# Actions: click, type, key, scroll, eval
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"click","x":640,"y":400}' $AMUX_URL/api/browser/action
-
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"type","text":"hello"}' $AMUX_URL/api/browser/action
-
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"key","key":"Enter"}' $AMUX_URL/api/browser/action
-
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"action":"eval","script":"document.title"}' $AMUX_URL/api/browser/action
-
-# AI agent — autonomous browser task
-curl -sk -X POST -H 'Content-Type: application/json' \
-  -d '{"task":"Find the latest invoice","profile":"default"}' \
-  $AMUX_URL/api/browser/agent
-
-# List auth profiles
-curl -sk $AMUX_URL/api/browser/profiles
-
-# Stop browser
-curl -sk -X POST $AMUX_URL/api/browser/stop
-```
+The shared route uses Amux, then direct CDP with the Chrome identity preselected
+in Browser → Browser route settings, then CUA if enabled. Replies identify the
+actual backend/profile and attempted routes. A failed mutation is never replayed
+on a fallback: observe again before retrying. Scope refusals stay refusals. An occupied native profile uses the configured isolated CDP copy; its current worker keeps its browser and tabs. CUA currently transfers cookies; localStorage and IndexedDB stay in
+full Chrome snapshots. A worker owns its tab, never an arbitrary existing tab.
 
 ---
 

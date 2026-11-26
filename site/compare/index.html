@@ -1,15 +1,15 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
-  <title>Comparisons — amux</title>
+  <title>Comparisons | amux</title>
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <meta name="description" content="See how amux compares to other AI coding tools and frameworks.">
   <meta name="keywords" content="amux, comparisons, claude code, AI coding">
   <link rel="canonical" href="https://amux.io/compare/">
-  <meta property="og:title" content="Comparisons — amux">
+  <meta property="og:title" content="Comparisons | amux">
   <meta property="og:description" content="See how amux compares to other AI coding tools and frameworks.">
   <meta property="og:url" content="https://amux.io/compare/">
   <meta property="og:image" content="https://amux.io/og-image.png">
@@ -20,19 +20,39 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
-  </head>
+    <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
+</head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
@@ -40,19 +60,12 @@
     <h1>Comparisons</h1><p class="subtitle">See how amux compares to other AI coding tools and frameworks.</p>
 
     <!-- EXP-017: best-multiplexers callout on compare index -->
-    <div style="background:rgba(16,185,129,.06);border:1px solid rgba(16,185,129,.25);border-radius:8px;padding:14px 18px;margin:16px 0;display:flex;align-items:center;gap:14px;flex-wrap:wrap">
-      <div style="flex:1;min-width:200px">
-        <div style="font-weight:600;font-size:.9rem;margin-bottom:2px">Looking for the best AI agent multiplexers in 2026?</div>
-        <div style="color:var(--muted);font-size:.83rem">Our in-depth guide compares amux, cmux, dmux, Claude Code Routines, and Warp — with a 12-row feature matrix and clear pick-for-your-use-case guidance.</div>
-      </div>
-      <a href="/guides/best-ai-agent-multiplexers-2026/" onclick="posthog&&posthog.capture('exp017_compare_index_multiplexers_callout_click',{page:window.location.pathname})" style="background:rgba(16,185,129,.15);color:var(--text);border:1px solid rgba(16,185,129,.35);padding:7px 14px;border-radius:6px;font-weight:600;text-decoration:none;font-size:.85rem;white-space:nowrap;flex-shrink:0">Read the guide →</a>
-    </div>
 
     <!-- EXP-012: Freelancer CTA on compare index -->
     <div style="background:rgba(99,102,241,.06);border:1px solid rgba(99,102,241,.25);border-radius:8px;padding:16px 20px;margin:20px 0;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
       <div style="flex:1;min-width:180px">
         <div style="font-weight:600;font-size:.95rem;margin-bottom:3px">Freelancer? Run 5× the client work with parallel AI agents.</div>
-        <div style="color:var(--muted);font-size:.85rem">amux lets you run separate Claude Code sessions per client — isolated worktrees, no context bleed, one dashboard.</div>
+        <div style="color:var(--muted);font-size:.85rem">amux lets you run separate Claude Code sessions per client: isolated worktrees, no context bleed, one dashboard.</div>
       </div>
       <div style="display:flex;gap:10px;flex-shrink:0;flex-wrap:wrap">
         <a href="/for/freelancers/" onclick="posthog&&posthog.capture('exp012_freelancer_cta_click',{destination:'for-freelancers',page:window.location.pathname})" style="background:rgba(99,102,241,.15);color:var(--text);border:1px solid rgba(99,102,241,.4);padding:8px 16px;border-radius:6px;font-weight:600;text-decoration:none;font-size:.9rem;white-space:nowrap">How it works</a>
@@ -61,16 +74,54 @@
     </div>
 
     <ul style="list-style:none;margin-left:0"><li style="margin-bottom:1rem"><a href="/compare/amux-vs-hermes-agent/" style="font-weight:500;color:var(--green);">NEW: amux vs Hermes Agent</a><br><span style="color:var(--muted);font-size:0.85rem">NousResearch's self-improving personal AI daemon vs amux's parallel coding fleet. One agent with deep memory vs 10-50 agents coordinated by a shared kanban board.</span></li>
-<li style="margin-bottom:1rem"><a href="/compare/amux-vs-cowork/" style="font-weight:500;color:var(--green);">NEW: amux vs Cowork</a><br><span style="color:var(--muted);font-size:0.85rem">Claude Cowork (single computer-use agent, Anthropic) vs amux (parallel coding fleet, open source). Different scale, different model, different price.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-cowork/" style="font-weight:500;color:var(--green);">NEW: amux vs Cowork</a><br><span style="color:var(--muted);font-size:0.85rem">Claude Cowork (single computer-use agent, Anthropic) vs amux (parallel coding fleet, source-available). Different scale, different model, different price.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-openclaw/" style="font-weight:500;color:var(--green);">NEW: amux vs OpenClaw</a><br><span style="color:var(--muted);font-size:0.85rem">OpenClaw (messaging-native personal assistant, 347k GitHub stars) vs amux (developer fleet dashboard). Different audiences, different interfaces, complementary tools.</span></li>
-<li style="margin-bottom:1rem"><a href="/compare/amux-vs-symphony/" style="font-weight:500">amux vs OpenAI Symphony</a><br><span style="color:var(--muted);font-size:0.85rem">OpenAI open-sourced Symphony — a ticket-driven Codex orchestrator. Developer-driven dashboard vs autonomous pipeline. Claude Code vs Codex. Built-in kanban vs Linear dependency.</span></li>
-<li style="margin-bottom:1rem"><a href="/compare/amux-vs-cmux/" style="font-weight:500">amux vs cmux</a><br><span style="color:var(--muted);font-size:0.85rem">Native macOS terminal app vs web-accessible orchestration platform. GPU rendering and embedded browser vs REST API, self-healing, and mobile PWA. The complete 2026 comparison.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-symphony/" style="font-weight:500">amux vs OpenAI Symphony</a><br><span style="color:var(--muted);font-size:0.85rem">OpenAI released Symphony, a ticket-driven Codex orchestrator. Developer-driven dashboard vs autonomous pipeline. Claude Code vs Codex. Built-in kanban vs Linear dependency.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-conductor/" style="font-weight:500">amux vs Conductor</a><br><span style="color:var(--muted);font-size:0.85rem">Mac app for parallel agents in git worktrees vs a free-to-self-host AI engineering team on Mac or Linux with a shared board, schedules and a free phone app.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-vibe-kanban/" style="font-weight:500">amux vs Vibe Kanban</a><br><span style="color:var(--muted);font-size:0.85rem">Vibe Kanban went community maintained and local only in 2026. How it compares with an agent-driven board, messages, schedules and a free phone app.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-herdr/" style="font-weight:500">amux vs herdr</a><br><span style="color:var(--muted);font-size:0.85rem">The free Apache-2.0 runtime for coding agents' terminals across your SSH machines, with a native app, phone apps and Ovis, versus a control plane with a shared task board, scheduler and business tools that can run its workers inside herdr.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-claude-squad/" style="font-weight:500">amux vs Claude Squad</a><br><span style="color:var(--muted);font-size:0.85rem">A Go terminal app for a few agents with a worktree each, versus a dashboard, shared board, schedules and phone app for an AI team.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-happy/" style="font-weight:500">amux vs Happy</a><br><span style="color:var(--muted);font-size:0.85rem">A free, end-to-end encrypted desktop and phone app for Claude, Codex and Grok, versus a control plane that runs a team of agents on a shared board with an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-paradev/" style="font-weight:500">amux vs Paradev (formerly Superset)</a><br><span style="color:var(--muted);font-size:0.85rem">A per-seat agentic IDE with a worktree, diff viewer and browser per task, versus a control plane that runs a team of agents on a shared board with an always-on Cloud server at a flat price.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-paseo/" style="font-weight:500">amux vs Paseo</a><br><span style="color:var(--muted);font-size:0.85rem">A free, Apache-2.0 development environment for dozens of coding agents on machines you run, versus a control plane that runs a team of agents on a shared board with an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-open-session/" style="font-weight:500">amux vs Open Session</a><br><span style="color:var(--muted);font-size:0.85rem">Tella's MIT team workspace for coding agents with Slack, Linear and GitHub intake on your own server, versus a control plane with native iPhone, iPad and Mac apps, Tailscale HTTPS and an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-ai-maestro/" style="font-weight:500">amux vs AI Maestro</a><br><span style="color:var(--muted);font-size:0.85rem">A free MIT dashboard that links agents on several machines in a peer mesh, versus a control plane with native iPhone, iPad and Mac apps, a shared board with atomic claiming and an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-mission-control/" style="font-weight:500">amux vs Mission Control</a><br><span style="color:var(--muted);font-size:0.85rem">An MIT, alpha control plane that governs tasks, spend and approvals across OpenClaw, CrewAI, LangGraph and other runtimes, versus a control plane that runs coding agent CLIs with native iPhone, iPad and Mac apps.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-orquesta/" style="font-weight:500">amux vs Orquesta</a><br><span style="color:var(--muted);font-size:0.85rem">A team prompt orchestration layer with an MIT self-hosted server and per-user Cloud plans, versus a self-hosted control plane with native iPhone, iPad and Mac apps and an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-sculptor/" style="font-weight:500">amux vs Sculptor</a><br><span style="color:var(--muted);font-size:0.85rem">Imbue's free, MIT desktop app for parallel coding agents with a worktree per task, versus a control plane that runs a team of agents from your phone with an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-nimbalyst/" style="font-weight:500">amux vs Nimbalyst</a><br><span style="color:var(--muted);font-size:0.85rem">The free, MIT visual desktop workspace (formerly Crystal) for editing agents' work with red and green diffs, versus a control plane that runs a team of agents from your phone with an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-claude-code-projects/" style="font-weight:500">amux vs Claude Code Projects</a><br><span style="color:var(--muted);font-size:0.85rem">Claude's coordinator conversation that splits a stream of tasks into parallel cloud threads and hands back pull requests (public beta on Pro, Max and Ultra), versus a control plane that runs Claude Code, Codex and Gemini CLI agents on a shared board, with your team, on a machine you control.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-claude-code-agent-view/" style="font-weight:500">amux vs Claude Code Agent View</a><br><span style="color:var(--muted);font-size:0.85rem">Claude Code's built-in screen for background sessions on your own machine (<code>claude agents</code>, research preview), versus a control plane that runs Claude Code, Codex and Gemini CLI agents on one board, from your phone, on an always-on server.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-cloudcli/" style="font-weight:500">amux vs CloudCLI</a><br><span style="color:var(--muted);font-size:0.85rem">The open-source web UI for Claude Code, Cursor CLI and Codex (formerly Claude Code UI) with hosted containers from 7 EUR, versus a control plane that runs a team of agents on a dedicated always-on server.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-emdash/" style="font-weight:500">amux vs Emdash</a><br><span style="color:var(--muted);font-size:0.85rem">The free Apache-2.0 desktop app for running coding agents in parallel git worktrees and reviewing each diff, against a phone-ready dashboard with a shared board and a hosted server.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-ccmanager/" style="font-weight:500">amux vs CCManager</a><br><span style="color:var(--muted);font-size:0.85rem">The free MIT terminal app for running Claude Code, Codex, Gemini CLI and more across git worktrees, with no tmux needed, vs a web and phone dashboard with a shared board and an always-on Cloud server.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-agent-deck/" style="font-weight:500">amux vs Agent Deck</a><br><span style="color:var(--muted);font-size:0.85rem">The free MIT terminal session manager for Claude Code, Codex, Gemini CLI and a dozen more agents, on tmux with a web mode. amux runs the team from a web dashboard and phone app, on a shared board.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-agent-of-empires/" style="font-weight:500">amux vs Agent of Empires</a><br><span style="color:var(--muted);font-size:0.85rem">The free MIT Rust session manager (aoe) with a terminal TUI and a phone-ready web dashboard over tmux, plus worktrees and container sandboxes. amux runs the team on a shared board, with a native iPhone app and an always-on Cloud server.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-warp/" style="font-weight:500">amux vs Warp</a><br><span style="color:var(--muted);font-size:0.85rem">The terminal with its own multi-model agent, Claude Code, Codex and Gemini CLI in vertical tabs, and Warp-hosted cloud agents (free, Build $20/mo, Business $50 per seat). amux runs the team on a shared board from any browser or phone, self-hosted or on amux Cloud.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-codeagentswarm/" style="font-weight:500">amux vs CodeAgentSwarm</a><br><span style="color:var(--muted);font-size:0.85rem">The closed-source desktop app, free in beta, that runs twelve coding CLIs in one window with live diffs and an MCP kanban. amux keeps agents running on an always-on server with no app left open.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-t3-code/" style="font-weight:500">amux vs T3 Code</a><br><span style="color:var(--muted);font-size:0.85rem">The free MIT app that drives Claude Code, Codex and ten more agents as threads from desktop, web, iOS and Android. amux runs a team of agents on one shared board, on an always-on server we run for you.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-agentsroom/" style="font-weight:500">amux vs AgentsRoom</a><br><span style="color:var(--muted);font-size:0.85rem">The desktop app for macOS, Windows and Linux that runs about 20 agent CLIs with roles, a customer backlog and a phone companion. amux runs the team on a server, with an always-on option we run for you.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-claude-code-remote-control/" style="font-weight:500">amux vs Claude Code Remote Control</a><br><span style="color:var(--muted);font-size:0.85rem">Anthropic's built-in way to drive Claude Code sessions on your own machine from the Claude app on your phone. amux runs a team of Claude Code, Codex and Gemini CLI agents on a shared board, on a server that stays on when your laptop sleeps.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-super-engineering/" style="font-weight:500">amux vs super.engineering</a><br><span style="color:var(--muted);font-size:0.85rem">The free native Rust desktop app for macOS and Linux that runs 18 agent CLIs in parallel worktrees on your own machine. amux runs a team of agents on one shared board, with an always-on server we run for you.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-superconductor/" style="font-weight:500">amux vs Superconductor</a><br><span style="color:var(--muted);font-size:0.85rem">The hosted multiplayer workspace that runs Claude Code, Codex and seven more agents in cloud sandboxes billed by the second. amux runs a team of agents on one shared board, self-hosted free or on a dedicated server at a flat price.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-jean/" style="font-weight:500">amux vs Jean</a><br><span style="color:var(--muted);font-size:0.85rem">The free Apache-2.0 desktop app and headless server from the Coolify team, built around a git worktree per task. amux runs a team of agents on one shared board, with an always-on server we run for you.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-traycer/" style="font-weight:500">amux vs Traycer</a><br><span style="color:var(--muted);font-size:0.85rem">The free MIT desktop app that turns ideas into specs and tickets for 19 coding agents, with per-seat team pricing. amux runs agents on a shared board with usage-limit recovery on one always-on server at a flat price.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-parallel-code/" style="font-weight:500">amux vs Parallel Code</a><br><span style="color:var(--muted);font-size:0.85rem">The free MIT desktop app for Mac and Linux that runs agents in git worktrees, with a board of what needs you and inline diff review. amux runs a team of agents on a shared board with an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-orca/" style="font-weight:500">amux vs Orca</a><br><span style="color:var(--muted);font-size:0.85rem">The free MIT desktop app for parallel agents in git worktrees, with diff review, a built-in browser and a beta phone companion. amux runs the team on a shared board from a browser or phone, with an always-on server option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-xum/" style="font-weight:500">amux vs Xum</a><br><span style="color:var(--muted);font-size:0.85rem">Coder's free AGPL desktop app, formerly Mux, with its own agent loop on your API keys and SSH or Docker runtimes. amux runs Claude Code, Codex and Gemini CLI on your subscriptions from a shared board.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-github-copilot-app/" style="font-weight:500">amux vs GitHub Copilot app</a><br><span style="color:var(--muted);font-size:0.85rem">GitHub's desktop app for parallel Copilot agent sessions, each in its own worktree, with issues, pull requests and CI built in, included in Copilot plans. amux runs Claude Code, Codex and Gemini CLI on your own subscriptions from a shared board, self-hosted or always on.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-polyscope/" style="font-weight:500">amux vs Polyscope</a><br><span style="color:var(--muted);font-size:0.85rem">Beyond Code's macOS and Windows app for Claude Code, Codex and Cursor agents in copy-on-write clones, with diff review and phone access on Pro ($99 a year). amux runs a team of agents on a shared board, self-hosted or always on.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-crystl/" style="font-weight:500">amux vs crystl</a><br><span style="color:var(--muted);font-size:0.85rem">The macOS terminal app for Claude Code, Codex and other CLI agents, with gems and shards, floating approvals, an orchestrator and an iPhone app (free tier, Guild $170/year). amux runs the team on a shared board from any browser or phone, with an always-on Cloud server.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-cosyra/" style="font-weight:500">amux vs Cosyra</a><br><span style="color:var(--muted);font-size:0.85rem">The mobile cloud terminal: iPhone and Android apps into a 2 vCPU Ubuntu VM with Claude Code, Codex, OpenCode and Antigravity CLI, from $20/mo for 120 hours. amux runs a fleet on a shared board on a server that stays on 24/7, or self-hosted free.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-opcode/" style="font-weight:500">amux vs Opcode</a><br><span style="color:var(--muted);font-size:0.85rem">The free AGPL desktop GUI for Claude Code (formerly Claudia), with custom background agents, checkpoints and a cost dashboard, versus a control plane that runs a team of agents from your phone with an always-on Cloud option.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-omnara/" style="font-weight:500">amux vs Omnara</a><br><span style="color:var(--muted);font-size:0.85rem">An open-source managed agent platform for agents you build with an API, versus a control plane that runs Claude Code, Codex and Gemini CLI as a team.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-cmux/" style="font-weight:500">amux vs cmux</a><br><span style="color:var(--muted);font-size:0.85rem">Native macOS terminal app vs web-accessible orchestration platform. GPU rendering and embedded browser vs REST API, usage-limit resume, and mobile PWA. The complete 2026 comparison.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-claude-managed-agents/" style="font-weight:500">amux vs Claude Managed Agents</a><br><span style="color:var(--muted);font-size:0.85rem">Anthropic launched Managed Agents April 2026 at $0.08/session-hour. Feature-by-feature comparison, cost math, and migration path to the self-hosted alternative.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-dmux/" style="font-weight:500">amux vs dmux</a><br><span style="color:var(--muted);font-size:0.85rem">The complete head-to-head: feature matrix, architecture, workflows, and migration tips for the two leading parallel AI coding agent orchestrators.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-claude-code-agent-teams/" style="font-weight:500">amux vs Claude Code Agent Teams</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with Anthropic's built-in Agent Teams feature for running parallel Claude Code sessions.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-cursor/" style="font-weight:500">amux vs Cursor</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux's parallel agent orchestration with Cursor's AI-powered IDE for coding productivity.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-aider/" style="font-weight:500">amux vs Aider</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with Aider, the popular open-source AI pair programming tool, for parallel development.</span></li>
-<li style="margin-bottom:1rem"><a href="/compare/amux-vs-devin/" style="font-weight:500">amux vs Devin</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux's open-source agent multiplexer with Devin, the autonomous AI software engineer.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-devin/" style="font-weight:500">amux vs Devin</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux's self-hosted agent multiplexer with Devin, the autonomous AI software engineer.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-github-copilot/" style="font-weight:500">amux vs GitHub Copilot</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux parallel agent orchestration with GitHub Copilot for AI-assisted development.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-windsurf/" style="font-weight:500">amux vs Windsurf</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with Windsurf (formerly Codeium) for AI coding productivity.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-openhands/" style="font-weight:500">amux vs OpenHands</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with OpenHands (formerly OpenDevin), the open-source autonomous AI developer.</span></li>
@@ -79,7 +130,7 @@
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-cline/" style="font-weight:500">amux vs Cline (Roo Code)</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux headless agent orchestration with Cline's VS Code-based AI coding assistant.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-goose/" style="font-weight:500">amux vs Goose</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with Block's open-source Goose AI coding agent framework.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-codex/" style="font-weight:500">amux vs OpenAI Codex</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux's local Claude Code orchestration with OpenAI's cloud-based Codex agent.</span></li>
-<li style="margin-bottom:1rem"><a href="/compare/amux-vs-antigravity-cli/" style="font-weight:500">amux vs Antigravity CLI (agy)</a><br><span style="color:var(--muted);font-size:0.85rem">Antigravity CLI replaced Gemini CLI on June 18, 2026. amux runs and manages multiple agy sessions in parallel — self-healing, kanban, and mobile monitoring built in.</span></li>
+<li style="margin-bottom:1rem"><a href="/compare/amux-vs-antigravity-cli/" style="font-weight:500">amux vs Antigravity CLI (agy)</a><br><span style="color:var(--muted);font-size:0.85rem">Antigravity CLI replaced Gemini CLI on June 18, 2026. amux runs and manages multiple agy sessions in parallel, with usage-limit resume, kanban, and mobile monitoring built in.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-sandboxed-sh/" style="font-weight:500">amux vs sandboxed.sh (Open Agent)</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with sandboxed.sh for self-hosted AI agent orchestration.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-claude-code-web-ui/" style="font-weight:500">amux vs Claude Code Web UIs</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with other web-based interfaces for Claude Code like CloudCLI and claude-code-web.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-langraph/" style="font-weight:500">amux vs LangGraph</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with LangGraph for building and orchestrating AI agent workflows.</span></li>
@@ -89,51 +140,24 @@
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-autogen/" style="font-weight:500">amux vs AutoGen (Microsoft)</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with Microsoft's AutoGen framework for multi-agent systems.</span></li>
 <li style="margin-bottom:1rem"><a href="/compare/amux-vs-claude-desktop/" style="font-weight:500">amux vs Claude Desktop</a><br><span style="color:var(--muted);font-size:0.85rem">Compare amux with the Claude Desktop app for development workflows.</span></li></ul>
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='\u2605 '+d.stargazers_count}).catch(function(){})</script>
 </body>

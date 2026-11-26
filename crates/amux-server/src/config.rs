@@ -43,6 +43,25 @@ pub const DEFAULT_PORT: u16 = 8823;
 /// so in a comment, naming this exact line. One env-derived accessor lets each
 /// deployment answer for itself, with no build-time branch (the single-codebase
 /// rule) and nothing to keep in step.
+/// The address to bind, from `AMUX_RS_BIND`, plus the raw value when it did
+/// not parse.
+///
+/// Unset keeps the old behaviour, every IPv4 interface, because the installed
+/// server is reached over the LAN and the tailnet. Test servers set
+/// `127.0.0.1`: the chaos harness used to start throwaway servers on every
+/// interface, which the network watch reported as new listeners and which a
+/// LAN host could reach while the run lasted.
+pub fn bind_address(env: &BTreeMap<String, String>) -> (std::net::IpAddr, Option<String>) {
+    let any = std::net::IpAddr::from([0, 0, 0, 0]);
+    match env.get("AMUX_RS_BIND").map(|v| v.trim()) {
+        None | Some("") => (any, None),
+        Some(v) => match v.parse() {
+            Ok(ip) => (ip, None),
+            Err(_) => (any, Some(v.to_string())),
+        },
+    }
+}
+
 pub fn canonical_port() -> u16 {
     std::env::var("AMUX_RS_PORT")
         .ok()
@@ -55,6 +74,12 @@ pub struct ServerConfig {
     /// `~/.amux` — sessions dir, DB, TLS material, tokens.
     pub amux_home: PathBuf,
     pub port: u16,
+    /// The address the listeners bind, from `AMUX_RS_BIND` (default every
+    /// IPv4 interface, as before). See [`bind_address`].
+    pub bind: std::net::IpAddr,
+    /// The `AMUX_RS_BIND` value that did not parse, when one did not, so boot
+    /// can say it fell back to the default instead of doing so silently.
+    pub bind_rejected: Option<String>,
     /// Path to the SQLite database (shared with the Python server).
     pub db_path: PathBuf,
     /// Everything from server.env plus process env overlays, for
@@ -248,6 +273,7 @@ impl ServerConfig {
             .get("AMUX_RS_PORT")
             .and_then(|p| p.parse().ok())
             .unwrap_or(DEFAULT_PORT);
+        let (bind, bind_rejected) = bind_address(&env);
         let db_path = env
             .get("AMUX_DB")
             .map(PathBuf::from)
@@ -255,6 +281,8 @@ impl ServerConfig {
         ServerConfig {
             amux_home: home,
             port,
+            bind,
+            bind_rejected,
             db_path,
             env,
         }
@@ -344,13 +372,22 @@ mod home_resolution_tests {
     use super::*;
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        move |k| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| v.to_string())
+        }
     }
 
     #[test]
     fn amux_home_wins_and_cc_home_is_the_legacy_fallback() {
         assert_eq!(
-            resolve_home(env(&[("AMUX_HOME", "/a"), ("CC_HOME", "/c"), ("HOME", "/h")])),
+            resolve_home(env(&[
+                ("AMUX_HOME", "/a"),
+                ("CC_HOME", "/c"),
+                ("HOME", "/h")
+            ])),
             PathBuf::from("/a")
         );
         assert_eq!(
@@ -359,7 +396,10 @@ mod home_resolution_tests {
             "CC_HOME was honoured by exactly one of the ten old copies — settings read \
              one home while groups/dictation/push read another"
         );
-        assert_eq!(resolve_home(env(&[("HOME", "/h")])), PathBuf::from("/h/.amux"));
+        assert_eq!(
+            resolve_home(env(&[("HOME", "/h")])),
+            PathBuf::from("/h/.amux")
+        );
     }
 
     /// The bug that made this consolidation worth doing. An exported-but-empty
@@ -380,7 +420,10 @@ mod home_resolution_tests {
         // The shape the old code produced, asserted as NOT happening: a
         // relative path is the failure mode, so name it explicitly.
         let got = resolve_home(env(&[("AMUX_HOME", ""), ("HOME", "/h")]));
-        assert!(got.is_absolute(), "an empty AMUX_HOME must not yield a relative home: {got:?}");
+        assert!(
+            got.is_absolute(),
+            "an empty AMUX_HOME must not yield a relative home: {got:?}"
+        );
     }
 
     /// `$HOME` missing split the old copies too: `unwrap_or_default()` gave the
@@ -429,8 +472,30 @@ pub fn parse_env_file(path: &Path) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn bind_defaults_to_every_interface_and_reports_a_bad_value() {
+        let any: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+        assert_eq!(bind_address(&map(&[])), (any, None));
+        assert_eq!(bind_address(&map(&[("AMUX_RS_BIND", " ")])), (any, None));
+        assert_eq!(
+            bind_address(&map(&[("AMUX_RS_BIND", "127.0.0.1")])),
+            ("127.0.0.1".parse().unwrap(), None)
+        );
+        assert_eq!(
+            bind_address(&map(&[("AMUX_RS_BIND", "::1")])),
+            ("::1".parse().unwrap(), None)
+        );
+        assert_eq!(
+            bind_address(&map(&[("AMUX_RS_BIND", "localhost")])),
+            (any, Some("localhost".to_string()))
+        );
+    }
+
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
     /// Nothing in the live process env, so only the injected maps decide.
     fn no_live(_: &str) -> bool {
@@ -449,9 +514,9 @@ mod tests {
     #[test]
     fn a_key_we_exported_is_refreshed_but_a_key_the_process_owns_is_not() {
         let file = map(&[
-            ("STALE", "new-from-file"),  // we exported it last boot: refresh
-            ("THEIRS", "file-value"),    // launchd set it: leave alone
-            ("FRESH", "brand-new"),      // nobody has it: export
+            ("STALE", "new-from-file"), // we exported it last boot: refresh
+            ("THEIRS", "file-value"),   // launchd set it: leave alone
+            ("FRESH", "brand-new"),     // nobody has it: export
         ]);
         // What the successor inherited across the exec. STALE and THEIRS look
         // IDENTICAL here: both are simply present. Only the marker separates
@@ -507,7 +572,13 @@ mod tests {
         );
 
         // One key edited in the file: exactly one write, and it is that key.
-        let drifted = |k: &str| if k == "B" { Some("stale".to_string()) } else { inherited.get(k).cloned() };
+        let drifted = |k: &str| {
+            if k == "B" {
+                Some("stale".to_string())
+            } else {
+                inherited.get(k).cloned()
+            }
+        };
         assert_eq!(plan.writes(&drifted), vec![("B", "v2")]);
     }
 
@@ -519,13 +590,23 @@ mod tests {
         let inherited = map(&[("KEPT", "v"), ("GONE", "old")]);
 
         let plan = plan_env(&file, true, &inherited, &no_live, Some("KEPT,GONE"));
-        assert_eq!(plan.unset, vec!["GONE".to_string()], "a key the file no longer sets must be withdrawn");
+        assert_eq!(
+            plan.unset,
+            vec!["GONE".to_string()],
+            "a key the file no longer sets must be withdrawn"
+        );
 
         // THE DESTRUCTIVE CASE. `parse_env_file` returns an empty map for a
         // MISSING file and an EMPTY one alike, so without the existence gate an
         // unreadable server.env would withdraw every key the server had ever
         // exported. Same inputs, file_exists=false, and nothing may be unset.
-        let plan = plan_env(&BTreeMap::new(), false, &inherited, &no_live, Some("KEPT,GONE"));
+        let plan = plan_env(
+            &BTreeMap::new(),
+            false,
+            &inherited,
+            &no_live,
+            Some("KEPT,GONE"),
+        );
         assert!(
             plan.unset.is_empty(),
             "an unreadable server.env must not wipe the process config: {:?}",
@@ -564,7 +645,10 @@ mod tests {
         // set that forgets a key every boot.
         let after = map(&[("THEIRS", "set-by-launchd"), ("A", "1"), ("B", "2")]);
         let plan2 = plan_env(&file, true, &after, &no_live, Some(&plan.marker));
-        assert_eq!(plan2.marker, "A,B", "the export set must be stable across generations");
+        assert_eq!(
+            plan2.marker, "A,B",
+            "the export set must be stable across generations"
+        );
         assert_eq!(plan2.export.get("A").map(String::as_str), Some("1"));
     }
 
@@ -617,12 +701,18 @@ mod tests {
 
 /// `$KEY` parsed as f64, trimmed, falling back to `default`.
 pub fn env_f64(key: &str, default: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// `$KEY` parsed as i64, trimmed, falling back to `default`.
 pub fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 /// Unix epoch seconds as f64. Three identical copies (board_drive, alerts,

@@ -40,12 +40,12 @@ use crate::integrations::email::{
     connected_accounts_in, default_amux_home, html_escape, urlencode, HttpTransport,
     ReqwestTransport, DEFAULT_TOKEN_URI, GMAIL_BASE,
 };
+use crate::integrations::oauth_store;
 use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -72,16 +72,40 @@ pub const GMAIL_SCOPES: [&str; 4] = [
 /// account could re-authorize. Deriving it from the canonical port means the
 /// callback is always served where this server actually listens, and a future
 /// port move is a console re-registration rather than a second code change.
+///
+/// A cloud server is opened at its domain, never at localhost, so Google's
+/// redirect to localhost reached nothing (sandbox, 2026-10-28: "i cant connect
+/// gmail"). `AMUX_OAUTH_ORIGIN` names the address the owner's browser reaches
+/// this server at; cloud bootstrap and update set it to `https://<domain>`. The
+/// Mac leaves it unset and keeps the localhost URI its OAuth client registered.
 pub fn gmail_redirect_uri() -> String {
-    std::env::var("GMAIL_REDIRECT_URI")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            format!(
-                "http://localhost:{}/api/gmail/callback",
-                crate::config::canonical_port()
-            )
-        })
+    let home = crate::config::amux_home();
+    if let Some(u) = crate::api::settings::effective_env(&home, "GMAIL_REDIRECT_URI").filter(|s| !s.trim().is_empty()) {
+        return u.trim().to_string();
+    }
+    match oauth_origin() {
+        Some(o) => format!("{o}/api/gmail/callback"),
+        None => format!("http://localhost:{}/api/gmail/callback", crate::config::canonical_port()),
+    }
+}
+
+/// `AMUX_OAUTH_ORIGIN` as `scheme://host[:port]` (no path, no trailing slash),
+/// or None when unset or malformed. Read per call, like `AMUX_PUBLIC_URL`, so
+/// setting it needs no restart.
+pub(crate) fn oauth_origin() -> Option<String> {
+    let raw = crate::api::settings::effective_env(&crate::config::amux_home(), "AMUX_OAUTH_ORIGIN")?;
+    normalize_origin(&raw)
+}
+
+fn normalize_origin(raw: &str) -> Option<String> {
+    let u = raw.trim().trim_end_matches('/');
+    let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://"))?;
+    let ok = !rest.is_empty() && !rest.contains('/') && !rest.contains(char::is_whitespace);
+    if !ok {
+        tracing::warn!(value = raw, measured = true, n_considered = 1, verdict = "oauth_origin_malformed",
+            "AMUX_OAUTH_ORIGIN is not scheme://host[:port]; OAuth redirects fall back to localhost");
+    }
+    ok.then(|| u.to_string())
 }
 /// Whose mailbox a freshly-exchanged token can actually act on (AMUX-3839).
 ///
@@ -99,7 +123,11 @@ async fn granted_mailbox(
     if status >= 400 {
         return Err(format!("HTTP {status} from the mailbox profile"));
     }
-    let addr = body.get("emailAddress").and_then(Value::as_str).unwrap_or("").trim();
+    let addr = body
+        .get("emailAddress")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if addr.is_empty() {
         // A 200 with no address is not a match and not a mismatch. Returning
         // Err keeps it in the "could not verify" arm, which says so, rather than
@@ -129,17 +157,25 @@ const HEALTH_TTL_S: u64 = 300;
 pub struct GmailAuthCtx {
     pub http: Arc<dyn HttpTransport>,
     pub home: PathBuf,
-    health_cache: Mutex<HashMap<String, (Instant, String)>>,
+    /// (when, verdict, grant epoch it was read in): see `account_health`.
+    health_cache: Mutex<HashMap<String, (Instant, String, u64)>>,
 }
 
 impl GmailAuthCtx {
     pub fn new(http: Arc<dyn HttpTransport>, home: PathBuf) -> Self {
-        Self { http, home, health_cache: Mutex::new(HashMap::new()) }
+        Self {
+            http,
+            home,
+            health_cache: Mutex::new(HashMap::new()),
+        }
     }
 }
 
 fn default_ctx() -> Arc<GmailAuthCtx> {
-    Arc::new(GmailAuthCtx::new(Arc::new(ReqwestTransport::new()), default_amux_home()))
+    Arc::new(GmailAuthCtx::new(
+        Arc::new(ReqwestTransport::new()),
+        default_amux_home(),
+    ))
 }
 
 /// Bearer-protected routes (absolute paths — merged, not nested, so the
@@ -163,7 +199,9 @@ pub fn callback_routes() -> Router<AppState> {
 }
 
 pub fn callback_routes_with(ctx: Arc<GmailAuthCtx>) -> Router<AppState> {
-    Router::new().route("/api/gmail/callback", get(callback)).layer(Extension(ctx))
+    Router::new()
+        .route("/api/gmail/callback", get(callback))
+        .layer(Extension(ctx))
 }
 
 // ---- shared helpers --------------------------------------------------------
@@ -178,7 +216,7 @@ fn html(status: StatusCode, body: String) -> Response {
 
 fn token_urlsafe(nbytes: usize) -> String {
     let mut bytes = vec![0u8; nbytes];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("OS random source");
     crate::integrations::email::base64url_nopad(&bytes)
 }
 
@@ -201,14 +239,15 @@ fn client_config(home: &Path) -> Result<ClientConfig, String> {
     })?;
     let v: Value = serde_json::from_str(&raw)
         .map_err(|e| format!("gmail-oauth-client.json is not valid JSON: {e}"))?;
-    let node = v
-        .get("installed")
-        .or_else(|| v.get("web"))
-        .ok_or_else(|| {
-            "gmail-oauth-client.json has no \"installed\" or \"web\" node".to_string()
-        })?;
+    let node = v.get("installed").or_else(|| v.get("web")).ok_or_else(|| {
+        "gmail-oauth-client.json has no \"installed\" or \"web\" node".to_string()
+    })?;
     let s = |k: &str, d: &str| {
-        node.get(k).and_then(Value::as_str).filter(|x| !x.is_empty()).unwrap_or(d).to_string()
+        node.get(k)
+            .and_then(Value::as_str)
+            .filter(|x| !x.is_empty())
+            .unwrap_or(d)
+            .to_string()
     };
     let cfg = ClientConfig {
         client_id: s("client_id", ""),
@@ -233,7 +272,9 @@ fn client_config(home: &Path) -> Result<ClientConfig, String> {
 /// the file is absent or missing either field. The values are for the server's
 /// own OAuth flow and presence/masking only, never emitted raw.
 pub(crate) fn google_oauth_client_file(home: &Path) -> Option<(String, String)> {
-    client_config(home).ok().map(|c| (c.client_id, c.client_secret))
+    client_config(home)
+        .ok()
+        .map(|c| (c.client_id, c.client_secret))
 }
 
 /// Was a consent for this account STARTED and never completed (AMUX-3839)?
@@ -257,9 +298,9 @@ fn abandoned_consent_age_s(pending: &Value, account: &str, now: f64) -> Option<f
         .as_object()?
         .values()
         .filter(|e| {
-            e.get("account").and_then(Value::as_str).is_some_and(|a| {
-                a.trim().eq_ignore_ascii_case(account.trim())
-            })
+            e.get("account")
+                .and_then(Value::as_str)
+                .is_some_and(|a| a.trim().eq_ignore_ascii_case(account.trim()))
         })
         .filter_map(|e| e.get("ts").and_then(Value::as_f64))
         // Entries older than the TTL are already dead and pruned on the next
@@ -283,32 +324,37 @@ fn now_ts() -> f64 {
 /// Python `_gmail_pending_save`: prune >1h entries, add ours, 0600.
 fn pending_save(home: &Path, state: &str, account: &str, verifier: &str) -> std::io::Result<()> {
     let p = pending_path(home);
-    let mut d: Map<String, Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    let _lease = crate::integrations::secure_store::lock(&p)?;
+    let mut d: Map<String, Value> = crate::integrations::secure_store::read_json(&p)?;
     let now = now_ts();
     d.retain(|_, v| now - v.get("ts").and_then(Value::as_f64).unwrap_or(0.0) < PENDING_TTL_S);
     d.insert(
         state.to_string(),
         json!({ "account": account, "verifier": verifier, "ts": now }),
     );
-    std::fs::write(&p, Value::Object(d).to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::integrations::secure_store::write(&p, Value::Object(d).to_string().as_bytes())
 }
 
 /// Python `_gmail_pending_restore`: SINGLE-USE (the entry is removed even
 /// when expired), returns (account, verifier) while fresh.
 fn pending_take(home: &Path, state: &str) -> Option<(String, Option<String>)> {
     let p = pending_path(home);
-    let mut d: Map<String, Value> = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
-    let e = d.remove(state)?;
-    let _ = std::fs::write(&p, Value::Object(d).to_string());
+    let take = || -> std::io::Result<Option<Value>> {
+        let _lease = crate::integrations::secure_store::lock(&p)?;
+        let mut d: Map<String, Value> = crate::integrations::secure_store::read_json(&p)?;
+        let Some(e) = d.remove(state) else {
+            return Ok(None);
+        };
+        crate::integrations::secure_store::write(&p, Value::Object(d).to_string().as_bytes())?;
+        Ok(Some(e))
+    };
+    let e = match take() {
+        Ok(e) => e?,
+        Err(error) => {
+            tracing::warn!(%error, verdict = "gmail_pending_consume_failed", "OAuth state not consumed; no exchange attempted");
+            return None;
+        }
+    };
     if now_ts() - e.get("ts").and_then(Value::as_f64).unwrap_or(0.0) > PENDING_TTL_S {
         return None;
     }
@@ -360,7 +406,10 @@ pub async fn auth_url(
 ) -> Response {
     let account = p.account.unwrap_or_default().trim().to_string();
     if account.is_empty() {
-        return err(StatusCode::BAD_REQUEST, json!({ "error": "account required" }));
+        return err(StatusCode::BAD_REQUEST, json!({"error":"account required"}));
+    }
+    if !oauth_store::valid_account(&account) {
+        return err(StatusCode::BAD_REQUEST, json!({"error":"invalid account"}));
     }
     let cfg = match client_config(&ctx.home) {
         Ok(c) => c,
@@ -494,10 +543,17 @@ pub async fn callback(
     let state = p.state.unwrap_or_default().trim().to_string();
     let error = p.error.unwrap_or_default().trim().to_string();
     if !error.is_empty() {
+        if !state.is_empty() {
+            let _ = pending_take(&ctx.home, &state);
+            super::connectors::cancel_delegated_gmail_state(&ctx.home, &state);
+            tracing::warn!(verdict="gmail_oauth_cancelled", "OAuth error consumed pending consent state");
+        }
         // A redirect_uri_mismatch is the reauth-blocking case (AMUX-3352):
         // render the one-time console fix instead of a dead-end "Auth failed".
         if error.contains("redirect_uri_mismatch") {
-            let cid = client_config(&ctx.home).map(|c| c.client_id).unwrap_or_default();
+            let cid = client_config(&ctx.home)
+                .map(|c| c.client_id)
+                .unwrap_or_default();
             return html(
                 StatusCode::BAD_REQUEST,
                 format!(
@@ -516,7 +572,11 @@ pub async fn callback(
             ),
         );
     }
-    let entry = if state.is_empty() { None } else { pending_take(&ctx.home, &state) };
+    let entry = if state.is_empty() {
+        None
+    } else {
+        pending_take(&ctx.home, &state)
+    };
     let Some((account, verifier)) = entry.filter(|_| !code.is_empty()) else {
         // Not ours? The connectors broker's google-family grants hand Google
         // THIS redirect URI on purpose — it is the one already registered on
@@ -587,7 +647,10 @@ pub async fn callback(
             )
         }
     };
-    let access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
+    let access = body
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if status >= 400 || access.is_empty() {
         // If the exchange itself reports a redirect_uri_mismatch, surface the
         // one-time console fix rather than a raw HTTP dump (AMUX-3352).
@@ -663,6 +726,24 @@ pub async fn callback(
 
     // Python's exact token-file shape — the one integrations/email.rs
     // `load_token_file` reads. The formats must be ONE.
+    if !oauth_store::valid_account(&account) {
+        return html(
+            StatusCode::BAD_REQUEST,
+            "<h2>Invalid Gmail account</h2>".into(),
+        );
+    }
+    let _lease = match oauth_store::lock(&ctx.home, "google", &account).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            return html(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "<h2>Grant storage unavailable</h2><pre>{}</pre>",
+                    html_escape(&error.to_string())
+                ),
+            )
+        }
+    };
     let tokens_dir = ctx.home.join("gmail-tokens");
     if let Err(e) = std::fs::create_dir_all(&tokens_dir) {
         return html(
@@ -696,8 +777,10 @@ pub async fn callback(
         token_file["identity_unverified"] = json!(true);
         token_file["identity_unverified_why"] = json!(why);
     }
-    if let Err(e) = std::fs::write(tokens_dir.join(format!("{account}.json")), token_file.to_string())
-    {
+    if let Err(e) = crate::integrations::secure_store::write(
+        &tokens_dir.join(format!("{account}.json")),
+        token_file.to_string().as_bytes(),
+    ) {
         return html(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
@@ -706,6 +789,21 @@ pub async fn callback(
             ),
         );
     }
+    // A new grant makes the cached verdict stale. Without this, /accounts kept
+    // answering needs_reauth for up to HEALTH_TTL_S after a successful
+    // reconnect, and claude-rotate skipped the mailbox as dead (2026-10-17).
+    let dropped = ctx.health_cache.lock().expect("health cache").remove(&account);
+    // The connectors rollup (and the maintenance receipt built from it) read
+    // the same grant; without this it kept the old verdict for up to 300s.
+    crate::api::connectors::invalidate_rollup(&ctx.home);
+    tracing::info!(
+        account,
+        verdict = "gmail_health_cache_cleared",
+        stale = dropped.as_ref().map(|(_, s, _)| s.as_str()).unwrap_or("none"),
+        measured = true,
+        n_considered = 1,
+        "a reconnect replaced the token; the next health read probes it"
+    );
     html(
         StatusCode::OK,
         format!(
@@ -754,10 +852,9 @@ pub async fn accounts(Extension(ctx): Extension<Arc<GmailAuthCtx>>) -> Response 
     let unverified: Vec<Value> = accts
         .iter()
         .filter_map(|a| {
-            let raw = std::fs::read_to_string(
-                ctx.home.join("gmail-tokens").join(format!("{a}.json")),
-            )
-            .ok()?;
+            let raw =
+                crate::integrations::secure_store::read_string(ctx.home.join("gmail-tokens").join(format!("{a}.json")))
+                    .ok()?;
             let v: Value = serde_json::from_str(&raw).ok()?;
             v.get("identity_unverified")
                 .and_then(Value::as_bool)
@@ -792,9 +889,15 @@ pub async fn accounts(Extension(ctx): Extension<Arc<GmailAuthCtx>>) -> Response 
 /// from a REAL authenticated round trip (getProfile), cached 300s. A token
 /// file that exists but cannot be exercised is exactly the disagreement
 /// this field exists to expose.
+///
+/// A verdict read before the last grant change is stale whatever its age
+/// (2026-11-08: after a re-consent through the Connectors flow this kept
+/// answering needs_reauth for up to 300s, while the inbox already worked,
+/// because only the Gmail flow's own callback cleared this cache).
 async fn account_health(ctx: &GmailAuthCtx, account: &str) -> String {
-    if let Some((at, state)) = ctx.health_cache.lock().expect("health cache").get(account) {
-        if at.elapsed().as_secs() < HEALTH_TTL_S {
+    let epoch = crate::api::connectors::grant_epoch();
+    if let Some((at, state, seen)) = ctx.health_cache.lock().expect("health cache").get(account) {
+        if at.elapsed().as_secs() < HEALTH_TTL_S && *seen == epoch {
             return state.clone();
         }
     }
@@ -802,7 +905,7 @@ async fn account_health(ctx: &GmailAuthCtx, account: &str) -> String {
     ctx.health_cache
         .lock()
         .expect("health cache")
-        .insert(account.to_string(), (Instant::now(), state.clone()));
+        .insert(account.to_string(), (Instant::now(), state.clone(), epoch));
     state
 }
 
@@ -818,11 +921,19 @@ pub(crate) async fn health_for(http: Arc<dyn HttpTransport>, home: &Path, accoun
 }
 
 async fn probe_health(ctx: &GmailAuthCtx, account: &str) -> String {
-    let path = ctx.home.join("gmail-tokens").join(format!("{account}.json"));
-    let Some(tf) = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-    else {
+    let _lease = match oauth_store::lock(&ctx.home, "google", account).await {
+        Ok(lease) => lease,
+        Err(_) => return "storage_error".into(),
+    };
+    let path = oauth_store::gmail_path(&ctx.home, account);
+    let raw = match crate::integrations::secure_store::read_string(&path) {
+        Ok(raw) => raw,
+        // Sealed at rest with the key unavailable: the grant exists and may be
+        // fine, so say locked rather than send the owner to reconnect it.
+        Err(e) if crate::integrations::at_rest::is_locked(&e) => return "locked".into(),
+        Err(_) => return "not_connected".into(),
+    };
+    let Some(tf) = serde_json::from_str::<Value>(&raw).ok() else {
         return "not_connected".into();
     };
     let profile_url = format!("{GMAIL_BASE}/profile");
@@ -836,7 +947,10 @@ async fn probe_health(ctx: &GmailAuthCtx, account: &str) -> String {
     }
     // Stored access token stale/absent: exercise the refresh token — the
     // discriminator between needs_reauth (invalid_grant) and not_connected.
-    let refresh = tf.get("refresh_token").and_then(Value::as_str).unwrap_or("");
+    let refresh = tf
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if refresh.is_empty() {
         return "not_connected".into();
     }
@@ -850,7 +964,11 @@ async fn probe_health(ctx: &GmailAuthCtx, account: &str) -> String {
     };
     let token_uri = {
         let t = s("token_uri");
-        if t.is_empty() { DEFAULT_TOKEN_URI.to_string() } else { t }
+        if t.is_empty() {
+            DEFAULT_TOKEN_URI.to_string()
+        } else {
+            t
+        }
     };
     let form = vec![
         ("grant_type".to_string(), "refresh_token".to_string()),
@@ -860,23 +978,30 @@ async fn probe_health(ctx: &GmailAuthCtx, account: &str) -> String {
     ];
     match ctx.http.post_form(&token_uri, &form).await {
         Ok((st, body)) if st < 400 => {
-            let new_access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
+            let new_access = body
+                .get("access_token")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if new_access.is_empty() {
                 return "not_connected".into();
             }
-            // Persist in Python's shape so the next reader skips the refresh
-            // (same behavior as _gmail_load_creds).
-            let _ = std::fs::write(
-                &path,
-                json!({
-                    "token": new_access,
-                    "refresh_token": refresh,
-                    "token_uri": token_uri,
-                    "client_id": cid,
-                    "client_secret": csec,
-                })
-                .to_string(),
-            );
+            let mut document = tf.clone();
+            document["client_id"] = json!(cid);
+            document["client_secret"] = json!(csec);
+            document["token_uri"] = json!(token_uri);
+            let updated = match oauth_store::refreshed(
+                &document,
+                &body,
+                document.get("expires_at").is_some(),
+            ) {
+                Ok(updated) => updated,
+                Err(_) => return "not_connected".into(),
+            };
+            if oauth_store::persist_refresh(&ctx.home, "google", account, &path, &document, updated)
+                .is_err()
+            {
+                return "storage_error".into();
+            }
             match ctx.http.get(&profile_url, Some(new_access)).await {
                 Ok((st2, _)) if st2 < 400 => "ok".into(),
                 _ => "not_connected".into(),
@@ -906,10 +1031,41 @@ pub async fn delete_account(
     Query(p): Query<AccountParams>,
 ) -> Response {
     let account = p.account.unwrap_or_default().trim().to_string();
-    let path = ctx.home.join("gmail-tokens").join(format!("{account}.json"));
-    if !account.is_empty() && path.exists() {
-        let _ = std::fs::remove_file(&path);
+    if !oauth_store::valid_account(&account) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({"error":"valid account required"}),
+        );
     }
+    let _lease = match oauth_store::lock(&ctx.home, "google", &account).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":error.to_string()}),
+            )
+        }
+    };
+    let path = ctx
+        .home
+        .join("gmail-tokens")
+        .join(format!("{account}.json"));
+    if let Err(error) = std::fs::remove_file(&path)
+        .and_then(|_| std::fs::File::open(path.parent().unwrap())?.sync_all())
+    {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(%error, verdict = "gmail_disconnect_commit_failed", "Gmail disconnect could not be committed");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"Gmail disconnect could not be committed"}),
+            );
+        }
+    }
+    ctx.health_cache
+        .lock()
+        .expect("health cache")
+        .remove(&account);
+    crate::api::connectors::invalidate_rollup(&ctx.home);
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -936,13 +1092,37 @@ mod tests {
     use tower::ServiceExt;
 
     #[test]
+    fn a_cloud_origin_is_kept_only_as_scheme_host_and_port() {
+        assert_eq!(normalize_origin(" https://sandbox.amux.io/ ").as_deref(), Some("https://sandbox.amux.io"));
+        assert_eq!(normalize_origin("http://localhost:8824").as_deref(), Some("http://localhost:8824"));
+        for bad in ["", "sandbox.amux.io", "https://", "https://a.io/api", "ftp://a.io", "https://a b.io"] {
+            assert_eq!(normalize_origin(bad), None, "{bad:?} is not an origin");
+        }
+    }
+
+    #[test]
     fn prerequisite_names_the_console_client_and_redirect_uri() {
         // AMUX-3352: the reauth-blocking console step must be spelled out.
-        let v = oauth_prerequisite("492989726165-abc.apps.googleusercontent.com", "https://localhost:8824/api/gmail/callback");
-        assert_eq!(v["console_url"], "https://console.cloud.google.com/apis/credentials");
-        assert_eq!(v["client_id"], "492989726165-abc.apps.googleusercontent.com");
-        assert_eq!(v["add_redirect_uri"], "https://localhost:8824/api/gmail/callback");
-        let h = prerequisite_html("492989726165-abc.apps.googleusercontent.com", "https://localhost:8824/api/gmail/callback");
+        let v = oauth_prerequisite(
+            "492989726165-abc.apps.googleusercontent.com",
+            "https://localhost:8824/api/gmail/callback",
+        );
+        assert_eq!(
+            v["console_url"],
+            "https://console.cloud.google.com/apis/credentials"
+        );
+        assert_eq!(
+            v["client_id"],
+            "492989726165-abc.apps.googleusercontent.com"
+        );
+        assert_eq!(
+            v["add_redirect_uri"],
+            "https://localhost:8824/api/gmail/callback"
+        );
+        let h = prerequisite_html(
+            "492989726165-abc.apps.googleusercontent.com",
+            "https://localhost:8824/api/gmail/callback",
+        );
         assert!(h.contains("492989726165-abc.apps.googleusercontent.com"));
         assert!(h.contains("https://localhost:8824/api/gmail/callback"));
         assert!(h.contains("Authorized redirect URIs"));
@@ -963,7 +1143,10 @@ mod tests {
             Arc::new(Self {
                 calls: Mutex::new(Vec::new()),
                 script: Mutex::new(
-                    script.into_iter().map(|(m, u, s, v)| (m.into(), u.into(), s, v)).collect(),
+                    script
+                        .into_iter()
+                        .map(|(m, u, s, v)| (m.into(), u.into(), s, v))
+                        .collect(),
                 ),
             })
         }
@@ -981,8 +1164,9 @@ mod tests {
                 body.cloned(),
             ));
             let mut script = self.script.lock().unwrap();
-            if let Some(pos) =
-                script.iter().position(|(m, sub, _, _)| m == method && url.contains(sub.as_str()))
+            if let Some(pos) = script
+                .iter()
+                .position(|(m, sub, _, _)| m == method && url.contains(sub.as_str()))
             {
                 let (_, _, status, v) = script.remove(pos);
                 return Ok((status, v));
@@ -1012,7 +1196,11 @@ mod tests {
             url: &str,
             form: &[(String, String)],
         ) -> Result<(u16, Value), String> {
-            let v = Value::Object(form.iter().map(|(k, val)| (k.clone(), json!(val))).collect());
+            let v = Value::Object(
+                form.iter()
+                    .map(|(k, val)| (k.clone(), json!(val)))
+                    .collect(),
+            );
             self.answer("FORM", url, None, Some(&v))
         }
     }
@@ -1042,7 +1230,7 @@ mod tests {
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
                 auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
             dir,
         )
@@ -1059,20 +1247,30 @@ mod tests {
     }
 
     async fn send(app: &axum::Router, method: &str, path: &str) -> (StatusCode, String) {
-        let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     async fn send_json(app: &axum::Router, method: &str, path: &str) -> (StatusCode, Value) {
         let (st, body) = send(app, method, path).await;
-        (st, serde_json::from_str(&body).unwrap_or(Value::String(body)))
+        (
+            st,
+            serde_json::from_str(&body).unwrap_or(Value::String(body)),
+        )
     }
 
     fn qparam<'a>(url: &'a str, key: &str) -> Option<&'a str> {
-        url.split(['?', '&']).find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+        url.split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
     }
 
     #[tokio::test]
@@ -1083,7 +1281,10 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["account"], json!(ACCT));
         let url = v["url"].as_str().unwrap();
-        assert!(url.starts_with("https://accounts.google.com/o/oauth2/auth?"), "{url}");
+        assert!(
+            url.starts_with("https://accounts.google.com/o/oauth2/auth?"),
+            "{url}"
+        );
         // The four Python scopes, space-joined then percent-encoded.
         let want_scope = urlencode(
             "https://www.googleapis.com/auth/gmail.modify \
@@ -1101,15 +1302,19 @@ mod tests {
             qparam(url, "client_id"),
             Some(urlencode("PLACEHOLDER_ID.apps.googleusercontent.com").as_str())
         );
-        assert_eq!(qparam(url, "redirect_uri"), Some(urlencode(&gmail_redirect_uri()).as_str()));
+        assert_eq!(
+            qparam(url, "redirect_uri"),
+            Some(urlencode(&gmail_redirect_uri()).as_str())
+        );
         assert_eq!(qparam(url, "code_challenge_method"), Some("S256"));
 
         // Pending state persisted in Python's file shape, challenge derived
         // from the stored verifier (S256).
         let state = qparam(url, "state").unwrap();
-        let pending: Value =
-            serde_json::from_str(&std::fs::read_to_string(home.path().join("gmail-pending.json")).unwrap())
-                .unwrap();
+        let pending: Value = serde_json::from_str(
+            &crate::integrations::secure_store::read_string(home.path().join("gmail-pending.json")).unwrap(),
+        )
+        .unwrap();
         let entry = &pending[state];
         assert_eq!(entry["account"], json!(ACCT));
         assert!(entry["ts"].as_f64().unwrap() > 0.0);
@@ -1144,7 +1349,10 @@ mod tests {
         let (st, v) = send_json(&app2, "GET", "/api/gmail/auth?account=x%40y.z").await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
         assert!(v["error"].as_str().unwrap().contains("client_id"), "{v}");
-        assert!(v["error"].as_str().unwrap().contains("client_secret"), "{v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("client_secret"),
+            "{v}"
+        );
     }
 
     /// AMUX-3839. "Your token expired" and "your consent never came back" are
@@ -1160,12 +1368,24 @@ mod tests {
             "st4": {"account": "hello@amux.io", "verifier": "v", "ts": now - 7200.0},
         });
         // The MOST RECENT live attempt for this account, in seconds.
-        assert_eq!(abandoned_consent_age_s(&pending, "hello@amux.io", now), Some(120.0));
-        assert!(abandoned_consent_age_s(&pending, "HELLO@AMUX.IO", now).is_some(), "case");
+        assert_eq!(
+            abandoned_consent_age_s(&pending, "hello@amux.io", now),
+            Some(120.0)
+        );
+        assert!(
+            abandoned_consent_age_s(&pending, "HELLO@AMUX.IO", now).is_some(),
+            "case"
+        );
         // ANOTHER ACCOUNT'S abandoned consent is not this account's problem.
-        assert_eq!(abandoned_consent_age_s(&pending, "other@amux.io", now), Some(60.0));
+        assert_eq!(
+            abandoned_consent_age_s(&pending, "other@amux.io", now),
+            Some(60.0)
+        );
         // NOBODY'S. An account with no pending entry gets no claim made about it.
-        assert_eq!(abandoned_consent_age_s(&pending, "nobody@amux.io", now), None);
+        assert_eq!(
+            abandoned_consent_age_s(&pending, "nobody@amux.io", now),
+            None
+        );
         // PAST THE TTL IS NOT AN ATTEMPT ANYONE CAN COMPLETE. st4 is 2h old and
         // must not be reported; without this the field would point at a dead
         // entry the next save prunes.
@@ -1173,8 +1393,14 @@ mod tests {
         assert_eq!(abandoned_consent_age_s(&only_old, "z@amux.io", now), None);
         // A COMPLETED flow removes its own entry (pending_take is single-use),
         // so an empty file means nothing is outstanding.
-        assert_eq!(abandoned_consent_age_s(&json!({}), "hello@amux.io", now), None);
-        assert_eq!(abandoned_consent_age_s(&json!("not an object"), "a@b.c", now), None);
+        assert_eq!(
+            abandoned_consent_age_s(&json!({}), "hello@amux.io", now),
+            None
+        );
+        assert_eq!(
+            abandoned_consent_age_s(&json!("not an object"), "a@b.c", now),
+            None
+        );
     }
 
     /// The shipped path: the field appears when a mint was abandoned and is
@@ -1188,16 +1414,23 @@ mod tests {
         // FIRST mint: nothing outstanding yet, so no claim is made.
         let (_, v1) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
         assert!(
-            v1.get("previous_attempt_never_completed").is_none_or(Value::is_null),
+            v1.get("previous_attempt_never_completed")
+                .is_none_or(Value::is_null),
             "a first mint must not invent an abandoned attempt: {v1}"
         );
 
         // SECOND mint with no callback in between: the first one is abandoned.
         let (_, v2) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
         let note = &v2["previous_attempt_never_completed"];
-        assert!(!note.is_null(), "the abandoned first mint must be reported: {v2}");
         assert!(
-            note["meaning"].as_str().unwrap_or_default().contains("did not expire"),
+            !note.is_null(),
+            "the abandoned first mint must be reported: {v2}"
+        );
+        assert!(
+            note["meaning"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("did not expire"),
             "and it must name the WRONG conclusion it exists to prevent: {note}"
         );
 
@@ -1205,7 +1438,8 @@ mod tests {
         // "something is pending" flag would fail.
         let (_, v3) = send_json(&app, "GET", "/api/gmail/auth?account=other%40amux.io").await;
         assert!(
-            v3.get("previous_attempt_never_completed").is_none_or(Value::is_null),
+            v3.get("previous_attempt_never_completed")
+                .is_none_or(Value::is_null),
             "another account's abandoned consent is not this one's: {v3}"
         );
     }
@@ -1226,19 +1460,36 @@ mod tests {
         )]);
         let (app, _d) = app_with(http.clone(), home.path());
         let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
-        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
-        let (st, _) =
-            send(&app, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        let state = qparam(v["url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
+        let (st, _) = send(
+            &app,
+            "GET",
+            &format!("/api/gmail/callback?code=authcode123&state={state}"),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
 
         // ON DISK.
         let tok: Value = serde_json::from_str(
-            &std::fs::read_to_string(home.path().join("gmail-tokens").join(format!("{ACCT}.json")))
-                .unwrap(),
+            &crate::integrations::secure_store::read_string(
+                home.path()
+                    .join("gmail-tokens")
+                    .join(format!("{ACCT}.json")),
+            )
+            .unwrap(),
         )
         .unwrap();
-        assert_eq!(tok["identity_unverified"], json!(true), "the file must carry the stamp: {tok}");
-        assert!(tok["identity_unverified_why"].is_string(), "with the reason: {tok}");
+        assert_eq!(
+            tok["identity_unverified"],
+            json!(true),
+            "the file must carry the stamp: {tok}"
+        );
+        assert!(
+            tok["identity_unverified_why"].is_string(),
+            "with the reason: {tok}"
+        );
 
         // AND WHERE SOMEONE LOOKS. The stamp existing only in the file would be
         // the same defect one layer down.
@@ -1261,22 +1512,45 @@ mod tests {
                 200,
                 json!({ "access_token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT" }),
             ),
-            ("GET", "users/me/profile", 200, json!({ "emailAddress": ACCT })),
+            (
+                "GET",
+                "users/me/profile",
+                200,
+                json!({ "emailAddress": ACCT }),
+            ),
         ]);
         let (app, _d) = app_with(http.clone(), home.path());
         let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
-        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
-        send(&app, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        let state = qparam(v["url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
+        send(
+            &app,
+            "GET",
+            &format!("/api/gmail/callback?code=authcode123&state={state}"),
+        )
+        .await;
 
         let tok: Value = serde_json::from_str(
-            &std::fs::read_to_string(home.path().join("gmail-tokens").join(format!("{ACCT}.json")))
-                .unwrap(),
+            &crate::integrations::secure_store::read_string(
+                home.path()
+                    .join("gmail-tokens")
+                    .join(format!("{ACCT}.json")),
+            )
+            .unwrap(),
         )
         .unwrap();
-        assert!(tok.get("identity_unverified").is_none(), "a verified write is unstamped: {tok}");
+        assert!(
+            tok.get("identity_unverified").is_none(),
+            "a verified write is unstamped: {tok}"
+        );
         // And the ordinary file shape stays byte-identical to what
         // `load_token_file` and the Python round-trip pin.
-        assert_eq!(tok.as_object().unwrap().len(), 5, "no extra keys on the happy path: {tok}");
+        assert_eq!(
+            tok.as_object().unwrap().len(),
+            5,
+            "no extra keys on the happy path: {tok}"
+        );
 
         let (_, acc) = send_json(&app, "GET", "/api/gmail/accounts").await;
         assert_eq!(
@@ -1290,17 +1564,32 @@ mod tests {
     #[test]
     fn the_identity_comparison_is_case_insensitive_and_nothing_cleverer() {
         assert!(identity_matches("hello@amux.io", "hello@amux.io"));
-        assert!(identity_matches("Hello@Amux.IO", "hello@amux.io"), "addresses are case-insensitive");
-        assert!(identity_matches(" hello@amux.io ", "hello@amux.io"), "surrounding space is noise");
+        assert!(
+            identity_matches("Hello@Amux.IO", "hello@amux.io"),
+            "addresses are case-insensitive"
+        );
+        assert!(
+            identity_matches(" hello@amux.io ", "hello@amux.io"),
+            "surrounding space is noise"
+        );
         // THE CASE THAT MATTERS: two different accounts are two different
         // accounts. This is the authuser=N case.
-        assert!(!identity_matches("esteininger21@gmail.com", "ethan@mixpeek.com"));
+        assert!(!identity_matches(
+            "esteininger21@gmail.com",
+            "ethan@mixpeek.com"
+        ));
         // AND THE CLEVERNESS THAT WOULD WAVE A MISMATCH THROUGH. Dot-insensitivity
         // and +tag stripping are gmail.com delivery conveniences that do not hold
         // for Workspace domains, so they must NOT match here.
-        assert!(!identity_matches("e.steininger21@gmail.com", "esteininger21@gmail.com"));
+        assert!(!identity_matches(
+            "e.steininger21@gmail.com",
+            "esteininger21@gmail.com"
+        ));
         assert!(!identity_matches("hello+x@amux.io", "hello@amux.io"));
-        assert!(!identity_matches("", "hello@amux.io"), "an empty request matches nothing");
+        assert!(
+            !identity_matches("", "hello@amux.io"),
+            "an empty request matches nothing"
+        );
     }
 
     /// AMUX-3839, the shipped path: a consent granted by a DIFFERENT account
@@ -1322,22 +1611,43 @@ mod tests {
                 json!({ "access_token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT" }),
             ),
             // Google consented as somebody else.
-            ("GET", "users/me/profile", 200, json!({ "emailAddress": "someone.else@gmail.com" })),
+            (
+                "GET",
+                "users/me/profile",
+                200,
+                json!({ "emailAddress": "someone.else@gmail.com" }),
+            ),
         ]);
         let (app, _d) = app_with(http.clone(), home.path());
         let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
-        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
+        let state = qparam(v["url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
 
-        let (st, page) =
-            send(&app, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        let (st, page) = send(
+            &app,
+            "GET",
+            &format!("/api/gmail/callback?code=authcode123&state={state}"),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{page}");
-        assert!(page.contains("someone.else@gmail.com"), "it names who DID consent: {page}");
+        assert!(
+            page.contains("someone.else@gmail.com"),
+            "it names who DID consent: {page}"
+        );
         assert!(page.contains(ACCT), "and who was asked for: {page}");
-        assert!(!page.contains("connected!"), "it must not report success: {page}");
+        assert!(
+            !page.contains("connected!"),
+            "it must not report success: {page}"
+        );
         // THE LOAD-BEARING ASSERTION. A version that showed the warning and
         // wrote the file anyway would pass every assertion above.
         assert!(
-            !home.path().join("gmail-tokens").join(format!("{ACCT}.json")).exists(),
+            !home
+                .path()
+                .join("gmail-tokens")
+                .join(format!("{ACCT}.json"))
+                .exists(),
             "a refused consent must leave no token behind"
         );
     }
@@ -1362,12 +1672,21 @@ mod tests {
         )]);
         let (app, _d) = app_with(http.clone(), home.path());
         let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
-        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
-        let (st, page) =
-            send(&app, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        let state = qparam(v["url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
+        let (st, page) = send(
+            &app,
+            "GET",
+            &format!("/api/gmail/callback?code=authcode123&state={state}"),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "{page}");
         assert!(
-            home.path().join("gmail-tokens").join(format!("{ACCT}.json")).exists(),
+            home.path()
+                .join("gmail-tokens")
+                .join(format!("{ACCT}.json"))
+                .exists(),
             "a transient lookup failure must not block the connect"
         );
     }
@@ -1387,21 +1706,33 @@ mod tests {
             // the VERIFIED path; without it the callback falls into the
             // could-not-verify arm and the test would no longer be able to tell
             // the two apart.
-            ("GET", "users/me/profile", 200, json!({ "emailAddress": ACCT })),
+            (
+                "GET",
+                "users/me/profile",
+                200,
+                json!({ "emailAddress": ACCT }),
+            ),
         ]);
         let (app, _d) = app_with(http.clone(), home.path());
 
         // Mint the URL (writes pending), then hit the callback like Google's
         // redirect would.
         let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
-        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
-        let pending: Value =
-            serde_json::from_str(&std::fs::read_to_string(home.path().join("gmail-pending.json")).unwrap())
-                .unwrap();
+        let state = qparam(v["url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
+        let pending: Value = serde_json::from_str(
+            &crate::integrations::secure_store::read_string(home.path().join("gmail-pending.json")).unwrap(),
+        )
+        .unwrap();
         let verifier = pending[&state]["verifier"].as_str().unwrap().to_string();
 
-        let (st, page) =
-            send(&app, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        let (st, page) = send(
+            &app,
+            "GET",
+            &format!("/api/gmail/callback?code=authcode123&state={state}"),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "{page}");
         assert!(page.contains("connected!"), "{page}");
 
@@ -1414,8 +1745,12 @@ mod tests {
         assert_eq!(form["code_verifier"], json!(verifier));
 
         // Token file: EXACT Python shape, nothing extra.
-        let tok_path = home.path().join("gmail-tokens").join(format!("{ACCT}.json"));
-        let tok: Value = serde_json::from_str(&std::fs::read_to_string(&tok_path).unwrap()).unwrap();
+        let tok_path = home
+            .path()
+            .join("gmail-tokens")
+            .join(format!("{ACCT}.json"));
+        let tok: Value =
+            serde_json::from_str(&crate::integrations::secure_store::read_string(&tok_path).unwrap()).unwrap();
         assert_eq!(
             tok,
             json!({
@@ -1442,8 +1777,12 @@ mod tests {
         assert_eq!(reader_http.calls()[0].2.as_deref(), Some("PLACEHOLDER_AT"));
 
         // Single-use state: replaying the callback must fail.
-        let (st, page) =
-            send(&app, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        let (st, page) = send(
+            &app,
+            "GET",
+            &format!("/api/gmail/callback?code=authcode123&state={state}"),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(page.contains("Invalid or expired"), "{page}");
     }
@@ -1464,7 +1803,9 @@ mod tests {
         // A state without a code is invalid too (Python: `not entry or not
         // code`).
         let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=a%40b.c").await;
-        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
+        let state = qparam(v["url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
         let (st, page) = send(&app, "GET", &format!("/api/gmail/callback?state={state}")).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(page.contains("Invalid or expired"), "{page}");
@@ -1479,9 +1820,15 @@ mod tests {
         )]);
         let (app2, _d2) = app_with(http, home.path());
         let (_, v) = send_json(&app2, "GET", "/api/gmail/auth?account=a%40b.c").await;
-        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
-        let (st, page) =
-            send(&app2, "GET", &format!("/api/gmail/callback?code=bad&state={state}")).await;
+        let state = qparam(v["url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
+        let (st, page) = send(
+            &app2,
+            "GET",
+            &format!("/api/gmail/callback?code=bad&state={state}"),
+        )
+        .await;
         assert_eq!(st, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(page.contains("Token exchange failed"), "{page}");
         assert!(!home.path().join("gmail-tokens").join("a@b.c.json").exists());
@@ -1505,14 +1852,22 @@ mod tests {
         )
         .unwrap();
         // Healthy account: profile answers 200.
-        let http = MockHttp::new(vec![("GET", "/profile", 200, json!({ "emailAddress": ACCT }))]);
+        let http = MockHttp::new(vec![(
+            "GET",
+            "/profile",
+            200,
+            json!({ "emailAddress": ACCT }),
+        )]);
         let (app, _d) = app_with(http.clone(), home.path());
         let (st, v) = send_json(&app, "GET", "/api/gmail/accounts").await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["accounts"], json!([ACCT]));
         assert_eq!(v["health"][ACCT], json!("ok"));
         assert_eq!(v["needs_reauth"], json!([]));
-        assert!(v["note"].as_str().unwrap().contains("token file exists"), "{v}");
+        assert!(
+            v["note"].as_str().unwrap().contains("token file exists"),
+            "{v}"
+        );
         // The probe exercised the stored token, not just the file's existence.
         assert_eq!(http.calls()[0].2.as_deref(), Some("PLACEHOLDER_LIVE"));
 
@@ -1520,12 +1875,68 @@ mod tests {
         // needs_reauth (the discriminator, not a generic failure).
         let http2 = MockHttp::new(vec![
             ("GET", "/profile", 401, json!({ "error": "unauthorized" })),
-            ("FORM", "oauth2.googleapis.com/token", 400, json!({ "error": "invalid_grant" })),
+            (
+                "FORM",
+                "oauth2.googleapis.com/token",
+                400,
+                json!({ "error": "invalid_grant" }),
+            ),
         ]);
         let (app2, _d2) = app_with(http2, home.path());
         let (_, v2) = send_json(&app2, "GET", "/api/gmail/accounts").await;
         assert_eq!(v2["health"][ACCT], json!("needs_reauth"), "{v2}");
         assert_eq!(v2["needs_reauth"], json!([ACCT]));
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_clears_a_cached_needs_reauth() {
+        let home = home_with_client_config();
+        let tokens = home.path().join("gmail-tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        std::fs::write(
+            tokens.join(format!("{ACCT}.json")),
+            json!({
+                "token": "PLACEHOLDER_DEAD",
+                "refresh_token": "PLACEHOLDER_RT_DEAD",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "PLACEHOLDER_ID",
+                "client_secret": "PLACEHOLDER_SECRET",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // One server: the revoked grant is probed and cached, the owner
+        // reconnects, and the next read probes the new token.
+        let http = MockHttp::new(vec![
+            ("GET", "/profile", 401, json!({ "error": "unauthorized" })),
+            ("FORM", "oauth2.googleapis.com/token", 400, json!({ "error": "invalid_grant" })),
+            (
+                "FORM",
+                "oauth2.googleapis.com/token",
+                200,
+                json!({ "access_token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT",
+                         "expires_in": 3599, "scope": "openid" }),
+            ),
+            ("GET", "users/me/profile", 200, json!({ "emailAddress": ACCT })),
+            ("GET", "/profile", 200, json!({ "emailAddress": ACCT })),
+        ]);
+        let (app, _d) = app_with(http.clone(), home.path());
+        let (_, v) = send_json(&app, "GET", "/api/gmail/accounts").await;
+        assert_eq!(v["health"][ACCT], json!("needs_reauth"), "{v}");
+
+        let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
+        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
+        let (st, page) = send(
+            &app,
+            "GET",
+            &format!("/api/gmail/callback?code=authcode123&state={state}"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{page}");
+
+        let (_, v) = send_json(&app, "GET", "/api/gmail/accounts").await;
+        assert_eq!(v["health"][ACCT], json!("ok"), "{v}");
+        assert_eq!(v["needs_reauth"], json!([]));
     }
 
     #[tokio::test]
@@ -1542,7 +1953,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: Some("SECRET_BEARER".into()),
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let app = crate::api::router(state);
 
@@ -1576,6 +1987,9 @@ mod tests {
 
         let (st, v) = send_json(&app, "POST", "/api/gmail/connect").await;
         assert_eq!(st, StatusCode::GONE);
-        assert!(v["error"].as_str().unwrap().contains("/api/gmail/auth"), "{v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("/api/gmail/auth"),
+            "{v}"
+        );
     }
 }

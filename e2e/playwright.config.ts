@@ -8,8 +8,30 @@ import { defineConfig, devices } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { E2E_ANTHROPIC_KEY } from './test-env';
+import { E2E_ANTHROPIC_KEY, geminiStubPort } from './test-env';
 import { reapStaleTmp } from './tmp-reap';
+
+// CI: AMUX_E2E_PLAN names a shard plan from scripts/e2e-plan.mjs. Unset (any
+// local run) means every project runs every spec, exactly as before.
+const SHARD_PLAN: { current: number; total: number; projects: Record<string, string[]> } | null =
+  process.env.AMUX_E2E_PLAN ? JSON.parse(fs.readFileSync(process.env.AMUX_E2E_PLAN, 'utf8')) : null;
+
+// PULL REQUESTS ONLY: scripts/ci-affected.mjs selects the spec files a change
+// can affect. AMUX_E2E_SPECS (JSON list, relative to e2e/) scopes desktop and
+// mobile; AMUX_E2E_IOS_SPECS scopes ios-safari. Unset or empty means every
+// spec, which is every push to main and every local run. The same variables
+// reach the shard planner's --list and the e2e verdict's expected population,
+// so planning, execution and the "every planned test ran" check agree on one
+// selection, and the banner below names it on every run.
+const parseSpecList = (v: string | undefined): string[] | null => (v && v.trim() ? JSON.parse(v) : null);
+const SPEC_SELECTION: Record<string, string[] | null> = {
+  desktop: parseSpecList(process.env.AMUX_E2E_SPECS),
+  mobile: parseSpecList(process.env.AMUX_E2E_SPECS),
+  'ios-safari': parseSpecList(process.env.AMUX_E2E_IOS_SPECS),
+};
+const fileMatchers = (files: string[]): RegExp[] =>
+  files.map((f) => new RegExp('^' + path.join(__dirname, f).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$'))
+    .concat(files.length ? [] : [/^$/]);
 
 // ONE SERVER AND ONE AMUX_HOME PER PROJECT — not one shared by all of them
 // (AF-46, measured 2026-08-13).
@@ -28,11 +50,16 @@ import { reapStaleTmp } from './tmp-reap';
 // would have come back the moment anyone added a fourth project or a fourth
 // state-mutating spec. A port and a home each is the boundary; adding a target
 // below now costs nothing and races nothing.
+// The ports are fixed, and every lane on one machine runs this suite against
+// the same three. A second concurrent run fails "is already used", or worse,
+// a test reaches the other lane's server. AMUX_E2E_PORT_OFFSET moves all
+// three (e.g. 1000 -> 19823/19833/19843).
+const PORT_OFFSET = Number(process.env.AMUX_E2E_PORT_OFFSET || 0) || 0;
 const TARGETS = [
-  { name: 'desktop', port: 18823, use: { viewport: { width: 1280, height: 800 } } },
+  { name: 'desktop', port: 18823 + PORT_OFFSET, use: { viewport: { width: 1280, height: 800 } } },
   // Mobile is a first-class target (amux is mobile-first): 375px must
   // render without overflow.
-  { name: 'mobile', port: 18833, use: { viewport: { width: 375, height: 667 } } },
+  { name: 'mobile', port: 18833 + PORT_OFFSET, use: { viewport: { width: 375, height: 667 } } },
   // iOS SAFARI IS ITS OWN TARGET, not a viewport (AMUX tab-customizer, 2026-08-13).
   // A bottom-sheet fix passed desktop+mobile Chromium at 375px while Ethan still
   // could not see the menu on his phone — Chromium at a phone WIDTH is not Safari
@@ -45,7 +72,7 @@ const TARGETS = [
   // wrong in effect — a new mobile spec would silently never reach iOS, which
   // is the one target that motivated the project. Isolation removed the reason
   // for it, so the list is gone; do not reintroduce one to quiet a red.
-  { name: 'ios-safari', port: 18843, use: { ...devices['iPhone 15'] } },
+  { name: 'ios-safari', port: 18843 + PORT_OFFSET, use: { ...devices['iPhone 15'] } },
 ];
 
 // The broad suite exercises dashboard/runtime behaviour, not a real Anthropic
@@ -55,9 +82,8 @@ const TARGETS = [
 // click test into a 30s pointer-interception timeout. `/api/identity`
 // intentionally ignores process-injected keys, so seed an obviously non-secret
 // value in each isolated project's durable server.env: the exact configuration
-// surface the product checks. settings_api_key_anthropic still
-// overwrites/restores it through the real endpoint, while unrelated specs run
-// in the configured-install state they actually assume.
+// surface the product checks, so specs run in the configured-install state
+// they actually assume.
 
 // One temp home per TARGET, created eagerly so each server and its tests agree.
 // Reap what earlier (usually interrupted) runs left behind before minting more
@@ -72,15 +98,30 @@ const TARGETS = [
 for (const root of new Set([os.tmpdir(), ...(process.platform === 'darwin' ? ['/tmp'] : [])])) {
   reapStaleTmp(root, 'amux-e2e-');
 }
-const homes: Record<string, string> = Object.fromEntries(
-  TARGETS.map((t) => [t.name, fs.mkdtempSync(path.join(os.tmpdir(), `amux-e2e-${t.name}-`))]),
-);
-for (const home of Object.values(homes)) {
+// Playwright loads this file again in every worker process, and a second
+// mkdtemp there named a home no server uses. The runner makes the homes once
+// and hands them to its workers in AMUX_E2E_HOMES, which they inherit.
+const inheritedHomes = !!process.env.AMUX_E2E_HOMES;
+const homes: Record<string, string> = inheritedHomes
+  ? JSON.parse(process.env.AMUX_E2E_HOMES)
+  : Object.fromEntries(
+    TARGETS.map((t) => [t.name, fs.mkdtempSync(path.join(os.tmpdir(), `amux-e2e-${t.name}-`))]),
+  );
+process.env.AMUX_E2E_HOMES = JSON.stringify(homes);
+// Seeded once, by the runner: a worker rewriting server.env would undo what a
+// running spec wrote there.
+for (const home of inheritedHomes ? [] : Object.values(homes)) {
   fs.writeFileSync(
     path.join(home, 'server.env'),
     `ANTHROPIC_API_KEY=${E2E_ANTHROPIC_KEY}\n`,
     { mode: 0o600 },
   );
+  // Each server's scratchpad lives in its own temp home. The default,
+  // ~/Vault/Scratchpad under the REAL $HOME, collected 150 test notes in the
+  // owner's folder before this (2026-10-18). e2e/scratchpad-dir.ts refuses
+  // to run a scratchpad test against the real folder.
+  fs.mkdirSync(path.join(home, 'scratchpad'), { recursive: true });
+  fs.writeFileSync(path.join(home, 'scratchpad.json'), JSON.stringify({ retain_days: 0, dir: path.join(home, 'scratchpad') }));
 }
 console.log(
   '[e2e] provider prerequisite: seeded each isolated server.env with a non-secret test key; ' +
@@ -122,10 +163,13 @@ const selected: string[] = (() => {
 
 for (const t of TARGETS) {
   const scoped = (t as { testMatch?: unknown }).testMatch;
+  const prSelection = SPEC_SELECTION[t.name];
   const running = selected.length === 0 || selected.includes(t.name);
   const what = scoped
     ? `SCOPED to ${String(scoped)} — it does NOT run the full suite`
-    : 'full suite';
+    : prSelection
+      ? `SCOPED by the PR selection (scripts/ci-affected.mjs) to ${prSelection.length} spec file(s); it does NOT run the full suite, which runs on every push to main`
+      : 'full suite';
   console.log(
     running
       ? `[e2e] target ${t.name}: ${what}.`
@@ -162,15 +206,47 @@ console.log(
     'If a browser launch times out, this line is the first thing to check.',
 );
 
+// Every project's pages start with the walkthrough and the Cloud offer off,
+// including specs that import test from @playwright/test rather than
+// ./fixtures. A project whose storageState lost either key fails here, at
+// config load, rather than as a phone-width test that finds the server-wide
+// offer already spent (AF-1327).
+function checkSeeded<P extends { name: string; use?: { storageState?: unknown } }>(p: P): P {
+  const st = p.use?.storageState as { origins?: { localStorage?: { name: string }[] }[] } | undefined;
+  const keys = new Set((st?.origins || []).flatMap(o => (o.localStorage || []).map(e => e.name)));
+  const missing = ['amux_walkthrough_done', 'amux_cloud_offer'].filter(k => !keys.has(k));
+  if (missing.length) throw new Error(`e2e project ${p.name} has no storageState seed for ${missing.join(', ')}`);
+  return p;
+}
+
 export default defineConfig({
   testDir: '.',
   reporter: process.env.AMUX_E2E_EVIDENCE_DIR
     ? [['line'], ['./ci-evidence-reporter.mjs']] : undefined,
   // Real providers and peer coordination require the dedicated lifecycle lab.
-  testIgnore: ['**/lifecycle/live-*.spec.ts'],
+  // *.test.mjs are node:test suites. Playwright's default match loaded them,
+  // printed their `not ok` lines and counted nothing, so three of them were
+  // red for a week inside green shards. They run as their own gated step
+  // ("Dashboard client unit tests" in rust.yml).
+  // e2e/intent has its own config (intent.config.ts: stand-in model, seeded household).
+  testIgnore: ['**/lifecycle/live-*.spec.ts', '**/*.test.mjs', '**/intent/**'],
   timeout: 30_000,
   retries: 0,
   use: {
+    // AMUX-4984. A failure used to leave NOTHING but its error string, so an
+    // unexplained red could only be reasoned about. Two of them this week were
+    // diagnosed by re-deriving the code path and one of those derivations was
+    // WRONG — a probe built from it failed to reproduce the failure it was
+    // supposed to explain.
+    //
+    // rust.yml already has a step named "Upload traces" pointing at
+    // test-results/. It was uploading nothing of the sort, because nothing
+    // here ever produced a trace. The step promised an artifact the config
+    // could not give it.
+    //
+    // Screenshot is global: it costs nothing on a passing run, since it is
+    // only taken when a test fails.
+    screenshot: 'only-on-failure',
     ignoreHTTPSErrors: true, // self-signed cert is the product behavior
     // SERVICE WORKERS OFF BY DEFAULT — opt-OUT, not opt-in (AMUX-3057 class).
     //
@@ -184,15 +260,85 @@ export default defineConfig({
     // This was fixed three times per-spec (tab-customizer, system-jobs,
     // peek-tab-menu-anchor) and then omitted from the next three specs I wrote,
     // which is how it reached CI. A per-file convention that must be REMEMBERED
-    // is the thing that failed; the default has to carry it. sw-fail-bar.spec.ts
+    // is the thing that failed; the default has to carry it. sw-offline-notice.spec.ts
     // — the one spec that actually tests the worker — opts back in with
     // test.use({ serviceWorkers: 'allow' }).
     serviceWorkers: 'block',
   },
   projects: TARGETS.map((t) => ({
+    // A duration-balanced shard plan (scripts/e2e-plan.mjs) gives each project
+    // the exact files this shard runs; a project with none matches nothing.
+    // The plan is computed from a --list taken under the same PR selection,
+    // so when both are present the plan is already inside the selection.
+    ...(SHARD_PLAN
+      ? { testMatch: fileMatchers(SHARD_PLAN.projects[t.name] || []) }
+      : SPEC_SELECTION[t.name]
+        ? { testMatch: fileMatchers(SPEC_SELECTION[t.name] as string[]) }
+        : {}),
     name: t.name,
-    use: { ...t.use, baseURL: `https://localhost:${t.port}` },
-  })),
+    // The project's throwaway AMUX_HOME, for a spec that puts a fixture file
+    // where its server reads it (email-approval-scope.spec.ts).
+    metadata: { home: homes[t.name] },
+    use: {
+      ...t.use,
+      baseURL: `https://localhost:${t.port}`,
+      // Full trace for ios-safari only. `retain-on-failure` records every test
+      // and discards the passes, so it is the one setting here with a real
+      // per-test cost, scoped to where the failures actually are (4 of the 5
+      // specs AMUX-4967 catalogued were ios-safari). Widening it to the others
+      // is a one-line change if a desktop failure ever needs it.
+      ...(t.name === 'ios-safari' ? { trace: 'retain-on-failure' as const } : {}),
+      // WALKTHROUGH OFF BY DEFAULT — opt-OUT, like serviceWorkers above and for
+      // the same reason (AMUX-4986/4987). `_wtMaybeStart` opens it 1500ms after
+      // load when `sessions.length === 0`, which is the NORMAL state of every CI
+      // project's isolated server, and `#wt-tooltip` then eats the click until
+      // the budget is gone. 38 of 75 specs do not set this key themselves.
+      // A spec that TESTS the walkthrough clears the key in its own
+      // addInitScript.
+      storageState: {
+        cookies: [],
+        origins: [{
+          origin: `https://localhost:${t.port}`,
+          // amux_cloud_offer: the self-hosted Cloud offer stays off too (fixtures.ts).
+          // ios-safari once started empty here (measured 2026-10-23, read then as
+          // "WebKit ignores this localStorage"). The cause was its project override
+          // below replacing this whole `use`; WebKit applies the seed (AF-1327,
+          // run 44894280415: a raw @playwright/test page on ios-safari spent the
+          // phone trigger under cloud-offer.spec.ts). checkSeeded() below fails
+          // the config if a project loses it again.
+          localStorage: [{ name: 'amux_walkthrough_done', value: '1' }, { name: 'amux_cloud_offer', value: '{"dismissed":1}' }],
+        }],
+      },
+    },
+    // AMUX-4983. ios-safari alone gets a larger budget, because the thing it
+    // spends it on is not the test.
+    //
+    // Measured 2026-09-23: with the server up and webkit warm, the test that
+    // failed CI runs in 2.4-2.6s, five times out of five (--repeat-each=5,
+    // one server start). The failure is never an assertion — it is
+    // "Test timeout of 30000ms exceeded while setting up \"page\"", i.e. the
+    // 30s TEST budget consumed by a COLD page/browser launch before any test
+    // code runs. Reproduced 1 in 3 locally on identical bytes.
+    //
+    // So the margin here is enormous rather than generous: a warm run uses 3%
+    // of 90s. It cannot hide a slow test; it only stops a cold launch from
+    // being charged to the first test that happens to draw it. That matters
+    // beyond this spec — a setup timeout lands on whichever test went first,
+    // so the spec NAME in such a failure is noise, which is how AMUX-4967
+    // ended up cataloguing five unrelated "flaky specs" and was discarded.
+    //
+    // retries stays 0 on purpose. A retry would also paper over this, and
+    // would additionally hide a genuinely failing assertion; a bigger budget
+    // cannot, because the assertion still runs and still fails.
+    //
+    // This is the cheapest of the three options on the card. If it recurs,
+    // the next step is instrumenting the launch itself — the config already
+    // prints host load every run for exactly that reason (AMUX-3605/3646,
+    // load averages in the thirties on 28 cores).
+    // Only the timeout here: a `use` key in this spread replaces the one
+    // above, seed included.
+    ...(t.name === 'ios-safari' ? { timeout: 90_000 } : {}),
+  })).map(checkSeeded),
   webServer: TARGETS.map((t) => ({
     // Builds from COMMITTED HEAD, not this shared working tree — a peer
     // mid-edit used to fail runs with a Rust error against JS-only changes,
@@ -220,11 +366,29 @@ export default defineConfig({
     env: {
       AMUX_HOME: homes[t.name],
       AMUX_RS_PORT: String(t.port),
+      // The broad suite tests the fleet screen. A fresh server would open a new
+      // person's intent Home instead; that has its own set (e2e/intent).
+      AMUX_HOME_DEFAULT: 'fleet',
       // A browser test necessarily connects over loopback, which the server
       // deliberately auth-bypasses (Python parity). Without this, every
       // "rejects a bad token" assertion is a check that cannot pass — it was
       // read as an auth regression on 2026-08-09 when the code was correct.
       AMUX_RS_NO_LOOPBACK_BYPASS: '1',
+      // Saving a skill writes <CLAUDE_CONFIG_DIR>/commands/<name>.md (AA-40).
+      // Without this the e2e server would write into the developer's real
+      // ~/.claude/commands, because the server runs with the real $HOME.
+      CLAUDE_CONFIG_DIR: path.join(homes[t.name], 'claude-config'),
+      // The vault's master key goes to a 0600 file in the throwaway home, never
+      // into the developer's login Keychain (vault_secrets.rs keystore_is_file).
+      AMUX_VAULT_KEYSTORE: 'file',
+      // Every Gemini call (Dictate, Recordings) goes to a local stub port, never
+      // the real billed API; a spec that needs an answer listens there
+      // (e2e/transcription-settings.spec.ts). Nothing listening is a failure.
+      AMUX_GEMINI_BASE: `http://127.0.0.1:${geminiStubPort(t.port)}`,
+      // An app's own port (static_files/app_ports.rs) comes from the gap
+      // between this target and the next (10 apart). The default, the 32 after
+      // the apps port, runs into the next target's server.
+      AMUX_APP_PORTS: `${t.port + 2}-${t.port + 9}`,
     },
   })),
 });

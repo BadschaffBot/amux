@@ -4,14 +4,22 @@
 // Requires Node 22+ (built-in WebSocket).
 //
 // Per-tab persistent daemon: page commands go through a daemon that holds
-// the CDP session open. Chrome's "Allow debugging" modal fires once per
-// daemon (= once per tab). Daemons auto-exit after 20min idle.
+// the CDP session open. Daemons auto-exit after 20min idle.
+//
+// Chrome's "Allow remote debugging?" modal fires once per NEW connection to the
+// real Chrome, and Chrome offers no way to remember it. So every connection to
+// the real Chrome goes through relay.mjs, which holds ONE approved connection
+// for as long as Chrome runs and multiplexes every daemon and `list` over it:
+// one click per Chrome launch instead of one per tab (Ethan, 2026-09-28).
+// CDP_NO_RELAY=1 connects directly. amux saved profiles (AMUX_PROFILE/CDP_PORT)
+// never show the modal and never use the relay.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, openSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn, execFileSync } from 'child_process';
 import net from 'net';
+import { syncSite, siteOf, fingerprint, profilesIndex, coveringProfile, isSessionBound, log as syncLog } from './profile-sync.mjs';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
@@ -75,10 +83,24 @@ function amuxCdpPort() {
   } catch {
     base = (process.env.AMUX_URL || 'https://localhost:8824').trim();
   }
+  // CDP ONLY WHEN A ROUTE CANNOT DO IT (Ethan, 2026-10-27: "i prefer using
+  // amux browser and only cdp if we cannot accomplish"). amux withholds the
+  // port unless you say why `amux browser route` cannot do this job, and the
+  // port it then gives is a logged proxy, so the reason and every command you
+  // send are on the worker's audit trail (`amux audit <worker>`).
+  const reason = (process.env.AMUX_CDP_REASON || '').trim();
+  if (reason.length < 12) {
+    throw new Error(
+      `AMUX_PROFILE=${want}: drive this browser with \`amux browser route\` (state, shot, action) first.\n` +
+      `If a route cannot do the job, say why and run again:\n` +
+      `  AMUX_CDP_REASON="<why the route cannot do it>" AMUX_PROFILE=${want} node cdp.mjs ...`);
+  }
   let body;
   try {
     // -k: the server uses a self-signed cert, as every recipe in this repo does.
-    body = execFileSync('curl', ['-sk', '--max-time', '5', `${base}/api/browser/status`],
+    body = execFileSync('curl', ['-sk', '--max-time', '5', '-G', `${base}/api/browser/status`,
+                                 '--data-urlencode', `cdp_reason=${reason}`,
+                                 '-H', `X-Amux-Session: ${process.env.AMUX_SESSION || ''}`],
                         { encoding: 'utf8' });
   } catch (e) {
     throw new Error(`AMUX_PROFILE=${want}: could not reach amux at ${base} (${e.message})`);
@@ -106,13 +128,56 @@ function amuxCdpPort() {
       `Running profiles: ${available}. Refusing to drive a different saved login.`);
   }
   if (!selected.cdp_port) {
-    throw new Error(`AMUX_PROFILE=${want}: the matching browser reported no cdp_port`);
+    throw new Error(`AMUX_PROFILE=${want}: the matching browser reported no cdp_port${st.cdp ? ` (${st.cdp})` : ''}`);
   }
   return Number(selected.cdp_port);
 }
 
+const RELAY_PORT = Number(process.env.CDP_RELAY_PORT || 9322);
+const RELAY_SCRIPT = resolve(new URL('.', import.meta.url).pathname, 'relay.mjs');
+
+function relayVersion() {
+  try {
+    const v = JSON.parse(execFileSync('curl', ['-s', '--max-time', '2', `http://127.0.0.1:${RELAY_PORT}/json/version`],
+                                      { encoding: 'utf8' }));
+    return v.Browser === 'amux-cdp-relay' ? v : null;
+  } catch { return null; }
+}
+
+// The relay's websocket URL, starting the relay if it is not running. Null
+// when it cannot start, and the caller then connects directly (one modal).
+function relayWsUrl() {
+  let v = relayVersion();
+  if (!v) {
+    const log = resolve(homedir(), '.cache', 'cdp', 'relay.log');
+    let out = 'ignore';
+    try { mkdirSync(resolve(homedir(), '.cache', 'cdp'), { recursive: true, mode: 0o700 }); out = openSync(log, 'a'); } catch {}
+    const child = spawn(process.execPath, [RELAY_SCRIPT], {
+      detached: true, stdio: ['ignore', out, out],
+      env: { ...process.env, CDP_PORT: '', AMUX_PROFILE: '' },
+    });
+    child.unref();
+    for (let i = 0; i < 30 && !v; i++) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      v = relayVersion();
+    }
+    if (!v) process.stderr.write(`cdp: relay did not start (see ${log}); connecting directly\n`);
+  }
+  return v ? v.webSocketDebuggerUrl : null;
+}
+
 function getWsUrl() {
   const port = amuxCdpPort();
+  if (!port && process.env.CDP_NO_RELAY !== '1') {
+    const viaRelay = relayWsUrl();
+    if (viaRelay) return viaRelay;
+  }
+  return directWsUrl(port);
+}
+
+// The real Chrome's own endpoint (or an amux profile's). relay.mjs reads this
+// through `cdp.mjs upstream-url`, so discovery lives in one place.
+function directWsUrl(port = amuxCdpPort()) {
   if (port) {
     // The browser endpoint needs its PATH, not just the port: Chrome's browser
     // websocket is `/devtools/browser/<uuid>`, which only `/json/version`
@@ -582,6 +647,82 @@ async function runDaemon(targetId) {
     process.exit(1);
   }
 
+  // SAVE LOGINS TO AN AMUX PROFILE (Ethan, 2026-09-28). When a worker drives
+  // a site in the real Chrome, carry that site's logins into an amux saved
+  // profile so the next worker reaches it natively: once if no profile covers
+  // the site yet, and again whenever its login cookies change during this
+  // session (Ethan signed in, or handed over credentials). Runs after the
+  // command has answered, and once more at shutdown. Off for amux profiles
+  // themselves (they are already the native path) and with CDP_PROFILE_SYNC=0.
+  const AUTO_SYNC = process.env.CDP_PROFILE_SYNC !== '0' && !process.env.CDP_PORT && !process.env.AMUX_PROFILE;
+  const baselines = new Map();
+  const lastSync = new Map();
+  const boundNoted = new Set(), revokedNoted = new Set();
+  let profCache = null, profCacheAt = 0, syncNote = '';
+  const rotatingNoted = new Set();
+  let syncChain = Promise.resolve();
+  async function autoSync(tag) {
+    if (!AUTO_SYNC) return;
+    try {
+      // The URL from the browser, not the page: Runtime.evaluate hangs on a
+      // busy or dialog-blocked tab (2026-09-28, the amux dashboard tab timed
+      // out twice and held its daemon's shutdown for 15s).
+      const { targetInfo } = await cdp.send('Target.getTargetInfo', { targetId });
+      let url;
+      try { url = new URL(targetInfo.url); } catch { return; }
+      if (!/^https?:$/.test(url.protocol)) return;
+      const site = siteOf(url.hostname);
+      if (!site) return;
+      if (isSessionBound(site)) {
+        if (!boundNoted.has(site)) {
+          boundNoted.add(site);
+          syncLog({ site, skipped: 'session_bound', verdict: 'cdp_sync_session_bound_skipped', tag, target: targetId });
+        }
+        return;
+      }
+      const { cookies } = await cdp.send('Storage.getCookies', {});
+      const fp = fingerprint(cookies, site);
+      if (!fp) {
+        // A site we copied a login from has lost its login cookies: the site
+        // signed this browser out. Say so, so a sync that kills the session it
+        // copies announces itself instead of reading as a random logout.
+        if (lastSync.has(site) && !revokedNoted.has(site)) {
+          revokedNoted.add(site);
+          syncLog({ site, verdict: 'session_revoked_after_sync', synced_at: new Date(lastSync.get(site)).toISOString(), tag, target: targetId });
+          process.stderr.write(`[amux] WARN ${site} signed this browser out after its login was saved to an amux profile (verdict=session_revoked_after_sync)\n`);
+        }
+        return; // nothing login-shaped on this site
+      }
+      if (!baselines.has(site)) baselines.set(site, fp);
+      if (Date.now() - (lastSync.get(site) || 0) < 60_000) return;
+      if (!profCache || Date.now() - profCacheAt > 300_000) { profCache = profilesIndex(); profCacheAt = Date.now(); }
+      const covered = coveringProfile(site, profCache);
+      const changed = baselines.get(site) !== fp;
+      if (covered && !changed) return;
+      const reason = covered ? 'login changed during this CDP session' : 'no amux profile covered this site';
+      const out = await syncSite(CDP, cdp, sessionId, { reason, list: profCache });
+      lastSync.set(site, Date.now());
+      baselines.set(site, fp);
+      profCache = null;
+      if (out.profile) {
+        syncNote = `[amux] saved ${site} logins to amux profile '${out.profile}' (${out.cookies_landed}/${out.cookies_sent} cookies` +
+          `${out.local_storage_set ? `, ${out.local_storage_set} localStorage keys` : ''}, ${reason}). ` +
+          `Next time: AMUX_PROFILE=${out.profile}`;
+      }
+      if (out.verdict === 'cdp_sync_identity_mismatch_skipped') {
+        syncNote = `[amux] ${out.sign_in_instead}`;
+        process.stderr.write(`[amux] WARN ${site}: amux profile '${out.profile}' is signed in as another account; not overwritten (verdict=cdp_sync_identity_mismatch_skipped)\n`);
+      } else if (out.sign_in_instead && !rotatingNoted.has(site)) {
+        // Said once per site per daemon: the copy is refused every time, the advice need not repeat.
+        rotatingNoted.add(site);
+        syncNote = (syncNote ? syncNote + '\n' : '') + `[amux] ${out.sign_in_instead}`;
+        process.stderr.write(`[amux] WARN ${site}: rotating session token not copied into an amux profile (verdict=cdp_sync_rotating_session_not_copied)\n`);
+      }
+    } catch (e) {
+      syncLog({ error: e.message, tag, target: targetId });
+    }
+  }
+
   // Shutdown helpers
   let alive = true;
   function shutdown() {
@@ -589,8 +730,9 @@ async function runDaemon(targetId) {
     alive = false;
     server.close();
     if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
-    cdp.close();
-    process.exit(0);
+    const done = () => { cdp.close(); process.exit(0); };
+    if (!AUTO_SYNC) return done();
+    Promise.race([syncChain.then(() => autoSync('shutdown')), sleep(60_000)]).finally(done);
   }
 
   // Exit if target goes away or Chrome disconnects
@@ -638,10 +780,21 @@ async function runDaemon(targetId) {
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
+        case 'save-profile': {
+          await syncChain;
+          const out = await syncSite(CDP, cdp, sessionId, { profile: args[0] || '', reason: 'explicit save-profile' });
+          result = JSON.stringify(out, null, 2);
+          break;
+        }
         case 'stop': return { ok: true, result: '', stopAfter: true };
         default: return { ok: false, error: `Unknown command: ${cmd}` };
       }
-      return { ok: true, result: result ?? '' };
+      if (AUTO_SYNC && !['list', 'list_raw', 'save-profile'].includes(cmd)) {
+        syncChain = syncChain.then(() => autoSync(cmd));
+      }
+      const note = syncNote;
+      syncNote = '';
+      return { ok: true, result: (result ?? '') + (note ? `\n${note}` : '') };
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -798,6 +951,10 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 Usage: cdp <command> [args]
 
   list                              List open pages (shows unique target prefixes)
+  relay                             Status of the shared connection (one "Allow" per Chrome launch)
+  save-profile <target> [profile]   Save the tab's site logins into an amux profile (appends to the
+                                    profile already registered for the site). Done automatically
+                                    when a site has no profile or its login changes; CDP_PROFILE_SYNC=0 stops it
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression
   shot  <target> [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
@@ -850,7 +1007,7 @@ DAEMON IPC (for advanced use / scripting)
 
 const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','loadall','evalraw',
+  'net','network','click','clickxy','type','loadall','evalraw','save-profile',
 ]);
 
 // Tell amux this browser is being driven (AMUX-4685).
@@ -925,6 +1082,16 @@ async function main() {
   // Daemon mode (internal)
   if (cmd === '_daemon') { await runDaemon(args[0]); return; }
 
+  // For relay.mjs: the real Chrome's endpoint, never the relay's own.
+  if (cmd === 'upstream-url') { console.log(directWsUrl(null)); return; }
+
+  if (cmd === 'relay') {
+    try {
+      console.log(execFileSync('curl', ['-s', '--max-time', '2', `http://127.0.0.1:${RELAY_PORT}/status`], { encoding: 'utf8' }));
+    } catch { console.log('relay not running (it starts on the next command that needs Chrome)'); }
+    return;
+  }
+
   // Every real command counts as driving. Placed after the daemon branch so the
   // long-lived daemon does not send one per poll, and before the help/usage
   // exits so a `help` invocation does not pretend a browser is in use.
@@ -950,7 +1117,14 @@ async function main() {
     const url = args[0] || 'about:blank';
     const cdp = new CDP();
     await cdp.connect(getWsUrl());
-    const { targetId } = await cdp.send('Target.createTarget', { url });
+    // A worker's tab goes in a new background window. A plain createTarget lands
+    // in whichever window Ethan last used, whatever Chrome profile that is, and
+    // pulls it forward: a social-activities lookup opened inside his Work window
+    // with the automation banner on top (2026-10-20). Run by hand (no
+    // AMUX_SESSION) it still opens where you are looking.
+    const worker = !!process.env.AMUX_SESSION;
+    const { targetId } = await cdp.send('Target.createTarget', worker ? { url, newWindow: true, background: true } : { url });
+    if (worker) process.stderr.write(`[amux] opened in a background window, not your active one (worker ${process.env.AMUX_SESSION})\n`);
     // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
     const pages = await getPages(cdp);
     if (!pages.some(p => p.targetId === targetId)) {
@@ -959,7 +1133,6 @@ async function main() {
     cdp.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
     console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
-    console.log('Note: this tab will need "Allow debugging?" approval on first access.');
     return;
   }
 

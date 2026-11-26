@@ -18,8 +18,12 @@ pub fn routes() -> Router<AppState> {
         .route("/", axum::routing::get(metrics))
         .route("/host", axum::routing::get(host))
         .route("/host/history", axum::routing::get(host_history))
+        .route("/host/pressure", axum::routing::get(host_pressure))
         .route("/fleet", axum::routing::get(fleet))
+        .route("/telemetry", axum::routing::get(telemetry))
         .route("/replay", axum::routing::get(replay))
+        .route("/workers", axum::routing::get(worker_resources))
+        .route("/workers/live", axum::routing::get(worker_resources_live))
 }
 
 /// The full host-analysis script, embedded at compile time so the running
@@ -122,6 +126,71 @@ pub struct HistoryQuery {
 /// contract the live endpoint carries (ethos rule 4). `interval_secs` travels
 /// with the answer so an empty window reads as "nothing sampled yet, samples
 /// land every N seconds" rather than as a flat zero.
+/// GET /api/metrics/host/pressure — the host guard's latest sample: level
+/// (ok/strained/critical) with its reasons and raw readings, worker tool
+/// processes judged runaways (and whether each was reniced), and how many
+/// automated ticks each loop skipped at critical. `measured:false` with
+/// `why_unmeasured` before the first tick or when every probe failed.
+async fn host_pressure() -> Response {
+    match crate::runtime_jobs::host_guard::current() {
+        Some(p) => Json(serde_json::to_value(&p).unwrap_or_default()).into_response(),
+        None => Json(json!({
+            "measured": false,
+            "n_considered": 0,
+            "why_unmeasured": "the host guard has not completed a tick yet (or is disabled by AMUX_HOST_GUARD_SECS=0)",
+            "level": null,
+        }))
+        .into_response(),
+    }
+}
+
+/// GET /api/metrics/telemetry — fleet status-channel coverage (MSG-69352
+/// item 1). For every running worker: the health of its status channel, the
+/// authority of the rule that decided its status, and `agent_state` (which
+/// is `unknown` when only a screen guess remains). `coverage_pct` counts
+/// `healthy` over workers whose provider has hooks, so a fleet silently
+/// falling back to screen-reading shows as a number, not as wrong labels.
+async fn telemetry(State(state): State<AppState>) -> Response {
+    let sessions = match crate::api::sessions_legacy::legacy_sessions_values(state.store.clone()).await {
+        Ok(v) => v,
+        Err(e) => {
+            return Json(json!({"measured": false, "n_considered": 0,
+                "why_unmeasured": format!("sessions could not be built: {e}")})).into_response()
+        }
+    };
+    let mut counts = serde_json::Map::new();
+    let mut workers = Vec::new();
+    let (mut hooked, mut healthy) = (0usize, 0usize);
+    for s in &sessions {
+        if s["running"] != true || s["archived"] == true {
+            continue;
+        }
+        let health = s["telemetry"]["health"].as_str().unwrap_or("unmeasured").to_string();
+        *counts.entry(health.clone()).or_insert(json!(0)) =
+            json!(counts.get(&health).and_then(|v| v.as_u64()).unwrap_or(0) + 1);
+        if health != "unsupported" {
+            hooked += 1;
+            if health == "healthy" {
+                healthy += 1;
+            }
+        }
+        workers.push(json!({
+            "name": s["name"], "status": s["status"], "agent_state": s["agent_state"],
+            "turn_state": s["turn_state"], "activity": s["activity"],
+            "authority": s["status_authority"], "decided_by": s["status_evidence"]["source"],
+            "telemetry": s["telemetry"], "last_progress_at": s["last_progress_at"],
+        }));
+    }
+    Json(json!({
+        "measured": true,
+        "n_considered": workers.len(),
+        "counts": counts,
+        "coverage_pct": (healthy * 1000).checked_div(hooked).map(|v| v as f64 / 10.0),
+        "workers": workers,
+    }))
+    .into_response()
+}
+
 async fn host_history(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
@@ -186,8 +255,12 @@ async fn host_history(
         .iter()
         .filter(|s| s.get("measured").and_then(|m| m.as_bool()) == Some(false))
         .count();
-    let newest = samples.first().and_then(|s| s.get("ts").and_then(|t| t.as_i64()));
-    let oldest = samples.last().and_then(|s| s.get("ts").and_then(|t| t.as_i64()));
+    let newest = samples
+        .first()
+        .and_then(|s| s.get("ts").and_then(|t| t.as_i64()));
+    let oldest = samples
+        .last()
+        .and_then(|s| s.get("ts").and_then(|t| t.as_i64()));
     let n = samples.len();
     Json(crate::api::measured::measured(
         json!({
@@ -265,8 +338,66 @@ fn resolve_bin(name: &str) -> &str {
     }
 }
 
-fn collect_system_metrics() -> serde_json::Value {
-    let hostname = cmd_output("hostname", &[]).unwrap_or_default().trim().to_string();
+/// `/proc/loadavg` -> the three load averages.
+pub(crate) fn parse_proc_loadavg(text: &str) -> Vec<f64> {
+    text.split_whitespace()
+        .take(3)
+        .filter_map(|s| s.parse::<f64>().ok())
+        .map(|v| (v * 100.0).round() / 100.0)
+        .collect()
+}
+
+/// `/proc/meminfo` -> (MemTotal, MemAvailable, SwapTotal, SwapFree) in kB.
+/// MemAvailable is what the kernel says can be handed out without swapping;
+/// "used" is total minus that, the same definition `free` uses.
+pub(crate) fn parse_proc_meminfo(text: &str) -> Option<(u64, u64, u64, u64)> {
+    let mut m = std::collections::HashMap::new();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if let Some(n) = v.split_whitespace().next().and_then(|n| n.parse::<u64>().ok()) {
+                m.insert(k.trim(), n);
+            }
+        }
+    }
+    let total = *m.get("MemTotal")?;
+    let avail = m.get("MemAvailable").copied().or_else(|| m.get("MemFree").copied())?;
+    Some((total, avail, *m.get("SwapTotal").unwrap_or(&0), *m.get("SwapFree").unwrap_or(&0)))
+}
+
+fn linux_system_metrics(sys: &mut serde_json::Map<String, serde_json::Value>) {
+    let mb = |kb: u64| (kb as f64 / 1024.0 * 10.0).round() / 10.0;
+    if let Ok(t) = std::fs::read_to_string("/proc/loadavg") {
+        let nums = parse_proc_loadavg(&t);
+        if !nums.is_empty() {
+            sys.insert("load_avg".into(), json!(nums));
+        }
+    }
+    if let Some((total, avail, swap_total, swap_free)) =
+        std::fs::read_to_string("/proc/meminfo").ok().as_deref().and_then(parse_proc_meminfo)
+    {
+        let used = total.saturating_sub(avail);
+        sys.insert("ram_total_mb".into(), json!(mb(total)));
+        sys.insert("ram_used_mb".into(), json!(mb(used)));
+        sys.insert(
+            "ram_percent".into(),
+            json!(if total > 0 { (used as f64 / total as f64 * 1000.0).round() / 10.0 } else { 0.0 }),
+        );
+        sys.insert("swap_total_mb".into(), json!(mb(swap_total)));
+        sys.insert("swap_used_mb".into(), json!(mb(swap_total.saturating_sub(swap_free))));
+    }
+    if let Some(up) = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|t| t.split_whitespace().next().and_then(|s| s.parse::<f64>().ok()))
+    {
+        sys.insert("uptime_seconds".into(), json!(up as i64));
+    }
+}
+
+pub(crate) fn collect_system_metrics() -> serde_json::Value {
+    let hostname = cmd_output("hostname", &[])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let mut sys = serde_json::Map::new();
     sys.insert("hostname".into(), json!(hostname));
     sys.insert("psutil".into(), json!(false));
@@ -311,8 +442,7 @@ fn collect_system_metrics() -> serde_json::Value {
                         }
                     }
                 }
-                let free = pages.get("free").unwrap_or(&0)
-                    + pages.get("speculative").unwrap_or(&0);
+                let free = pages.get("free").unwrap_or(&0) + pages.get("speculative").unwrap_or(&0);
                 let used = total_bytes.saturating_sub(free);
                 sys.insert(
                     "ram_total_mb".into(),
@@ -335,7 +465,9 @@ fn collect_system_metrics() -> serde_json::Value {
         // Swap
         if let Some(swap_s) = cmd_output("sysctl", &["-n", "vm.swapusage"]) {
             fn parse_mb(s: &str) -> Option<f64> {
-                s.trim().strip_suffix('M').and_then(|n| n.trim().parse().ok())
+                s.trim()
+                    .strip_suffix('M')
+                    .and_then(|n| n.trim().parse().ok())
             }
             let parts: Vec<&str> = swap_s.split("  ").collect();
             let mut total_mb = 0.0f64;
@@ -347,8 +479,14 @@ fn collect_system_metrics() -> serde_json::Value {
                     used_mb = parse_mb(rest).unwrap_or(0.0);
                 }
             }
-            sys.insert("swap_total_mb".into(), json!((total_mb * 10.0).round() / 10.0));
-            sys.insert("swap_used_mb".into(), json!((used_mb * 10.0).round() / 10.0));
+            sys.insert(
+                "swap_total_mb".into(),
+                json!((total_mb * 10.0).round() / 10.0),
+            );
+            sys.insert(
+                "swap_used_mb".into(),
+                json!((used_mb * 10.0).round() / 10.0),
+            );
         }
         // Uptime
         if let Some(bt) = cmd_output("sysctl", &["-n", "kern.boottime"]) {
@@ -363,6 +501,30 @@ fn collect_system_metrics() -> serde_json::Value {
             }
         }
     }
+
+    // Linux: /proc. Everything above is macOS-only (sysctl/vm_stat), so on a
+    // Linux host this returned no load, no RAM, no swap and no CPU count, and
+    // `amux resources` printed "1 cores, 0 GB RAM, memory 0% used" for a 4-core
+    // 7.7 GB box while `pressure` in the same response said "load 7.9 on 4
+    // cores" (2026-10-26). A gauge that reads empty on half the platforms is
+    // trusted as "plenty of headroom", the worst reading it can give.
+    if cfg!(target_os = "linux") {
+        linux_system_metrics(&mut sys);
+    }
+    if !sys.contains_key("cpu_count") {
+        if let Ok(n) = std::thread::available_parallelism() {
+            sys.insert("cpu_count".into(), json!(n.get()));
+        }
+    }
+    let measured: Vec<&str> = ["load_avg", "cpu_count", "ram_total_mb", "swap_total_mb", "uptime_seconds"]
+        .into_iter()
+        .filter(|k| sys.contains_key(*k))
+        .collect();
+    if measured.len() < 5 {
+        tracing::warn!(os = std::env::consts::OS, measured = ?measured, verdict = "system_metrics_partial",
+            "system metrics: some host fields could not be measured on this platform");
+    }
+    sys.insert("measured_fields".into(), json!(measured));
 
     // Disk, measured on the volume that actually holds the user's data.
     //
@@ -446,20 +608,20 @@ fn collect_system_metrics() -> serde_json::Value {
 }
 
 fn sessions_dir() -> PathBuf {
-    let home = std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    });
+    let home = std::env::var("AMUX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux"));
     home.join("sessions")
 }
 
 fn memory_dir() -> PathBuf {
-    let home = std::env::var("AMUX_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    });
+    let home = std::env::var("AMUX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux"));
     home.join("memory")
 }
 
-fn collect_session_metrics() -> Vec<serde_json::Value> {
+pub(crate) fn collect_session_metrics() -> Vec<serde_json::Value> {
     let sdir = sessions_dir();
     let mdir = memory_dir();
     let entries = match std::fs::read_dir(&sdir) {
@@ -468,11 +630,27 @@ fn collect_session_metrics() -> Vec<serde_json::Value> {
     };
     // Discover tmux sessions + pane PIDs
     let tmux_pids = tmux_session_pids();
+    // One `ps` for every worker, the tree built in memory. This used to spawn
+    // `pgrep -P` per process and `ps -p` per worker: ~1300 spawns, 71s at
+    // load 87 on 2026-10-17 (AMUX resources visibility, desktop lane).
+    let mut children: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+    let mut stats: std::collections::HashMap<u64, (u64, f64)> = std::collections::HashMap::new();
+    for line in cmd_output("ps", &["-axo", "pid=,ppid=,rss=,%cpu="]).unwrap_or_default().lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if let [pid, ppid, rss, cpu, ..] = f[..] {
+            if let (Ok(pid), Ok(ppid)) = (pid.parse::<u64>(), ppid.parse::<u64>()) {
+                children.entry(ppid).or_default().push(pid);
+                stats.insert(pid, (rss.parse().unwrap_or(0), cpu.parse().unwrap_or(0.0)));
+            }
+        }
+    }
 
     let mut sessions = Vec::new();
     for entry in entries.flatten() {
         let fname = entry.file_name().to_string_lossy().into_owned();
-        let Some(name) = fname.strip_suffix(".env") else { continue };
+        let Some(name) = fname.strip_suffix(".env") else {
+            continue;
+        };
         if name.contains(".meta") {
             continue;
         }
@@ -504,29 +682,18 @@ fn collect_session_metrics() -> Vec<serde_json::Value> {
         // Process stats: find all descendant PIDs then ps them
         if active {
             if let Some(pane_pid) = tmux_pids.get(&tmux_name) {
-                let mut all_pids = vec![*pane_pid];
-                collect_descendants(*pane_pid, &mut all_pids);
-                let pid_list = all_pids
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                if let Some(ps_out) =
-                    cmd_output("ps", &["-o", "pid=,rss=,pcpu=", "-p", &pid_list])
-                {
-                    let mut pids = Vec::new();
-                    let mut total_rss = 0u64;
-                    let mut total_cpu = 0.0f64;
-                    for line in ps_out.lines() {
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 3 {
-                            if let Ok(pid) = parts[0].parse::<u64>() {
-                                pids.push(pid);
-                            }
-                            total_rss += parts[1].parse::<u64>().unwrap_or(0);
-                            total_cpu += parts[2].parse::<f64>().unwrap_or(0.0);
-                        }
+                let all_pids = descendants_of(*pane_pid, &children);
+                let mut pids = Vec::new();
+                let mut total_rss = 0u64;
+                let mut total_cpu = 0.0f64;
+                for pid in all_pids {
+                    if let Some((rss, cpu)) = stats.get(&pid) {
+                        pids.push(pid);
+                        total_rss += rss;
+                        total_cpu += cpu;
                     }
+                }
+                if !pids.is_empty() {
                     s["pids"] = json!(pids);
                     s["rss_mb"] = json!((total_rss as f64 / 1024.0 * 10.0).round() / 10.0);
                     s["cpu_percent"] = json!((total_cpu * 10.0).round() / 10.0);
@@ -539,15 +706,18 @@ fn collect_session_metrics() -> Vec<serde_json::Value> {
     sessions
 }
 
-fn collect_descendants(pid: u64, out: &mut Vec<u64>) {
-    if let Some(pgrep_out) = cmd_output("pgrep", &["-P", &pid.to_string()]) {
-        for line in pgrep_out.lines() {
-            if let Ok(child) = line.trim().parse::<u64>() {
-                out.push(child);
-                collect_descendants(child, out);
-            }
+/// `root` and everything under it, from a ppid -> children map.
+fn descendants_of(root: u64, children: &std::collections::HashMap<u64, Vec<u64>>) -> Vec<u64> {
+    let mut out = vec![root];
+    let mut i = 0;
+    while i < out.len() && out.len() < 100_000 {
+        let cur = out[i];
+        if let Some(kids) = children.get(&cur) {
+            out.extend(kids.iter().copied().filter(|k| *k != cur));
         }
+        i += 1;
     }
+    out
 }
 
 fn tmux_session_pids() -> std::collections::HashMap<String, u64> {
@@ -579,10 +749,8 @@ fn tmux_session_pids() -> std::collections::HashMap<String, u64> {
         // even the correct one — reads as hand-spelled. Keeping the convention
         // is what lets a grep-shaped check stay reliable.
         let pt = crate::backend::tmux::pane_target(&name);
-        if let Some(pane_out) = cmd_output(
-            "tmux",
-            &["list-panes", "-t", &pt, "-F", "#{pane_pid}"],
-        ) {
+        if let Some(pane_out) = cmd_output("tmux", &["list-panes", "-t", &pt, "-F", "#{pane_pid}"])
+        {
             if let Some(pid_s) = pane_out.lines().next() {
                 if let Ok(pid) = pid_s.trim().parse::<u64>() {
                     map.insert(name, pid);
@@ -628,7 +796,9 @@ async fn metrics(State(state): State<AppState>) -> Response {
             "quarantined": count(&conn, "SELECT COUNT(*) FROM issues WHERE deleted IS NULL AND status = 'quarantined'"),
         },
         "leases": {
-            "live": count(&conn, "SELECT COUNT(*) FROM _amux_leases WHERE expires_at > datetime('now')"),
+            // Lease expiry is RFC3339, while datetime('now') uses a space.
+            // Compare instants: lexical comparison labels expired leases live.
+            "live": count(&conn, "SELECT COUNT(*) FROM _amux_leases WHERE julianday(expires_at) > julianday('now')"),
             "total": count(&conn, "SELECT COUNT(*) FROM _amux_leases"),
         },
         "turns_recorded": count(&conn, "SELECT COUNT(*) FROM _amux_turns"),
@@ -637,7 +807,11 @@ async fn metrics(State(state): State<AppState>) -> Response {
     // System/session/server metrics — shell commands run off the runtime
     let started = state.started;
     match tokio::task::spawn_blocking(move || {
-        (collect_system_metrics(), collect_session_metrics(), collect_server_metrics(started))
+        (
+            collect_system_metrics(),
+            collect_session_metrics(),
+            collect_server_metrics(started),
+        )
     })
     .await
     {
@@ -679,9 +853,8 @@ async fn fleet(State(state): State<AppState>) -> Response {
         )
         .ok()
     };
-    let parse = |s: Option<String>| {
-        s.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-    };
+    let parse =
+        |s: Option<String>| s.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
 
     // Per-provider fleet state (RR-0044b): the dashboard's "Exhausted,
     // resets in 2h 14m, 14 workers parked" card. Derived from the SAME
@@ -732,6 +905,165 @@ async fn fleet(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
+// ---- per-worker resource metrics -------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct WorkerResourcesQuery {
+    since_h: Option<f64>,
+    limit: Option<usize>,
+    session: Option<String>,
+}
+
+/// GET /api/metrics/workers — historical per-worker resource samples.
+///
+/// Query params: `since_h` (default 24, max 168), `limit` (default 1000),
+/// `session` (filter to one worker). Returns aggregated per-worker totals
+/// and per-sample rows.
+async fn worker_resources(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<WorkerResourcesQuery>,
+) -> Response {
+    let since_h = q.since_h.unwrap_or(24.0).clamp(0.0, 168.0);
+    let limit = q.limit.unwrap_or(1000).clamp(1, 10000);
+    let session_filter = q.session.clone();
+
+    let result = state.store.read_async(move |conn| {
+        let (sql, params): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(ref sess) = session_filter {
+            (
+                "SELECT session, ts, rss_kb, cpu_pct, n_procs, n_threads \
+                 FROM worker_resource_samples \
+                 WHERE ts >= datetime('now', ?1) AND session = ?2 \
+                 ORDER BY ts DESC LIMIT ?3".to_string(),
+                vec![
+                    Box::new(format!("-{since_h} hours")) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(sess.clone()),
+                    Box::new(limit as i64),
+                ],
+            )
+        } else {
+            (
+                "SELECT session, ts, rss_kb, cpu_pct, n_procs, n_threads \
+                 FROM worker_resource_samples \
+                 WHERE ts >= datetime('now', ?1) \
+                 ORDER BY ts DESC LIMIT ?2".to_string(),
+                vec![
+                    Box::new(format!("-{since_h} hours")) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit as i64),
+                ],
+            )
+        };
+
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let samples: Vec<serde_json::Value> = stmt
+            .query_map(param_refs.as_slice(), |r| {
+                Ok(json!({
+                    "session": r.get::<_, String>(0)?,
+                    "ts": r.get::<_, String>(1)?,
+                    "rss_kb": r.get::<_, i64>(2)?,
+                    "cpu_pct": r.get::<_, f64>(3)?,
+                    "n_procs": r.get::<_, i64>(4)?,
+                    "n_threads": r.get::<_, i64>(5)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Compute per-worker summary: latest, peak, and average
+        let mut summaries: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
+        for s in samples.iter().rev() {
+            let sess = s["session"].as_str().unwrap_or("").to_string();
+            let rss = s["rss_kb"].as_i64().unwrap_or(0);
+            let cpu = s["cpu_pct"].as_f64().unwrap_or(0.0);
+
+            let entry = summaries.entry(sess.clone()).or_insert_with(|| json!({
+                "session": sess,
+                "latest_rss_kb": 0,
+                "peak_rss_kb": 0,
+                "avg_rss_kb": 0,
+                "latest_cpu_pct": 0.0,
+                "peak_cpu_pct": 0.0,
+                "sample_count": 0,
+                "_sum_rss": 0i64,
+            }));
+            let count = entry["sample_count"].as_i64().unwrap_or(0) + 1;
+            let sum_rss = entry["_sum_rss"].as_i64().unwrap_or(0) + rss;
+            let peak_rss = entry["peak_rss_kb"].as_i64().unwrap_or(0).max(rss);
+            let peak_cpu = if cpu > entry["peak_cpu_pct"].as_f64().unwrap_or(0.0) { cpu } else { entry["peak_cpu_pct"].as_f64().unwrap_or(0.0) };
+            *entry = json!({
+                "session": sess,
+                "latest_rss_kb": rss,
+                "peak_rss_kb": peak_rss,
+                "avg_rss_kb": sum_rss / count,
+                "latest_cpu_pct": cpu,
+                "peak_cpu_pct": peak_cpu,
+                "sample_count": count,
+                "_sum_rss": sum_rss,
+            });
+        }
+
+        let mut worker_summaries: Vec<serde_json::Value> = summaries.into_values()
+            .map(|mut v| { v.as_object_mut().map(|o| o.remove("_sum_rss")); v })
+            .collect();
+        worker_summaries.sort_by(|a, b| {
+            b["peak_rss_kb"].as_i64().cmp(&a["peak_rss_kb"].as_i64())
+        });
+
+        let max_concurrent = crate::runtime_jobs::worker_resources::max_concurrent();
+        let max_rss_mb = std::env::var("AMUX_WORKER_MAX_RSS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
+        Ok(json!({
+            "since_h": since_h,
+            "limit": limit,
+            "sample_count": samples.len(),
+            "worker_count": worker_summaries.len(),
+            "max_concurrent_active": if max_concurrent > 0 { json!(max_concurrent) } else { json!(null) },
+            "max_rss_mb": if max_rss_mb > 0 { json!(max_rss_mb) } else { json!(null) },
+            "workers": worker_summaries,
+            "samples": samples,
+        }))
+    }).await;
+
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => Json(json!({
+            "measured": false,
+            "n_considered": 0,
+            "why_unmeasured": format!("worker_resource_samples unreadable: {e}"),
+        })).into_response(),
+    }
+}
+
+/// GET /api/metrics/workers/live — current (live) per-worker resource usage,
+/// sampled on demand from ps. No history, just what each worker is using
+/// right now.
+async fn worker_resources_live() -> Response {
+    let snapshots = tokio::task::spawn_blocking(crate::runtime_jobs::worker_resources::latest)
+        .await
+        .unwrap_or_default();
+    let total_rss_kb: u64 = snapshots.iter().map(|s| s.rss_kb).sum();
+    let total_cpu: f64 = snapshots.iter().map(|s| s.cpu_pct).sum();
+    let n = snapshots.len();
+    let mut sorted = snapshots;
+    sorted.sort_by_key(|s| std::cmp::Reverse(s.rss_kb));
+    let max_conc = crate::runtime_jobs::worker_resources::max_concurrent();
+    let max_conc_val = if max_conc > 0 { json!(max_conc) } else { json!(null) };
+    Json(json!({
+        "measured": true,
+        "n_considered": n,
+        "total_rss_mb": total_rss_kb as f64 / 1024.0,
+        "total_cpu_pct": (total_cpu * 10.0).round() / 10.0,
+        "worker_count": n,
+        "max_concurrent_active": max_conc_val,
+        "workers": sorted,
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::{router, AppState};
@@ -762,7 +1094,10 @@ mod tests {
             assert!(v.get(k).is_some(), "missing key {k}: {v}");
         }
         // Measurable on any supported host (macOS or Linux CI).
-        assert!(v["cpu"]["count"].as_u64().unwrap_or(0) >= 1, "cpu.count: {v}");
+        assert!(
+            v["cpu"]["count"].as_u64().unwrap_or(0) >= 1,
+            "cpu.count: {v}"
+        );
         assert!(
             v["disk"]["total_gb"].as_f64().unwrap_or(0.0) > 0.0,
             "disk.total_gb: {v}"
@@ -788,10 +1123,37 @@ mod tests {
     /// data volume was 90% full. The tell is cheap and specific: the system
     /// snapshot is tiny, so a `disk_total_gb` in that range means the reading
     /// came from the wrong volume again.
+    /// Linux hosts report load, RAM, swap and cores from /proc. They used to
+    /// report none of them, and `amux resources` printed "1 cores, 0 GB RAM"
+    /// for a 4-core 7.7 GB box under load 7.9 (2026-10-26).
+    #[test]
+    fn proc_parsers_read_linux_load_and_memory() {
+        assert_eq!(super::parse_proc_loadavg("7.94 6.12 5.03 3/812 99\n"), vec![7.94, 6.12, 5.03]);
+        let mi = "MemTotal:        8041924 kB\nMemFree:          312000 kB\nMemAvailable:    2041924 kB\nSwapTotal:       2097148 kB\nSwapFree:        1048574 kB\n";
+        assert_eq!(super::parse_proc_meminfo(mi), Some((8_041_924, 2_041_924, 2_097_148, 1_048_574)));
+        // An older kernel without MemAvailable falls back to MemFree rather than
+        // reporting nothing.
+        assert_eq!(super::parse_proc_meminfo("MemTotal: 100 kB\nMemFree: 40 kB\n"), Some((100, 40, 0, 0)));
+        assert_eq!(super::parse_proc_meminfo("garbage"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_host_metrics_are_measured() {
+        let sys = super::collect_system_metrics();
+        assert!(sys["cpu_count"].as_u64().unwrap_or(0) >= 1, "{sys}");
+        assert!(sys["ram_total_mb"].as_f64().unwrap_or(0.0) > 0.0, "{sys}");
+        assert_eq!(sys["load_avg"].as_array().map(|a| a.len()), Some(3), "{sys}");
+        let measured: Vec<&str> = sys["measured_fields"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        assert!(measured.contains(&"ram_total_mb") && measured.contains(&"load_avg"), "{measured:?}");
+    }
+
     #[test]
     fn disk_metrics_measure_the_data_volume_not_the_sealed_system_snapshot() {
         let sys = super::collect_system_metrics();
-        let total = sys["disk_total_gb"].as_f64().expect("disk_total_gb present");
+        let total = sys["disk_total_gb"]
+            .as_f64()
+            .expect("disk_total_gb present");
         let used = sys["disk_used_gb"].as_f64().expect("disk_used_gb present");
         let pct = sys["disk_percent"].as_f64().expect("disk_percent present");
 
@@ -825,22 +1187,20 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         (router(state), store, dir)
     }
 
     fn seed_worker(store: &SharedStore, n: u128, provider: &str, state: WorkerState) {
-        let id = amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(
-            1_700_000_000_000,
-            n,
-        ));
+        let id = amux_core::ids::WorkerId::from_ulid(ulid::Ulid::from_parts(1_700_000_000_000, n));
         let provider = provider.to_string();
         store
             .write(move |conn| {
                 let row = crate::db::queries::WorkerRow::new(
                     &id,
                     &WorkerConfig {
+                        worker_type: Default::default(),
                         display_name: format!("w{n}"),
                         name_aliases: vec![],
                         cwd: "/tmp".into(),
@@ -860,7 +1220,10 @@ mod tests {
                     &state,
                     "2026-01-01T00:00:00Z",
                 )?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
     }
@@ -872,17 +1235,36 @@ mod tests {
     async fn fleet_metrics_report_per_provider_state() {
         let (app, store, _dir) = app();
         let reset = Utc::now() + chrono::Duration::hours(2);
-        seed_worker(&store, 31, "claude", WorkerState::RateLimited { reset_at: Some(reset) });
-        seed_worker(&store, 32, "claude", WorkerState::Idle { since: Utc::now() });
+        seed_worker(
+            &store,
+            31,
+            "claude",
+            WorkerState::RateLimited {
+                reset_at: Some(reset),
+            },
+        );
+        seed_worker(
+            &store,
+            32,
+            "claude",
+            WorkerState::Idle { since: Utc::now() },
+        );
         seed_worker(&store, 33, "codex", WorkerState::Idle { since: Utc::now() });
 
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/api/metrics/fleet").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics/fleet")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         let claude = &v["providers"]["claude"];
@@ -924,10 +1306,17 @@ mod tests {
 
         let res = app
             .clone()
-            .oneshot(Request::builder().uri("/api/metrics/fleet").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics/fleet")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(
             v["last_heartbeat"].is_object(),

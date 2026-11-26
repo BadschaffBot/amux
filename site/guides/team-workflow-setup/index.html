@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
   <title>How to Run an AI Engineering Team (2026 Guide) — amux</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="How to run an AI engineering team: set up amux as the shared control plane, coordinate dozens of coding agents from a phone or browser, with built-in kanban, self-healing, and remote access.">
+  <meta name="description" content="How to run an AI engineering team: set up amux as the shared control plane, coordinate dozens of coding agents from a phone or browser, with built-in kanban, resume after usage limits, and remote access.">
   <meta name="keywords" content="how to run an AI engineering team, AI engineering team setup, manage AI agent team dashboard, run AI coding team, AI agent team workflow, AI agent orchestration 2026, multi-agent team setup, agentic engineering team">
   <link rel="canonical" href="https://amux.io/guides/team-workflow-setup/">
   <meta property="og:title" content="How to Run an AI Engineering Team (2026 Guide) — amux">
@@ -20,27 +20,47 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
 
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Guides","item":"https://amux.io/guides/"},{"@type":"ListItem","position":3,"name":"How to Run an AI Engineering Team","item":"https://amux.io/guides/team-workflow-setup/"}]}</script>
 
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"How to Run an AI Engineering Team (2026 Guide)","description":"Set up amux as the shared control plane for an AI engineering team. Run dozens of parallel coding agents, coordinate via kanban, and monitor from your phone or browser.","url":"https://amux.io/guides/team-workflow-setup/","datePublished":"2026-07-03","dateModified":"2026-07-03","author":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}}}</script>
 
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"HowTo","name":"How to Set Up amux for an AI Engineering Team","description":"Step-by-step guide to running an AI engineering team with amux as the shared control plane — parallel agents, kanban coordination, mobile monitoring, and self-healing.","step":[{"@type":"HowToStep","position":1,"name":"Install amux on a shared server or each developer's machine","text":"Clone the amux repository and run ./install.sh. amux requires Python 3 and tmux. For a shared team server, one installation serves all team members. For per-developer installs, each runs their own amux instance and shares a board URL."},{"@type":"HowToStep","position":2,"name":"Register projects with amux register","text":"For each project or repository, run: amux register myproject --dir ~/Dev/myproject --yolo. This registers the project path, configures agent defaults, and enables YOLO mode for unattended operation. Use --worktree to give each agent session its own git branch automatically."},{"@type":"HowToStep","position":3,"name":"Establish session naming conventions","text":"Pick a naming scheme before launching your first agent: [owner]-[domain]-[task-type] (e.g., eh-auth-feature) or ticket-based (FEAT-042-frontend). Consistent names let the whole team read the dashboard at a glance and know who owns what."},{"@type":"HowToStep","position":4,"name":"Configure the shared kanban board","text":"The amux board is the team's shared source of truth. Each agent session is tagged to a board item. When an agent claims a task (POST /api/board/TASK-ID/claim), it is atomically assigned — no two agents pick up the same work. The board is visible to everyone at the shared dashboard URL."},{"@type":"HowToStep","position":5,"name":"Set up mobile access via PWA or iOS app","text":"Open https://your-amux-host:8824 in Safari on iOS and tap Add to Home Screen for a full-screen PWA. Or install the amux iOS app from the App Store. Both give you real-time session status, board management, and the ability to send messages to running agents from your phone."},{"@type":"HowToStep","position":6,"name":"Enable the self-healing watchdog","text":"amux includes a built-in watchdog that monitors every session. When an agent crashes, hits a context overflow, or gets stuck on a permission prompt, the watchdog auto-restarts it and replays the last message. Enable it per-session with --watchdog or globally in your amux config."},{"@type":"HowToStep","position":7,"name":"Set up remote access via Tailscale","text":"Install Tailscale on the machine running amux and on every team member's device. Share the amux host on the Tailscale network. Team members access the dashboard at https://amux-host:8824 from anywhere — phone, laptop, or tablet — without exposing the port to the public internet."}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"HowTo","name":"How to Set Up amux for an AI Engineering Team","description":"Step-by-step guide to running an AI engineering team with amux as the shared control plane — parallel agents, kanban coordination, mobile monitoring, and recovery after usage limits and reboots.","step":[{"@type":"HowToStep","position":1,"name":"Install amux on a shared server or each developer's machine","text":"Run curl -fsSL https://amux.io/install.sh | bash. amux is a single Rust binary that needs tmux 3.2+ and an agent CLI. For a shared team server, one installation serves all team members. For per-developer installs, each runs their own amux instance and shares a board URL."},{"@type":"HowToStep","position":2,"name":"Register projects with amux register","text":"For each project or repository, run: amux register myproject --dir ~/Dev/myproject --yolo. This registers the project path, configures agent defaults, and enables YOLO mode for unattended operation. Use --worktree to give each agent session its own git branch automatically."},{"@type":"HowToStep","position":3,"name":"Establish session naming conventions","text":"Pick a naming scheme before launching your first agent: [owner]-[domain]-[task-type] (e.g., eh-auth-feature) or ticket-based (FEAT-042-frontend). Consistent names let the whole team read the dashboard at a glance and know who owns what."},{"@type":"HowToStep","position":4,"name":"Configure the shared kanban board","text":"The amux board is the team's shared source of truth. Each agent session is tagged to a board item. When an agent claims a task (POST /api/board/TASK-ID/claim), it is atomically assigned — no two agents pick up the same work. The board is visible to everyone at the shared dashboard URL."},{"@type":"HowToStep","position":5,"name":"Set up mobile access via PWA or iOS app","text":"Open https://your-amux-host:8824 in Safari on iOS and tap Add to Home Screen for a full-screen PWA. Or install the amux iOS app from the App Store. Both give you real-time session status, board management, and the ability to send messages to running agents from your phone."},{"@type":"HowToStep","position":6,"name":"Set up recovery and stall alerts","text":"amux holds message delivery when a provider usage limit hits and resumes the agent at the reset (AMUX_RATE_LIMIT_ACTION=wait). Stall detection flags stalled board work and stuck orchestrators (AMUX_GOAL_STALL_H) and fires owner alerts. On macOS the com.amux.fleet-start login job brings every worker back after a reboot. Restarting a crashed agent process is not built into the amux server today; an optional macOS script (scripts/tmux-watchdog.sh, not installed by default) restarts crashed Claude Code workers."},{"@type":"HowToStep","position":7,"name":"Set up remote access via Tailscale","text":"Install Tailscale on the machine running amux and on every team member's device. Share the amux host on the Tailscale network. Team members access the dashboard at https://amux-host:8824 from anywhere — phone, laptop, or tablet — without exposing the port to the public internet."}]}</script>
 
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is an AI engineering team?","acceptedAnswer":{"@type":"Answer","text":"An AI engineering team is a development team — solo or collaborative — that uses AI coding agents (Claude Code, Codex, Gemini CLI) as the primary unit of work rather than human developers writing code directly. The human role shifts from writing code to defining tasks, reviewing output, and making architectural decisions. One developer running 10 parallel agents has the throughput of a 5-person traditional team."}},{"@type":"Question","name":"How does amux work as a team control plane?","acceptedAnswer":{"@type":"Answer","text":"amux is a single Rust binary that provides: a tmux-based session manager for running dozens of parallel agent sessions, a SQLite-backed kanban board for work coordination, a REST API for inter-agent communication, a self-healing watchdog for unattended overnight operation, a web dashboard accessible from any browser, and a mobile PWA and native iOS app. The dashboard is the shared status board for the whole team — every agent's state, board task, and output visible in one place."}},{"@type":"Question","name":"Should we run one amux per developer or a shared amux server?","acceptedAnswer":{"@type":"Answer","text":"Both configurations work. Per-developer installs are simpler — each developer runs their own amux and agents, coordinates via the shared board URL. A shared server centralizes everything: one machine runs all agents, the whole team monitors one dashboard. Shared servers are better for teams with dedicated compute or who want unified oversight. Per-developer installs are better for teams where developers use different machines or prefer isolation."}},{"@type":"Question","name":"How do multiple agents avoid working on the same task?","acceptedAnswer":{"@type":"Answer","text":"The amux board uses atomic task claiming: POST /api/board/TASK-ID/claim is a compare-and-swap operation. Even with 20 agents polling the same queue simultaneously, each task gets claimed exactly once. The session field shows which agent owns which task. Agents can also use session naming conventions to communicate ownership without a central lock."}},{"@type":"Question","name":"Can I manage agents from my phone?","acceptedAnswer":{"@type":"Answer","text":"Yes. The amux dashboard is a mobile-optimized PWA that works as a home screen app on iOS and Android. There is also a native amux iOS app on the App Store. Both give you real-time session status, board management (add/move/complete tasks), the ability to send messages to running agents, and log access. With Tailscale, you can access your team's agents from anywhere — coffee shop, commute, or bed."}},{"@type":"Question","name":"What AI coding agents does amux support?","acceptedAnswer":{"@type":"Answer","text":"amux is runtime-agnostic — it manages tmux sessions, and any CLI-based agent runs inside one. Current common runtimes: Claude Code (Anthropic), Codex CLI (OpenAI), Gemini CLI (Google), and Aider. You can mix runtimes on the same amux instance — run Claude Code for architecture-heavy tasks and Gemini CLI for refactoring, for example, all visible on the same dashboard."}}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is an AI engineering team?","acceptedAnswer":{"@type":"Answer","text":"An AI engineering team is a development team — solo or collaborative — that uses AI coding agents (Claude Code, Codex, Gemini CLI) as the primary unit of work rather than human developers writing code directly. The human role shifts from writing code to defining tasks, reviewing output, and making architectural decisions. One developer running 10 parallel agents has the throughput of a 5-person traditional team."}},{"@type":"Question","name":"How does amux work as a team control plane?","acceptedAnswer":{"@type":"Answer","text":"amux is a single Rust binary that provides: a tmux-based session manager for running dozens of parallel agent sessions, a SQLite-backed kanban board for work coordination, a REST API for inter-agent communication, resume after usage limits and stall alerts for unattended overnight operation, a web dashboard accessible from any browser, and a mobile PWA and native iOS app. The dashboard is the shared status board for the whole team — every agent's state, board task, and output visible in one place."}},{"@type":"Question","name":"Should we run one amux per developer or a shared amux server?","acceptedAnswer":{"@type":"Answer","text":"Both configurations work. Per-developer installs are simpler — each developer runs their own amux and agents, coordinates via the shared board URL. A shared server centralizes everything: one machine runs all agents, the whole team monitors one dashboard. Shared servers are better for teams with dedicated compute or who want unified oversight. Per-developer installs are better for teams where developers use different machines or prefer isolation."}},{"@type":"Question","name":"How do multiple agents avoid working on the same task?","acceptedAnswer":{"@type":"Answer","text":"The amux board uses atomic task claiming: POST /api/board/TASK-ID/claim is a compare-and-swap operation. Even with 20 agents polling the same queue simultaneously, each task gets claimed exactly once. The session field shows which agent owns which task. Agents can also use session naming conventions to communicate ownership without a central lock."}},{"@type":"Question","name":"Can I manage agents from my phone?","acceptedAnswer":{"@type":"Answer","text":"Yes. The amux dashboard is a mobile-optimized PWA that works as a home screen app on iOS and Android. There is also a native amux iOS app on the App Store. Both give you real-time session status, board management (add/move/complete tasks), the ability to send messages to running agents, and log access. With Tailscale, you can access your team's agents from anywhere — coffee shop, commute, or bed."}},{"@type":"Question","name":"What AI coding agents does amux support?","acceptedAnswer":{"@type":"Answer","text":"amux is runtime-agnostic — it manages tmux sessions, and any CLI-based agent runs inside one. Current common runtimes: Claude Code (Anthropic), Codex CLI (OpenAI), Gemini CLI (Google), and Aider. You can mix runtimes on the same amux instance — run Claude Code for architecture-heavy tasks and Gemini CLI for refactoring, for example, all visible on the same dashboard."}}]}</script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
 
@@ -52,7 +72,7 @@
 
     <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.4rem 1.6rem;margin:1.5rem 0;">
       <strong style="font-size:0.85rem;">Answer in 3 sentences</strong>
-      <p style="font-size:0.92rem;color:var(--dim);margin:0.6rem 0 0;line-height:1.75;">Running an AI engineering team means launching dozens of parallel coding agents — Claude Code, Codex, or Gemini CLI — and coordinating their work through a shared board, dashboard, and self-healing watchdog instead of sprint planning and Slack threads. The human role shifts from writing code to writing specs, reviewing output, and making architectural decisions. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> is the open-source control plane that makes this practical: one Rust binary gives you parallel session management, a kanban board, a mobile-first dashboard, and crash recovery — all visible from your phone.</p>
+      <p style="font-size:0.92rem;color:var(--dim);margin:0.6rem 0 0;line-height:1.75;">Running an AI engineering team means launching dozens of parallel coding agents — Claude Code, Codex, or Gemini CLI — and coordinating their work through a shared board, dashboard, and stall alerts instead of sprint planning and Slack threads. The human role shifts from writing code to writing specs, reviewing output, and making architectural decisions. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> is the self-hosted control plane that makes this practical: one Rust binary gives you parallel session management, a kanban board, a mobile-first dashboard, and resume after usage limits — all visible from your phone.</p>
     </div>
 
     <nav class="toc" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem 1.6rem;margin:2rem 0;">
@@ -76,7 +96,7 @@
     <p>This approach works at every scale — a solo developer running 10 agents overnight, a two-person startup shipping 5x faster than their competition, or a 10-person team where every developer has their own agent fleet visible on a shared dashboard. The <a href="/guides/agentic-engineering/">agentic engineering methodology</a> applies regardless of headcount.</p>
 
     <h2 id="control-plane">How amux Works as the Team Control Plane</h2>
-    <p>amux is a single Rust binary — no containers, no SaaS subscription, no external dependencies beyond Python 3 and tmux. It runs on any Mac, Linux machine, or cloud VM and serves as the operational backbone for your agent fleet.</p>
+    <p>amux is a single Rust binary — no containers, no SaaS subscription, nothing to install beyond tmux 3.2+ and an agent CLI. It runs on any Mac, Linux machine, or cloud VM and serves as the operational backbone for your agent fleet.</p>
 
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1rem;margin:1.5rem 0;">
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.1rem 1.2rem;">
@@ -88,8 +108,8 @@
         <div style="font-size:0.84rem;color:var(--dim);line-height:1.6;">SQLite-backed task board with atomic claiming — no two agents pick up the same task. Visible to the whole team, syncs to iCal for due dates.</div>
       </div>
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.1rem 1.2rem;">
-        <div style="font-weight:600;font-size:0.9rem;margin-bottom:0.4rem;">Self-healing watchdog</div>
-        <div style="font-size:0.84rem;color:var(--dim);line-height:1.6;">Monitors every session. When an agent crashes, overflows context, or gets stuck, the watchdog auto-restarts and replays — no human intervention required.</div>
+        <div style="font-weight:600;font-size:0.9rem;margin-bottom:0.4rem;">Recovery</div>
+        <div style="font-size:0.84rem;color:var(--dim);line-height:1.6;">Resumes after usage limits; workers return after a macOS reboot; stall alerts when work stops moving.</div>
       </div>
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.1rem 1.2rem;">
         <div style="font-weight:600;font-size:0.9rem;margin-bottom:0.4rem;">Mobile dashboard</div>
@@ -117,7 +137,7 @@
 <span class="comment"># Verify the install</span>
 <span class="prompt">$</span> <span class="cmd">amux --version</span>
 <span class="prompt">$</span> <span class="cmd">which amux   # should be in /usr/local/bin or ~/.local/bin</span></code></pre>
-    <p>Prerequisites: Python 3.9+, tmux, and git. The install script handles everything else. For a shared server, run this once on the server — all team members connect to the same instance via browser.</p>
+    <p>Prerequisites: macOS or Linux, tmux 3.2+, git, and at least one agent CLI. The install script handles everything else. For a shared server, run this once on the server — all team members connect to the same instance via browser.</p>
 
     <h3>Step 2: Register projects with <code>amux register</code></h3>
     <pre><code><span class="comment"># Register each project/repo you want agents to work on</span>
@@ -150,17 +170,16 @@
       <li><strong>Android PWA:</strong> Open <code>https://your-amux-host:8824</code> in Chrome, tap the install prompt, and add to home screen.</li>
       <li><strong>Safari PWA:</strong> Open in Safari on iOS, tap the Share button, and choose Add to Home Screen for a full-screen experience.</li>
     </ul>
-    <p>Once set up, you can start, stop, and monitor agents from your phone. No terminal required during the day — just check the board during meetings and intervene when the watchdog flags something that needs human input.</p>
+    <p>Once set up, you can start, stop, and monitor agents from your phone. No terminal required during the day — just check the board during meetings and intervene when a stall alert flags something that needs human input.</p>
 
-    <h3>Step 6: Enable the self-healing watchdog</h3>
-    <pre><code><span class="comment"># Enable watchdog globally for all sessions (recommended for teams)</span>
-<span class="prompt">$</span> <span class="cmd">amux config set watchdog.enabled true</span>
-<span class="prompt">$</span> <span class="cmd">amux config set watchdog.restart_on_crash true</span>
-<span class="prompt">$</span> <span class="cmd">amux config set watchdog.compact_on_overflow true</span>
+    <h3>Step 6: Set up recovery and stall alerts</h3>
+    <pre><code><span class="comment"># Recovery settings live in ~/.amux/server.env (or the Scope tab)</span>
+<span class="prompt">$</span> <span class="cmd">echo 'AMUX_RATE_LIMIT_ACTION=wait' &gt;&gt; ~/.amux/server.env</span>  <span class="comment"># hold delivery at a usage limit, resume at reset</span>
+<span class="prompt">$</span> <span class="cmd">echo 'AMUX_GOAL_STALL_H=2' &gt;&gt; ~/.amux/server.env</span>         <span class="comment"># flag a stuck orchestrator after 2 hours</span>
 
-<span class="comment"># Or per-session at launch time</span>
-<span class="prompt">$</span> <span class="cmd">amux start auth-feature --watchdog "Implement JWT refresh endpoint per spec"</span></code></pre>
-    <p>The watchdog handles the three most common failure modes automatically: agent crashes (restart + replay), context window overflow (compact + resume), and stuck permission prompts (YOLO mode auto-approves). With watchdog enabled, overnight runs complete reliably without babysitting. See the <a href="/guides/self-healing-configuration/">self-healing configuration guide</a> for advanced options.</p>
+<span class="comment"># macOS: the login job that brings workers back after a reboot</span>
+<span class="prompt">$</span> <span class="cmd">launchctl list | grep com.amux.fleet-start</span></code></pre>
+    <p>amux covers the common overnight failure modes: usage limits (delivery is held and resumes at the provider's reset), reboots (on macOS every non-archived worker comes back in its own conversation), context overflow (Claude Code compacts its own context, and amux lets you set the threshold), and stalls (stalled board work and stuck orchestrators are surfaced and owner alerts fire). YOLO mode launches Claude Code with <code>--dangerously-skip-permissions</code>, so approval prompts never appear. Restarting a crashed agent process is not built into the amux server today; an optional macOS script (<code>scripts/tmux-watchdog.sh</code>, not installed by default) restarts crashed Claude Code workers. See <a href="/guides/self-healing-configuration/">Recovery configuration</a> for more options.</p>
 
     <h3>Step 7: Set up remote access via Tailscale</h3>
     <pre><code><span class="comment"># On the amux server</span>
@@ -299,7 +318,7 @@ cx-tests-frontend   <span class="comment"># Codex CLI session, frontend tests</s
 <span class="prompt">$</span> <span class="cmd">amux board done FEAT-042</span></code></pre>
 
     <h3>Daily board review as the standup</h3>
-    <p>For remote teams, a shared dashboard link replaces the traditional standup. Every team member opens <code>https://amux-host:8824</code> asynchronously and sees: which sessions are WORKING vs IDLE, which tasks are in progress vs done, and which tasks need attention (watchdog flags, stuck sessions). The dashboard is the standup. The standup is the dashboard.</p>
+    <p>For remote teams, a shared dashboard link replaces the traditional standup. Every team member opens <code>https://amux-host:8824</code> asynchronously and sees: which sessions are WORKING vs IDLE, which tasks are in progress vs done, and which tasks need attention (stall alerts, stuck sessions). The dashboard is the standup. The standup is the dashboard.</p>
 
     <h2 id="phone">Monitoring Your Agent Fleet from Your Phone</h2>
     <p>The single biggest quality-of-life improvement in running an AI engineering team is getting the dashboard on your phone. When your agents run overnight or during meetings, you need ambient awareness — not another screen open on your desk.</p>
@@ -315,14 +334,14 @@ cx-tests-frontend   <span class="comment"># Codex CLI session, frontend tests</s
     </ul>
 
     <h3>Overnight monitoring workflow</h3>
-    <pre><code><span class="comment"># Before bed: queue the overnight tasks, verify watchdog is active</span>
+    <pre><code><span class="comment"># Before bed: queue the overnight tasks, check usage-limit resume is on</span>
 <span class="prompt">$</span> <span class="cmd">amux board add "Refactor: billing service" --desc "specs/billing-refactor.md"</span>
 <span class="prompt">$</span> <span class="cmd">amux board add "Tests: payments module" --desc "specs/payments-tests.md"</span>
 <span class="prompt">$</span> <span class="cmd">amux board add "Docs: API reference update" --desc "specs/api-docs.md"</span>
 
-<span class="prompt">$</span> <span class="cmd">amux start billing-refactor --watchdog "Claim and implement your board task"</span>
-<span class="prompt">$</span> <span class="cmd">amux start payments-tests  --watchdog "Claim and implement your board task"</span>
-<span class="prompt">$</span> <span class="cmd">amux start api-docs         --watchdog "Claim and implement your board task"</span>
+<span class="prompt">$</span> <span class="cmd">amux start billing-refactor "Claim and implement your board task"</span>
+<span class="prompt">$</span> <span class="cmd">amux start payments-tests   "Claim and implement your board task"</span>
+<span class="prompt">$</span> <span class="cmd">amux start api-docs         "Claim and implement your board task"</span>
 
 <span class="comment"># Morning: check from phone while coffee brews</span>
 <span class="comment"># Board shows done items, session cards show final output</span>
@@ -362,7 +381,7 @@ cx-tests-frontend   <span class="comment"># Codex CLI session, frontend tests</s
           <span style="color:var(--muted);font-size:0.8rem;">Q</span> How much does running a team of agents cost per month?
         </summary>
         <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
-          amux itself is MIT-licensed and free. The cost is your AI API usage — Claude Code, Codex, or Gemini CLI tokens. A well-run team of 5 developers, each running 5&ndash;10 agents per day, typically spends $200&ndash;$800/month in API costs. That's equivalent to a fraction of one developer salary, for output that rivals a team twice the size. The <a href="/guides/ai-coding-agent-costs/">AI coding agent cost guide</a> breaks down the math and optimization strategies.
+          amux itself is source-available (MIT + Commons Clause) and free. The cost is your AI API usage — Claude Code, Codex, or Gemini CLI tokens. A well-run team of 5 developers, each running 5&ndash;10 agents per day, typically spends $200&ndash;$800/month in API costs. That's equivalent to a fraction of one developer salary, for output that rivals a team twice the size. The <a href="/guides/ai-coding-agent-costs/">AI coding agent cost guide</a> breaks down the math and optimization strategies.
         </div>
       </details>
       <details style="border:1px solid var(--border);border-radius:8px;padding:0;">
@@ -381,15 +400,15 @@ cx-tests-frontend   <span class="comment"># Codex CLI session, frontend tests</s
         <li><a href="/guides/agentic-engineering/">Agentic Engineering: the practical guide</a> — the methodology behind running agent teams</li>
         <li><a href="/guides/kanban-board-for-agents/">Kanban board for AI agents</a> — detailed board coordination patterns</li>
         <li><a href="/guides/remote-access-tailscale/">Remote access with Tailscale</a> — secure access from anywhere, step by step</li>
-        <li><a href="/guides/self-healing-configuration/">Self-healing configuration</a> — watchdog setup for unattended overnight runs</li>
+        <li><a href="/guides/self-healing-configuration/">Recovery configuration</a> — usage-limit resume, reboot restore and stall alerts for overnight runs</li>
         <li><a href="/guides/running-10-plus-agents/">Running 10+ agents</a> — scaling beyond a handful of sessions</li>
-        <li><a href="/pricing/">Pricing</a> — amux is MIT-licensed and free; see managed options</li>
+        <li><a href="/pricing/">Pricing</a> — amux is source-available (MIT + Commons Clause) and free; see managed options</li>
       </ul>
     </div>
 
     <div class="cta-box">
       <h3>Run your AI engineering team with amux</h3>
-      <p>Open-source control plane for AI agent teams — self-healing, kanban, CRM, and email built in. MIT licensed.</p>
+      <p>Self-hosted control plane for AI agent teams — usage-limit resume, kanban, CRM, and email built in. MIT + Commons Clause.</p>
       <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
 amux register myproject --dir ~/Dev/myproject --yolo
 amux start myproject
@@ -398,51 +417,24 @@ amux serve  # → https://localhost:8824</code></pre>
     </div>
   </main>
 
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 
   <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>

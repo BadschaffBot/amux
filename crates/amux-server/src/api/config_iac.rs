@@ -40,22 +40,28 @@ use super::AppState;
 
 /// Everything an instance's configuration consists of, in one payload.
 pub async fn export(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let conn = match state.store.read() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("store unreadable: {e}")})),
-            )
-        }
-    };
+    match export_doc(&state) {
+        Ok(doc) => (StatusCode::OK, Json(doc)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e})),
+        ),
+    }
+}
+
+/// The export document itself. Shared with the move bundle
+/// (`api/move_bundle.rs`), whose `config` part is exactly this.
+pub(crate) fn export_doc(state: &AppState) -> Result<Value, String> {
+    let conn = state
+        .store
+        .read()
+        .map_err(|e| format!("store unreadable: {e}"))?;
 
     // ---- skins, all three levels ------------------------------------------
     let mut skins = Map::new();
     if let Ok(mut st) = conn.prepare("SELECT key, value FROM prefs WHERE key LIKE 'skin:%'") {
-        if let Ok(rows) = st.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        }) {
+        if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
             for (k, v) in rows.flatten() {
                 let parsed: Value = serde_json::from_str(&v).unwrap_or(Value::Null);
                 // `skin:group:ops` -> skins.group.ops ; `skin:global` -> skins.global
@@ -117,7 +123,8 @@ pub async fn export(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
             .collect();
         names.sort();
         for name in names {
-            let env = crate::config::parse_env_file(&home.join("sessions").join(format!("{name}.env")));
+            let env =
+                crate::config::parse_env_file(&home.join("sessions").join(format!("{name}.env")));
             if env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false) {
                 continue;
             }
@@ -139,17 +146,31 @@ pub async fn export(State(state): State<AppState>) -> (StatusCode, Json<Value>) 
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(json!({
-            "version": 1,
-            "skins": Value::Object(skins),
-            "columns": columns,
-            "workers": workers,
-            "note": "apply is idempotent; workers are DECLARED here, not started \
-                     (`amux workers start <name>` is the separate verb, on purpose)",
-        })),
-    )
+    Ok(json!({
+        "version": 1,
+        "skins": Value::Object(skins),
+        "columns": columns,
+        "workers": workers,
+        "note": "apply is idempotent; workers are DECLARED here, not started \
+                 (`amux workers start <name>` is the separate verb, on purpose)",
+    }))
+}
+
+/// Who may write instance configuration: the human. A request that names a
+/// session is an agent, refused unless AMUX_SCOPE_WRITE_AGENTS=1 (same policy
+/// as /api/scope). Returns the refusal text, or None when allowed.
+pub(crate) fn agent_write_refusal(headers: &HeaderMap, what: &str) -> Option<String> {
+    let actor = headers
+        .get("x-amux-session")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    (!actor.is_empty() && std::env::var("AMUX_SCOPE_WRITE_AGENTS").ok().as_deref() != Some("1"))
+        .then(|| {
+            format!(
+                "session '{actor}' may not {what}: global and group layers belong to the \
+                 human (same policy as /api/scope). Set AMUX_SCOPE_WRITE_AGENTS=1 to allow it."
+            )
+        })
 }
 
 /// Apply a config document. Reports per-item `changed` vs `unchanged` so a
@@ -161,24 +182,22 @@ pub async fn apply(
 ) -> (StatusCode, Json<Value>) {
     // Writing global/group configuration is the human's, matching
     // /api/scope's own policy: a session may not reshape the whole instance.
-    let actor = headers
-        .get("x-amux-session")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if !actor.is_empty() && std::env::var("AMUX_SCOPE_WRITE_AGENTS").ok().as_deref() != Some("1") {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": format!(
-                    "session '{actor}' may not apply instance config — global and group \
-                     layers belong to the human (same policy as /api/scope). Set \
-                     AMUX_SCOPE_WRITE_AGENTS=1 to allow it."
-                ),
-            })),
-        );
+    if let Some(error) = agent_write_refusal(&headers, "apply instance config") {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": error })));
     }
+    let (ok, report) = apply_doc(&state, &doc, false).await;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    (status, Json(report))
+}
 
+/// Apply (or, with `dry_run`, only compare) a config document. In a dry run
+/// `changed` lists what apply WOULD change and nothing is written. The move
+/// bundle's import uses both modes. Returns (no errors, report).
+pub(crate) async fn apply_doc(state: &AppState, doc: &Value, dry_run: bool) -> (bool, Value) {
     let mut changed: Vec<String> = Vec::new();
     let mut unchanged: Vec<String> = Vec::new();
     let mut errors: Vec<Value> = Vec::new();
@@ -199,20 +218,20 @@ pub async fn apply(
             };
             for (key, val) in pairs {
                 let want = val.to_string();
-                let have: Option<String> = state
-                    .store
-                    .read()
+                let have: Option<String> = state.store.read().ok().and_then(|c| {
+                    c.query_row(
+                        "SELECT value FROM prefs WHERE key=?1",
+                        rusqlite::params![key],
+                        |r| r.get::<_, String>(0),
+                    )
                     .ok()
-                    .and_then(|c| {
-                        c.query_row(
-                            "SELECT value FROM prefs WHERE key=?1",
-                            rusqlite::params![key],
-                            |r| r.get::<_, String>(0),
-                        )
-                        .ok()
-                    });
+                });
                 if have.as_deref() == Some(want.as_str()) {
                     unchanged.push(key);
+                    continue;
+                }
+                if dry_run {
+                    changed.push(key);
                     continue;
                 }
                 let k2 = key.clone();
@@ -224,7 +243,10 @@ pub async fn apply(
                              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                             rusqlite::params![k2, want],
                         )?;
-                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                        Ok(crate::db::WriteOutcome {
+                            applied: true,
+                            events: vec![],
+                        })
                     })
                     .await;
                 match res {
@@ -244,7 +266,10 @@ pub async fn apply(
             };
             let label = c.get("label").and_then(Value::as_str).map(String::from);
             let position = c.get("position").and_then(Value::as_i64);
-            let gate = c.get("gate").and_then(|g| g.as_array()).map(|_| c["gate"].to_string());
+            let gate = c
+                .get("gate")
+                .and_then(|g| g.as_array())
+                .map(|_| c["gate"].to_string());
             let id2 = id.to_string();
             let tag = format!("column:{id}");
             // COMPARE FIRST. Writing unconditionally made a re-apply report
@@ -252,11 +277,8 @@ pub async fn apply(
             // this endpoint promises — a config tool that claims to have
             // changed things it did not is one you cannot trust to tell you
             // when it DID.
-            let current: Option<(Option<String>, Option<i64>, Option<String>)> = state
-                .store
-                .read()
-                .ok()
-                .and_then(|c| {
+            let current: Option<(Option<String>, Option<i64>, Option<String>)> =
+                state.store.read().ok().and_then(|c| {
                     c.query_row(
                         "SELECT label, position, gate FROM statuses WHERE id=?1",
                         rusqlite::params![id2],
@@ -272,6 +294,10 @@ pub async fn apply(
                     unchanged.push(tag);
                     continue;
                 }
+            }
+            if dry_run {
+                changed.push(tag);
+                continue;
             }
             let res = state
                 .store
@@ -316,9 +342,12 @@ pub async fn apply(
             let f = home.join("sessions").join(format!("{name}.env"));
             let mut env = crate::config::parse_env_file(&f);
             let before = env.clone();
-            for (yaml_key, env_key) in
-                [("dir", "CC_DIR"), ("tags", "CC_TAGS"), ("flags", "CC_FLAGS"), ("creator", "CC_CREATOR")]
-            {
+            for (yaml_key, env_key) in [
+                ("dir", "CC_DIR"),
+                ("tags", "CC_TAGS"),
+                ("flags", "CC_FLAGS"),
+                ("creator", "CC_CREATOR"),
+            ] {
                 if let Some(v) = w.get(yaml_key) {
                     let s = match v {
                         Value::String(s) => s.clone(),
@@ -337,6 +366,10 @@ pub async fn apply(
                 unchanged.push(tag);
                 continue;
             }
+            if dry_run {
+                changed.push(tag);
+                continue;
+            }
             let body: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
             if let Some(p) = f.parent() {
                 let _ = std::fs::create_dir_all(p);
@@ -348,16 +381,18 @@ pub async fn apply(
         }
     }
 
-    let status = if errors.is_empty() { StatusCode::OK } else { StatusCode::MULTI_STATUS };
+    let ok = errors.is_empty();
+    let verb = if dry_run { "would change" } else { "changed" };
     (
-        status,
-        Json(json!({
-            "ok": errors.is_empty(),
+        ok,
+        json!({
+            "ok": ok,
+            "dry_run": dry_run,
             "changed": changed,
             "unchanged": unchanged,
             "errors": errors,
             // The number people actually want on a second run.
-            "summary": format!("{} changed, {} already matched", changed.len(), unchanged.len()),
-        })),
+            "summary": format!("{} {verb}, {} already matched", changed.len(), unchanged.len()),
+        }),
     )
 }

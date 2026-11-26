@@ -93,16 +93,27 @@ pub mod ids {
     pub const INVARIANTS: &str = "invariants-monitor";
     pub const SCHEDULER: &str = "scheduler";
     pub const HOST_METRICS: &str = "host-metrics";
+    pub const TRACE_ARCHIVE: &str = "trace-archive";
+    pub const HOST_GUARD: &str = "host-guard";
+    pub const GOAL_KEEPER: &str = "goal-keeper";
+    pub const TASK_TITLES: &str = "task-titles";
+    pub const DESC_REFRESH: &str = "desc-refresh";
+    pub const EVENT_DISPATCH: &str = "event-dispatch";
+    pub const EMAIL_EVENTS: &str = "email-events";
+    pub const LINKEDIN_EVENTS: &str = "linkedin-events";
+    pub const CRM_WATCH: &str = "crm-watch";
     pub const ORCH_RUNTIME: &str = "orchestrator-runtime";
     pub const EVENT_PROCESSORS: &str = "event-processors";
     pub const SCAN: &str = "terminal-scan";
     pub const BOOTSTRAP: &str = "session-bootstrap";
     pub const EMAIL_THEMES: &str = "email-themes";
-    pub const COMMIT_NUDGE: &str = "commit-nudge";
     pub const COMMIT_MENTION_NOTES: &str = "commit-mention-notes";
     pub const SELF_ADOPT: &str = "self-adoption";
     pub const TUNNEL: &str = "tunnel-relay";
     pub const BROWSER_REAPER: &str = "browser-idle-reaper";
+    pub const COMPUTER_REAPER: &str = "computer-sandbox-reaper";
+    pub const ZOMBIE_REAPER: &str = "orphan-zombie-reaper";
+    pub const SEARCH_INGEST: &str = "search-ingest";
     // The PeriodicTask ids below are NOT referenced by any spawn site — they
     // register themselves through `spawn_periodic_every` under the name their
     // own module passes. They are listed here only so CATALOG rows and tests
@@ -111,20 +122,46 @@ pub mod ids {
     pub const BOARD_DRIVE: &str = "board-drive";
     pub const CDC_POLLER: &str = "cdc-poller";
     pub const PANE_SIZE: &str = "pane_size";
+    pub const WORKTREE_HYGIENE: &str = "worktree-hygiene";
     pub const STORAGE: &str = "storage";
     pub const HEARTBEAT: &str = "heartbeat";
     pub const TAILNET_WATCH: &str = "tailnet-watch";
     pub const TELEGRAM_POLL: &str = "telegram-poll";
     pub const TELEGRAM_RELAY: &str = "telegram-relay";
+    pub const BRIDGE_OUTBOUND: &str = "bridge-outbound";
+    pub const BRIDGE_DISCORD: &str = "bridge-discord";
+    pub const BRIDGE_WHATSAPP_APP: &str = "bridge-whatsapp-app";
+    pub const BRIDGE_IMESSAGE: &str = "bridge-imessage";
+    pub const BRIDGE_EMAIL: &str = "bridge-email";
     pub const MESSAGE_CAPTURE: &str = "message-capture";
     pub const MAC_HEALTH: &str = "mac-health";
     pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
     pub const CONTEXT_HEALTH: &str = "context-health";
+    pub const SUBSCRIPTION_RELAUNCH: &str = "subscription-relaunch";
     pub const DISK_WATCH: &str = "disk-watch";
+    pub const LEDGER_CHECKPOINT: &str = "ledger-checkpoint";
     pub const STATUS_HISTORY: &str = "status-history";
+    pub const BROWSER_LOGIN_SYNC: &str = "browser-login-sync";
+    pub const CONNECTOR_MAINTENANCE: &str = "connector-maintenance";
+    pub const SOCIAL_METRICS: &str = "social-metrics";
+    pub const SOCIAL_PUBLISH: &str = "social-publish";
+    pub const EPISODES: &str = "episodes";
     pub const TOKEN_LEDGER: &str = "token-ledger";
     pub const BOARD_HYGIENE: &str = "board-hygiene";
     pub const RECORDINGS_TRANSCRIBE: &str = "recordings-transcribe";
+    pub const RECORDINGS_LIVE: &str = "recordings-live";
+    pub const MODEL_CATALOG_REFRESH: &str = "model-catalog-refresh";
+    pub const WORKER_RESOURCES: &str = "worker-resources";
+    pub const CAPTURE_RECONCILE: &str = "capture-reconcile";
+    pub const EMAIL_APPROVAL_DIGEST: &str = "email-approval-digest";
+    pub const EMAIL_SCHEDULED_SEND: &str = "email-scheduled-send";
+    pub const DECISION_DIGEST: &str = "decision-digest";
+    pub const DIRECTIVE: &str = "directive";
+    pub const NEEDS_INPUT_AUTO: &str = "needs-input-auto";
+    pub const CONTRACT_WATCH: &str = "contract-watch";
+    pub const LAND_QUEUE: &str = "land-queue";
+    pub const CONVERSE_RETENTION: &str = "converse-retention";
+    pub const MEMORY_DREAM: &str = "memory-dream";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -144,30 +181,67 @@ pub const ALL_IDS: &[&str] = &[
     ids::SCAN,
     ids::BOOTSTRAP,
     ids::EMAIL_THEMES,
-    ids::COMMIT_NUDGE,
     ids::COMMIT_MENTION_NOTES,
     ids::SELF_ADOPT,
     ids::TUNNEL,
     ids::BROWSER_REAPER,
+    ids::COMPUTER_REAPER,
+    ids::ZOMBIE_REAPER,
+    ids::SEARCH_INGEST,
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
     ids::CDC_POLLER,
     ids::PANE_SIZE,
+    ids::WORKTREE_HYGIENE,
     ids::STORAGE,
     ids::HEARTBEAT,
     ids::TAILNET_WATCH,
     ids::TELEGRAM_POLL,
     ids::TELEGRAM_RELAY,
+    ids::BRIDGE_OUTBOUND,
+    ids::BRIDGE_DISCORD,
+    ids::BRIDGE_WHATSAPP_APP,
+    ids::BRIDGE_IMESSAGE,
+    ids::BRIDGE_EMAIL,
     ids::MESSAGE_CAPTURE,
     ids::MAC_HEALTH,
     ids::ACCOUNTABILITY_NUDGE,
     ids::CONTEXT_HEALTH,
+    ids::SUBSCRIPTION_RELAUNCH,
     ids::DISK_WATCH,
+    ids::LEDGER_CHECKPOINT,
     ids::HOST_METRICS,
+    ids::TRACE_ARCHIVE,
+    ids::HOST_GUARD,
+    ids::GOAL_KEEPER,
+    ids::TASK_TITLES,
+    ids::DESC_REFRESH,
+    ids::EVENT_DISPATCH,
+    ids::EMAIL_EVENTS,
+    ids::LINKEDIN_EVENTS,
+    ids::CRM_WATCH,
     ids::STATUS_HISTORY,
+    ids::BROWSER_LOGIN_SYNC,
+    ids::CONNECTOR_MAINTENANCE,
+    ids::SOCIAL_METRICS,
+    ids::SOCIAL_PUBLISH,
+    ids::EPISODES,
     ids::TOKEN_LEDGER,
     ids::BOARD_HYGIENE,
     ids::RECORDINGS_TRANSCRIBE,
+    ids::RECORDINGS_LIVE,
+    ids::MODEL_CATALOG_REFRESH,
+    ids::CAPTURE_RECONCILE,
+    ids::EMAIL_APPROVAL_DIGEST,
+    ids::EMAIL_SCHEDULED_SEND,
+    ids::DECISION_DIGEST,
+    ids::DIRECTIVE,
+    ids::NEEDS_INPUT_AUTO,
+    ids::CONTRACT_WATCH,
+    ids::LAND_QUEUE,
+    ids::CONVERSE_RETENTION,
+    ids::WORKER_RESOURCES,
+    ids::MEMORY_DREAM,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -222,14 +296,21 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::SCHEDULER,
         name: "Schedule firing",
-        purpose: "Fires every due user schedule and delivers its command to the worker; in shadow mode it only journals what it would have fired.",
+        purpose: "Fires every due user schedule and delivers its command to the worker; in shadow mode it only journals what it would have fired. A goal-continuation tmux schedule (names /goal and keep going) is skipped while the goal is met, the worker is mid-turn, or another continuation woke it within AMUX_GOAL_CONTINUE_INTERVAL_S. A long brief is sent in full once per version and as a pointer to its saved file while unchanged. Held receipts ride along on each delivered fire.",
         // NOT an off switch: shadow mode still runs the loop. Claiming `off`
         // here would grey out a loop that is very much ticking.
-        env: &[EnvControl {
-            var: "AMUX_RS_SCHEDULER",
-            effect: "1 = fire for real; anything else = shadow mode (journals what it would fire)",
-            off: None,
-        }],
+        env: &[
+            EnvControl {
+                var: "AMUX_RS_SCHEDULER",
+                effect: "unset or 1 = fire for real (default); 0/false/off/no = shadow mode (journals what it would fire)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_SCHEDULE_BRIEF_MIN_CHARS",
+                effect: "a tmux command at least this long is versioned under ~/.amux/schedules/briefs and sent as a pointer while unchanged; default 800, 0 always sends the full text",
+                off: None,
+            },
+        ],
         pref: None,
         detail: None,
     },
@@ -258,11 +339,18 @@ pub const CATALOG: &[Doc] = &[
         // ticks) rather than clamping to a 1s interval. Any value >= 1 is still
         // the tick period. This used to read `off: None` with a note that 0 did
         // nothing; that stopped being true when the central knob landed.
-        env: &[EnvControl {
-            var: "AMUX_BOARD_DRIVE_SECS",
-            effect: "tick seconds; 0 disables the loop (fleet-isolation opt-out, AF-69)",
-            off: Some("0"),
-        }],
+        env: &[
+            EnvControl {
+                var: "AMUX_BOARD_DRIVE_SECS",
+                effect: "tick seconds; 0 disables the loop (fleet-isolation opt-out, AF-69)",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_BLOCKER_RECOVERY_LANE_INTERVAL_S",
+                effect: "at most one blocker-recovery review per lane per this many seconds (default 3600; scoped per worker/group); 0 disables blocker recovery",
+                off: Some("0"),
+            },
+        ],
         pref: None,
         detail: Some("/api/debug/board-drive"),
     },
@@ -358,6 +446,14 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/debug/logs"),
     },
     Doc {
+        id: ids::WORKTREE_HYGIENE,
+        name: "Worker worktree hygiene",
+        purpose: "Re-flags out-of-cone files that a sparse worker worktree shows as deleted, which otherwise refuse the worker's rebase.",
+        env: NO_ENV,
+        pref: None,
+        detail: None,
+    },
+    Doc {
         id: ids::PANE_SIZE,
         name: "Pane-size repair",
         purpose: "Restores a worker's tmux window width after a peek shrank it to the reader's viewport.",
@@ -377,18 +473,6 @@ pub const CATALOG: &[Doc] = &[
             var: "AMUX_COMMIT_MENTION_TICK_S",
             effect: "seconds between scans (floor 60)",
             off: None,
-        }],
-        pref: None,
-        detail: None,
-    },
-    Doc {
-        id: ids::COMMIT_NUDGE,
-        name: "Commit nudge",
-        purpose: "Nudges an idle lane that is sitting on uncommitted work it owns via the staged-guard.",
-        env: &[EnvControl {
-            var: "AMUX_COMMIT_NUDGE_SECS",
-            effect: "sweep seconds; 0 stops the sweep",
-            off: Some("0"),
         }],
         pref: None,
         detail: None,
@@ -426,6 +510,61 @@ pub const CATALOG: &[Doc] = &[
         detail: None,
     },
     Doc {
+        id: ids::SEARCH_INGEST,
+        name: "Search ingest",
+        purpose: "Indexes new session-log and transcript bytes into ~/.amux/search-firehose.db (FTS5) for /api/search types log/transcript, /api/log-search and peek search. Incremental by byte offset; a rotated or rewritten file is re-read.",
+        env: &[
+            EnvControl {
+                var: "AMUX_SEARCH_INGEST",
+                effect: "0 stops the job; searches then scan the files directly",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_SEARCH_INGEST_TICK_S",
+                effect: "seconds between ingest passes (default 10)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_SEARCH_INGEST_BUDGET_MB",
+                effect: "most new bytes indexed per pass (default 64)",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: Some("/api/search/status"),
+    },
+    Doc {
+        id: ids::COMPUTER_REAPER,
+        name: "Computer sandbox reaper",
+        purpose: "Removes amux-labelled CUA computer-use containers that are idle, exited, duplicated for one lane, or unowned. Never starts Docker; finds containers by the amux-computer label only.",
+        env: &[
+            EnvControl {
+                var: "AMUX_COMPUTER_IDLE_S",
+                effect: "seconds without an action before a sandbox is stopped (default 900 = 15 min); 0 disables this arm",
+                off: None, // disables one arm, not the running job
+            },
+            EnvControl {
+                var: "AMUX_COMPUTER_REAP_TICK_S",
+                effect: "sweep interval in seconds (default 60)",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: Some("/api/computer/status"),
+    },
+    Doc {
+        id: ids::ZOMBIE_REAPER,
+        name: "Orphan zombie reaper",
+        purpose: "Reaps this server's zombie children that nobody waits on: children of a build it exec'd over (self-adoption keeps the pid), or a spawn that dropped its handle. Reaps only zombies seen on two ticks in a row. Logs verdict=orphan_zombies_reaped.",
+        env: &[EnvControl {
+            var: "AMUX_ZOMBIE_REAP_TICK_S",
+            effect: "sweep interval in seconds (default 60); 0 turns the reaper off",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: None,
+    },
+    Doc {
         id: ids::BROWSER_REAPER,
         name: "Browser idle reaper",
         purpose: "Releases browsers that are abandoned: no verb activity in 5 min (activity arm), no real page for 1 hour (idle arm), or older than 4 hours (TTL arm). Logins survive on disk; only a relaunch is lost.",
@@ -456,8 +595,8 @@ pub const CATALOG: &[Doc] = &[
     },
     Doc {
         id: ids::TUNNEL,
-        name: "Tunnel relay",
-        purpose: "Long-polls the amux cloud gateway and serves each public request from a local port, so a localhost app is reachable without an inbound port. Registered only while a tunnel is running — absent here means no tunnel is up, which is also the default.",
+        name: "ChatGPT app relay",
+        purpose: "Long-polls the amux cloud gateway and serves the ChatGPT app's OAuth and /mcp requests from amux, refusing every other path. Registered only while the connector is published; absent here means it is not, which is also the default.",
         env: &[
             EnvControl {
                 var: "AMUX_TUNNEL_TOKEN",
@@ -465,8 +604,8 @@ pub const CATALOG: &[Doc] = &[
                 off: Some(OFF_WHEN_UNSET),
             },
             EnvControl {
-                var: "AMUX_TUNNEL_PORT",
-                effect: "the local port to auto-target at boot. UNSET means no auto-start: defaulting to amux's own port would publish an unauthenticated control plane",
+                var: "AMUX_TUNNEL_MCP",
+                effect: "1 starts the relay at boot even without the dashboard's Publish marker",
                 off: Some(OFF_WHEN_UNSET),
             },
             EnvControl {
@@ -482,11 +621,6 @@ pub const CATALOG: &[Doc] = &[
             EnvControl {
                 var: "AMUX_TUNNEL_MAX_CONCURRENT",
                 effect: "simultaneous local fetches; excess waits 8s then gets a 503 (default 8)",
-                off: None,
-            },
-            EnvControl {
-                var: "AMUX_TUNNEL_ALLOW_SELF",
-                effect: "1 = permit tunnelling amux's OWN port. Refused by default: this port has no request auth and /api/sessions/<n>/send is ungated",
                 off: None,
             },
         ],
@@ -533,7 +667,7 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::TELEGRAM_RELAY,
         name: "Telegram relay",
-        purpose: "Auto-relays session replies back to Telegram when a session responds to a Telegram-routed message; works for all sessions without per-session configuration.",
+        purpose: "Retired by the chat bridge, which sends replies from the worker's transcript; with AMUX_TELEGRAM_SCREEN_RELAY=1 it reads linked workers' screens and relays new text, the old way.",
         env: &[EnvControl {
             var: "TELEGRAM_BOT_TOKEN",
             effect: "unset = relay idles; set = relays enabled",
@@ -543,9 +677,65 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/telegram/status"),
     },
     Doc {
+        id: ids::BRIDGE_OUTBOUND,
+        name: "Chat bridge replies",
+        purpose: "Sends workers' replies to bridged WhatsApp, Slack, Telegram and Discord conversations, holds replies into a conversation with someone other than the owner for approval, and retries failed sends.",
+        env: &[],
+        pref: None,
+        detail: Some("/api/bridge"),
+    },
+    Doc {
+        id: ids::BRIDGE_DISCORD,
+        name: "Discord channel reads",
+        purpose: "Reads the Discord channels in DISCORD_CHANNELS every few seconds and files new messages through the chat bridge; idles while no bot token is set.",
+        env: &[EnvControl {
+            var: "DISCORD_BOT_TOKEN",
+            effect: "unset = idles, checking every 30 s; set = reads every 4 s",
+            off: None,
+        }],
+        pref: None,
+        detail: Some("/api/bridge"),
+    },
+    Doc {
+        id: ids::BRIDGE_WHATSAPP_APP,
+        name: "WhatsApp self chat",
+        purpose: "Reads the owner's WhatsApp \"message yourself\" chat from the WhatsApp app on this Mac every 3 s and files @worker, @person and #channel messages through the chat bridge; answers go back through the app.",
+        env: &[EnvControl {
+            var: "AMUX_WHATSAPP_APP",
+            effect: "unset = on when AMUX_OWNER_PHONE is set and WhatsApp's database exists; 0 = off, checking every 30 s",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/bridge"),
+    },
+    Doc {
+        id: ids::BRIDGE_IMESSAGE,
+        name: "iMessage self thread",
+        purpose: "Reads the owner's iMessage thread with their own number from Messages on this Mac every 3 s and files @worker, @person and #channel messages through the chat bridge; answers go back into that thread.",
+        env: &[EnvControl {
+            var: "AMUX_IMESSAGE_BRIDGE",
+            effect: "unset = on when AMUX_OWNER_PHONE (or AMUX_IMESSAGE_SELF_HANDLES) is set and Messages' database exists; 0 = off, checking every 30 s",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/bridge"),
+    },
+    Doc {
+        id: ids::BRIDGE_EMAIL,
+        name: "Email to yourself",
+        purpose: "Searches the owner's Gmail every 60 s for mail they sent themselves whose subject starts with @worker, @person or #channel, files it through the chat bridge, and answers as a reply in the same thread.",
+        env: &[EnvControl {
+            var: "AMUX_BRIDGE_EMAIL",
+            effect: "unset = the AMUX_OWNER_EMAIL account when it is connected; an address = that account; 0 = off, checking every 300 s",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/bridge"),
+    },
+    Doc {
         id: ids::MAC_HEALTH,
         name: "Mac process health",
-        purpose: "Safely reaps aged orphaned Ray, Playwright Chrome, debug rustc, and server-owned zombie children; warns on foreign zombies and excessive claude processes. Runs every 30 minutes.",
+        purpose: "Safely reaps aged orphaned Ray, Playwright Chrome and debug rustc; reports zombies without stealing child exit statuses, and warns on excessive claude processes. Runs every 30 minutes.",
         env: &[
             EnvControl {
                 var: "AMUX_MAC_HEALTH_TICK_S",
@@ -574,7 +764,7 @@ pub const CATALOG: &[Doc] = &[
             },
             EnvControl {
                 var: "AMUX_MAC_HEALTH_ZOMBIE_GRACE_S",
-                effect: "minimum age (seconds) before an owned zombie child is reaped (default 60)",
+                effect: "minimum process lifetime (seconds) before a zombie is reported; only its spawning caller reaps it (default 60)",
                 off: None,
             },
         ],
@@ -602,6 +792,14 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/debug/context-health"),
     },
     Doc {
+        id: ids::SUBSCRIPTION_RELAUNCH,
+        name: "Subscription relaunch",
+        purpose: "Relaunches, at an idle boundary and on the same conversation, Claude workers that started before the host's Claude sign-in and still run on ANTHROPIC_API_KEY.",
+        env: NO_ENV,
+        pref: None,
+        detail: None,
+    },
+    Doc {
         id: ids::DISK_WATCH,
         name: "Disk watch",
         purpose: "Measures disk pressure and regenerable cache growth, starts bounded scans when due, and reports findings without deleting user data.",
@@ -621,6 +819,32 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/reclaim/scan"),
     },
     Doc {
+        id: ids::TRACE_ARCHIVE,
+        name: "Trace archive",
+        purpose: "Keeps every agent trace. Sets Claude Code's cleanupPeriodDays when unset (it deletes sessions after 30 days by default) and warns when it is under a year. Gzips each Claude transcript, subagent transcript and Codex rollout that has been quiet for 2 hours into ~/.amux/traces (backed up with ~/.amux), indexed by worker with message, tool-call, error and token counts; marks traces whose original was deleted. Oldest first, bounded bytes per tick, paused while the host is critical.",
+        env: &[
+            EnvControl { var: "AMUX_TRACE_ARCHIVE_SECS", effect: "0 disables archiving and the retention guard", off: Some("0") },
+            EnvControl { var: "AMUX_TRACE_ARCHIVE_TICK_MB", effect: "source MB archived per 10-minute tick, default 400", off: None },
+            EnvControl { var: "AMUX_TRACE_ARCHIVE_QUIET_S", effect: "seconds a transcript must be unchanged before archiving, default 7200", off: None },
+        ],
+        pref: None,
+        detail: Some("/api/traces"),
+    },
+    Doc {
+        id: ids::LEDGER_CHECKPOINT,
+        name: "Ledger checkpoints",
+        purpose: "Signs the ledger's head (seq and hash) with this host's Ed25519 key every interval and exports it to ~/.amux/ledger-checkpoints.jsonl, and to S3-compatible storage and a webhook when configured, so a rewrite of the ledger that re-hashes every row no longer matches what was signed and published. Measures whether the S3 copy is write-once rather than assuming it.",
+        env: &[
+            EnvControl { var: "AMUX_LEDGER_CHECKPOINTS", effect: "off stops signing and exporting (the ledger itself keeps running)", off: Some("off") },
+            EnvControl { var: "AMUX_LEDGER_CHECKPOINT_SECS", effect: "0 disables the tick loop", off: Some("0") },
+            EnvControl { var: "AMUX_LEDGER_CHECKPOINT_INTERVAL_S", effect: "seconds between checkpoints, default 3600 (the job wakes every 300)", off: None },
+            EnvControl { var: "AMUX_LEDGER_CHECKPOINT_S3_ENDPOINT", effect: "with _BUCKET, _ACCESS_KEY_ID and _SECRET_ACCESS_KEY: export each checkpoint to S3-compatible storage (_REGION default auto, _PREFIX, _LOCK_DAYS and _LOCK_MODE for object lock)", off: None },
+            EnvControl { var: "AMUX_LEDGER_CHECKPOINT_WEBHOOK", effect: "POST each checkpoint as JSON to this URL", off: None },
+        ],
+        pref: None,
+        detail: Some("/api/ledger/checkpoints"),
+    },
+    Doc {
         id: ids::HOST_METRICS,
         name: "Host metrics history",
         purpose: "Samples the host analysis /api/metrics/host serves (CPU, load, memory, swap, disk, process counts) into host_metrics, so utilization over time is answerable rather than only right now. A failed probe is recorded as an unmeasured row, never as a gap.",
@@ -631,6 +855,149 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: Some("/api/metrics/host/history"),
+    },
+    Doc {
+        id: ids::WORKER_RESOURCES,
+        name: "Worker resource samples",
+        purpose: "Samples each worker's RSS, CPU, process and thread counts into worker_resource_samples every 30s, so which worker was using the machine at a past moment is answerable, and logs a WARN when a worker's RSS passes AMUX_WORKER_MAX_RSS_MB.",
+        env: &[
+            EnvControl { var: "AMUX_WORKER_RESOURCES_EVERY_SECS", effect: "seconds between samples (default 30, floored at 10)", off: None },
+            EnvControl { var: "AMUX_WORKER_METRICS_RETAIN_DAYS", effect: "days of samples kept (default 7, floored at 1)", off: None },
+            EnvControl { var: "AMUX_WORKER_MAX_RSS_MB", effect: "per-worker RSS above which a WARN is logged (default 0, no cap)", off: None },
+        ],
+        pref: None,
+        detail: Some("/api/metrics/workers"),
+    },
+    Doc {
+        id: ids::GOAL_KEEPER,
+        name: "Goal keeper",
+        purpose: "Continues a Claude worker whose owner-set /goal is not met (latest transcript goal_status met:false and the footer shows /goal active, or the goal was cleared by an error, or the worker's AMUX_GOAL_CHECK checker says not met) once it has been idle 2 minutes, because Claude Code's own goal loop does not survive a resume. At most one continue per 10 minutes; two continues with no tool call stop it for that goal until the goal changes or the owner writes. Reaches isolated workers as owner configuration (goal: guard). Each tick also runs the goal-loop guard's restore (AMUX-5277): a lane parked on a needsyou card gets `/goal <condition>` back once when the card leaves needsyou, and is never continued while parked.",
+        env: &[
+            EnvControl { var: "AMUX_GOAL_KEEPER_SECS", effect: "0 disables the keeper", off: Some("0") },
+            EnvControl { var: "AMUX_GOAL_CONTINUE", effect: "0 opts a worker, group or the fleet out (scoped)", off: None },
+            EnvControl { var: "AMUX_GOAL_CONTINUE_IDLE_S", effect: "idle seconds before a continue, default 120", off: None },
+            EnvControl { var: "AMUX_GOAL_CONTINUE_INTERVAL_S", effect: "minimum seconds between continues by the keeper or a goal-continuation schedule, default 600", off: None },
+            EnvControl { var: "AMUX_GOAL_CHECK", effect: "the worker's goal checker, a shell command (exit 0 met, 1 not met, else unknown; prints N/M or {\"done\",\"total\",\"summary\"}); it decides met (scoped)", off: None },
+            EnvControl { var: "AMUX_GOAL_CHECK_INTERVAL_S", effect: "seconds between checker runs, default 600 (scoped)", off: None },
+            EnvControl { var: "AMUX_GOAL_CHECK_TIMEOUT_S", effect: "checker time limit, default 120 (scoped)", off: None },
+            EnvControl { var: "AMUX_GOAL_STALL_H", effect: "hours without checker movement before one owner alert, default 6 (scoped)", off: Some("0") },
+            EnvControl { var: "AMUX_GOAL_LOOP_GUARD", effect: "0 turns off goal-loop detection, park and restore (scoped)", off: None },
+        ],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::TASK_TITLES,
+        name: "Card task titles",
+        purpose: "Keeps every running Claude worker's card title current. Claude Code titles only unnamed conversations and amux names every worker, so the card shows a generated title; this refreshes it from the worker's recent conversation when the transcript moved since the title and the title is older than the interval, a few workers per tick, oldest first. Covers isolated workers too: the title is a display label in amux meta and nothing reaches the worker. KEEP re-stamps the current title.",
+        env: &[
+            EnvControl { var: "AMUX_TASK_TITLE_SECS", effect: "seconds between ticks, default 60; 0 disables the refresh", off: Some("0") },
+            EnvControl { var: "AMUX_TASK_TITLE_REFRESH_S", effect: "minimum age of a title before it is refreshed, default 900", off: None },
+            EnvControl { var: "AMUX_TASK_TITLE_PER_TICK", effect: "titles generated per tick at most, default 3", off: None },
+        ],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::EVENT_DISPATCH,
+        name: "Event subscriptions",
+        purpose: "Every second, reads the events written since its stored cursor (session_events, and board_change_log as board.card.* events) and fires each enabled subscription whose pattern, source, session and filter match: send, board, schedule, shell or notify. Dedupes per subscription (or per dedupe key), caps each subscription at 60 fires an hour, and asks the helper model only for subscriptions marked judge. A restart replays what it missed up to 5000 events.",
+        env: &[EnvControl { var: "AMUX_EVENT_DISPATCH_SECS", effect: "0 stops the dispatcher; no subscription fires", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/subscriptions/fires"),
+    },
+    Doc {
+        id: ids::EMAIL_EVENTS,
+        name: "Email events",
+        purpose: "Every 60 s, reads the last day of each connected Gmail inbox and writes each message that arrived since watching began as an email.received event (account, from, to, subject, snippet, thread_id, message_id), so an event subscription can wake a worker when a particular email lands. The first read of an account only records when watching began. Keyed per message, so a re-read never fires twice.",
+        env: &[EnvControl { var: "AMUX_EMAIL_EVENTS_SECS", effect: "seconds between inbox reads, default 60; 0 stops email events", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/subscriptions/catalog"),
+    },
+    Doc {
+        id: ids::LINKEDIN_EVENTS,
+        name: "LinkedIn events",
+        purpose: "About every 45 minutes, opens LinkedIn's conversation list on the ethan browser profile (the compose page, so no conversation is opened or marked read), and writes each new unread message as a linkedin.message_received event (from_name, snippet, time_label, is_inmail, sponsored), so an event subscription can wake a worker when someone messages the owner on LinkedIn. Read-only: no clicks, no typing. The first read only records what is listed. The last read time survives a restart.",
+        env: &[EnvControl { var: "AMUX_LINKEDIN_EVENTS_SECS", effect: "seconds between LinkedIn reads, default 2700; 0 stops LinkedIn events", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/subscriptions/catalog"),
+    },
+    Doc {
+        id: ids::CRM_WATCH,
+        name: "CRM watch and capture",
+        purpose: "Every 2 minutes, fetches each watched public page in the CRM that is due (a company's website or careers page, on its own check interval) and emits crm.channel.changed when it shows lines it did not before; then attaches new email.received and linkedin.message_received events, and delivered sends in the sent-mail log, to the people they are from or to, emitting crm.contact.replied for inbound. Social profiles are checked by workers, which report through /api/crm/channels/<id>/observed.",
+        env: &[EnvControl { var: "AMUX_CRM_WATCH_SECS", effect: "seconds between passes, default 120; 0 stops CRM watching and capture", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/crm/channels?watch=1"),
+    },
+    Doc {
+        id: ids::DESC_REFRESH,
+        name: "Worker descriptions",
+        purpose: "Keeps each worker's description (CC_DESC, which peers route by) current with how it is used. Hourly, a few non-isolated, non-archived, non-paused workers with new owner messages or closed cards since their last check (at most daily) are read against their description; the helper model answers KEEP or a replacement in the same style. A replacement keeps the old text (Revert in Configuration), is marked auto, and refreshes the peer rosters. A locked description (CC_DESC_LOCK=1, set by the owner's own edit) is never changed.",
+        env: &[
+            EnvControl { var: "AMUX_DESC_REFRESH_SECS", effect: "seconds between ticks, default 3600; 0 disables the refresh", off: Some("0") },
+            EnvControl { var: "AMUX_DESC_REFRESH_INTERVAL_S", effect: "minimum seconds between checks of one worker, default 86400", off: None },
+            EnvControl { var: "AMUX_DESC_REFRESH_PER_TICK", effect: "workers checked per tick at most, default 3", off: None },
+        ],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::HOST_GUARD,
+        name: "Host guard",
+        purpose: "Every 30s computes one host pressure level (ok/strained/critical) from load per core, memory pressure and free disk. At critical, automated loops that start work (board dispatch, schedule fires, automated worker starts) skip their tick and retry on the next; owner actions never wait on it. While strained or worse, a worker's tool process that has averaged most of a core for 15+ minutes is reniced, never killed.",
+        env: &[
+            EnvControl { var: "AMUX_HOST_GUARD_SECS", effect: "0 disables the guard (no level, nothing deferred, nothing reniced)", off: Some("0") },
+            EnvControl { var: "AMUX_HOST_LOAD_STRAINED", effect: "load per core (5-min avg) that is strained, default 1.5", off: None },
+            EnvControl { var: "AMUX_HOST_LOAD_CRITICAL", effect: "load per core (5-min avg) that is critical, default 2.5", off: None },
+            EnvControl { var: "AMUX_HOST_DEFER_FLOOR_MIN", effect: "minutes a schedule held through a critical host waits before it fires anyway, one per tick, default 30", off: Some("0") },
+            EnvControl { var: "AMUX_HOST_DISK_STRAINED_GB", effect: "free GiB on the amux home volume that is strained, default 40", off: None },
+            EnvControl { var: "AMUX_HOST_DISK_CRITICAL_GB", effect: "free GiB that is critical, default 10", off: None },
+            EnvControl { var: "AMUX_RUNAWAY_MIN_SECS", effect: "age before a worker tool process can be a runaway, default 900", off: None },
+            EnvControl { var: "AMUX_RUNAWAY_AVG_CORES", effect: "lifetime average cores that makes it a runaway, default 0.8", off: None },
+            EnvControl { var: "AMUX_RUNAWAY_RENICE", effect: "0 reports runaways without renicing them", off: None },
+        ],
+        pref: None,
+        detail: Some("/api/metrics/host/pressure"),
+    },
+    Doc {
+        id: ids::CONNECTOR_MAINTENANCE,
+        name: "Connector maintenance",
+        purpose: "Refreshes renewable saved grants before expiry and probes configured connections without changing owner definitions, account pins or scopes. Independent of autofix/board policy; provider revocation still requires consent. A grant that can no longer be refreshed (confirmed by an uncached check) alerts the owner on web push and the owner inbox, never SMS, with a reconnect link: once when it breaks, then daily while it stays broken.",
+        env: &[
+            EnvControl { var: "AMUX_CONNECTOR_MAINTENANCE_SECS", effect: "pass interval in seconds (default 300, 0 disables)", off: Some("0") },
+            EnvControl { var: "AMUX_CONNECTOR_REAUTH_ALERT", effect: "0 stops the owner alert for grants that cannot refresh (re-read every pass)", off: None },
+        ],
+        pref: None,
+        detail: Some("/api/connectors/maintenance"),
+    },
+    Doc {
+        id: ids::SOCIAL_METRICS,
+        name: "Social metrics",
+        purpose: "Reads each social post's views and engagement once its 24h, 72h and 7d windows pass, and stores one snapshot per window. A failed read is stored unmeasured with its error and retried.",
+        env: &[EnvControl { var: "AMUX_SOCIAL_METRICS_SECS", effect: "pass interval in seconds (default 600, 0 disables)", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/social/posts"),
+    },
+    Doc {
+        id: ids::SOCIAL_PUBLISH,
+        name: "Social publish",
+        purpose: "Publishes queued social posts when their time comes. A failure that reached nothing is retried up to three times, then marked failed with its error; a send that got no answer is marked uncertain and never sent again on its own.",
+        env: &[EnvControl { var: "AMUX_SOCIAL_PUBLISH_SECS", effect: "pass interval in seconds (default 30, 0 disables)", off: Some("0") }],
+        pref: None,
+        detail: Some("/api/social/queue"),
+    },
+    Doc {
+        id: ids::BROWSER_LOGIN_SYNC,
+        name: "Browser login sync",
+        purpose: "Keeps opted-in browser profiles signed in by mirroring the listed sites' cookies from the owner's Chrome profile signed in as the same account; only sites named in the registry are ever copied.",
+        env: &[EnvControl {
+            var: "AMUX_BROWSER_LOGIN_SYNC_SECS",
+            effect: "pass interval in seconds (default 21600, 0 disables)",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/browser/profiles"),
     },
     Doc {
         id: ids::STATUS_HISTORY,
@@ -648,6 +1015,18 @@ pub const CATALOG: &[Doc] = &[
                 off: None,
             },
         ],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::EPISODES,
+        name: "Episode records",
+        purpose: "Writes one self-contained row per task attempt: the card, git sha, conversation and configuration at claim, then the outcome, end sha and transcripts at close, so pruning other tables cannot erase what an attempt started from.",
+        env: &[EnvControl {
+            var: "AMUX_EPISODES_SECS",
+            effect: "capture interval in seconds (default 15, minimum 5)",
+            off: None,
+        }],
         pref: None,
         detail: None,
     },
@@ -687,6 +1066,263 @@ pub const CATALOG: &[Doc] = &[
         pref: None,
         detail: Some("/api/recordings/config"),
     },
+    Doc {
+        id: ids::RECORDINGS_LIVE,
+        name: "Live recording transcripts",
+        purpose: "Transcribes each open recording session in windows of about 15 seconds while it is recorded, so the words up to any crash are already on disk (live.json, live.md) and the finished transcript only adds the tail. Off with the Record tab's live option.",
+        env: &[EnvControl {
+            var: "AMUX_RECORDINGS_LIVE_SECS",
+            effect: "tick seconds (default 5); 0 disables the job",
+            off: Some("0"),
+        }],
+        pref: Some(PrefControl {
+            key: "recordings_live",
+            effect: "off: nothing is transcribed while recording; the finished transcript is made at the end, all at once",
+        }),
+        detail: Some("/api/recordings/options"),
+    },
+    Doc {
+        id: ids::CONVERSE_RETENTION,
+        name: "Converse retention",
+        purpose: "Deletes Converse-tab voice conversations (transcript and recorded audio under AMUX_HOME/converse) once they are older than the retention window, and logs one verdict line per sweep. Without it expired conversations are hidden but their files stay on disk.",
+        env: &[
+            EnvControl {
+                var: "AMUX_CONVERSE_RETENTION_SECS",
+                effect: "tick seconds (default 3600); 0 disables the job",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_CONVERSE_RETENTION_DAYS",
+                effect: "days a conversation is kept (default 30), read on every tick",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: Some("/api/converse/config"),
+    },
+    Doc {
+        id: ids::MEMORY_DREAM,
+        name: "Memory curation",
+        purpose: "Asks a running worker to rewrite its own amux memory when the file is over AMUX_MEMORY_DREAM_KB, changed since the last ask, and the last ask is a week old. Every launch loads the whole memory and the only other write verb appends, so without this memory only grows. The worker saves with `amux memory curate --stdin`, which keeps the prior version under memory/.history.",
+        env: &[
+            EnvControl {
+                var: "AMUX_MEMORY_DREAM",
+                effect: "0 stops the asks (also settable per worker, group or global scope)",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_MEMORY_DREAM_KB",
+                effect: "size in KB above which a worker is asked (default 12)",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::MODEL_CATALOG_REFRESH,
+        name: "Model catalog refresh",
+        purpose: "Probes each vendor's own list-models API (Anthropic, OpenAI, Gemini) when a key is configured and caches the merged result for /api/models and every ProviderAdapter::models(). Each vendor is asked at most hourly after a success; a failed probe serves the last good listing (persisted in model-catalog-live.json, so it survives restarts) and is retried on the next 5-minute tick. A vendor with no key serves the static fallback.",
+        env: &[EnvControl {
+            var: "AMUX_MODEL_CATALOG_REFRESH_SECS",
+            effect: "tick seconds; 0 disables the job (static catalog only)",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/models"),
+    },
+    Doc {
+        id: ids::CAPTURE_RECONCILE,
+        name: "Capture-card reconciliation",
+        purpose: "Closes an auto-captured intake card as done when a landed commit names its MSG id \
+                  (evidence written onto the card), and tags capture cards still open 24h after \
+                  capture as `unreconciled`. Board notes, turn-end text and cards marked done that \
+                  cite the MSG id close them immediately; this tick covers commits. AMUX-5238.",
+        env: &[
+            EnvControl {
+                var: "AMUX_CAPTURE_RECONCILE_TICK_S",
+                effect: "seconds between passes (floor 60)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_CAPTURE_RECONCILE_SECS",
+                effect: "0 disables the job",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_CAPTURE_RECONCILE",
+                effect: "scoped per lane; 0 stops closing and tagging that lane's capture cards",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::DIRECTIVE,
+        name: "Directives",
+        purpose: "Works open directives: retries a delivery that did not land, repeats an \
+                  unanswered directive once, then tells the owner. Only a sender the target's \
+                  scope names in AMUX_DIRECTIVE_SENDERS can issue one.",
+        env: &[
+            EnvControl {
+                var: "AMUX_DIRECTIVE_ACK_S",
+                effect: "seconds before an unanswered directive is repeated, and again before the \
+                         owner is told (default 600)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_DIRECTIVE_TICK_S",
+                effect: "seconds between passes over the open directives (default 60)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_DIRECTIVE_SECS",
+                effect: "0 disables the job",
+                off: Some("0"),
+            },
+        ],
+        pref: None,
+        detail: Some("/api/directives"),
+    },
+    Doc {
+        id: ids::DECISION_DIGEST,
+        name: "Decision digest",
+        purpose: "Once a local day, sends the owner every needsyou card with its recommendation \
+                  and the date it takes effect unless vetoed. Classification fails closed: \
+                  only a typed decision whose worker declared it internal and reversible can \
+                  apply, and money, outside sends and customer data never do. Default on; \
+                  AMUX_DECISION_DIGEST_APPLY=0 is the off switch. Z15.",
+        env: &[
+            EnvControl {
+                var: "AMUX_DECISION_DIGEST",
+                effect: "0 stops the digest and every application (re-read every tick)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_DECISION_DIGEST_APPLY",
+                effect: "default on; 0 at worker, group or global scope, or in server.env for the \
+                         fleet, stops applying and leaves a dry run (owner-only key)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_DECISION_DIGEST_HOUR",
+                effect: "local hour the digest becomes due (default 9, capped at 15); defaults apply \
+                         8 hours after it is sent",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_DECISION_DIGEST_WAIT_DAYS",
+                effect: "days from first publication to the effect date (default 2, floored at 2)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_DECISION_DIGEST_SECS",
+                effect: "0 disables the job",
+                off: Some("0"),
+            },
+        ],
+        pref: None,
+        detail: Some("/api/decision-digest"),
+    },
+    Doc {
+        id: ids::EMAIL_APPROVAL_DIGEST,
+        name: "Email approval digest",
+        purpose: "Once a local day, when outbound email drafts are waiting for approval, sends \
+                  the owner one list of them on web push and the owner inbox (never SMS). \
+                  Approvals for email no longer expire, so this is how the queue reaches the \
+                  owner away from the dashboard. AMUX-5240.",
+        env: &[
+            EnvControl {
+                var: "AMUX_EMAIL_APPROVAL_DIGEST",
+                effect: "0 stops the digest (re-read every tick)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_EMAIL_APPROVAL_DIGEST_HOUR",
+                effect: "local hour the digest becomes due (default 9)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_EMAIL_APPROVAL_DIGEST_SECS",
+                effect: "0 disables the job",
+                off: Some("0"),
+            },
+        ],
+        pref: None,
+        detail: Some("/api/email/approvals"),
+    },
+    Doc {
+        id: ids::EMAIL_SCHEDULED_SEND,
+        name: "Scheduled email send",
+        purpose: "Every 30 seconds, sends each held outbound email whose approver scheduled it \
+                  for a time that has come, through the same release as the Approve button \
+                  (one-shot, audited). A failed release goes back to pending for a human.",
+        env: &[
+            EnvControl {
+                var: "AMUX_EMAIL_SCHEDULED_SEND_TICK_S",
+                effect: "seconds between checks (default 30)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_EMAIL_SCHEDULED_SEND_SECS",
+                effect: "0 disables the job",
+                off: Some("0"),
+            },
+        ],
+        pref: None,
+        detail: Some("/api/email/approvals"),
+    },
+    Doc {
+        id: ids::NEEDS_INPUT_AUTO,
+        name: "Needs-input auto-approve",
+        purpose: "Every minute, approves each NEW needs-input item that its worker's policy \
+                  covers, exactly as the triage sheet's Approve does, once per item. Never \
+                  money, production data, outside parties, credentials or scope decisions \
+                  (contract rule 11). AMUX-5301.",
+        env: &[
+            EnvControl {
+                var: "AMUX_NEEDS_INPUT_AUTO",
+                effect: "0 in server.env stops it fleet-wide; scoped per worker/group it turns \
+                         one worker or group off (re-read every tick)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_NEEDS_INPUT_AUTO_TICK_S",
+                effect: "seconds between passes (default 60, floor 30)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_NEEDS_INPUT_AUTO_SECS",
+                effect: "0 disables the job",
+                off: Some("0"),
+            },
+        ],
+        pref: None,
+        detail: Some("/api/needs-input/auto"),
+    },
+    Doc {
+        id: ids::CONTRACT_WATCH,
+        name: "Contract watch",
+        purpose: "Every 5 minutes: runs the frozen post-deploy check of each deploy card whose \
+                  server-verified commit production now contains (contract rule 2b), and starts \
+                  a fresh read-only reviewer on a different model for each card eligible for \
+                  verified (rule 3). Three failures of either reopen or escalate the card.",
+        env: NO_ENV,
+        pref: None,
+        detail: Some("/api/contract/counters"),
+    },
+    Doc {
+        id: ids::LAND_QUEUE,
+        name: "Land queue",
+        purpose: "Every 20 seconds, takes each repository's queued lands (contract rule 5) in order, \
+                  composes them onto origin/main in a server worktree, runs the land gate and the \
+                  repo's pre-push hook, and pushes; a red batch is bisected and a red commit goes \
+                  back to its lane unmerged.",
+        env: NO_ENV,
+        pref: None,
+        detail: Some("/api/land"),
+    },
 ];
 
 pub fn doc_for(id: &str) -> Option<&'static Doc> {
@@ -702,6 +1338,10 @@ struct Job {
     interval: Option<Duration>,
     spawned_at: f64,
     ticks: u64,
+    failures: u64,
+    consecutive_failures: u64,
+    recoveries: u64,
+    last_failure_at: Option<f64>,
     last_start: Option<f64>,
     last_end: Option<f64>,
     last_ms: Option<f64>,
@@ -773,7 +1413,9 @@ pub fn is_triggerable(id: &str) -> bool {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    g.get(id).map(|j| j.kind == "periodic" && j.disabled.is_none()).unwrap_or(false)
+    g.get(id)
+        .map(|j| j.kind == "periodic" && j.disabled.is_none())
+        .unwrap_or(false)
 }
 
 /// Record a job at its spawn. Called by [`super::spawn_periodic_every`] and by
@@ -789,6 +1431,10 @@ pub fn register(
     register_inner(id, kind, interval, abort, None);
 }
 
+pub(crate) fn set_abort(id: &str, abort: tokio::task::AbortHandle) {
+    if let Ok(mut m) = reg().lock() { if let Some(j) = m.get_mut(id) { j.abort = Some(abort); } }
+}
+
 /// Register a job whose tick loop was deliberately NOT spawned because fleet
 /// isolation is on (AF-69). Called by [`super::spawn_periodic_every`] when a
 /// global switch (`AMUX_ISOLATED`/`AMUX_NO_FLEET`) or the per-job
@@ -800,12 +1446,7 @@ pub fn register(
 /// job must be inert-but-visible, or a live hazard reads as a silent skip (the
 /// exact failure ethos rule 4 and this module's own docs cite). No abort handle:
 /// there is no loop to stop.
-pub fn register_disabled(
-    id: &str,
-    kind: &'static str,
-    interval: Option<Duration>,
-    reason: String,
-) {
+pub fn register_disabled(id: &str, kind: &'static str, interval: Option<Duration>, reason: String) {
     register_inner(id, kind, interval, None, Some(reason));
 }
 
@@ -824,6 +1465,10 @@ fn register_inner(
                 interval,
                 spawned_at: unix_now(),
                 ticks: 0,
+                failures: 0,
+                consecutive_failures: 0,
+                recoveries: 0,
+                last_failure_at: None,
                 last_start: None,
                 last_end: None,
                 last_ms: None,
@@ -849,6 +1494,7 @@ pub fn tick_end(id: &str) {
         if let Some(j) = m.get_mut(id) {
             let now = unix_now();
             j.ticks += 1;
+            if j.consecutive_failures > 0 { j.recoveries += 1; j.consecutive_failures = 0; }
             j.last_ms = j.last_start.map(|s| (now - s) * 1000.0);
             j.last_end = Some(now);
         }
@@ -864,6 +1510,7 @@ pub fn tick(id: &str) {
         if let Some(j) = m.get_mut(id) {
             let now = unix_now();
             j.ticks += 1;
+            if j.consecutive_failures > 0 { j.recoveries += 1; j.consecutive_failures = 0; }
             j.last_start = Some(now);
             j.last_end = Some(now);
         }
@@ -879,6 +1526,10 @@ pub struct Snapshot {
     pub interval_s: Option<f64>,
     pub spawned_at: f64,
     pub ticks: u64,
+    pub failures: u64,
+    pub consecutive_failures: u64,
+    pub recoveries: u64,
+    pub last_failure_at: Option<f64>,
     pub last_tick_at: Option<f64>,
     pub last_tick_ms: Option<f64>,
     pub in_flight_since: Option<f64>,
@@ -891,7 +1542,9 @@ pub struct Snapshot {
 
 /// Every job that has actually been spawned in this process.
 pub fn snapshot() -> Vec<Snapshot> {
-    let Ok(m) = reg().lock() else { return Vec::new() };
+    let Ok(m) = reg().lock() else {
+        return Vec::new();
+    };
     m.iter()
         .map(|(id, j)| Snapshot {
             id: id.clone(),
@@ -899,6 +1552,10 @@ pub fn snapshot() -> Vec<Snapshot> {
             interval_s: j.interval.map(|d| d.as_secs_f64()),
             spawned_at: j.spawned_at,
             ticks: j.ticks,
+            failures: j.failures,
+            consecutive_failures: j.consecutive_failures,
+            recoveries: j.recoveries,
+            last_failure_at: j.last_failure_at,
             last_tick_at: j.last_end,
             last_tick_ms: j.last_ms,
             // In flight iff a start is recorded that no end has caught up to.
@@ -923,6 +1580,7 @@ pub fn tick_every(id: &str, interval: Duration) {
             let now = unix_now();
             j.interval = Some(interval);
             j.ticks += 1;
+            if j.consecutive_failures > 0 { j.recoveries += 1; j.consecutive_failures = 0; }
             j.last_start = Some(now);
             j.last_end = Some(now);
         }
@@ -931,9 +1589,14 @@ pub fn tick_every(id: &str, interval: Duration) {
 
 /// Spawn a long-lived internal loop AND register it in one call. The point is
 /// that there is no way to do the first without the second.
-pub fn spawn_loop<F>(id: &'static str, interval: Option<Duration>, fut: F) -> tokio::task::JoinHandle<()>
+pub fn spawn_loop<F, Fut>(
+    id: &'static str,
+    interval: Option<Duration>,
+    mut factory: F,
+) -> tokio::task::JoinHandle<()>
 where
-    F: std::future::Future<Output = ()> + Send + 'static,
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     if let Some(reason) = super::fleet_isolation_reason(id) {
         register_disabled(id, "loop", interval, reason.clone());
@@ -944,9 +1607,47 @@ where
         );
         return tokio::spawn(async {});
     }
-    let h = super::executor::spawn(super::poll_watch::watch(id, fut));
-    register(id, "loop", interval, Some(h.abort_handle()));
+    register(id, "loop", interval, None);
+    let h = super::executor::spawn(async move {
+        let mut failures = 0u64;
+        loop {
+            if guard_job(id, async { super::poll_watch::watch(id, factory()).await }).await {
+                // Normal completion can mean an explicit stop (the tunnel's
+                // generation fence). Never resurrect an owner-stopped loop.
+                break;
+            }
+            failures = failures.saturating_add(1);
+            tokio::time::sleep(recovery_delay(interval.unwrap_or(Duration::from_secs(1)), failures)).await;
+        }
+    });
+    set_abort(id, h.abort_handle());
     h
+}
+
+/// Catch a failed poll without losing the consumer or its cleanup. Each
+/// consumer re-reads durable claims on its next pass; no side effect is replayed
+/// just because its future panicked. Do not include panic payloads in logs.
+pub(crate) async fn guard_job(id: &str, fut: impl std::future::Future<Output = ()>) -> bool {
+    use futures::FutureExt;
+    if std::panic::AssertUnwindSafe(fut).catch_unwind().await.is_ok() { return true; }
+    let mut failures = 1;
+    if let Ok(mut m) = reg().lock() {
+        if let Some(j) = m.get_mut(id) {
+            j.failures = j.failures.saturating_add(1);
+            j.consecutive_failures = j.consecutive_failures.saturating_add(1);
+            j.last_failure_at = Some(unix_now());
+            j.last_start = None;
+            failures = j.consecutive_failures;
+        }
+    }
+    tracing::error!(job = id, failures, measured = true, n_considered = 1,
+        verdict = "runtime_job_panic_recovering", "job panicked; durable state retained and recovery scheduled with bounded backoff");
+    false
+}
+
+pub(crate) fn recovery_delay(interval: Duration, failures: u64) -> Duration {
+    let base = interval.clamp(Duration::from_millis(10), Duration::from_secs(1));
+    (base * (1u32 << failures.saturating_sub(1).min(15))).min(Duration::from_secs(300))
 }
 
 /// Register a loop somebody else already spawned (its `spawn()` owns the
@@ -1034,6 +1735,12 @@ pub fn classify(f: &Facts, now: f64) -> &'static str {
         if now - started > limit {
             return "hung";
         }
+        // A tick in flight within its budget is the loop running, whatever
+        // the previous tick's end says (AF-1084). tiering ended a tick at
+        // T+300, began the next at T+505 and was still moving gigabytes to the
+        // HDD at T+985, logging a move a minute; last_tick_at was 780 s old
+        // against a 765 s limit, so it read "stalled" and filed a card.
+        return "ok";
     }
     match f.last_tick_at {
         Some(t) if now - t > limit => "stalled",
@@ -1113,8 +1820,7 @@ pub fn health_issues(now: f64) -> Vec<HealthIssue> {
         let f = Facts {
             spawned: l.is_some(),
             dead: l.map(|x| x.dead).unwrap_or(false),
-            disabled: disabled_by_control
-                || l.and_then(|x| x.disabled_reason.as_ref()).is_some(),
+            disabled: disabled_by_control || l.and_then(|x| x.disabled_reason.as_ref()).is_some(),
             interval_s: l.and_then(|x| x.interval_s),
             spawned_at: l.map(|x| x.spawned_at),
             last_tick_at: l.and_then(|x| x.last_tick_at),
@@ -1123,8 +1829,9 @@ pub fn health_issues(now: f64) -> Vec<HealthIssue> {
                 .map(|x| x.ticks > 0 || x.in_flight_since.is_some())
                 .unwrap_or(false),
         };
-        let status = classify_observed(&f, l.and_then(|x| x.last_tick_ms), now);
-        if !matches!(status, "stalled" | "dead" | "hung" | "not_spawned" | "slow") {
+        let status = if !f.disabled && l.is_some_and(|x| x.consecutive_failures > 0) { "recovering" }
+            else { classify_observed(&f, l.and_then(|x| x.last_tick_ms), now) };
+        if !matches!(status, "stalled" | "dead" | "hung" | "not_spawned" | "slow" | "recovering") {
             continue;
         }
         out.push(HealthIssue {
@@ -1217,11 +1924,10 @@ fn human_bytes(n: u64) -> String {
 /// that it is live: the job re-reads it every tick, so the value shown here is
 /// the value in force.
 fn pref(state: &AppState, key: &str) -> Option<String> {
-    state
-        .store
-        .read()
-        .ok()
-        .and_then(|c| c.query_row("SELECT value FROM prefs WHERE key=?1", [key], |r| r.get(0)).ok())
+    state.store.read().ok().and_then(|c| {
+        c.query_row("SELECT value FROM prefs WHERE key=?1", [key], |r| r.get(0))
+            .ok()
+    })
 }
 
 /// Every env READOUT for this job, plus whether one of them says a human
@@ -1260,7 +1966,15 @@ fn env_json(d: &Doc) -> (Vec<Value>, bool) {
 
 /// Env vars whose NAME says the value is a credential. Matched as substrings of
 /// the uppercased name, so a var nobody has written yet is covered too.
-const SECRET_ENV_MARKERS: &[&str] = &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "_KEY", "APIKEY", "CREDENTIAL"];
+const SECRET_ENV_MARKERS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "_KEY",
+    "APIKEY",
+    "CREDENTIAL",
+];
 
 /// Is this env var's VALUE a credential that must never be rendered?
 pub fn is_secret_env(var: &str) -> bool {
@@ -1304,7 +2018,10 @@ fn redact_env(var: &str, val: Option<&str>) -> Value {
 fn pref_json(state: &AppState, d: &Doc) -> Option<Value> {
     let p = d.pref?;
     let val = pref(state, p.key);
-    let off = matches!(val.as_deref().map(str::trim), Some("0") | Some("false") | Some("off"));
+    let off = matches!(
+        val.as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("off")
+    );
     Some(json!({
         "kind": "pref",
         "key": p.key,
@@ -1426,8 +2143,9 @@ pub async fn system_jobs(
                 .map(|x| x.ticks > 0 || x.in_flight_since.is_some())
                 .unwrap_or(false),
         };
-        let status = classify_observed(&f, l.and_then(|x| x.last_tick_ms), now);
-        if matches!(status, "stalled" | "dead" | "hung" | "not_spawned" | "slow") {
+        let status = if !f.disabled && l.is_some_and(|x| x.consecutive_failures > 0) { "recovering" }
+            else { classify_observed(&f, l.and_then(|x| x.last_tick_ms), now) };
+        if matches!(status, "stalled" | "dead" | "hung" | "not_spawned" | "slow" | "recovering") {
             unhealthy += 1;
         }
         jobs.push(json!({
@@ -1450,6 +2168,10 @@ pub async fn system_jobs(
             "spawned_at": f.spawned_at,
             "uptime_s": f.spawned_at.map(|s| now - s),
             "ticks": l.map(|x| x.ticks).unwrap_or(0),
+            "failures": l.map(|x| x.failures).unwrap_or(0),
+            "consecutive_failures": l.map(|x| x.consecutive_failures).unwrap_or(0),
+            "recoveries": l.map(|x| x.recoveries).unwrap_or(0),
+            "last_failure_at": l.and_then(|x| x.last_failure_at),
             "last_tick_at": f.last_tick_at,
             "last_tick_age_s": f.last_tick_at.map(|t| now - t),
             "last_tick_ms": l.and_then(|x| x.last_tick_ms),
@@ -1489,14 +2211,35 @@ pub async fn system_jobs(
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
 }
 
+/// Public debug read. The on-demand run is routed behind the bearer in api/mod.rs.
 pub fn routes() -> axum::Router<AppState> {
-    axum::Router::new()
-        .route("/api/system-jobs", axum::routing::get(system_jobs))
-        .route("/api/system-jobs/{id}/run", axum::routing::post(run_system_job))
+    axum::Router::new().route("/api/system-jobs", axum::routing::get(system_jobs))
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_long_lived_consumer_recovers_a_panic_but_honors_normal_completion_and_abort() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let job = super::spawn_loop("supervision-loop-test", Some(std::time::Duration::from_millis(10)), move || {
+            let counted = counted.clone();
+            async move {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 { panic!("injected consumer failure"); }
+                super::tick("supervision-loop-test");
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), job).await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "normal completion is not endlessly restarted");
+        let row = super::snapshot().into_iter().find(|r| r.id == "supervision-loop-test").unwrap();
+        assert_eq!((row.failures, row.consecutive_failures, row.recoveries), (1, 0, 1));
+        let aborted = super::spawn_loop("supervision-abort-test", None, || async { std::future::pending::<()>().await; });
+        aborted.abort();
+        assert!(aborted.await.unwrap_err().is_cancelled());
+        assert_eq!(super::recovery_delay(std::time::Duration::from_secs(60), 1000), std::time::Duration::from_secs(300));
+    }
     use super::*;
 
     /// AMUX-3817: `/api/system-jobs` printed AMUX_TUNNEL_TOKEN in plaintext.
@@ -1513,18 +2256,39 @@ mod tests {
         // SET, not absent. Blanking it to null would make a configured token
         // indistinguishable from a missing one and send someone to set a var
         // that is already set (ethos rule 4).
-        assert!(s.contains("set"), "a configured secret must still read as configured: {r}");
-        assert!(s.contains("16"), "length is a useful, non-disclosing fact: {r}");
+        assert!(
+            s.contains("set"),
+            "a configured secret must still read as configured: {r}"
+        );
+        assert!(
+            s.contains("16"),
+            "length is a useful, non-disclosing fact: {r}"
+        );
 
         // Every shape of name that carries a credential.
-        for v in ["AMUX_TUNNEL_TOKEN", "OPENAI_API_KEY", "DB_PASSWORD", "x_secret", "MY_CREDENTIAL"] {
+        for v in [
+            "AMUX_TUNNEL_TOKEN",
+            "OPENAI_API_KEY",
+            "DB_PASSWORD",
+            "x_secret",
+            "MY_CREDENTIAL",
+        ] {
             assert!(is_secret_env(v), "{v} names a credential");
         }
         // THE CONTROLS. A matcher that flagged everything would pass the whole
         // block above and blank the readouts this endpoint exists for.
-        for v in ["AMUX_TUNNEL_PORT", "AMUX_RS_SCHEDULER", "AMUX_BOARD_DRIVE_SECS", "AMUX_TUNNEL_GATEWAY"] {
+        for v in [
+            "AMUX_TUNNEL_PORT",
+            "AMUX_RS_SCHEDULER",
+            "AMUX_BOARD_DRIVE_SECS",
+            "AMUX_TUNNEL_GATEWAY",
+        ] {
             assert!(!is_secret_env(v), "{v} is a knob, not a secret");
-            assert_eq!(redact_env(v, Some("180")), json!("180"), "{v} must render its value");
+            assert_eq!(
+                redact_env(v, Some("180")),
+                json!("180"),
+                "{v} must render its value"
+            );
         }
         // Unset stays null and empty stays empty, for both kinds: `off_now` is
         // computed from the real value, and these two are what the UI reads to
@@ -1574,37 +2338,64 @@ mod tests {
     #[test]
     fn stall_budget_scales_with_the_interval() {
         // The hourly storage sweep must not read as stalled at 10 minutes...
-        let f = Facts { interval_s: Some(3600.0), ..base() };
+        let f = Facts {
+            interval_s: Some(3600.0),
+            ..base()
+        };
         assert_eq!(classify(&f, T + 600.0), "ok");
         // ...but does after 2.5 hours.
         assert_eq!(classify(&f, T + 9100.0), "stalled");
         // A 5s loop is stalled in well under a minute — the same rule, not a
         // special case.
-        let g = Facts { interval_s: Some(5.0), ..base() };
+        let g = Facts {
+            interval_s: Some(5.0),
+            ..base()
+        };
         assert_eq!(classify(&g, T + 20.0), "ok");
         assert_eq!(classify(&g, T + 40.0), "stalled");
     }
 
     #[test]
     fn never_ticked_is_starting_then_stalled() {
-        let f = Facts { last_tick_at: None, ..base() };
+        let f = Facts {
+            last_tick_at: None,
+            ..base()
+        };
         assert_eq!(classify(&f, T + 10.0), "starting");
         assert_eq!(classify(&f, T + 100.0), "stalled");
+    }
+
+    #[test]
+    fn retired_commit_nudge_is_not_a_missing_runtime_job() {
+        assert!(doc_for("commit-nudge").is_none());
+        assert!(!health_issues(unix_now()).iter().any(|issue| issue.id == "commit-nudge"));
     }
 
     /// The distinction that cost hours: a loop nobody started, versus one a
     /// human switched off. Both are "not running"; only one is a bug.
     #[test]
     fn unspawned_is_loud_unless_a_human_turned_it_off() {
-        let f = Facts { spawned: false, ..Default::default() };
+        let f = Facts {
+            spawned: false,
+            ..Default::default()
+        };
         assert_eq!(classify(&f, T), "not_spawned");
-        let g = Facts { spawned: false, disabled: true, ..Default::default() };
+        let g = Facts {
+            spawned: false,
+            disabled: true,
+            ..Default::default()
+        };
         assert_eq!(classify(&g, T), "disabled");
         // A job whose loop was spawned and immediately returned because its
-        // env var says 0 is OFF, not dead — commit-nudge's exact shape. Red
+        // env var says 0 is OFF, not dead. Red
         // for a switch someone deliberately flipped teaches people to ignore
         // red.
-        let h = Facts { spawned: true, dead: true, disabled: true, ..base() };
+        let h = Facts {
+            spawned: true,
+            dead: true,
+            disabled: true,
+            ..base()
+        };
         assert_eq!(classify(&h, T + 1.0), "disabled");
     }
 
@@ -1614,17 +2405,41 @@ mod tests {
     /// cannot express at all.
     #[test]
     fn a_tick_that_never_ends_reads_as_hung_not_ok() {
-        let f = Facts { in_flight_since: Some(T), ..base() }; // 65s budget
-        // NEGATIVE CONTROL: a tick in flight for 30s is just a slow tick.
+        let f = Facts {
+            in_flight_since: Some(T),
+            ..base()
+        }; // 65s budget
+           // NEGATIVE CONTROL: a tick in flight for 30s is just a slow tick.
         assert_eq!(classify(&f, T + 30.0), "ok");
         assert_eq!(classify(&f, T + 70.0), "hung");
+    }
+
+    /// AF-1084: a previous tick that ended past the budget does not make a
+    /// job stalled while a newer tick is running inside its budget.
+    #[test]
+    fn a_running_tick_is_not_stalled_by_an_old_previous_end() {
+        let running = Facts {
+            last_tick_at: Some(T - 50.0),
+            in_flight_since: Some(T),
+            ..base()
+        }; // 65s budget
+        assert_eq!(classify(&running, T + 30.0), "ok", "previous end is 80 s old, but a tick is running");
+        assert_eq!(classify(&running, T + 70.0), "hung", "past the budget it is still hung");
+        let idle = Facts {
+            last_tick_at: Some(T - 50.0),
+            ..base()
+        };
+        assert_eq!(classify(&idle, T + 30.0), "stalled", "with nothing running, an old end is stalled");
     }
 
     #[test]
     fn dead_outranks_freshness() {
         // A task that panicked keeps its last (fresh) tick timestamp forever,
         // so freshness alone would report it healthy.
-        let f = Facts { dead: true, ..base() };
+        let f = Facts {
+            dead: true,
+            ..base()
+        };
         assert_eq!(classify(&f, T + 1.0), "dead");
     }
 
@@ -1667,9 +2482,15 @@ mod tests {
         let t = super::super::spawn_periodic_every(id, Duration::from_millis(20), || async {});
         tokio::time::sleep(Duration::from_millis(120)).await;
         let m = reg().lock().unwrap();
-        let j = m.get(id).expect("spawn_periodic_every must register the job");
+        let j = m
+            .get(id)
+            .expect("spawn_periodic_every must register the job");
         assert_eq!(j.interval, Some(Duration::from_millis(20)));
-        assert!(j.ticks >= 2, "ticks recorded by the spawner, got {}", j.ticks);
+        assert!(
+            j.ticks >= 2,
+            "ticks recorded by the spawner, got {}",
+            j.ticks
+        );
         assert!(j.last_end.is_some());
         drop(m);
         t.abort();
@@ -1689,8 +2510,9 @@ mod tests {
 
         let spawned_count = Arc::new(AtomicUsize::new(0));
         let count = spawned_count.clone();
-        let spawned = spawn_loop(SPAWNED, Some(Duration::from_millis(20)), async move {
-            count.fetch_add(1, Ordering::SeqCst);
+        let spawned = spawn_loop(SPAWNED, Some(Duration::from_millis(20)), move || {
+            let count = count.clone();
+            async move { count.fetch_add(1, Ordering::SeqCst); }
         });
 
         let adopted_count = Arc::new(AtomicUsize::new(0));
@@ -1708,7 +2530,10 @@ mod tests {
             (SPAWNED, "AMUX_AF69_ISOLATED_SPAWN_LOOP_PROBE_SECS=0"),
             (ADOPTED, "AMUX_AF69_ISOLATED_ADOPT_LOOP_PROBE_SECS=0"),
         ] {
-            let row = snapshot().into_iter().find(|s| s.id == id).expect("suppressed loop visible");
+            let row = snapshot()
+                .into_iter()
+                .find(|s| s.id == id)
+                .expect("suppressed loop visible");
             assert_eq!(row.disabled_reason.as_deref(), Some(reason));
             assert_eq!(row.ticks, 0);
         }
@@ -1728,7 +2553,11 @@ mod tests {
         let mut seen = std::collections::BTreeSet::new();
         for d in CATALOG {
             assert!(!d.id.is_empty(), "catalog row with empty id");
-            assert!(!d.purpose.is_empty(), "{}: purpose is the whole point", d.id);
+            assert!(
+                !d.purpose.is_empty(),
+                "{}: purpose is the whole point",
+                d.id
+            );
             assert!(seen.insert(d.id), "duplicate catalog id {}", d.id);
         }
     }
@@ -1743,7 +2572,13 @@ mod tests {
         let docs: std::collections::BTreeSet<&str> = CATALOG.iter().map(|d| d.id).collect();
         let undocumented: Vec<_> = ids.difference(&docs).collect();
         let phantom: Vec<_> = docs.difference(&ids).collect();
-        assert!(undocumented.is_empty(), "job ids with no CATALOG row: {undocumented:?}");
-        assert!(phantom.is_empty(), "CATALOG rows with no id constant: {phantom:?}");
+        assert!(
+            undocumented.is_empty(),
+            "job ids with no CATALOG row: {undocumented:?}"
+        );
+        assert!(
+            phantom.is_empty(),
+            "CATALOG rows with no id constant: {phantom:?}"
+        );
     }
 }

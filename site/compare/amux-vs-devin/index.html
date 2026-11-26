@@ -1,15 +1,15 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="theme-color" content="#1e2330">
-  <title>amux vs Devin 2026 — Open-Source AI Agent Fleet vs Managed Engineer</title>
+  <title>amux vs Devin 2026 — Self-Hosted AI Agent Fleet vs Managed Engineer</title>
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
-  <meta name="description" content="amux vs Devin 2026: open-source fleet of 10-50 agents at $10-50/month vs Devin's managed $500/month single-agent cloud. Full feature comparison, cost breakdown, and honest trade-offs.">
+  <meta name="description" content="amux vs Devin 2026: self-hosted fleet of 10-50 agents at $10-50/month vs Devin's managed $500/month single-agent cloud. Full feature comparison, cost breakdown, and honest trade-offs.">
   <meta name="keywords" content="amux vs devin, devin alternative open source, cheap devin alternative, open source autonomous AI engineer, devin 2026, amux devin comparison">
   <link rel="canonical" href="https://amux.io/compare/amux-vs-devin/">
-  <meta property="og:title" content="amux vs Devin 2026 — Open-Source AI Agent Fleet vs Managed Engineer">
+  <meta property="og:title" content="amux vs Devin 2026 — Self-Hosted AI Agent Fleet vs Managed Engineer">
   <meta property="og:description" content="amux vs Devin: run 10-50 agents at $10-50/month vs one managed agent at $500/month. Full comparison of cost, control, parallelism, and autonomy.">
   <meta property="og:url" content="https://amux.io/compare/amux-vs-devin/">
   <meta property="og:image" content="https://amux.io/og-image.png">
@@ -20,50 +20,63 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
   <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Compare","item":"https://amux.io/compare/"},{"@type":"ListItem","position":3,"name":"amux vs Devin","item":"https://amux.io/compare/amux-vs-devin/"}]}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"amux vs Devin 2026","description":"Full comparison of amux open-source AI agent fleet and Devin managed autonomous engineer — cost, control, parallelism, and use cases.","datePublished":"2026-07-29","dateModified":"2026-08-22","author":{"@type":"Organization","name":"amux"},"about":{"@type":"SoftwareApplication","name":"amux","url":"https://amux.io/","applicationCategory":"DeveloperApplication"}}</script>
-  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Is amux cheaper than Devin?","acceptedAnswer":{"@type":"Answer","text":"Yes, significantly. Devin costs $500/month for the Teams plan (250 Agent Compute Units). amux is free and open source — you pay only for the underlying API tokens (Claude Code, Codex, or Gemini CLI). Heavy parallel use typically costs $10–50/month in API tokens. For the same $500 Devin budget, amux users run 50–200 agent-sessions per month."}},{"@type":"Question","name":"What is the open-source alternative to Devin?","acceptedAnswer":{"@type":"Answer","text":"amux is the leading open-source alternative for teams that want autonomous AI engineering at scale. Instead of one managed agent in a cloud sandbox, amux runs a fleet of 10–50 Claude Code, Codex, or Gemini CLI sessions simultaneously on your own machine — with a shared kanban board, self-healing watchdog, and iOS app for phone management. MIT licensed, single Rust binary, zero external dependencies."}},{"@type":"Question","name":"Can amux run as many tasks as Devin?","acceptedAnswer":{"@type":"Answer","text":"amux runs significantly more tasks in parallel than Devin. Devin handles one task at a time per session. amux runs 10–50 parallel agent sessions simultaneously — each an independent coding agent working on a different task from the shared kanban board. With amux, a solo developer can wake up to 20-50 completed tasks instead of one."}},{"@type":"Question","name":"Does amux have the same level of autonomy as Devin?","acceptedAnswer":{"@type":"Answer","text":"amux provides comparable autonomy through Claude Code, Codex, or Gemini CLI agents — which are themselves state-of-the-art autonomous coding systems. The key difference is that amux adds fleet orchestration, self-healing (auto-compact, auto-restart, NEEDS INPUT watchdog), and overnight operation on top of these agents. Devin provides a more turnkey managed experience with built-in Slack/Jira integrations. For raw coding autonomy, Claude Code via amux matches or exceeds Devin on most benchmark tasks."}},{"@type":"Question","name":"Can I use amux and Devin together?","acceptedAnswer":{"@type":"Answer","text":"Yes. A common pattern: use Devin for high-stakes, client-facing tasks where you want a fully managed, auditable record with Slack notifications. Run amux with 20 background agents simultaneously on the rest of your backlog — feature work, tests, documentation, refactors. Both can share a GitHub repo. The fleet output from amux often exceeds what Devin produces in the same time window, at a fraction of the cost."}}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"amux vs Devin 2026","description":"Full comparison of amux self-hosted AI agent fleet and Devin managed autonomous engineer — cost, control, parallelism, and use cases.","datePublished":"2026-07-29","dateModified":"2026-10-07","author":{"@type":"Organization","name":"amux"},"about":{"@type":"SoftwareApplication","name":"amux","url":"https://amux.io/","applicationCategory":"DeveloperApplication"}}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"Is amux cheaper than Devin?","acceptedAnswer":{"@type":"Answer","text":"Yes, significantly. Devin costs $500/month for the Teams plan (250 Agent Compute Units). amux is free to self-host — you pay only for the underlying API tokens (Claude Code, Codex, or Gemini CLI). Heavy parallel use typically costs $10–50/month in API tokens. For the same $500 Devin budget, amux users run 50–200 agent-sessions per month."}},{"@type":"Question","name":"What is the open-source alternative to Devin?","acceptedAnswer":{"@type":"Answer","text":"amux is the leading self-hosted alternative for teams that want autonomous AI engineering at scale. Instead of one managed agent in a cloud sandbox, amux runs a fleet of 10–50 Claude Code, Codex, or Gemini CLI sessions simultaneously on your own machine — with a shared kanban board, usage-limit and reboot recovery, and iOS app for phone management. MIT + Commons Clause, single Rust binary, zero external dependencies."}},{"@type":"Question","name":"Can amux run as many tasks as Devin?","acceptedAnswer":{"@type":"Answer","text":"amux runs significantly more tasks in parallel than Devin. Devin handles one task at a time per session. amux runs 10–50 parallel agent sessions simultaneously — each an independent coding agent working on a different task from the shared kanban board. With amux, a solo developer can wake up to 20-50 completed tasks instead of one."}},{"@type":"Question","name":"Does amux have the same level of autonomy as Devin?","acceptedAnswer":{"@type":"Answer","text":"amux provides comparable autonomy through Claude Code, Codex, or Gemini CLI agents — which are themselves state-of-the-art autonomous coding systems. The key difference is that amux adds fleet orchestration, recovery (usage-limit resume, macOS reboot recovery, NEEDS INPUT and stall alerts), and overnight operation on top of these agents. Devin provides a more turnkey managed experience with built-in Slack/Jira integrations. For raw coding autonomy, Claude Code via amux matches or exceeds Devin on most benchmark tasks."}},{"@type":"Question","name":"Can I use amux and Devin together?","acceptedAnswer":{"@type":"Answer","text":"Yes. A common pattern: use Devin for high-stakes, client-facing tasks where you want a fully managed, auditable record with Slack notifications. Run amux with 20 background agents simultaneously on the rest of your backlog — feature work, tests, documentation, refactors. Both can share a GitHub repo. The fleet output from amux often exceeds what Devin produces in the same time window, at a fraction of the cost."}}]}</script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/compare/">Compare</a> <span class="sep">›</span> <span>amux vs Devin</span></div>
 
     <h1>amux vs Devin 2026</h1>
-    <p class="subtitle">Open-source AI agent fleet vs. managed autonomous engineer — cost, control, and parallel output compared. Updated August 2026.</p>
+    <p class="subtitle">Open-source AI agent fleet vs. managed autonomous engineer — cost, control, and parallel output compared. Updated October 2026.</p>
 
     <!-- Answer box -->
-    <div style="background:var(--bg-2,#1a1f2e);border:1px solid var(--line,#2a3040);border-radius:8px;padding:1.125rem 1.25rem;margin:1.5rem 0">
-      <p style="margin:0;font-size:.95rem;line-height:1.65"><strong>The short answer:</strong> Devin is a fully managed, zero-setup autonomous engineer — one task at a time, $500/month, cloud sandbox. amux is an open-source control plane that runs a fleet of 10–50 Claude Code, Codex, or Gemini CLI agents simultaneously on your own machine, at $10–50/month in API tokens. If you want maximum parallel throughput, local file access, and full control, choose amux. If you want a turnkey managed product with Slack integrations and no setup, Devin is worth the premium.</p>
+    <div style="background:var(--bg-2,var(--panel));border:1px solid var(--line,var(--panel-3));border-radius:8px;padding:1.125rem 1.25rem;margin:1.5rem 0">
+      <p style="margin:0;font-size:.95rem;line-height:1.65"><strong>The short answer:</strong> Devin is a fully managed, zero-setup autonomous engineer — one task at a time, $500/month, cloud sandbox. amux is a self-hosted control plane that runs a fleet of 10–50 Claude Code, Codex, or Gemini CLI agents simultaneously on your own machine, at $10–50/month in API tokens. If you want maximum parallel throughput, local file access, and full control, choose amux. If you want a turnkey managed product with Slack integrations and no setup, Devin is worth the premium.</p>
     </div>
 
-    <!-- EXP-007: compare pages GitHub CTA -->
-    <div style="display:flex;align-items:center;gap:1rem;background:var(--bg-2,#1a1f2e);border:1px solid var(--line,#2a3040);border-radius:8px;padding:0.875rem 1.125rem;margin:1.5rem 0;flex-wrap:wrap">
-      <span style="font-size:13px;color:var(--fg-mute,#8892a4);flex:1;min-width:180px">Considering amux? See it in action before deciding →</span>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="if(window.posthog) posthog.capture('exp007_compare_github_cta_click', {page: window.location.pathname})" style="display:inline-flex;align-items:center;gap:0.5rem;background:#24292e;color:#fff;text-decoration:none;padding:0.5rem 1rem;border-radius:6px;font-size:13px;font-weight:600;white-space:nowrap">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.7.5.5 5.7.5 12c0 5 3.3 9.3 7.9 10.8.6.1.8-.2.8-.6v-2.2c-3.2.7-3.9-1.5-3.9-1.5-.5-1.4-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.1.1 1.7 1.2 1.7 1.2 1 1.7 2.7 1.2 3.4.9.1-.7.4-1.2.7-1.5-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.4-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.2 1.2.9-.3 1.9-.4 2.9-.4s2 .1 2.9.4c2.2-1.5 3.2-1.2 3.2-1.2.6 1.6.2 2.8.1 3.1.7.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6 4.6-1.5 7.9-5.8 7.9-10.8C23.5 5.7 18.3.5 12 .5z"/></svg>
-        ⭐ Star amux on GitHub
-      </a>
-    </div>
+    <!-- EXP-120: /compare/amux-vs-devin/ top-of-page CTA October 2026 -->
 
     <!-- Quick pick cards -->
     <h2>Which one is right for you?</h2>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin:1rem 0 2rem">
-      <div style="background:var(--bg-2,#1a1f2e);border:1px solid var(--line,#2a3040);border-radius:8px;padding:1.125rem 1.25rem">
+      <div style="background:var(--bg-2,var(--panel));border:1px solid var(--line,var(--panel-3));border-radius:8px;padding:1.125rem 1.25rem">
         <div style="font-weight:700;font-size:.95rem;margin-bottom:.75rem;color:var(--fg,#e2e8f0)">Choose Devin if...</div>
-        <ul style="margin:0;padding-left:1.1rem;font-size:.875rem;line-height:1.9;color:var(--fg-mute,#8892a4)">
+        <ul style="margin:0;padding-left:1.1rem;font-size:.875rem;line-height:1.9;color:var(--fg-mute,var(--fg-mute))">
           <li>You want zero local setup — just sign up and go</li>
           <li>Your workflow lives in Slack, Jira, or Linear</li>
           <li>You want session replay and a polished audit trail</li>
@@ -72,9 +85,9 @@
           <li>You need the agent to browse the web during the task</li>
         </ul>
       </div>
-      <div style="background:var(--bg-2,#1a1f2e);border:1px solid rgba(16,185,129,.25);border-radius:8px;padding:1.125rem 1.25rem">
-        <div style="font-weight:700;font-size:.95rem;margin-bottom:.75rem;color:#6ee7b7">Choose amux if...</div>
-        <ul style="margin:0;padding-left:1.1rem;font-size:.875rem;line-height:1.9;color:var(--fg-mute,#8892a4)">
+      <div style="background:var(--bg-2,var(--panel));border:1px solid rgba(16,185,129,.25);border-radius:8px;padding:1.125rem 1.25rem">
+        <div style="font-weight:700;font-size:.95rem;margin-bottom:.75rem;color:var(--c-green)">Choose amux if...</div>
+        <ul style="margin:0;padding-left:1.1rem;font-size:.875rem;line-height:1.9;color:var(--fg-mute,var(--fg-mute))">
           <li>You want 10–50 tasks running in parallel overnight</li>
           <li>Your codebase is local and the agent needs full filesystem access</li>
           <li>You need to switch between Claude Code, Codex, and Gemini CLI</li>
@@ -90,86 +103,86 @@
     <div style="overflow-x:auto;margin:1rem 0 2rem">
       <table style="width:100%;border-collapse:collapse;font-size:.875rem">
         <thead>
-          <tr style="background:var(--bg-2,#1a1f2e)">
-            <th style="text-align:left;padding:.625rem .875rem;border-bottom:2px solid var(--line,#2a3040);font-weight:600">Feature</th>
-            <th style="text-align:center;padding:.625rem .875rem;border-bottom:2px solid var(--line,#2a3040);font-weight:600;color:#6ee7b7">amux</th>
-            <th style="text-align:center;padding:.625rem .875rem;border-bottom:2px solid var(--line,#2a3040);font-weight:600;color:var(--fg-mute,#8892a4)">Devin</th>
+          <tr style="background:var(--bg-2,var(--panel))">
+            <th style="text-align:left;padding:.625rem .875rem;border-bottom:2px solid var(--line,var(--panel-3));font-weight:600">Feature</th>
+            <th style="text-align:center;padding:.625rem .875rem;border-bottom:2px solid var(--line,var(--panel-3));font-weight:600;color:var(--c-green)">amux</th>
+            <th style="text-align:center;padding:.625rem .875rem;border-bottom:2px solid var(--line,var(--panel-3));font-weight:600;color:var(--fg-mute,var(--fg-mute))">Devin</th>
           </tr>
         </thead>
         <tbody>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))">
             <td style="padding:.6rem .875rem;font-weight:500">Hosting</td>
             <td style="padding:.6rem .875rem;text-align:center">Your machine (local-first)</td>
             <td style="padding:.6rem .875rem;text-align:center">Cognition cloud (Ubuntu sandbox)</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))">
             <td style="padding:.6rem .875rem;font-weight:500">Parallel agent sessions</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">10–50+ simultaneously</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">10–50+ simultaneously</td>
             <td style="padding:.6rem .875rem;text-align:center">1 task at a time</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))">
             <td style="padding:.6rem .875rem;font-weight:500">Pricing</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Free + API tokens ($10–50/mo typical)</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Free + API tokens ($10–50/mo typical)</td>
             <td style="padding:.6rem .875rem;text-align:center">$500/month (Teams), Enterprise custom</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))">
             <td style="padding:.6rem .875rem;font-weight:500">Underlying model</td>
             <td style="padding:.6rem .875rem;text-align:center">Claude Code, Codex, Gemini CLI (your choice)</td>
             <td style="padding:.6rem .875rem;text-align:center">Proprietary Cognition model</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))">
             <td style="padding:.6rem .875rem;font-weight:500">Local file / environment access</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Full access to your local machine</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Full access to your local machine</td>
             <td style="padding:.6rem .875rem;text-align:center">Isolated cloud sandbox only</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)">
-            <td style="padding:.6rem .875rem;font-weight:500">Self-healing watchdog</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Auto-compact, restart, unstick NEEDS INPUT</td>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))">
+            <td style="padding:.6rem .875rem;font-weight:500">Recovery</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Usage-limit resume, macOS reboot recovery, stall and NEEDS INPUT alerts</td>
             <td style="padding:.6rem .875rem;text-align:center">Proprietary recovery (managed)</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))">
             <td style="padding:.6rem .875rem;font-weight:500">Mobile management</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">iOS app + PWA (native fleet control)</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">iOS app + PWA (native fleet control)</td>
             <td style="padding:.6rem .875rem;text-align:center">Slack notifications</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))">
             <td style="padding:.6rem .875rem;font-weight:500">Open source</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Yes — MIT + Commons Clause, single Rust binary</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Source-available, MIT + Commons Clause, single Rust binary</td>
             <td style="padding:.6rem .875rem;text-align:center">No — proprietary SaaS</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))">
             <td style="padding:.6rem .875rem;font-weight:500">Setup time</td>
-            <td style="padding:.6rem .875rem;text-align:center">~5 minutes (brew install amux)</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Zero (SaaS, sign up and go)</td>
+            <td style="padding:.6rem .875rem;text-align:center">~5 minutes (curl -fsSL https://amux.io/install.sh | bash)</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Zero (SaaS, sign up and go)</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))">
             <td style="padding:.6rem .875rem;font-weight:500">Web browsing during task</td>
             <td style="padding:.6rem .875rem;text-align:center">Via browser automation tab</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Native (built-in browser)</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Native (built-in browser)</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))">
             <td style="padding:.6rem .875rem;font-weight:500">Slack / Jira / Linear integrations</td>
             <td style="padding:.6rem .875rem;text-align:center">Via scheduler + board webhooks</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Native, built-in</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Native, built-in</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))">
             <td style="padding:.6rem .875rem;font-weight:500">Session replay / audit</td>
             <td style="padding:.6rem .875rem;text-align:center">Event-sourced execution log + scrollback</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Full session replay (polished UI)</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Full session replay (polished UI)</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))">
             <td style="padding:.6rem .875rem;font-weight:500">Vendor lock-in</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">None — switch runtimes freely</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">None — switch runtimes freely</td>
             <td style="padding:.6rem .875rem;text-align:center">Proprietary model + platform</td>
           </tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)">
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))">
             <td style="padding:.6rem .875rem;font-weight:500">Kanban board, CRM, email, scheduler</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">Built-in</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">Built-in</td>
             <td style="padding:.6rem .875rem;text-align:center">Task-focused only</td>
           </tr>
           <tr>
             <td style="padding:.6rem .875rem;font-weight:500">Overnight / unattended operation</td>
-            <td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">First-class — self-healing designed for this</td>
+            <td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">First-class: usage-limit resume and stall alerts</td>
             <td style="padding:.6rem .875rem;text-align:center">Yes (managed)</td>
           </tr>
         </tbody>
@@ -181,9 +194,9 @@
     <p>This is where the gap is widest. For a developer running 20 tasks per week:</p>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;margin:1rem 0 1.5rem">
-      <div style="background:var(--bg-2,#1a1f2e);border:1px solid var(--line,#2a3040);border-radius:8px;padding:1.125rem 1.25rem">
-        <div style="font-weight:700;font-size:.95rem;margin-bottom:.5rem;color:var(--fg-mute,#8892a4)">Devin — $500/month</div>
-        <ul style="margin:0;padding-left:1.1rem;font-size:.875rem;line-height:1.9;color:var(--fg-mute,#8892a4)">
+      <div style="background:var(--bg-2,var(--panel));border:1px solid var(--line,var(--panel-3));border-radius:8px;padding:1.125rem 1.25rem">
+        <div style="font-weight:700;font-size:.95rem;margin-bottom:.5rem;color:var(--fg-mute,var(--fg-mute))">Devin — $500/month</div>
+        <ul style="margin:0;padding-left:1.1rem;font-size:.875rem;line-height:1.9;color:var(--fg-mute,var(--fg-mute))">
           <li>250 ACU (Agent Compute Units) per month</li>
           <li>~$2/ACU effective cost</li>
           <li>A medium task uses 5–20 ACU → 12–50 tasks/month</li>
@@ -191,9 +204,9 @@
           <li>Runs one task at a time</li>
         </ul>
       </div>
-      <div style="background:var(--bg-2,#1a1f2e);border:1px solid rgba(16,185,129,.25);border-radius:8px;padding:1.125rem 1.25rem">
-        <div style="font-weight:700;font-size:.95rem;margin-bottom:.5rem;color:#6ee7b7">amux — $10–50/month typical</div>
-        <ul style="margin:0;padding-left:1.1rem;font-size:.875rem;line-height:1.9;color:var(--fg-mute,#8892a4)">
+      <div style="background:var(--bg-2,var(--panel));border:1px solid rgba(16,185,129,.25);border-radius:8px;padding:1.125rem 1.25rem">
+        <div style="font-weight:700;font-size:.95rem;margin-bottom:.5rem;color:var(--c-green)">amux — $10–50/month typical</div>
+        <ul style="margin:0;padding-left:1.1rem;font-size:.875rem;line-height:1.9;color:var(--fg-mute,var(--fg-mute))">
           <li>Free platform — only pay for API tokens</li>
           <li>Claude Sonnet: ~$3/MTok input, $15/MTok output</li>
           <li>A typical coding session: $0.50–$5</li>
@@ -225,8 +238,8 @@
       <li><strong>Cost at scale:</strong> At $500/month for Devin, you are paying for managed infrastructure. amux is free; you pay API costs directly. Heavy users (20+ sessions/day) typically spend $30–80/month versus $500+ for comparable Devin usage.</li>
       <li><strong>Runtime flexibility:</strong> Switch between Claude Code (Anthropic), Codex (OpenAI), and Gemini CLI (Google) from one dashboard — amux is model-agnostic. Devin uses its proprietary model exclusively.</li>
       <li><strong>Phone-first management:</strong> The amux iOS app and PWA let you monitor, steer, and message your entire agent fleet from your iPhone. Push alerts when an agent needs input. Check scrollback from the couch.</li>
-      <li><strong>Self-healing overnight operation:</strong> amux's watchdog auto-compacts context when it fills, restarts crashed sessions, and unsticks agents blocked by the Claude Code resume dialog — so you actually wake up to finished work instead of stalled sessions. See <a href="/use-cases/ai-coding-while-you-sleep/">running agents overnight</a>.</li>
-      <li><strong>Open source, self-hosted:</strong> One Rust binary, MIT licensed. Audit the code, modify it, self-host on your server, integrate with your own tools. No data leaves your machine unless you explicitly use the cloud features.</li>
+      <li><strong>Overnight operation:</strong> when a usage limit hits, amux holds delivery and resumes at the provider's reset; on macOS every worker comes back in its own conversation after a reboot; and stall detection alerts you when a session stops, so you wake up to finished work or a clear note on what stalled. See <a href="/use-cases/ai-coding-while-you-sleep/">running agents overnight</a>.</li>
+      <li><strong>Open source, self-hosted:</strong> One Rust binary, MIT + Commons Clause. Audit the code, modify it, self-host on your server, integrate with your own tools. No data leaves your machine unless you explicitly use the cloud features.</li>
     </ul>
 
     <!-- Why not both -->
@@ -243,50 +256,61 @@
     <div style="overflow-x:auto;margin:1rem 0 2rem">
       <table style="width:100%;border-collapse:collapse;font-size:.875rem">
         <thead>
-          <tr style="background:var(--bg-2,#1a1f2e)">
-            <th style="text-align:left;padding:.625rem .875rem;border-bottom:2px solid var(--line,#2a3040);font-weight:600">Situation</th>
-            <th style="text-align:center;padding:.625rem .875rem;border-bottom:2px solid var(--line,#2a3040);font-weight:600">Best pick</th>
+          <tr style="background:var(--bg-2,var(--panel))">
+            <th style="text-align:left;padding:.625rem .875rem;border-bottom:2px solid var(--line,var(--panel-3));font-weight:600">Situation</th>
+            <th style="text-align:center;padding:.625rem .875rem;border-bottom:2px solid var(--line,var(--panel-3));font-weight:600">Best pick</th>
           </tr>
         </thead>
         <tbody>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)"><td style="padding:.6rem .875rem">I want zero local setup</td><td style="padding:.6rem .875rem;text-align:center;color:var(--fg-mute)">Devin</td></tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)"><td style="padding:.6rem .875rem">I want to run 20+ tasks overnight</td><td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">amux</td></tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)"><td style="padding:.6rem .875rem">I need Slack/Jira/Linear task assignment</td><td style="padding:.6rem .875rem;text-align:center;color:var(--fg-mute)">Devin</td></tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)"><td style="padding:.6rem .875rem">I have a large local codebase</td><td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">amux</td></tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)"><td style="padding:.6rem .875rem">My budget is under $100/month</td><td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">amux</td></tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)"><td style="padding:.6rem .875rem">I want to manage agents from my iPhone</td><td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">amux</td></tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040)"><td style="padding:.6rem .875rem">I need a polished session replay for clients</td><td style="padding:.6rem .875rem;text-align:center;color:var(--fg-mute)">Devin</td></tr>
-          <tr style="border-bottom:1px solid var(--line,#2a3040);background:var(--bg-2,#1a1f2e)"><td style="padding:.6rem .875rem">I want to switch between AI models freely</td><td style="padding:.6rem .875rem;text-align:center;color:#6ee7b7;font-weight:600">amux</td></tr>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))"><td style="padding:.6rem .875rem">I want zero local setup</td><td style="padding:.6rem .875rem;text-align:center;color:var(--fg-mute)">Devin</td></tr>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))"><td style="padding:.6rem .875rem">I want to run 20+ tasks overnight</td><td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">amux</td></tr>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))"><td style="padding:.6rem .875rem">I need Slack/Jira/Linear task assignment</td><td style="padding:.6rem .875rem;text-align:center;color:var(--fg-mute)">Devin</td></tr>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))"><td style="padding:.6rem .875rem">I have a large local codebase</td><td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">amux</td></tr>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))"><td style="padding:.6rem .875rem">My budget is under $100/month</td><td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">amux</td></tr>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))"><td style="padding:.6rem .875rem">I want to manage agents from my iPhone</td><td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">amux</td></tr>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3))"><td style="padding:.6rem .875rem">I need a polished session replay for clients</td><td style="padding:.6rem .875rem;text-align:center;color:var(--fg-mute)">Devin</td></tr>
+          <tr style="border-bottom:1px solid var(--line,var(--panel-3));background:var(--bg-2,var(--panel))"><td style="padding:.6rem .875rem">I want to switch between AI models freely</td><td style="padding:.6rem .875rem;text-align:center;color:var(--c-green);font-weight:600">amux</td></tr>
           <tr><td style="padding:.6rem .875rem">I want both managed and fleet options</td><td style="padding:.6rem .875rem;text-align:center">Both</td></tr>
         </tbody>
       </table>
     </div>
 
-    <!-- August 2026 updates -->
-    <h2>What's changed in August 2026</h2>
-    <p>amux shipped several updates this month relevant to the amux vs Devin comparison:</p>
+    <!-- October 2026 updates -->
+    <h2>What's new in amux — October 2026</h2>
+    <p>Recent amux features that change the amux vs Devin comparison:</p>
     <ul>
-      <li><strong>OAuth broker:</strong> The new Connectors tab lets you authorize a third-party service once. Every agent in the fleet shares the OAuth grant automatically — no per-session credential setup. Devin handles this in its managed environment; amux now matches it for self-hosted deployments.</li>
-      <li><strong>Server self-adoption (zero-downtime deploys):</strong> The Rust binary now swaps in place when a new build lands. Sessions keep running through updates — no maintenance window.</li>
-      <li><strong>Board progress notes with owner notifications:</strong> Agents can now post mid-task progress notes to board cards. The card owner receives an in-app alert. Addresses one of Devin's perceived advantages (built-in Slack notifications) for teams monitoring overnight runs.</li>
-      <li><strong>Disk watchdog:</strong> Weekly scan warns before build caches fill the drive — useful for teams running amux on a shared server with heavy multi-session usage.</li>
+      <li><strong>Workspace isolation (<code>AMUX_WORKSPACE_ISOLATION=1</code>):</strong> each agent now gets its own git worktree. Parallel agents never conflict on shared checkouts. Devin isolates via a cloud sandbox; amux now isolates at the git layer for local fleets.</li>
+      <li><strong>Vault secrets (AMUX-5375):</strong> API keys scoped to a worker, group, or the whole fleet, stored server-side. Agents never see raw values. Devin handles credentials in its managed environment; amux now matches this for self-hosted runs.</li>
+      <li><strong>Standing approvals:</strong> pre-approved action rules — install packages, rewrite tests within scope, delete files matching a pattern. Agents run overnight without stalling on routine decisions. Devin handles approvals inside its own planning loop; amux's standing approvals apply fleet-wide.</li>
+      <li><strong>Companion chat:</strong> send mid-run messages to any agent from the iOS app. Steer without interrupting — the message lands at the agent's next turn boundary.</li>
+      <li><strong>Goal keeper:</strong> set a goal string per worker; amux checks alignment every N turns and re-focuses if the agent drifts. Relevant to Devin's single-task deep autonomy: amux now offers comparable steering for overnight fleet tasks.</li>
+      <li><strong>Pinned notes:</strong> persistent context injected at every context reload. Agents keep their standing constraints through compaction and restarts.</li>
     </ul>
-    <p>amux is now at 363★ on GitHub (up from 336★ in July 2026). See the full <a href="/changelog/">amux changelog</a>.</p>
+    <p>amux is now at 514+ stars on GitHub. See the full <a href="/changelog/">amux changelog</a>.</p>
+
+    <!-- August 2026 updates (historical) -->
+    <h2>What's changed in August 2026</h2>
+    <ul>
+      <li><strong>OAuth broker:</strong> Connectors tab — authorize a third-party service once. Every fleet agent shares the grant.</li>
+      <li><strong>Server self-adoption (zero-downtime deploys):</strong> the Rust binary swaps in place when a new build lands. Sessions keep running.</li>
+      <li><strong>Board progress notes:</strong> agents post mid-task notes to board cards; card owners receive in-app alerts.</li>
+      <li><strong>Disk watchdog:</strong> weekly scan warns before build caches fill the drive.</li>
+    </ul>
 
     <!-- FAQ section -->
     <h2>Frequently asked questions</h2>
 
     <h3>Is amux cheaper than Devin?</h3>
-    <p>Yes, significantly. Devin costs $500/month for the Teams plan (250 Agent Compute Units). amux is free and open source — you pay only the underlying API tokens for Claude Code, Codex, or Gemini CLI. Heavy parallel use typically costs $10–50/month. For the same $500 Devin budget, amux users commonly run 50–200 agent-sessions per month.</p>
+    <p>Yes, significantly. Devin costs $500/month for the Teams plan (250 Agent Compute Units). amux is free to self-host — you pay only the underlying API tokens for Claude Code, Codex, or Gemini CLI. Heavy parallel use typically costs $10–50/month. For the same $500 Devin budget, amux users commonly run 50–200 agent-sessions per month.</p>
 
     <h3>What is the open-source alternative to Devin?</h3>
-    <p>amux is the leading open-source alternative for autonomous AI engineering at scale. Instead of one managed agent in a cloud sandbox, amux runs a fleet of 10–50 Claude Code, Codex, or Gemini CLI sessions simultaneously on your own machine — with a shared kanban board, self-healing watchdog, and iOS app. MIT licensed, single Rust binary, zero external dependencies. <a href="/guides/getting-started/">Get started in 5 minutes →</a></p>
+    <p>amux is the leading self-hosted alternative for autonomous AI engineering at scale. Instead of one managed agent in a cloud sandbox, amux runs a fleet of 10–50 Claude Code, Codex, or Gemini CLI sessions simultaneously on your own machine — with a shared kanban board, usage-limit and reboot recovery, and iOS app. MIT + Commons Clause, single Rust binary, zero external dependencies. <a href="/guides/getting-started/">Get started in 5 minutes →</a></p>
 
     <h3>Can amux run as many tasks as Devin at once?</h3>
     <p>amux runs significantly more tasks in parallel. Devin handles one task at a time per session. amux runs 10–50 parallel agent sessions simultaneously — each an independent coding agent working on a different task from the shared kanban board. With amux, a solo developer can wake up to 20–50 completed tasks instead of one. See the <a href="/guides/run-ai-engineering-team/">AI engineering team guide</a> for fleet patterns.</p>
 
     <h3>Does amux have the same level of autonomy as Devin?</h3>
-    <p>amux provides comparable autonomy through Claude Code (Anthropic), Codex (OpenAI), or Gemini CLI (Google) — which are themselves state-of-the-art autonomous coding systems. The key difference is that amux adds fleet orchestration, self-healing (auto-compact, auto-restart, NEEDS INPUT watchdog), and overnight operation on top of these agents. For raw coding autonomy, Claude Code via amux matches or exceeds Devin on most real-world tasks.</p>
+    <p>amux provides comparable autonomy through Claude Code (Anthropic), Codex (OpenAI), or Gemini CLI (Google) — which are themselves state-of-the-art autonomous coding systems. The key difference is that amux adds fleet orchestration, recovery (usage-limit resume, macOS reboot recovery, NEEDS INPUT and stall alerts), and overnight operation on top of these agents. For raw coding autonomy, Claude Code via amux matches or exceeds Devin on most real-world tasks.</p>
 
     <h3>Can I use amux and Devin together?</h3>
     <p>Yes. A common pattern: use Devin for 2–3 high-stakes, client-visible tasks per week where you want a fully managed, auditable outcome. Run amux with 20 background agents on the rest of your backlog simultaneously. Both share a GitHub repo. The fleet output from amux typically exceeds what Devin produces in the same window, at a fraction of the cost.</p>
@@ -296,8 +320,8 @@
     <ul>
       <li><a href="/guides/getting-started/">Getting started with amux</a> — first agent running in 5 minutes</li>
       <li><a href="/guides/run-ai-engineering-team/">How to run an AI engineering team</a> — fleet patterns, team sizes, overnight operation</li>
-      <li><a href="/use-cases/ai-coding-while-you-sleep/">Running coding agents overnight</a> — unattended operation with self-healing</li>
-      <li><a href="/guides/self-healing-configuration/">Self-healing configuration</a> — the watchdog that keeps agents running</li>
+      <li><a href="/use-cases/ai-coding-while-you-sleep/">Running coding agents overnight</a> — unattended operation with usage-limit resume and stall alerts</li>
+      <li><a href="/guides/self-healing-configuration/">Recovery and restarts</a> — how amux keeps agents going through usage limits and reboots</li>
       <li><a href="/for/enterprise/">amux for enterprise teams</a> — self-hosted deployment, audit logs, multi-runtime</li>
       <li><a href="/compare/amux-vs-claude-managed-agents/">amux vs Claude Managed Agents</a></li>
       <li><a href="/compare/amux-vs-openhands/">amux vs OpenHands</a></li>
@@ -305,60 +329,33 @@
     </ul>
 
     <div class="cta-box">
-      <h3>Try amux — free and open source</h3>
-      <p>Run an AI engineering team from one dashboard. Claude Code, Codex, Gemini CLI — all from your phone or browser. Self-healing built in.</p>
-      <pre><code>brew install mixpeek/amux/amux
+      <h3>Try amux, free to self-host</h3>
+      <p>Run an AI engineering team from one dashboard. Claude Code, Codex, Gemini CLI — all from your phone or browser. Usage-limit and reboot recovery built in.</p>
+      <pre><code>curl -fsSL https://amux.io/install.sh | bash
 amux register myproject --dir ~/Dev/myproject
 amux start myproject
 amux serve  # → https://localhost:8824</code></pre>
       <a class="btn btn-primary" href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">⭐ Star amux on GitHub</a>
     </div>
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 
 <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>

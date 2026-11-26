@@ -7,7 +7,7 @@
 //!   `set-option remain-on-exit on`, then `send-keys -l` + Enter
 //! - terminate  -> `kill-session -t '=<ref>'`
 //! - status     -> `has-session` then `list-panes #{pane_dead}...`
-//! - reconcile  -> `list-sessions -F '#{session_name}'`, `amux-` prefix only
+//! - reconcile  -> ONE `list-panes -a` census, `amux-` prefix only (MO-3622)
 //! - capture    -> `capture-pane -p -S -<lines>`
 //!
 //! Every tmux target string is built by exactly two helpers below —
@@ -27,6 +27,154 @@ use super::{
 /// the server is wedged and we want the error, not the hang.
 const OP_TIMEOUT: Duration = Duration::from_secs(5);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ---------------------------------------------------------------------------
+// Spawn accounting (MO-3622).
+//
+// Every `TmuxBackend` verb is a PROCESS SPAWN, and on macOS each spawn also
+// wakes trustd, syspolicyd and XProtect. `reconcile` used to cost 1 + 2N spawns
+// per pass and the bootstrap loop runs it every 2s: 26 spawns/s at N=28, half
+// of everything amux-server-rs forks, while the 15-minute load read 167% of the
+// machine's cores. Nothing in the logs could say so, because a spawn leaves no
+// trace once it exits. This is that trace: a rolling window, a per-verb tally,
+// and a WARN when the rate stays high.
+//
+// SCOPE, stated so the number is not read as more than it is: it counts what
+// `TmuxBackend::run` starts. Peek captures and the session-verb helpers spawn
+// tmux from their own call sites and are NOT in this count.
+// ---------------------------------------------------------------------------
+
+/// How long a rate is averaged over before it is reported and reset.
+const SPAWN_WINDOW: Duration = Duration::from_secs(60);
+/// WARN above this many `TmuxBackend` spawns per second, averaged over a
+/// window. Steady state after MO-3622 is well under 1/s.
+/// `AMUX_TMUX_SPAWN_WARN_PER_S` overrides it.
+const DEFAULT_SPAWN_WARN_PER_S: f64 = 15.0;
+
+/// One completed accounting window.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct SpawnRate {
+    pub spawns: u64,
+    pub window_s: f64,
+    pub per_s: f64,
+    /// Highest-volume verbs first, at most five.
+    pub top_verbs: Vec<(String, u64)>,
+}
+
+struct SpawnWindow {
+    started: std::time::Instant,
+    count: u64,
+    by_verb: std::collections::BTreeMap<String, u64>,
+}
+
+impl SpawnWindow {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            started: now,
+            count: 0,
+            by_verb: Default::default(),
+        }
+    }
+
+    /// Close the window when it is old enough, returning its rate. The caller
+    /// decides what to do with the rate; this only measures.
+    fn roll(&mut self, now: std::time::Instant) -> Option<SpawnRate> {
+        let elapsed = now.saturating_duration_since(self.started);
+        if elapsed < SPAWN_WINDOW {
+            return None;
+        }
+        let mut top: Vec<(String, u64)> = std::mem::take(&mut self.by_verb).into_iter().collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top.truncate(5);
+        let rate = SpawnRate {
+            spawns: self.count,
+            window_s: elapsed.as_secs_f64(),
+            per_s: self.count as f64 / elapsed.as_secs_f64(),
+            top_verbs: top,
+        };
+        self.started = now;
+        self.count = 0;
+        Some(rate)
+    }
+
+    fn note(&mut self, verb: &str, now: std::time::Instant) -> Option<SpawnRate> {
+        let done = self.roll(now);
+        self.count += 1;
+        *self.by_verb.entry(verb.to_string()).or_default() += 1;
+        done
+    }
+}
+
+struct SpawnLedger {
+    total: u64,
+    window: Option<SpawnWindow>,
+    last: Option<SpawnRate>,
+}
+
+static SPAWN_LEDGER: std::sync::Mutex<SpawnLedger> = std::sync::Mutex::new(SpawnLedger {
+    total: 0,
+    window: None,
+    last: None,
+});
+
+fn spawn_warn_threshold() -> f64 {
+    std::env::var("AMUX_TMUX_SPAWN_WARN_PER_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(DEFAULT_SPAWN_WARN_PER_S)
+}
+
+/// The verb of a tmux argv: the first word that is not a flag (`-N`, `-L x` is
+/// not used here). Bounded so a pathological argv cannot grow the tally.
+fn tmux_verb(args: &[&str]) -> String {
+    args.iter()
+        .find(|a| !a.starts_with('-'))
+        .map(|a| a.chars().take(32).collect())
+        .unwrap_or_else(|| "?".into())
+}
+
+fn note_tmux_spawn(args: &[&str]) {
+    let now = std::time::Instant::now();
+    let verb = tmux_verb(args);
+    let Ok(mut ledger) = SPAWN_LEDGER.lock() else {
+        return;
+    };
+    ledger.total += 1;
+    let window = ledger.window.get_or_insert_with(|| SpawnWindow::new(now));
+    if let Some(rate) = window.note(&verb, now) {
+        if rate.per_s > spawn_warn_threshold() {
+            tracing::warn!(
+                target: "amux::tmux",
+                verdict = "tmux_spawn_rate_high",
+                measured = true,
+                n_considered = rate.spawns,
+                per_s = rate.per_s,
+                window_s = rate.window_s,
+                top_verbs = ?rate.top_verbs,
+                "TmuxBackend is starting tmux processes faster than a steady fleet needs; \
+                 each one also wakes trustd/syspolicyd/XProtect. Read top_verbs for the loop."
+            );
+        }
+        ledger.last = Some(rate);
+    }
+}
+
+/// `TmuxBackend` spawn accounting for `GET /api/debug/tmux`.
+///
+/// `last_window` is `null` until a full window has elapsed since the process
+/// started (a restart resets it), and `scope` says what is and is not counted,
+/// so a low number is never read as a statement about the whole server.
+pub fn tmux_spawn_stats() -> serde_json::Value {
+    let ledger = SPAWN_LEDGER.lock().ok();
+    serde_json::json!({
+        "scope": "TmuxBackend::run only; peek captures and session-verb helpers spawn tmux \
+                  from their own call sites and are not counted here",
+        "total_since_start": ledger.as_ref().map(|l| l.total),
+        "last_window": ledger.as_ref().and_then(|l| l.last.clone()),
+        "warn_per_s": spawn_warn_threshold(),
+    })
+}
 
 // ---------------------------------------------------------------------------
 // L2 — the two tmux target forms, encoded in ONE place each.
@@ -87,12 +235,81 @@ pub(crate) fn env_pair_is_argv_safe(key: &str, value: &str) -> bool {
         .any(|needle| k.contains(needle))
 }
 
+// ---------------------------------------------------------------------------
+// Native-arch launch (MO-3623, follow-on to MO-3622).
+//
+// MO-3622 fixed amux's own spawn sources; this is the proactive fix for the
+// cause underneath them, applied at the one point every NEW worker passes
+// through. `/usr/local/bin/tmux` is Intel-only, so its pane shells inherit
+// x86_64 preference, and that preference survives an `exec` of an arm64-only
+// binary (confirmed by experiment: a translated shell execing a thin-arm64
+// program directly still hands x86_64 to THAT program's own children — being
+// native yourself does not reset it). What DOES reset it: wrapping the exec in
+// `arch -arm64 -x86_64`, which sets a fresh preference list that then
+// propagates to everything the wrapped process spawns. So the agent's own
+// subprocess tree (every Bash tool call, every git/python it runs) goes
+// native, with no tmux server restart and no effect on any session already
+// running — this only ever changes a NEW spawn's command line.
+// ---------------------------------------------------------------------------
+
+/// True when wrapping a new session's launch in `arch -arm64 -x86_64` is both
+/// possible and worth doing: an Apple Silicon build of this server (the same
+/// signal `mac_health::rosetta_census` uses — this server is always built
+/// native for its own host) with `/usr/bin/arch` present, unless
+/// `AMUX_NATIVE_ARCH=0` opts out.
+fn should_prefer_native_arch() -> bool {
+    native_arch_eligible(
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        std::env::var("AMUX_NATIVE_ARCH").ok().as_deref() != Some("0"),
+        std::path::Path::new("/usr/bin/arch").exists(),
+    )
+}
+
+/// Pure form of the decision above, so a test can drive every combination
+/// without mutating process-global environment state (which a parallel test
+/// run could race).
+fn native_arch_eligible(is_apple_silicon_build: bool, opted_in: bool, arch_exists: bool) -> bool {
+    is_apple_silicon_build && opted_in && arch_exists
+}
+
+/// The argv to `exec`, with the native-arch wrapper prefixed when eligible.
+/// `arch -arm64 -x86_64` itself falls back per-slice when the wrapped binary
+/// has no arm64 build (verified: an x86_64-only binary still runs, under
+/// x86_64), so this never turns a working launch into a failing one — it can
+/// only make an eligible one run more of its own descendants natively.
+fn native_launch_argv(command: &[String]) -> Vec<String> {
+    if !should_prefer_native_arch() {
+        return command.to_vec();
+    }
+    let mut argv = vec![
+        "/usr/bin/arch".to_string(),
+        "-arm64".to_string(),
+        "-x86_64".to_string(),
+    ];
+    argv.extend(command.iter().cloned());
+    argv
+}
+
+/// The interactive worker launcher passes shell programs rather than argv.
+/// Use the same native preference as backend spawns; escaping the entire program
+/// preserves scoped environment assignments, isolation scrubbing and cwd gates.
+pub(crate) fn native_shell_launch(command: &str) -> String {
+    if !should_prefer_native_arch() {
+        return command.to_string();
+    }
+    tracing::info!(measured = true, n_considered = 1, verdict = "native_provider_launch",
+        "provider launch resets inherited architecture preference for its children");
+    native_launch_argv(&["/bin/sh".to_string(), "-c".to_string(), command.to_string()])
+        .iter().map(|arg| sh_quote(arg)).collect::<Vec<_>>().join(" ")
+}
+
 impl TmuxBackend {
     pub fn new() -> Self {
         Self { bin: "tmux".into() }
     }
 
     async fn run(&self, args: &[&str], timeout: Duration) -> Result<std::process::Output> {
+        note_tmux_spawn(args);
         let mut cmd = tokio::process::Command::new(&self.bin);
         cmd.args(args)
             .stdin(Stdio::null())
@@ -165,7 +382,10 @@ impl TmuxBackend {
         // zombie under the tmux server, never reaped, so tmux had nothing to
         // report. The kernel still holds that zombie's exit status.
         let pids = self
-            .run(&["list-panes", "-t", &pt, "-F", "#{pane_pid}:#{pid}"], OP_TIMEOUT)
+            .run(
+                &["list-panes", "-t", &pt, "-F", "#{pane_pid}:#{pid}"],
+                OP_TIMEOUT,
+            )
             .await?;
         let line = String::from_utf8_lossy(&pids.stdout);
         if let Some((pane_pid, server_pid)) = parse_pid_pair(line.lines().next().unwrap_or("")) {
@@ -219,7 +439,10 @@ impl SessionBackend for TmuxBackend {
             )));
         }
         let mut exits = parse_process_exits(&String::from_utf8_lossy(&out.stdout))?;
-        if !exits.values().any(|e| e.code.is_none() && e.signal.is_none()) {
+        if !exits
+            .values()
+            .any(|e| e.code.is_none() && e.signal.is_none())
+        {
             return Ok(exits);
         }
         // AMUX-4636: see status_by_ref. Only a session with exactly one dead
@@ -227,7 +450,12 @@ impl SessionBackend for TmuxBackend {
         // one shared exit code, exactly as parse_process_exits decides.
         let census = self
             .run(
-                &["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}:#{pane_pid}:#{pid}"],
+                &[
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    "#{session_name}:#{pane_dead}:#{pane_pid}:#{pid}",
+                ],
                 OP_TIMEOUT,
             )
             .await?;
@@ -242,14 +470,17 @@ impl SessionBackend for TmuxBackend {
             let Some([(pane_pid, server_pid)]) = pids.get(name).map(Vec::as_slice) else {
                 continue;
             };
-            let measured =
-                zombie_exit_status(std::path::Path::new("/proc"), pane_pid, server_pid);
+            let measured = zombie_exit_status(std::path::Path::new("/proc"), pane_pid, server_pid);
             let filled = match measured {
-                Some(BackendStatus::Completed { exit_code }) => {
-                    amux_core::protocol::ExitStatus { code: Some(exit_code), signal: None }
-                }
+                Some(BackendStatus::Completed { exit_code }) => amux_core::protocol::ExitStatus {
+                    code: Some(exit_code),
+                    signal: None,
+                },
                 Some(BackendStatus::Crashed { signal: Some(sig) }) => {
-                    amux_core::protocol::ExitStatus { code: None, signal: Some(sig) }
+                    amux_core::protocol::ExitStatus {
+                        code: None,
+                        signal: Some(sig),
+                    }
                 }
                 _ => continue,
             };
@@ -380,7 +611,7 @@ impl SessionBackend for TmuxBackend {
             let line = format!(
                 "cd {} && exec {}",
                 sh_quote(&spec.cwd),
-                spec.command
+                native_launch_argv(&spec.command)
                     .iter()
                     .map(|a| sh_quote(a))
                     .collect::<Vec<_>>()
@@ -465,8 +696,19 @@ impl SessionBackend for TmuxBackend {
         // READ-ONLY sweep: reconcile reports what exists under the amux-
         // prefix; acting on it (killing strays, adopting orphans) is the
         // orchestrator's decision, not the backend's.
+        //
+        // ONE spawn for the whole fleet (MO-3622). This used to run
+        // `list-sessions` and then `has-session` + `list-panes` per session:
+        // 1 + 2N processes per pass, on a loop that fires every 2s. At N=28
+        // that was 26 spawns/s of pure probing, and the bootstrap sweep that
+        // calls it reads only the ref, never the status. `list-panes -a` names
+        // every pane of every session with its dead/status/signal, which is
+        // exactly what `status_by_ref` asked for one session at a time.
         let out = self
-            .run(&["list-sessions", "-F", "#{session_name}"], OP_TIMEOUT)
+            .run(
+                &["list-panes", "-a", "-F", RECONCILE_CENSUS_FORMAT],
+                OP_TIMEOUT,
+            )
             .await?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -476,21 +718,43 @@ impl SessionBackend for TmuxBackend {
                 return Ok(Vec::new());
             }
             return Err(BackendError::CommandFailed(format!(
-                "tmux list-sessions failed: {}",
+                "tmux list-panes -a failed: {}",
                 stderr.trim()
             )));
         }
-        let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|n| n.starts_with("amux-"))
-            .map(str::to_string)
-            .collect();
-        // Probe all sessions concurrently (was sequential — 2 tmux calls per
-        // session × 50 sessions = 88s startup blackout, AMUX-3969b). Bounded
-        // to 10 at a time so we do not fork-bomb the tmux server.
+        let census = parse_reconcile_census(&String::from_utf8_lossy(&out.stdout))?;
+
+        let mut hosted = Vec::with_capacity(census.len());
+        let mut needs_probe = Vec::new();
+        for (name, status) in census {
+            match status {
+                // A dead pane with neither status nor signal is the AMUX-4636
+                // case: only `status_by_ref` knows how to read the exit code
+                // from the unreaped zombie. A session with no active-window
+                // pane in the census is not something to guess about either.
+                // Both are rare, and both keep the exact old per-session path.
+                Some(status) if status != (BackendStatus::Crashed { signal: None }) => {
+                    hosted.push(BackendSession {
+                        backend_ref: name,
+                        status,
+                    })
+                }
+                _ => needs_probe.push(name),
+            }
+        }
+        if !needs_probe.is_empty() {
+            tracing::debug!(
+                target: "amux::tmux",
+                verdict = "tmux_reconcile_per_session_probe",
+                measured = true,
+                n_considered = hosted.len() + needs_probe.len(),
+                probed = needs_probe.len(),
+                "reconcile census could not settle these sessions; probing each"
+            );
+        }
+        // Bounded to 10 at a time so we do not fork-bomb the tmux server.
         use futures::stream::{self, StreamExt};
-        let sessions: Vec<Result<BackendSession>> = stream::iter(names)
+        let probed: Vec<Result<BackendSession>> = stream::iter(needs_probe)
             .map(|name| async move {
                 let status = self.status_by_ref(&name).await?;
                 Ok(BackendSession {
@@ -501,7 +765,10 @@ impl SessionBackend for TmuxBackend {
             .buffer_unordered(10)
             .collect()
             .await;
-        sessions.into_iter().collect()
+        for session in probed {
+            hosted.push(session?);
+        }
+        Ok(hosted)
     }
 
     async fn capture(&self, proc: &ProcessRef, lines: u32) -> Result<String> {
@@ -550,6 +817,68 @@ fn parse_pane_dead(line: &str) -> BackendStatus {
         return BackendStatus::Completed { exit_code: code };
     }
     BackendStatus::Crashed { signal: None }
+}
+
+/// `list-panes -a` format for `reconcile`. `:`-separated for the reason
+/// `status_by_ref` gives (a LANG-less launchd env turns tabs into `_`); tmux
+/// never lets a session name contain `:`, so the name is whatever is left when
+/// the four trailing fields are split off the right.
+const RECONCILE_CENSUS_FORMAT: &str =
+    "#{session_name}:#{window_active}:#{pane_dead}:#{pane_dead_status}:#{pane_dead_signal}";
+
+/// Parse a `RECONCILE_CENSUS_FORMAT` census into one entry per `amux-` session,
+/// in first-seen order.
+///
+/// The status is that of the FIRST pane of the session's ACTIVE window, which
+/// is the line `list-panes -t =<name>:` printed first and the one
+/// `parse_pane_dead(stdout.lines().next())` read in `status_by_ref`. `None`
+/// means the census showed no active-window pane for the session.
+///
+/// Foreign (non-`amux-`) sessions are skipped before they are parsed, as
+/// `reconcile` always did. A malformed `amux-` line is an error rather than a
+/// missing session: a session that silently vanished from the census would read
+/// as "gone" to the sweep that reaps and interrupts.
+fn parse_reconcile_census(output: &str) -> Result<Vec<(String, Option<BackendStatus>)>> {
+    let mut order: Vec<String> = Vec::new();
+    let mut first_active: std::collections::BTreeMap<String, Option<BackendStatus>> =
+        Default::default();
+    for line in output.lines() {
+        if !line.starts_with("amux-") {
+            continue;
+        }
+        // Right to left: signal, status, dead, window_active, then the name.
+        let fields: Vec<_> = line.rsplitn(5, ':').collect();
+        if fields.len() != 5
+            || fields[4].is_empty()
+            || !matches!(fields[3], "0" | "1")
+            || !matches!(fields[2], "0" | "1")
+        {
+            return Err(BackendError::CommandFailed(format!(
+                "malformed tmux reconcile census line: {line:?}"
+            )));
+        }
+        let name = fields[4];
+        if !first_active.contains_key(name) {
+            order.push(name.to_string());
+            first_active.insert(name.to_string(), None);
+        }
+        if fields[3] == "1" {
+            let slot = first_active.get_mut(name).expect("inserted above");
+            if slot.is_none() {
+                *slot = Some(parse_pane_dead(&format!(
+                    "{}:{}:{}",
+                    fields[2], fields[1], fields[0]
+                )));
+            }
+        }
+    }
+    Ok(order
+        .into_iter()
+        .map(|name| {
+            let status = first_active.remove(&name).flatten();
+            (name, status)
+        })
+        .collect())
 }
 
 fn parse_process_exits(
@@ -628,7 +957,11 @@ fn dead_pane_pids(census: &str) -> std::collections::BTreeMap<String, Vec<(Strin
 /// or an unrelated process can never supply an exit. `comm` (field 2) may hold
 /// spaces and parentheses, so fields are counted after its LAST ')'. Anything
 /// unreadable is None, which keeps the honest Crashed { signal: None }.
-fn zombie_exit_status(proc_root: &std::path::Path, pid: &str, parent: &str) -> Option<BackendStatus> {
+fn zombie_exit_status(
+    proc_root: &std::path::Path,
+    pid: &str,
+    parent: &str,
+) -> Option<BackendStatus> {
     pid.parse::<u32>().ok()?;
     let stat = std::fs::read_to_string(proc_root.join(pid).join("stat")).ok()?;
     let rest = &stat[stat.rfind(')')? + 1..];
@@ -639,9 +972,13 @@ fn zombie_exit_status(proc_root: &std::path::Path, pid: &str, parent: &str) -> O
     }
     let raw: i32 = fields.get(52 - 3)?.parse().ok()?;
     if raw & 0x7f == 0 {
-        Some(BackendStatus::Completed { exit_code: (raw >> 8) & 0xff })
+        Some(BackendStatus::Completed {
+            exit_code: (raw >> 8) & 0xff,
+        })
     } else {
-        Some(BackendStatus::Crashed { signal: Some(raw & 0x7f) })
+        Some(BackendStatus::Crashed {
+            signal: Some(raw & 0x7f),
+        })
     }
 }
 
@@ -665,6 +1002,115 @@ fn sh_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // ---- MO-3623: wrap a new session's launch so its own descendants run
+    // native, and only when it is eligible to.
+
+    #[test]
+    fn native_arch_eligible_needs_all_three_conditions() {
+        assert!(super::native_arch_eligible(true, true, true));
+        assert!(
+            !super::native_arch_eligible(false, true, true),
+            "not an Apple Silicon build"
+        );
+        assert!(
+            !super::native_arch_eligible(true, false, true),
+            "AMUX_NATIVE_ARCH=0 opts out"
+        );
+        assert!(
+            !super::native_arch_eligible(true, true, false),
+            "/usr/bin/arch missing"
+        );
+    }
+
+    #[test]
+    fn native_launch_argv_prefixes_arch_only_when_eligible() {
+        let cmd = vec![
+            "claude".to_string(),
+            "--model".to_string(),
+            "sonnet".to_string(),
+        ];
+        // The pure gate says yes: wrapped, in this exact order.
+        let with_wrap = |cmd: &[String]| -> Vec<String> {
+            let mut argv = vec![
+                "/usr/bin/arch".to_string(),
+                "-arm64".to_string(),
+                "-x86_64".to_string(),
+            ];
+            argv.extend(cmd.iter().cloned());
+            argv
+        };
+        // native_launch_argv itself always reads the REAL environment via
+        // should_prefer_native_arch, so assert it agrees with that live
+        // reading rather than asserting a hardcoded outcome (this box's own
+        // eligibility is not this test's business, only that the two agree).
+        if super::should_prefer_native_arch() {
+            assert_eq!(super::native_launch_argv(&cmd), with_wrap(&cmd));
+        } else {
+            assert_eq!(super::native_launch_argv(&cmd), cmd);
+        }
+    }
+
+    /// THE REGRESSION, run for real. Only meaningful on a translated shell on
+    /// Apple Silicon hardware (mirrors the equivalent cell in
+    /// test-status-hooks.sh) -- anywhere else there is no Rosetta tax to prove
+    /// this removes, and saying so beats a vacuous pass.
+    #[test]
+    fn a_wrapped_launch_makes_its_own_children_native() {
+        use std::process::Command;
+        let translated = Command::new("/usr/sbin/sysctl")
+            .args(["-n", "sysctl.proc_translated"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+            .unwrap_or(false);
+        let arm64_hw = Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.optional.arm64"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+            .unwrap_or(false);
+        if !translated || !arm64_hw {
+            eprintln!(
+                "skip: this test process is not translated on Apple Silicon hardware, so \
+                 there is no Rosetta tax to prove native_launch_argv removes"
+            );
+            return;
+        }
+        // Some(true) = native, Some(false) = translated, None = the probe
+        // printed neither, which must fail loudly rather than read as either.
+        let probe = |argv: &[String]| -> Option<bool> {
+            let out = Command::new(&argv[0])
+                .args(&argv[1..])
+                .output()
+                .expect("probe must run");
+            match String::from_utf8_lossy(&out.stdout).trim() {
+                "0" => Some(true),
+                "1" => Some(false),
+                _ => None,
+            }
+        };
+        let bare = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            // Absolute path: amux panes and the builder run with a PATH that
+            // omits /usr/sbin, where a bare `sysctl` printed NOTHING. That made
+            // the wrapped probe fail and the bare-probe precondition pass on
+            // empty output rather than on a real "1".
+            "/usr/sbin/sysctl -n sysctl.proc_translated".to_string(),
+        ];
+        assert_eq!(
+            probe(&bare),
+            Some(false),
+            "a bare exec from this translated test process must still read translated; \
+             otherwise this test proves nothing"
+        );
+        assert_eq!(
+            probe(&super::native_launch_argv(&bare)),
+            Some(true),
+            "native_launch_argv's wrapper must make its own child report native"
+        );
+    }
+
     #[test]
     fn process_exit_census_requires_every_pane_to_be_dead() {
         let exits = super::parse_process_exits(
@@ -746,11 +1192,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let r = root.path();
         write_stat(r, "100", &fake_stat("100", "sh", "Z", "50", 256));
-        assert_eq!(zombie_exit_status(r, "100", "50"), Some(BackendStatus::Completed { exit_code: 1 }));
+        assert_eq!(
+            zombie_exit_status(r, "100", "50"),
+            Some(BackendStatus::Completed { exit_code: 1 })
+        );
         write_stat(r, "101", &fake_stat("101", "sh", "Z", "50", 9));
-        assert_eq!(zombie_exit_status(r, "101", "50"), Some(BackendStatus::Crashed { signal: Some(9) }));
+        assert_eq!(
+            zombie_exit_status(r, "101", "50"),
+            Some(BackendStatus::Crashed { signal: Some(9) })
+        );
         write_stat(r, "102", &fake_stat("102", "a b) (c", "Z", "50", 0));
-        assert_eq!(zombie_exit_status(r, "102", "50"), Some(BackendStatus::Completed { exit_code: 0 }));
+        assert_eq!(
+            zombie_exit_status(r, "102", "50"),
+            Some(BackendStatus::Completed { exit_code: 0 })
+        );
         // Controls: not a zombie, a foreign parent, no record, a non-numeric pid.
         write_stat(r, "103", &fake_stat("103", "sh", "S", "50", 256));
         assert_eq!(zombie_exit_status(r, "103", "50"), None);
@@ -761,11 +1216,16 @@ mod tests {
 
     #[test]
     fn dead_pane_pids_keeps_dead_panes_with_numeric_pids() {
-        let pids = dead_pane_pids("amux-a:1:100:50\namux-b:0:101:50\namux-c:1:x:50\nweird:name:1:102:50\n");
+        let pids = dead_pane_pids(
+            "amux-a:1:100:50\namux-b:0:101:50\namux-c:1:x:50\nweird:name:1:102:50\n",
+        );
         assert_eq!(pids["amux-a"], vec![("100".to_string(), "50".to_string())]);
         assert!(!pids.contains_key("amux-b"));
         assert!(!pids.contains_key("amux-c"));
-        assert_eq!(pids["weird:name"], vec![("102".to_string(), "50".to_string())]);
+        assert_eq!(
+            pids["weird:name"],
+            vec![("102".to_string(), "50".to_string())]
+        );
         assert_eq!(parse_pid_pair("100:50"), Some(("100".into(), "50".into())));
         assert_eq!(parse_pid_pair("100:"), None);
     }
@@ -777,6 +1237,232 @@ mod tests {
         assert_eq!(sh_quote("$(reboot)"), "'$(reboot)'");
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
         assert_eq!(sh_quote(""), "''");
+    }
+
+    // ---- MO-3622: reconcile is ONE spawn, and the accounting can fail -------
+
+    #[test]
+    fn reconcile_census_reads_the_first_pane_of_the_active_window() {
+        let census = parse_reconcile_census(
+            "amux-live:1:0::\n\
+             amux-done:1:1:3:\n\
+             amux-sig:1:1::9\n\
+             amux-bare:1:1::\n\
+             amux-multi:0:1:7:\n\
+             amux-multi:1:0::\n\
+             amux-multi:1:1:5:\n\
+             amux-inactive-only:0:0::\n\
+             foreign:1:1:1:\n",
+        )
+        .unwrap();
+        let by_name: std::collections::BTreeMap<_, _> = census.iter().cloned().collect();
+        assert_eq!(by_name["amux-live"], Some(BackendStatus::Running));
+        assert_eq!(
+            by_name["amux-done"],
+            Some(BackendStatus::Completed { exit_code: 3 })
+        );
+        assert_eq!(
+            by_name["amux-sig"],
+            Some(BackendStatus::Crashed { signal: Some(9) })
+        );
+        assert_eq!(
+            by_name["amux-bare"],
+            Some(BackendStatus::Crashed { signal: None })
+        );
+        // The dead pane in the INACTIVE window must not speak for the session,
+        // and only the first pane of the active window counts, exactly as
+        // `list-panes -t =name:` + `lines().next()` did.
+        assert_eq!(by_name["amux-multi"], Some(BackendStatus::Running));
+        // No active-window pane in the census: unknown, never guessed.
+        assert_eq!(by_name["amux-inactive-only"], None);
+        assert!(!by_name.contains_key("foreign"));
+        assert_eq!(census.len(), 6, "one entry per amux- session");
+        // First-seen order is kept, so the census is deterministic.
+        assert_eq!(census[0].0, "amux-live");
+    }
+
+    #[test]
+    fn reconcile_census_fails_loudly_on_a_malformed_amux_line() {
+        for bad in ["amux-x:1:0:", "amux-x:2:0::", "amux-x:1:9::", "amux-x"] {
+            assert!(
+                parse_reconcile_census(bad).is_err(),
+                "{bad:?} must be an error, not a session that quietly vanished"
+            );
+        }
+        // Foreign lines are never parsed, so their shape cannot break the sweep.
+        assert!(parse_reconcile_census("weird line\nother:junk\n:1:0::\n")
+            .unwrap()
+            .is_empty());
+        assert!(parse_reconcile_census("").unwrap().is_empty());
+    }
+
+    /// A `tmux` that logs every invocation and answers only the census (plus the
+    /// per-session probes when `probe` is set). Returns the backend and the log.
+    fn fake_tmux(
+        dir: &std::path::Path,
+        census: &str,
+        probe: bool,
+    ) -> (TmuxBackend, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("calls.log");
+        let script = dir.join("tmux");
+        let probes = if probe {
+            "  \"has-session\"*) exit 0 ;;\n  \"list-panes -t\"*\"pane_pid\"*) echo 1:1 ;;\n  \"list-panes -t\"*) echo 1:: ;;\n"
+        } else {
+            ""
+        };
+        let text = format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\ncase \"$*\" in\n  \"list-panes -a\"*)\ncat <<'EOF'\n{census}EOF\n    ;;\n{probes}  *) echo \"unexpected tmux call: $*\" >&2; exit 1 ;;\nesac\n",
+            log = log.display(),
+        );
+        std::fs::write(&script, text).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (
+            TmuxBackend {
+                bin: script.display().to_string(),
+            },
+            log,
+        )
+    }
+
+    /// `cmd.spawn()` of a just-written executable can hit ETXTBSY when another
+    /// test thread forks in the window (see opencode::structured). Retry that
+    /// one error; anything else is a real failure.
+    async fn reconcile_retrying(b: &TmuxBackend) -> Vec<BackendSession> {
+        for _ in 0..20 {
+            match b.reconcile().await {
+                Ok(v) => return v,
+                Err(e) if e.to_string().contains("Text file busy") => {
+                    tokio::time::sleep(Duration::from_millis(50)).await
+                }
+                Err(e) => panic!("reconcile failed: {e}"),
+            }
+        }
+        panic!("reconcile kept hitting ETXTBSY");
+    }
+
+    fn calls(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// THE REGRESSION. Before MO-3622 a fleet of N sessions cost 1 + 2N spawns
+    /// per reconcile, every 2s. It is one, whatever N is.
+    #[tokio::test]
+    async fn reconcile_costs_one_spawn_for_the_whole_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut census = String::new();
+        for i in 0..40 {
+            census.push_str(&format!("amux-lane{i}:1:0::\n"));
+        }
+        census.push_str("amux-done:1:1:0:\nforeign:1:0::\n");
+        let (backend, log) = fake_tmux(dir.path(), &census, false);
+
+        let hosted = reconcile_retrying(&backend).await;
+
+        let seen = calls(&log);
+        assert_eq!(seen.len(), 1, "one spawn for 41 sessions, got: {seen:?}");
+        assert!(seen[0].starts_with("list-panes -a"), "{seen:?}");
+        assert_eq!(hosted.len(), 41, "every amux- session, no foreign one");
+        assert!(hosted.iter().any(|s| s.backend_ref == "amux-done"
+            && s.status == BackendStatus::Completed { exit_code: 0 }));
+        assert_eq!(
+            hosted
+                .iter()
+                .filter(|s| s.status == BackendStatus::Running)
+                .count(),
+            40
+        );
+    }
+
+    /// The census cannot read an exit code out of a dead pane that recorded
+    /// none (AMUX-4636), so ONLY that session pays for the per-session probe.
+    #[tokio::test]
+    async fn reconcile_probes_only_the_session_the_census_cannot_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let census = "amux-a:1:0::\namux-b:1:0::\namux-bare:1:1::\namux-c:1:0::\n";
+        let (backend, log) = fake_tmux(dir.path(), census, true);
+
+        let hosted = reconcile_retrying(&backend).await;
+
+        let seen = calls(&log);
+        assert_eq!(
+            seen.iter()
+                .filter(|c| c.starts_with("list-panes -a"))
+                .count(),
+            1
+        );
+        let probes: Vec<_> = seen
+            .iter()
+            .filter(|c| !c.starts_with("list-panes -a"))
+            .collect();
+        assert!(!probes.is_empty(), "the unsettled session must be probed");
+        assert!(
+            probes.iter().all(|c| c.contains("amux-bare")),
+            "only amux-bare may be probed, got: {probes:?}"
+        );
+        assert_eq!(hosted.len(), 4);
+        assert!(hosted
+            .iter()
+            .any(|s| s.backend_ref == "amux-bare"
+                && s.status == BackendStatus::Crashed { signal: None }));
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_no_server_is_an_empty_answer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tmux");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'no server running on /tmp/tmux-501/default' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let backend = TmuxBackend {
+            bin: script.display().to_string(),
+        };
+        assert!(reconcile_retrying(&backend).await.is_empty());
+    }
+
+    #[test]
+    fn spawn_window_reports_rate_and_verbs_only_after_it_closes() {
+        let t0 = std::time::Instant::now();
+        let mut w = SpawnWindow::new(t0);
+        // 130 spawns inside the window: nothing is reported yet.
+        for i in 0..130u64 {
+            let verb = if i % 2 == 0 {
+                "has-session"
+            } else {
+                "list-panes"
+            };
+            assert_eq!(w.note(verb, t0 + Duration::from_millis(i * 100)), None);
+        }
+        w.note("capture-pane", t0 + Duration::from_secs(1));
+        // The next spawn after the window elapsed closes it.
+        let rate = w
+            .note("list-sessions", t0 + SPAWN_WINDOW + Duration::from_secs(1))
+            .expect("window must close once it is old enough");
+        assert_eq!(rate.spawns, 131);
+        assert!((rate.window_s - 61.0).abs() < 0.01);
+        assert!((rate.per_s - 131.0 / 61.0).abs() < 0.01);
+        assert_eq!(rate.top_verbs[0], ("has-session".to_string(), 65));
+        assert_eq!(rate.top_verbs[1], ("list-panes".to_string(), 65));
+        // The closing spawn opens the next window rather than being lost.
+        assert_eq!(w.count, 1);
+    }
+
+    #[test]
+    fn tmux_verb_skips_leading_flags() {
+        assert_eq!(
+            tmux_verb(&["-N", "display-message", "-p"]),
+            "display-message"
+        );
+        assert_eq!(tmux_verb(&["list-panes", "-a"]), "list-panes");
+        assert_eq!(tmux_verb(&[]), "?");
     }
 }
 
@@ -791,8 +1477,13 @@ mod argv_secret_tests {
     #[test]
     fn credential_shaped_names_are_refused_from_argv() {
         for key in [
-            "OPENAI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
-            "GITHUB_TOKEN", "SLACK_CLIENT_SECRET", "MATTERMOST_PASSWORD",
+            "OPENAI_API_KEY",
+            "GOOGLE_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GITHUB_TOKEN",
+            "SLACK_CLIENT_SECRET",
+            "MATTERMOST_PASSWORD",
         ] {
             assert!(
                 !env_pair_is_argv_safe(key, "sk-live-value"),
@@ -810,11 +1501,20 @@ mod argv_secret_tests {
     #[test]
     fn ordinary_configuration_still_travels() {
         for key in [
-            "TMUX_SESSION_NAME", "AMUX_SESSION", "AMUX_WORKER", "AMUX_URL",
-            "ANTHROPIC_API_BASE", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION",
-            "TERM", "GOOGLE_GENAI_USE_VERTEXAI",
+            "TMUX_SESSION_NAME",
+            "AMUX_SESSION",
+            "AMUX_WORKER",
+            "AMUX_URL",
+            "ANTHROPIC_API_BASE",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "TERM",
+            "GOOGLE_GENAI_USE_VERTEXAI",
         ] {
-            assert!(env_pair_is_argv_safe(key, "some-value"), "{key} is not a secret");
+            assert!(
+                env_pair_is_argv_safe(key, "some-value"),
+                "{key} is not a secret"
+            );
         }
     }
 

@@ -42,6 +42,23 @@ print(json.dumps({"tool_name":"Read","cwd":"/","tool_input":tool}))
 PY
 }
 
+# Heredoc bodies are not shell argv. Valid prose must not become probe failures.
+python3 - <<'PYTEST'
+import importlib.util
+spec=importlib.util.spec_from_file_location("read_guard", "scripts/hooks/large-read-guard.py")
+guard=importlib.util.module_from_spec(spec);spec.loader.exec_module(guard)
+for command in ["python3 - <<'EOF'\nprint(\"don't parse this as shell\")\nEOF", "cat small.txt && python3 - <<'EOF'\nowner's note\nEOF"]:
+    assert guard.simple_shell_argv(command)==[]
+assert guard.simple_shell_argv("cat 'file with spaces.txt'")==['cat','file with spaces.txt']
+try:
+    guard.simple_shell_argv("cat 'invalid")
+except ValueError:
+    pass
+else:
+    raise AssertionError("malformed simple commands must remain diagnostic failures")
+PYTEST
+ok "complex shell and heredoc bodies stop before unsupported lexical parsing"
+
 # GMA-123: an IMAGE must NOT be routed to `amux delegate read`. The delegate is a
 # text summarizer and died on the first byte of any PNG (0x89) with a raw
 # UnicodeDecodeError, while this guard was actively recommending it — the guard's
@@ -49,7 +66,22 @@ PY
 # images the blocked artifact IS the deliverable.
 printf '\x89PNG\r\n\x1a\n' > "$TMP/big.png"
 for i in 1 2 3 4 5 6 7 8; do printf 'binary junk %s\n' "$i" >> "$TMP/big.png"; done
-binary_out="$(read_payload "$TMP/big.png" | hook 2>&1 || true)"
+# The Read TOOL renders an image or PDF as pictures and pages, so line counts
+# mean nothing there and it passes (2026-10-04: a Chat tab was refused an
+# attached invoice PDF twice). A shell reader still dumps the bytes as text, so
+# `cat` of a big binary is what the refusal below is about.
+cp "$TMP/big.png" "$TMP/big.pdf"
+for f in big.png big.pdf; do
+  if pass_out="$(read_payload "$TMP/$f" | hook 2>&1)" && [[ -z "$pass_out" ]]; then
+    ok "the Read tool may open $f (rendered, not read as lines)"
+  else
+    echo "FAIL Read of $f was refused: $pass_out" >&2; exit 1
+  fi
+done
+grep -q '"verdict":"binary_read_passed"' "$TMP/home/.amux/logs/read-delegation.jsonl" \
+  && ok "a passed binary Read is audited as binary_read_passed" \
+  || { echo "FAIL no binary_read_passed audit row" >&2; exit 1; }
+binary_out="$(python3 -c 'import json,sys;print(json.dumps({"tool_name":"Bash","cwd":"/","tool_input":{"command":"cat "+sys.argv[1]}}))' "$TMP/big.png" | hook 2>&1 || true)"
 case "$binary_out" in
   *"looks BINARY"*) ok "an image is named as binary, not sent to the text helper" ;;
   *) echo "FAIL image not identified as binary: $binary_out" >&2; exit 1 ;;

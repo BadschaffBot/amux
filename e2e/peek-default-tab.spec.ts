@@ -18,3 +18,23 @@ test('a Codex worker opens on Terminal, not Transcript', async ({ page }) => {
   await expect(page.locator('#peek-tab-transcript')).not.toHaveClass(/active/);
   await expect(page.locator('#peek-terminal-panel')).toBeVisible();
 });
+
+// The fan-out tab was retired with orchestration (c5601217); identity and close state remain.
+test('terminal identity uses canonical model and active worktree, and a closed peek is inert', async ({ page }) => {
+  await page.goto('/');
+  await page.waitForFunction(() => typeof (window as any).openPeek === 'function');
+  await page.evaluate(`
+    sessions = [
+      {name:'ollama-parent',provider:'ollama',model:'qwen3-coder:30b-65k',active_model:'',dir:'/repo',worktree_active:true,worktree_path:'/tmp/exact-worktree'},
+      {name:'ollama-child',provider:'ollama',model:'qwen3-coder:30b-65k',dir:'/repo',ephemeral:true,ephemeral_parent:'ollama-parent'}
+    ];
+    openPeek('ollama-parent');
+  `);
+  await expect(page.locator('#peek-model-badge')).toContainText('qwen3-coder:30b-65k');
+  await expect(page.locator('#peek-dir-text')).toHaveText('/tmp/exact-worktree');
+
+  await page.evaluate(`closePeek()`);
+  await expect(page.locator('#peek-overlay')).toHaveAttribute('aria-hidden','true');
+  await expect(page.locator('#peek-overlay')).toHaveAttribute('inert','');
+  await expect(page.locator('#peek-overlay')).toBeHidden();
+});

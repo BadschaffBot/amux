@@ -18,16 +18,23 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use std::sync::Arc;
+use crate::integrations::email::{HttpTransport, ReqwestTransport};
+use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::json;
 
 pub fn routes() -> Router<AppState> {
+    routes_with(Arc::new(ReqwestTransport::new()))
+}
+pub fn routes_with(http: Arc<dyn HttpTransport>) -> Router<AppState> {
     Router::new()
         .route("/status", get(status))
         .route("/mappings", get(list_mappings).post(create_mapping))
         .route("/mappings/{chat_id}", axum::routing::delete(delete_mapping))
         .route("/send", axum::routing::post(send))
+        .layer(Extension(http))
 }
 
 fn err(status: StatusCode, body: serde_json::Value) -> Response {
@@ -46,7 +53,7 @@ async fn status(State(state): State<AppState>) -> Response {
     (
         StatusCode::OK,
         Json(json!({
-            "bot_token_set": std::env::var("TELEGRAM_BOT_TOKEN").map(|v| !v.trim().is_empty()).unwrap_or(false),
+            "bot_token_set": telegram_poll::bot_token().is_some(),
             "mapping_count": mapping_count,
             "last_poll_at": report.last_poll_at,
             "last_error": report.last_error,
@@ -59,9 +66,12 @@ async fn status(State(state): State<AppState>) -> Response {
 }
 
 async fn list_mappings(State(state): State<AppState>) -> Response {
-    match state.store.read().map_err(|e| e.to_string()).and_then(|conn| {
-        tg_db::list(&conn).map_err(|e| e.to_string())
-    }) {
+    match state
+        .store
+        .read()
+        .map_err(|e| e.to_string())
+        .and_then(|conn| tg_db::list(&conn).map_err(|e| e.to_string()))
+    {
         Ok(rows) => (StatusCode::OK, Json(json!({ "mappings": rows }))).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     }
@@ -89,9 +99,15 @@ struct CreateMappingReq {
 /// Telegram side, for an operator who wants to pre-link a chat_id (e.g.
 /// looked up via `getUpdates` before the bot has ever received `/link`) or
 /// fix a mapping without going through the chat.
-async fn create_mapping(State(state): State<AppState>, Json(body): Json<CreateMappingReq>) -> Response {
+async fn create_mapping(
+    State(state): State<AppState>,
+    Json(body): Json<CreateMappingReq>,
+) -> Response {
     if body.session.trim().is_empty() {
-        return err(StatusCode::BAD_REQUEST, json!({ "error": "session is required" }));
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "session is required" }),
+        );
     }
     let known = super::session_verbs::all_lane_names();
     if !known.iter().any(|n| n == &body.session) {
@@ -130,7 +146,10 @@ async fn create_mapping(State(state): State<AppState>, Json(body): Json<CreateMa
         .store
         .write_async(move |conn| {
             tg_db::upsert(conn, chat_id, &session, None, &chat_type)?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .await
         .map_err(|e| e.to_string());
@@ -145,13 +164,19 @@ async fn delete_mapping(State(state): State<AppState>, Path(chat_id): Path<i64>)
         .store
         .write_async(move |conn| {
             let removed = tg_db::remove(conn, chat_id)?;
-            Ok(crate::db::WriteOutcome { applied: removed, events: vec![] })
+            Ok(crate::db::WriteOutcome {
+                applied: removed,
+                events: vec![],
+            })
         })
         .await
         .map_err(|e| e.to_string());
     match result {
         Ok(reply) if reply.applied => StatusCode::NO_CONTENT.into_response(),
-        Ok(_) => err(StatusCode::NOT_FOUND, json!({ "error": "no mapping for that chat_id" })),
+        Ok(_) => err(
+            StatusCode::NOT_FOUND,
+            json!({ "error": "no mapping for that chat_id" }),
+        ),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     }
 }
@@ -174,9 +199,34 @@ struct SendReq {
     parse_mode: Option<String>,
 }
 
-async fn send(State(state): State<AppState>, Json(body): Json<SendReq>) -> Response {
+async fn send(
+    State(state): State<AppState>,
+    Extension(http): Extension<Arc<dyn HttpTransport>>,
+    headers: HeaderMap,
+    Json(body): Json<SendReq>,
+) -> Response {
+    if let Some(worker) = headers.get("X-Amux-Session").and_then(|v| v.to_str().ok()) {
+        let conn = state.store.read().ok();
+        if let Err(denial) = super::connectors::connector_entitlement_check(
+            conn.as_deref(),
+            &crate::config::amux_home(),
+            worker,
+            "telegram",
+            None,
+        ) {
+            tracing::warn!(
+                worker,
+                verdict = "telegram_send_not_entitled",
+                "worker connector scope denied Telegram send"
+            );
+            return err(StatusCode::FORBIDDEN, denial);
+        }
+    }
     if body.text.trim().is_empty() {
-        return err(StatusCode::BAD_REQUEST, json!({ "error": "text is required" }));
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "text is required" }),
+        );
     }
     let chat_id = match (body.chat_id, body.session.as_deref()) {
         (Some(id), _) => Some(id),
@@ -192,20 +242,63 @@ async fn send(State(state): State<AppState>, Json(body): Json<SendReq>) -> Respo
                     return err(
                         StatusCode::NOT_FOUND,
                         json!({ "error": "no Telegram chat linked to that session", "session": session }),
-                    )
+                    );
                 }
             }
         }
         (None, None) => {
-            return err(StatusCode::BAD_REQUEST, json!({ "error": "one of chat_id or session is required" }))
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "one of chat_id or session is required" }),
+            );
         }
     };
-    let Some(chat_id) = chat_id else { unreachable!() };
-    let Some(token) = std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.trim().is_empty()) else {
-        return err(StatusCode::PRECONDITION_FAILED, json!({ "error": "TELEGRAM_BOT_TOKEN not set" }));
+    let Some(chat_id) = chat_id else {
+        unreachable!()
     };
-    match telegram_poll::send_message(&token, chat_id, &body.text, body.parse_mode.as_deref()).await {
-        Ok(()) => (StatusCode::OK, Json(json!({ "sent": true, "chat_id": chat_id }))).into_response(),
+    // A worker's message to a chat it names by id may reach someone outside,
+    // so it needs an approved outbound request for that chat
+    // (api/outbound.rs, channel telegram, to <chat_id>). A message to the
+    // chat linked to its own session (the owner linked it, private only) is
+    // its relay to the owner and goes as before.
+    let mut approval: Option<String> = None;
+    let own_chat = |worker: &str| {
+        state.store.read().ok().and_then(|c| tg_db::by_chat(&c, chat_id).ok().flatten()).is_some_and(|m| m.session == worker)
+    };
+    if let (Some(worker), Some(_)) = (headers.get("X-Amux-Session").and_then(|v| v.to_str().ok()).filter(|w| !own_chat(w)), body.chat_id) {
+        let host = super::outbound::recipient_key("telegram", &chat_id.to_string());
+        approval = state.store.read().ok().and_then(|c| super::outbound::window_in(&c, worker, &host, crate::config::now_f64() as i64));
+        if approval.is_none() {
+            tracing::warn!(worker, chat_id, measured = true, n_considered = 1, verdict = "telegram_send_needs_approval",
+                "telegram: a worker's message to a chat by id has no approved outbound request; refused");
+            return err(StatusCode::FORBIDDEN, json!({
+                "code": "outbound_needs_approval",
+                "error": "a message to a Telegram chat by id needs the owner's approval of that exact message first",
+                "next": format!("POST $AMUX_URL/api/outbound {{\"channel\":\"telegram\",\"action\":\"message\",\"to\":\"{chat_id}\",\"text\":...,\"reason\":...}}; send it here once approved"),
+            }));
+        }
+    }
+    let Some(token) = telegram_poll::bot_token() else {
+        return err(
+            StatusCode::PRECONDITION_FAILED,
+            json!({ "error": "TELEGRAM_BOT_TOKEN not set" }),
+        );
+    };
+    match telegram_poll::send_message_with(
+        http.as_ref(),
+        &token,
+        chat_id,
+        &body.text,
+        body.parse_mode.as_deref(),
+    )
+    .await
+    {
+        Ok(()) => {
+            if let (Some(id), Some(worker)) = (&approval, headers.get("X-Amux-Session").and_then(|v| v.to_str().ok())) {
+                super::outbound::mark_sent(&state, id, worker, &format!("sent to Telegram chat {chat_id}")).await;
+            }
+            (StatusCode::OK, Json(json!({ "sent": true, "chat_id": chat_id, "approval": approval }))).into_response()
+        }
         Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e })),
     }
 }

@@ -93,7 +93,6 @@ fn the_parse_check_can_actually_fail() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // AMUX-3892 — a help text is DATA, and bash must not re-parse it.
 // ---------------------------------------------------------------------------
@@ -133,7 +132,10 @@ fn run_quiet(args: &[&str]) -> (i32, String) {
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .output()
         .unwrap_or_else(|e| panic!("run amux {args:?}: {e}"));
-    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned())
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// A help text is DATA: no unquoted heredoc in the CLI may contain a live
@@ -194,8 +196,10 @@ fn no_unquoted_heredoc_in_the_cli_re_parses_its_own_text() {
         // quoted, so bash does not expand them and they are not our problem.
         if let Some(pos) = raw.find("<<") {
             let rest = raw[pos + 2..].trim_start_matches('-');
-            let tag: String =
-                rest.chars().take_while(|c| c.is_ascii_uppercase() || *c == '_').collect();
+            let tag: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                .collect();
             if !tag.is_empty() && rest.starts_with(&tag) && rest[tag.len()..].trim().is_empty() {
                 in_heredoc = Some(tag);
             }
@@ -216,7 +220,12 @@ fn no_unquoted_heredoc_in_the_cli_re_parses_its_own_text() {
 fn help_prints_nothing_to_stderr() {
     for args in [vec!["help"], vec!["board", "help"]] {
         let (rc, err) = run_quiet(&args);
-        assert_eq!(rc, 0, "`amux {}` must succeed; stderr: {err}", args.join(" "));
+        assert_eq!(
+            rc,
+            0,
+            "`amux {}` must succeed; stderr: {err}",
+            args.join(" ")
+        );
         assert!(
             err.is_empty(),
             "`amux {}` wrote to stderr. A help text is data and bash must not \
@@ -274,5 +283,52 @@ fn the_stderr_check_can_actually_fail() {
         Some(0),
         "the broken specimen still exits 0 — which is why rc is not a usable \
          signal here and stderr has to be"
+    );
+}
+
+/// `mktemp -t NAME` with no X's works on macOS and fails on Linux ("too few
+/// X's in template"), so it passes every local run and reds CI. It has done so
+/// at least four times: fleet-boot's health probe, test-claude-scratch-report,
+/// and on 2026-10-24 `amux sync-checkout --override` (2fcc84d97), which held
+/// every deploy. A template with X's (`NAME.XXXXXX`) works on both.
+#[test]
+fn every_mktemp_template_carries_xs_for_gnu() {
+    let root = repo_root();
+    let mut files = vec![root.join("amux")];
+    for dir in ["scripts", ".githooks"] {
+        if let Ok(rd) = std::fs::read_dir(root.join(dir)) {
+            files.extend(rd.flatten().map(|e| e.path()).filter(|p| p.is_file()));
+        }
+    }
+    let mut bad = Vec::new();
+    for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for (n, line) in text.lines().enumerate() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            // A trailing ` # comment` can mention `mktemp -t` in prose.
+            let mut rest = line.split(" #").next().unwrap_or(line);
+            while let Some(i) = rest.find("mktemp ") {
+                rest = &rest[i + 7..];
+                // Only mktemp's own flags count, so a later `-t` in a comment
+                // or another command is not read as this call's template.
+                let toks: Vec<&str> = rest.split_whitespace().collect();
+                let flags = toks.iter().take_while(|t| t.starts_with('-')).count();
+                if let Some(t) = toks[..flags].iter().position(|t| *t == "-t" || *t == "-dt") {
+                    let tmpl = toks.get(t + 1).copied().unwrap_or("");
+                    if !tmpl.contains("XXX") {
+                        bad.push(format!("{}:{}: {}", f.display(), n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "mktemp -t templates without X's fail on Linux (GNU mktemp); add .XXXXXX:\n{}",
+        bad.join("\n")
     );
 }

@@ -31,9 +31,8 @@ const vendorGlobals = {
   Papa: 'readonly',          // papaparse
   marked: 'readonly',        // marked
   DOMPurify: 'readonly',     // dompurify
+  remend: 'readonly',        // remend, in the same vendor/md.js bundle (scripts/build-md.mjs)
   Sortable: 'readonly',      // sortablejs
-  Quill: 'readonly',         // quill
-  QuillMarkdown: 'readonly', // quilljs-markdown
   Chart: 'readonly',         // chart.js
   Motion: 'readonly',        // motion.dev
   GridStack: 'readonly',     // gridstack
@@ -45,6 +44,30 @@ const vendorGlobals = {
   L: 'readonly',             // leaflet (+ markercluster)
   FullCalendar: 'readonly',  // fullcalendar
   posthog: 'readonly',       // posthog snippet (index.html inline bootstrap)
+  // xlsx editor (ef0052c7): ExcelJS + Univer UMD bundles, loaded on demand by
+  // the file viewer. Missing here, they reddened every PR's e2e lint.
+  ExcelJS: 'readonly',
+  UniverCore: 'readonly',
+  UniverCoreFacade: 'readonly',
+  UniverDesignEnUS: 'readonly',
+  UniverDocs: 'readonly',
+  UniverDocsUi: 'readonly',
+  UniverDocsUiEnUS: 'readonly',
+  UniverEngineFormula: 'readonly',
+  UniverEngineRender: 'readonly',
+  UniverSheets: 'readonly',
+  UniverSheetsEnUS: 'readonly',
+  UniverSheetsFormula: 'readonly',
+  UniverSheetsFormulaUi: 'readonly',
+  UniverSheetsFormulaUiEnUS: 'readonly',
+  UniverSheetsNumfmt: 'readonly',
+  UniverSheetsNumfmtUi: 'readonly',
+  UniverSheetsNumfmtUiEnUS: 'readonly',
+  UniverSheetsUi: 'readonly',
+  UniverSheetsUiEnUS: 'readonly',
+  UniverThemes: 'readonly',
+  UniverUi: 'readonly',
+  UniverUiEnUS: 'readonly',
 };
 
 const gateRules = {

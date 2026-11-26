@@ -51,11 +51,19 @@ test('header badge, controls and text tabs fit both themes from phone through de
  for(const light of [true,false])for(const width of [375,600,601,768,1440]){
   await page.setViewportSize({width,height:900});
   await page.evaluate(light=>{document.body.classList.toggle('light',light);const badge=document.querySelector<HTMLElement>('#notif-badge')!;badge.textContent='99+';badge.style.display='flex';},light);
-  await expect.poll(()=>page.evaluate(()=>(window as any)._headerLayoutCheck())).toEqual([]);
-  await expect.poll(()=>page.evaluate(()=>{const r=document.querySelector('#notif-btn')!.getBoundingClientRect(),b=document.querySelector('#notif-badge')!.getBoundingClientRect();return b.left>=r.left-0.1&&b.right<=r.right+0.1;})).toBe(true);
+  // The app's own badge refresh (_notifUpdateBadge, once Needs You loads) sets
+  // the real count and hides a zero badge, which collapsed its box and failed the
+  // fit check for the whole poll (ios-safari CI f2bb59c75). Each poll re-applies
+  // the widest badge before it measures.
+  const widest=()=>{const badge=document.querySelector<HTMLElement>('#notif-badge')!;badge.textContent='99+';badge.style.display='flex';};
+  await expect.poll(()=>page.evaluate(`(${widest})(),_headerLayoutCheck()`)).toEqual([]);
+  await expect.poll(()=>page.evaluate(`(${widest})(),(()=>{const r=document.querySelector('#notif-btn').getBoundingClientRect(),b=document.querySelector('#notif-badge').getBoundingClientRect();return b.left>=r.left-0.1&&b.right<=r.right+0.1;})()`)).toBe(true);
   if(width===375){
-   const tab=await page.locator('#tab-calendar').boundingBox(),strip=await page.locator('.tab-bar').boundingBox();
-   expect(tab!.x+tab!.width).toBeLessThanOrEqual(strip!.x+strip!.width);
+   // The FOURTH visible tab, whichever it is: the strip's order changes over
+   // time (the Projects tab led it from cbf4d384 until it was removed).
+   const fit=await page.evaluate(()=>{const strip=document.querySelector('.tab-bar')!.getBoundingClientRect();const tabs=[...document.querySelectorAll<HTMLElement>('.tab-bar [id^="tab-"]')].filter(t=>t.offsetParent!==null&&getComputedStyle(t).display!=='none');const t=tabs[3];return t?{id:t.id,right:t.getBoundingClientRect().right,limit:strip.right}:null;});
+   expect(fit,'at least four tabs are visible').not.toBeNull();
+   expect(fit!.right,`${fit!.id} must fit inside the strip`).toBeLessThanOrEqual(fit!.limit);
   }
   if(width===375||width===1440)await page.screenshot({path:info.outputPath('header-'+width+'-'+(light?'light':'dark')+'.png'),clip:{x:0,y:0,width,height:200}});
  }

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -20,7 +20,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
 
   <script type="application/ld+json">{
     "@context":"https://schema.org",
@@ -39,7 +38,7 @@
     "author":{"@type":"Organization","name":"amux","url":"https://amux.io"},
     "publisher":{"@type":"Organization","name":"amux","url":"https://amux.io","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}},
     "datePublished":"2026-05-11",
-    "dateModified":"2026-08-03",
+    "dateModified":"2026-11-05",
     "mainEntityOfPage":"https://amux.io/blog/best-terminal-ai-coding-agents-2026/"
   }</script>
   <script type="application/ld+json">{
@@ -66,7 +65,7 @@
       {"@type":"Question","name":"Which terminal AI coding agent has the best code quality?","acceptedAnswer":{"@type":"Answer","text":"Claude Code with Opus 4.7 leads SWE-bench Verified at approximately 82%, the highest of any AI coding agent. Codex CLI with OpenAI's latest models scores around 72-75%. Warp achieves 71% on SWE-bench Verified. Aider is the most-tested across models and publishes its own edit-format leaderboard. However, code quality depends primarily on the underlying model, not the CLI tool — and most open-source agents (OpenCode, Aider, Goose) let you choose any model, so you can use Opus 4.7 with any of them."}},
       {"@type":"Question","name":"Can I use local LLMs with terminal AI coding agents?","acceptedAnswer":{"@type":"Answer","text":"Yes. OpenCode supports 75+ providers including Ollama for local models. Aider works with any OpenAI-compatible API, including Ollama and LM Studio. Goose supports Ollama and local models natively. Codex CLI supports OpenAI-compatible endpoints. Claude Code is locked to Anthropic's Claude models. Gemini CLI is locked to Google's Gemini models. For privacy-first or offline development, OpenCode and Aider are the best choices."}},
       {"@type":"Question","name":"What is the difference between a terminal AI coding agent and an AI IDE like Cursor?","acceptedAnswer":{"@type":"Answer","text":"Terminal AI coding agents (Claude Code, Gemini CLI, Codex CLI, OpenCode, Aider) run in your existing terminal — they read files, edit code, and run commands without a GUI. AI IDEs (Cursor, Windsurf) are full graphical editors with AI built in, including inline completions and visual diffs. Terminal agents are better for automation, scripting, headless operation, and parallel agent workflows. IDEs are better for interactive editing with inline completions. Many developers use both: an IDE for day-to-day coding and terminal agents for batch/autonomous work."}},
-      {"@type":"Question","name":"Which terminal coding agent is best for running multiple agents in parallel?","acceptedAnswer":{"@type":"Answer","text":"Claude Code is purpose-built for parallel execution — it runs as a standalone CLI process that can be spawned in multiple tmux sessions. Tools like amux orchestrate fleets of 10-50+ Claude Code agents with crash recovery, task coordination, and a web dashboard. Codex CLI supports parallel cloud sandbox tasks via the Automations API. Warp runs up to 4 concurrent cloud agents on its free tier. OpenCode and Aider are single-session tools but can be manually parallelized in separate terminals."}},
+      {"@type":"Question","name":"Which terminal coding agent is best for running multiple agents in parallel?","acceptedAnswer":{"@type":"Answer","text":"Claude Code is purpose-built for parallel execution — it runs as a standalone CLI process that can be spawned in multiple tmux sessions. Tools like amux orchestrate fleets of 10-50+ Claude Code agents with usage-limit resume, stall alerts, task coordination, and a web dashboard. Codex CLI supports parallel cloud sandbox tasks via the Automations API. Warp runs up to 4 concurrent cloud agents on its free tier. OpenCode and Aider are single-session tools but can be manually parallelized in separate terminals."}},
       {"@type":"Question","name":"Is Gemini CLI really free?","acceptedAnswer":{"@type":"Answer","text":"Yes. Gemini CLI offers 1,000 requests per day and 60 per minute completely free with a personal Google account. No credit card, no API key setup, no trial period. It uses the Gemini 3 Pro model with a 1M token context window. For higher limits, you can use a Gemini API key with pay-as-you-go pricing. This makes Gemini CLI the most accessible entry point for terminal-based AI coding."}},
       {"@type":"Question","name":"What happened to Goose? Is it still maintained by Block?","acceptedAnswer":{"@type":"Answer","text":"Goose was originally created by Block (Square's parent company). In December 2025, it was transferred to the Agentic AI Foundation (AAIF) under the Linux Foundation, alongside Anthropic's MCP protocol and OpenAI's AGENTS.md standard. Goose is now an AAIF project with institutional backing, active development, and 70+ MCP extensions. It's not just a coding agent — it's a general-purpose AI agent for code, workflows, research, and automation."}},
       {"@type":"Question","name":"Claude Code vs Gemini CLI vs Codex CLI: which should I pick?","acceptedAnswer":{"@type":"Answer","text":"Choose Claude Code if you want the highest code quality (Opus 4.7 leads benchmarks), the deepest extensibility (hooks, subagents, MCP, Agent SDK), and the ability to run agent fleets. Choose Gemini CLI if you want the most generous free tier (1,000 req/day) and the largest context window (1M tokens). Choose Codex CLI if you want the strongest sandboxing (OS-level isolation), the fastest execution (Rust-native, 240+ tokens/sec), and deep OpenAI ecosystem integration. All three are strong choices — the best pick depends on your preferred model provider and whether you need free access (Gemini), maximum quality (Claude), or maximum safety (Codex)."}}
@@ -119,43 +118,68 @@
       .axis-grid{grid-template-columns:1fr}
     }
   </style>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
   <main>
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">&rsaquo;</span> <a href="/blog/">Blog</a> <span class="sep">&rsaquo;</span> <span>Best Terminal AI Coding Agents 2026</span></div>
 
     <h1>Best Terminal AI Coding Agents in 2026</h1>
-    <p style="font-size:0.82rem;color:var(--muted);margin-bottom:0.5rem">Updated August 2026 — new: Gemini CLI full parity, amux read-aloud (Piper TTS), amux v0.9.202+ features</p>
-    <p class="subtitle">The IDE is optional. In 2026, the most productive developers run AI coding agents directly in the terminal &mdash; headless, scriptable, parallelizable. Eight CLI tools now dominate this space: <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a>, <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a>, <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a>, <a href="https://github.com/anomalyco/opencode" target="_blank" rel="noopener">OpenCode</a>, <a href="https://aider.chat/" target="_blank" rel="noopener">Aider</a>, <a href="https://www.warp.dev/" target="_blank" rel="noopener">Warp</a>, <a href="https://github.com/block/goose" target="_blank" rel="noopener">Goose</a>, and <a href="https://aws.amazon.com/q/developer/" target="_blank" rel="noopener">Amazon Q Developer CLI</a>. This guide compares all of them.</p>
+    <p style="font-size:0.82rem;color:var(--muted);margin-bottom:0.5rem">Updated August 2026</p>
+    <p class="subtitle">The IDE is optional. In 2026, the most productive developers run AI coding agents directly in the terminal: headless, scriptable, parallelizable. Eight CLI tools now dominate this space: <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a>, <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a>, <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a>, <a href="https://github.com/anomalyco/opencode" target="_blank" rel="noopener">OpenCode</a>, <a href="https://aider.chat/" target="_blank" rel="noopener">Aider</a>, <a href="https://www.warp.dev/" target="_blank" rel="noopener">Warp</a>, <a href="https://github.com/block/goose" target="_blank" rel="noopener">Goose</a>, and <a href="https://aws.amazon.com/q/developer/" target="_blank" rel="noopener">Amazon Q Developer CLI</a>. This guide compares all of them.</p>
 
     <!-- EXP-020: top-of-page CTA — 174 PVs / 2 GH clicks (1.2% CVR); same pattern as EXP-015 WIN +200% -->
-    <div style="background:oklch(0.85 0.15 145 / .1);border:1px solid oklch(0.75 0.15 145 / .4);border-radius:8px;padding:1rem 1.4rem;margin:1.5rem 0;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
-      <div style="flex:1;min-width:200px">
-        <p style="margin:0;font-size:0.9rem;color:var(--text);line-height:1.5">Running Claude Code, Gemini CLI, and Codex in parallel? amux orchestrates a fleet of terminal agents with self-healing, a shared kanban board, and a web + mobile dashboard.</p>
-      </div>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="posthog.capture('exp020_blog_topofpage_cta_click',{page:window.location.pathname})" style="display:inline-flex;align-items:center;gap:0.4rem;background:oklch(0.65 0.18 145);color:#fff;padding:0.5rem 1rem;border-radius:6px;font-size:0.85rem;font-weight:600;text-decoration:none;white-space:nowrap">View amux on GitHub ★</a>
-    </div>
 
     <!-- ───────── TL;DR ───────── -->
     <div class="tldr">
       <h3>Quick picks</h3>
-      <p><strong>Best overall:</strong> <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> &mdash; strongest model, deepest extensibility, built for agent fleets</p>
-      <p><strong>Best free:</strong> <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a> &mdash; 1,000 requests/day free, 1M token context, no credit card</p>
-      <p><strong>Best open source:</strong> <a href="https://github.com/anomalyco/opencode" target="_blank" rel="noopener">OpenCode</a> &mdash; 150k+ GitHub stars, 75+ model providers, MIT license</p>
-      <p><strong>Best for safety:</strong> <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a> &mdash; OS-level sandboxing, Rust-native, 240+ tokens/sec</p>
-      <p><strong>Best git integration:</strong> <a href="https://aider.chat/" target="_blank" rel="noopener">Aider</a> &mdash; auto-commits every edit, repo map, battle-tested since 2023</p>
+      <p><strong>Best overall:</strong> <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a>: strongest model, deepest extensibility, built for agent fleets</p>
+      <p><strong>Best free:</strong> <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a>: 1,000 requests/day free, 1M token context, no credit card</p>
+      <p><strong>Best open source:</strong> <a href="https://github.com/anomalyco/opencode" target="_blank" rel="noopener">OpenCode</a>: 150k+ GitHub stars, 75+ model providers, MIT license</p>
+      <p><strong>Best for safety:</strong> <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a>: OS-level sandboxing, Rust-native, 240+ tokens/sec</p>
+      <p><strong>Best git integration:</strong> <a href="https://aider.chat/" target="_blank" rel="noopener">Aider</a>: auto-commits every edit, repo map, battle-tested since 2023</p>
+      <p><strong>Best for running several at once:</strong> <a href="/">amux</a>: runs Claude Code, Codex, Gemini CLI and OpenCode side by side as workers on one board, from your browser or phone, self-hosted free or on an always-on Cloud server</p>
+    </div>
+
+    <div class="cta-box" data-cta-loc="cloud-inline-top">
+      <p style="margin:0;"><strong>Running more than one of these?</strong> amux runs Claude Code, Codex, Gemini CLI and OpenCode side by side, each as a worker on one shared board you steer from your browser or phone. Self-host it free, or let <strong>amux Cloud</strong> keep them running on your own server at <code>yourname.amux.io</code> while your laptop sleeps, from $39/mo.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-top:1rem;">
+        <a class="btn btn-primary" href="/start/?source=best-terminal-ai-coding-agents-2026">Start amux Cloud</a>
+        <a class="btn" href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">Self-host free on GitHub</a>
+      </div>
+      <p style="font-size:0.88rem;color:var(--fg-dim);margin:1rem 0 0;">Freelancer, agency or small team? <a href="/start/?plan=team&amp;source=best-terminal-ai-coding-agents-2026" style="color:var(--accent);">Cloud Team</a> is $69/mo with 8 vCPU and 16 GB RAM, twice the room of Solo for agents across several client projects.</p>
     </div>
 
     <nav class="toc" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem 1.6rem;margin:2rem 0;">
@@ -538,20 +562,18 @@
       <div class="tool-meta">
         <span>By <a href="https://www.warp.dev/" target="_blank" rel="noopener">Warp Inc.</a></span>
         <span>Rust &middot; AGPL-3.0</span>
-        <span><a href="https://github.com/warpdotdev/warp" target="_blank" rel="noopener">~57k stars on GitHub</a></span>
+        <span><a href="https://github.com/warpdotdev/warp" target="_blank" rel="noopener">~66k stars on GitHub</a></span>
       </div>
-      <p><a href="https://www.warp.dev/" target="_blank" rel="noopener">Warp</a> is different from the other tools on this list: it&rsquo;s not a CLI agent you run <em>inside</em> a terminal &mdash; it <em>is</em> the terminal. <a href="https://www.warp.dev/" target="_blank" rel="noopener">Warp 2.0</a> rebranded from &ldquo;terminal&rdquo; to &ldquo;Agentic Development Environment&rdquo; with four integrated capabilities: Code, Agents, Terminal, and Drive. It also <a href="https://github.com/warpdotdev/warp" target="_blank" rel="noopener">went open source</a> in 2026.</p>
+      <p><a href="https://www.warp.dev/" target="_blank" rel="noopener">Warp</a> is the terminal itself rather than a CLI agent you run inside one. It calls itself an agentic development environment: the Warp Terminal (macOS, Linux and Windows) has its own Warp Agent that routes work across models from OpenAI, Anthropic and others, and it can host the other agents on this list.</p>
       <ul>
-        <li><strong>Terminal + Agent + IDE</strong> &mdash; not just a CLI tool; a full development environment with code editing, file management, and agent capabilities in one app</li>
-        <li><strong>Agent multi-threading</strong> &mdash; run multiple agent tasks concurrently within the same workspace (up to 4 on free, more on paid)</li>
-        <li><strong>71% SWE-bench Verified</strong> &mdash; #1 on <a href="https://www.warp.dev/" target="_blank" rel="noopener">Terminal-Bench</a> (52%), competitive on SWE-bench</li>
-        <li><strong>Multi-model</strong> &mdash; supports <a href="https://anthropic.com/" target="_blank" rel="noopener">Claude</a>, <a href="https://openai.com/" target="_blank" rel="noopener">GPT</a>, <a href="https://deepmind.google/technologies/gemini/" target="_blank" rel="noopener">Gemini</a>, and BYOK (bring your own key)</li>
-        <li><strong>Runs other agents</strong> &mdash; natively supports running <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a>, <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex</a>, and <a href="https://github.com/google-gemini/gemini-cli" target="_blank" rel="noopener">Gemini CLI</a> within Warp</li>
-        <li><strong>700k+ developers</strong> &mdash; large active user base across macOS, Linux, and Windows</li>
+        <li><strong>Runs other agents:</strong> Claude Code, Codex, OpenCode and Gemini CLI in vertical tabs that show each session's git branch, worktree and pull request</li>
+        <li><strong>Cloud agents:</strong> the Oz platform runs agents on Warp's servers, and Warp Factories define fleets of agents in a YAML file</li>
+        <li><strong>Open client:</strong> the client code is on GitHub under AGPL v3, with the UI crates under MIT</li>
+        <li><strong>Large user base:</strong> Warp says more than 800,000 developers use it</li>
       </ul>
       <div class="tool-verdict">
-        <strong>Best for:</strong> Developers who want an all-in-one environment that replaces their terminal, IDE, and file manager. Teams that want a polished GUI experience with agent capabilities baked in.<br>
-        <strong>Trade-off:</strong> A different category than pure CLI agents &mdash; more of an IDE competitor. Credit-based pricing ($18&ndash;$180/mo). Not headless &mdash; requires the Warp desktop app. Cloud agent features require paid plans.
+        <strong>Best for:</strong> Developers who want a modern terminal with an agent built in and their other CLI agents in tabs.<br>
+        <strong>Trade-off:</strong> It is a desktop app, so it is not headless. Plans run from free to $200 a month, or $50 per seat for teams. For a shared board and phone access across many agents, see <a href="/compare/amux-vs-warp/">amux vs Warp</a>.
       </div>
     </div>
 
@@ -648,7 +670,7 @@
           <tr>
             <td><a href="https://www.warp.dev/" target="_blank" rel="noopener" class="tl">Warp</a></td>
             <td class="y">75 credits/mo</td>
-            <td>$18/mo (Build)</td>
+            <td>$20/mo (Build)</td>
             <td>Included in credits</td>
           </tr>
           <tr>
@@ -715,7 +737,7 @@
     <div class="axis-grid">
       <div class="axis-card">
         <h4><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a></h4>
-        <p>Open-source control plane for <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agent fleets. Web dashboard, mobile PWA, self-healing watchdog, shared kanban board with atomic task claiming. Single Rust binary, zero dependencies.</p>
+        <p>Self-hosted control plane for <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> agent fleets. Web dashboard, mobile PWA, usage-limit resume and stall alerts, shared kanban board with atomic task claiming. Single Rust binary, zero dependencies.</p>
       </div>
       <div class="axis-card">
         <h4>DIY tmux</h4>
@@ -731,15 +753,15 @@
       <h3><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> &mdash; fleet orchestration for terminal agents</h3>
       <div class="tool-meta">
         <span>By <a href="https://mixpeek.com/" target="_blank" rel="noopener">Mixpeek</a></span>
-        <span>Open source (MIT)</span>
+        <span>Source-available (MIT + Commons Clause)</span>
         <span><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a></span>
       </div>
-      <p>The terminal agents above are powerful individually. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> makes them powerful <em>at scale</em>: spawn 10&ndash;50+ <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a>, <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a>, or Antigravity CLI (agy) sessions, monitor them from a web dashboard or your phone, auto-recover from crashes, and coordinate tasks through a shared board. <strong>315★ GitHub</strong>, MIT licensed. One Rust binary. No Docker. No npm. Installs in one command.</p>
+      <p>The terminal agents above are powerful individually. <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> makes them powerful <em>at scale</em>: spawn 10&ndash;50+ <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a>, <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a>, or Antigravity CLI (agy) sessions, monitor them from a web dashboard or your phone, resume them after usage limits, and coordinate tasks through a shared board. <strong>315★ GitHub</strong>, MIT + Commons Clause. One Rust binary. No Docker. No npm. Installs in one command.</p>
       <ul style="margin:0.8rem 0 0;font-size:0.88rem;color:var(--dim);">
         <li><strong>Mobile dashboard + PWA</strong> — manage your entire agent fleet from your phone; iOS app available</li>
         <li><strong>Offline scrollback cache (v0.9.200)</strong> — every agent's output cached locally so you can review work during commutes, flights, or dead zones</li>
         <li><strong>Voice dictation (v0.9.202)</strong> — dictate messages to agents using local Whisper (12× faster than cloud, works fully offline); persistent outbox so no audio is ever lost</li>
-        <li><strong>Self-healing watchdog</strong> — detects stalled agents, replays last message, restarts crashed sessions unattended</li>
+        <li><strong>Recovery</strong> — holds delivery through usage limits and resumes at the provider's reset, brings every worker back in its own conversation after a macOS reboot, and flags stalled board work with an owner alert</li>
         <li><strong>Built-in CRM, email, scheduler</strong> — beyond coding agents: run business operations from the same dashboard</li>
       </ul>
     </div>
@@ -748,15 +770,14 @@
     <div style="background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.3);border-radius:8px;padding:20px 24px;margin:32px 0;display:flex;align-items:center;gap:20px;flex-wrap:wrap">
       <div style="flex:1;min-width:200px">
         <div style="font-weight:600;font-size:1rem;margin-bottom:4px">amux — orchestrate your entire agent fleet from one dashboard (315★ GitHub)</div>
-        <div style="color:var(--muted);font-size:.9rem">Open-source control plane for Claude Code, Codex CLI, and Antigravity CLI. Self-healing, offline scrollback, voice dictation, mobile PWA, kanban, CRM — MIT licensed, single Rust binary.</div>
+        <div style="color:var(--muted);font-size:.9rem">Self-hosted control plane for Claude Code, Codex CLI, and Antigravity CLI. Usage-limit resume, stall alerts, offline scrollback, voice dictation, mobile PWA, kanban, CRM — MIT + Commons Clause, single Rust binary.</div>
       </div>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="posthog&&posthog.capture('exp014_guide_github_cta_click',{page:window.location.pathname})" style="background:#6366f1;color:#fff;padding:10px 20px;border-radius:6px;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0">View on GitHub ★</a>
     </div>
 
     <pre><code><span class="dim"># Install and run 5 agents on your project</span>
-git clone https://github.com/mixpeek/amux && cd amux && ./install.sh
-amux register myproject --dir ~/Dev/myproject --yolo
-amux scale myproject --count 5
+curl -fsSL https://amux.io/install.sh | bash
+for i in 1 2 3 4 5; do amux register myproject-$i --dir ~/Dev/myproject --yolo; amux start myproject-$i --detach; done
 amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
 
     <p>See our <a href="/blog/best-multi-agent-orchestrators-2026/">complete orchestrator comparison</a> for the full landscape.</p>
@@ -797,7 +818,7 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
       <details style="background:var(--surface);border:1px solid var(--border);border-radius:8px;margin-bottom:0.8rem;">
         <summary style="padding:1rem 1.2rem;cursor:pointer;font-weight:600;font-size:0.92rem;">Which tool is best for running multiple agents in parallel?</summary>
         <div style="padding:0 1.2rem 1rem;font-size:0.88rem;color:var(--dim);line-height:1.7;">
-          <p><a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> is purpose-built for parallel execution. Tools like <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> orchestrate fleets of 10&ndash;50+ <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> sessions with crash recovery, task coordination, and a web dashboard. <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a> supports parallel cloud sandbox tasks via the Automations API. <a href="https://www.warp.dev/" target="_blank" rel="noopener">Warp</a> runs up to 4 concurrent cloud agents on its free tier.</p>
+          <p><a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> is purpose-built for parallel execution. Tools like <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">amux</a> orchestrate fleets of 10&ndash;50+ <a href="https://code.claude.com/" target="_blank" rel="noopener">Claude Code</a> sessions with usage-limit resume, stall alerts, task coordination, and a web dashboard. <a href="https://github.com/openai/codex" target="_blank" rel="noopener">Codex CLI</a> supports parallel cloud sandbox tasks via the Automations API. <a href="https://www.warp.dev/" target="_blank" rel="noopener">Warp</a> runs up to 4 concurrent cloud agents on its free tier.</p>
         </div>
       </details>
 
@@ -826,9 +847,19 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
     <!-- ───────── CTA ───────── -->
     <div style="background:var(--accent-dim);border:1px solid var(--amber);border-radius:8px;padding:1.4rem 1.6rem;margin:3rem 0 2rem;text-align:center;">
       <p style="font-size:1rem;font-weight:600;margin:0 0 0.5rem;">One agent is a tool. A fleet is a force multiplier.</p>
-      <p style="font-size:0.88rem;color:var(--dim);margin:0 0 1rem;">amux orchestrates dozens of Claude Code agents with crash recovery, task coordination, and a web dashboard.</p>
+      <p style="font-size:0.88rem;color:var(--dim);margin:0 0 1rem;">amux orchestrates dozens of Claude Code agents with usage-limit resume, stall alerts, task coordination, and a web dashboard.</p>
       <a href="/guides/getting-started/" style="display:inline-block;background:var(--amber);color:var(--bg);padding:0.6rem 1.4rem;border-radius:6px;text-decoration:none;font-weight:600;font-size:0.88rem;">Get Started</a>
       <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" style="display:inline-block;background:var(--surface);color:var(--text);padding:0.6rem 1.4rem;border-radius:6px;text-decoration:none;font-weight:600;font-size:0.88rem;margin-left:0.6rem;border:1px solid var(--border);">View on GitHub</a>
+    </div>
+
+    <div class="cta-box" data-cta-loc="cloud-inline-end">
+      <h3>Or let amux Cloud run it for you</h3>
+      <p>Your agents keep running when your laptop sleeps, and you steer them from your phone with the web app or the iOS app. You get your own always-on server at <code>yourname.amux.io</code> from $39/mo, signed in with your own Claude, ChatGPT or Gemini account or an API key.</p>
+      <div style="display:flex;flex-wrap:wrap;gap:0.75rem;margin-top:1rem;">
+        <a class="btn btn-primary" href="/start/?source=best-terminal-ai-coding-agents-2026">Start amux Cloud</a>
+        <a class="btn" href="/pricing/">See pricing</a>
+      </div>
+      <p style="font-size:0.88rem;color:var(--fg-dim);margin:1rem 0 0;">Freelancer, agency or small team? <a href="/start/?plan=team&amp;source=best-terminal-ai-coding-agents-2026" style="color:var(--accent);">Cloud Team</a> is $69/mo with 8 vCPU and 16 GB RAM, twice the room of Solo for agents across several client projects.</p>
     </div>
 
     <!-- ───────── Related ───────── -->
@@ -838,6 +869,8 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
         <li><a href="/blog/claude-code-vs-cursor-vs-windsurf/" style="color:var(--dim);text-decoration:none;">Claude Code vs Cursor vs Windsurf (2026)</a></li>
         <li><a href="/blog/best-ai-coding-tools-2026/" style="color:var(--dim);text-decoration:none;">Best AI Coding Tools 2026 (all categories)</a></li>
         <li><a href="/blog/best-multi-agent-orchestrators-2026/" style="color:var(--dim);text-decoration:none;">Best Multi-Agent Orchestrators 2026</a></li>
+        <li><a href="/guides/best-ai-coding-agent-dashboards-2026/" style="color:var(--dim);text-decoration:none;">Best AI Coding Agent Dashboards 2026</a></li>
+        <li><a href="/guides/best-claude-code-session-managers-2026/" style="color:var(--dim);text-decoration:none;">Best Claude Code Session Managers 2026</a></li>
         <li><a href="/blog/best-ai-agent-sdks-2026/" style="color:var(--dim);text-decoration:none;">Best AI Agent SDKs 2026</a></li>
         <li><a href="/compare/amux-vs-aider/" style="color:var(--dim);text-decoration:none;">amux vs Aider</a></li>
         <li><a href="/compare/amux-vs-codex/" style="color:var(--dim);text-decoration:none;">amux vs OpenAI Codex</a></li>
@@ -846,51 +879,24 @@ amux serve  <span class="dim"># → https://localhost:8824</span></code></pre>
     </div>
 
   </main>
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
   <script>
     fetch('https://api.github.com/repos/mixpeek/amux')
       .then(r=>r.json())

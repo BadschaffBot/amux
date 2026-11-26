@@ -37,7 +37,304 @@ use std::time::Duration;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/pull", post(pull))
+    Router::new().route("/api/pull", post(pull).get(pull_status))
+}
+
+// ---- deploy status: what this server runs, against main -----------------
+//
+// Ethan, 2026-10-24: "i should easily keep the mac server up to date". The
+// button used to report the shared checkout's `git pull` ("Already up to
+// date") while the server ran a hand build of a fork two weeks behind main,
+// and while the CI gate held every deploy. Neither fact reached the Settings
+// card. Now GET /api/pull says what runs, what main has, and what the gate is
+// doing, and POST adds the same report after it fetches and starts the builder.
+
+/// The ref the activation authority deploys from (its launchd plist sets it).
+fn activation_ref() -> String {
+    std::env::var("AMUX_RS_ACTIVATION_REF").unwrap_or_else(|_| "origin/main".into())
+}
+
+pub(crate) fn gate_state() -> Option<serde_json::Value> {
+    let path = std::env::var("AMUX_ACTIVATION_GATE_STATE")
+        .map(PathBuf::from)
+        // home() is already ~/.amux (AF-1127). This joined ".amux/" onto it, so
+        // it read ~/.amux/.amux/activation-gate.json, which nothing writes, and
+        // the deploy invariant and Settings never saw a CI hold.
+        .unwrap_or_else(|_| crate::api::session_verbs::home().join("activation-gate.json"));
+    let state = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if state.is_none() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(path = %path.display(), measured = false, n_considered = 0,
+                verdict = "activation_gate_unread",
+                "the activation gate's state could not be read; deploy lag cannot tell a CI hold from a stalled builder");
+        });
+    }
+    state
+}
+
+/// Push-to-live over the last deploys, from the builder's
+/// ~/.amux/deploy-latency.jsonl (one line per activation, seconds from the
+/// push). Ethan, 2026-11-12: "full amux cicd ... less than 2 mins ... metrics".
+/// `unmeasured` counts deploys whose push time was not known, so an empty
+/// percentile is never read as a fast one.
+pub(crate) fn push_to_live(raw: &str, last: usize) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let recent = &rows[rows.len().saturating_sub(last)..];
+    // Over every deploy, and over those that needed a new binary (compiled here or
+    // received prebuilt): a restamp goes live in seconds and would hide the slow ones.
+    let summary = |sel: &[&serde_json::Value]| {
+        let mut secs: Vec<i64> = sel.iter().filter_map(|r| r.get("from_push_s")?.as_i64()).collect();
+        secs.sort_unstable();
+        let pct = |p: usize| (!secs.is_empty()).then(|| secs[(secs.len() - 1) * p / 100]);
+        json!({
+            "measured": !secs.is_empty(),
+            "n_considered": sel.len(),
+            "unmeasured": sel.len() - secs.len(),
+            "p50_s": pct(50),
+            "p90_s": pct(90),
+            "max_s": secs.last(),
+            "under_120_s": secs.iter().filter(|s| **s < 120).count(),
+        })
+    };
+    let all: Vec<&serde_json::Value> = recent.iter().collect();
+    let built: Vec<&serde_json::Value> = recent
+        .iter()
+        .filter(|r| matches!(r.get("kind").and_then(|k| k.as_str()), Some("compiled" | "prebuilt")))
+        .collect();
+    let mut out = summary(&all);
+    out["built"] = summary(&built);
+    out["last"] = recent.last().cloned().unwrap_or(serde_json::Value::Null);
+    out
+}
+
+fn push_to_live_now() -> serde_json::Value {
+    let path = std::env::var("AMUX_DEPLOY_LATENCY_LOG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| crate::api::session_verbs::home().join("deploy-latency.jsonl"));
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => push_to_live(&raw, 50),
+        Err(_) => json!({"measured": false, "n_considered": 0,
+                         "why_unmeasured": format!("no deploy has been recorded at {}", path.display())}),
+    }
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(9)]
+}
+
+/// (state, sentence) from the measured facts. Pure, so every branch is tested.
+/// `tip` is None when main could not be read; `on_main` is whether the live
+/// commit is an ancestor of it; `behind` counts main's commits the server lacks.
+pub(crate) fn deploy_summary(
+    live: &str,
+    tip: Option<&str>,
+    on_main: bool,
+    behind: u64,
+    gate: Option<&serde_json::Value>,
+) -> (&'static str, String) {
+    let Some(tip) = tip else {
+        return ("unmeasured", format!("Server runs {}. main could not be read here, so it cannot say whether that is current.", short(live)));
+    };
+    let target = gate.and_then(|g| g["target"].as_str()).filter(|t| !t.is_empty());
+    let tip_state = gate.and_then(|g| g["tip_state"].as_str()).unwrap_or("unknown");
+    if !on_main {
+        return ("off_main", match target {
+            Some(t) => format!("Server runs {}, which is not on main (a local or forked build). The builder replaces it with {}, the newest main commit that passed CI.", short(live), short(t)),
+            None => format!("Server runs {}, which is not on main (a local or forked build). No main commit has passed CI recently, so the builder has nothing to replace it with yet.", short(live)),
+        });
+    }
+    if live == tip || behind == 0 {
+        return ("current", format!("Up to date: server runs {}, the latest commit on main.", short(live)));
+    }
+    if let Some(t) = target.filter(|t| *t != live) {
+        return ("deploying", format!("Updating: the builder is deploying {}, the newest main commit that passed CI. Server runs {}, {behind} commit(s) behind main.", short(t), short(live)));
+    }
+    let why = match tip_state {
+        "red" => format!("main is failing CI at {}", short(tip)),
+        "pending" => format!("CI is still running on {}", short(tip)),
+        _ => format!("main's newer commits have not passed CI ({} is {tip_state})", short(tip)),
+    };
+    ("held", format!("Server runs {}, the newest main commit that passed CI. main is {behind} commit(s) ahead; they deploy once they pass CI ({why}).", short(live)))
+}
+
+async fn deploy_status(dir: Option<&Path>) -> serde_json::Value {
+    let full = crate::activation::served().full.as_str();
+    let live = full.trim_end_matches("-dirty");
+    let gate = gate_state();
+    let mut tip: Option<String> = None;
+    let (mut on_main, mut behind) = (false, 0u64);
+    if let Some(dir) = dir {
+        let r = activation_ref();
+        tip = git(dir, &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")], GIT_TIMEOUT)
+            .await
+            .filter(|o| o.status.success())
+            .map(|o| out_of(&o))
+            .filter(|s| !s.is_empty());
+        if let Some(t) = tip.as_deref() {
+            on_main = git(dir, &["merge-base", "--is-ancestor", live, t], GIT_TIMEOUT)
+                .await
+                .is_some_and(|o| o.status.success());
+            if on_main {
+                behind = git(dir, &["rev-list", "--count", &format!("{live}..{t}")], GIT_TIMEOUT)
+                    .await
+                    .and_then(|o| out_of(&o).parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+    }
+    let (state, summary) = deploy_summary(live, tip.as_deref(), on_main, behind, gate.as_ref());
+    if state == "off_main" {
+        tracing::warn!(live = %live, tip = ?tip, measured = true, n_considered = 1, verdict = "server_off_main",
+            "the running server is not a build of main");
+    }
+    json!({
+        "measured": tip.is_some(),
+        "n_considered": 1,
+        "state": state,
+        "summary": summary,
+        "live": live,
+        "live_dirty": full.ends_with("-dirty"),
+        "ref": activation_ref(),
+        "tip": tip,
+        "on_main": on_main,
+        "behind": behind,
+        "gate": gate,
+        "push_to_live": push_to_live_now(),
+        // The checkout this server builds from, so /amux-contribute can find it.
+        "repo": dir.map(|d| d.display().to_string()),
+    })
+}
+
+/// Start the builder now instead of on its next 60s tick. Best effort: the
+/// answer says whether it ran, and the timer catches up either way.
+async fn kick_builder() -> serde_json::Value {
+    let (prog, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+        let uid = unsafe { libc::getuid() };
+        ("launchctl", vec!["kickstart".into(), format!("gui/{uid}/com.amux.server-rs-builder")])
+    } else {
+        ("systemctl", vec!["--user".into(), "start".into(), "amux-builder.service".into()])
+    };
+    let run = tokio::process::Command::new(prog)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match tokio::time::timeout(GIT_TIMEOUT, run).await {
+        Ok(Ok(o)) if o.status.success() => json!({"kicked": true}),
+        Ok(Ok(o)) => json!({"kicked": false, "why": out_of(&o)}),
+        Ok(Err(e)) => json!({"kicked": false, "why": e.to_string()}),
+        Err(_) => json!({"kicked": false, "why": "timed out"}),
+    }
+}
+
+async fn pull_status() -> Response {
+    Json(deploy_status(repo_dir().as_deref()).await).into_response()
+}
+
+/// The scoped switch that makes "Pull from remote" send local work upstream as
+/// a pull request and then replace it with remote main (`amux contribute
+/// --then-pull`). Cloud servers turn it on (cloud/desktop bootstrap.sh and
+/// update.sh): one owner, one checkout. Off by default, because a shared
+/// checkout holds other workers' uncommitted drafts, which are not the owner's
+/// to publish or replace.
+pub(crate) const PULL_SENDS_LOCAL_KEY: &str = "AMUX_PULL_SENDS_LOCAL_AS_PR";
+
+fn pull_sends_local_as_pr() -> bool {
+    super::settings::effective_env(&crate::config::amux_home(), PULL_SENDS_LOCAL_KEY)
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// The amux CLI beside this server's binary (both install to the same bin
+/// dir), else whatever `amux` the PATH finds.
+fn amux_cli() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("amux")))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("amux"))
+}
+
+/// The `AMUX_CONTRIBUTE {...}` line `amux contribute --json` ends with.
+pub(crate) fn contribute_result(output: &str) -> Option<serde_json::Value> {
+    output
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("AMUX_CONTRIBUTE "))
+        .and_then(|j| serde_json::from_str(j).ok())
+}
+
+/// Send the checkout's local work as a pull request, then match remote main.
+/// Ok carries the CLI's result; Err is the whole reply for a pull that must
+/// not go on, because the local work is not safely on GitHub yet.
+async fn contribute_then_override(dir: &Path) -> Result<serde_json::Value, serde_json::Value> {
+    let cli = amux_cli();
+    let run = tokio::process::Command::new(&cli)
+        .args(["contribute", "--then-pull", "--json", "--repo"])
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(300), run).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, cli = %cli.display(), measured = false, n_considered = 1,
+                verdict = "pull_contribute_unavailable", "Pull from remote could not run amux contribute; nothing was replaced");
+            return Err(json!({"ok": false, "output": format!("Could not run amux contribute ({e}). Nothing was replaced.")}));
+        }
+        Err(_) => {
+            tracing::warn!(measured = false, n_considered = 1, verdict = "pull_contribute_timed_out",
+                "amux contribute did not finish within 300s; nothing was replaced");
+            return Err(json!({"ok": false, "output": "Sending your local changes as a pull request took over 5 minutes. Nothing was replaced."}));
+        }
+    };
+    let text = out_of(&out);
+    let result = contribute_result(&text).unwrap_or_else(|| json!({"verdict": "no_result"}));
+    let verdict = result["verdict"].as_str().unwrap_or("no_result").to_string();
+    let shown: String = text.lines().filter(|l| !l.starts_with("AMUX_CONTRIBUTE ")).collect::<Vec<_>>().join("\n");
+    match out.status.code() {
+        Some(0) => {
+            tracing::info!(verdict = %verdict, pr_url = result["pr_url"].as_str().unwrap_or(""), measured = true, n_considered = 1,
+                "Pull from remote: local work handled by amux contribute");
+            Ok(json!({"verdict": verdict, "pr_url": result["pr_url"], "output": shown}))
+        }
+        code => {
+            tracing::warn!(verdict = %verdict, exit = ?code, measured = true, n_considered = 1,
+                "Pull from remote stopped: the local work could not be sent as a pull request, so nothing was replaced");
+            Err(json!({"ok": false, "needs_github": code == Some(4) && verdict == "github_not_connected",
+                "contribute": {"verdict": verdict}, "output": shown}))
+        }
+    }
+}
+
+async fn pull() -> Response {
+    let mut contribute = serde_json::Value::Null;
+    if let (Some(dir), true) = (repo_dir(), pull_sends_local_as_pr()) {
+        match contribute_then_override(&dir).await {
+            Ok(v) => contribute = v,
+            Err(v) => return Json(v).into_response(),
+        }
+    }
+    let resp = pull_checkout().await;
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
+        return Json(json!({"ok": false, "output": "could not read the pull result"})).into_response();
+    };
+    let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({"ok": false}));
+    let dir = repo_dir();
+    if dir.is_some() {
+        v["builder"] = kick_builder().await;
+    }
+    v["deploy"] = deploy_status(dir.as_deref()).await;
+    if !contribute.is_null() {
+        v["contribute"] = contribute;
+    }
+    (parts.status, Json(v)).into_response()
 }
 
 async fn git(dir: &Path, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
@@ -72,7 +369,12 @@ fn out_of(o: &std::process::Output) -> String {
 async fn fetch_upstream_for_activation(dir: &Path) -> Result<String, String> {
     let upstream = git(
         dir,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
         GIT_TIMEOUT,
     )
     .await
@@ -101,10 +403,15 @@ async fn fetch_upstream_for_activation(dir: &Path) -> Result<String, String> {
     }
 
     let lower = first_output.to_lowercase();
-    let auth_failed = ["permission denied", "authentication failed", "could not read from remote",
-                       "publickey", "terminal prompts disabled"]
-        .iter()
-        .any(|needle| lower.contains(needle));
+    let auth_failed = [
+        "permission denied",
+        "authentication failed",
+        "could not read from remote",
+        "publickey",
+        "terminal prompts disabled",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
     if auth_failed {
         let url = git(dir, &["remote", "get-url", remote], GIT_TIMEOUT)
             .await
@@ -219,12 +526,14 @@ pub(crate) async fn preflight(dir: &Path) -> Option<serde_json::Value> {
             .collect();
         if !dirty.is_empty() {
             let shown: Vec<String> = dirty.iter().take(20).cloned().collect();
-            return Some(json!({"ok": false, "blocked": "dirty_tree", "files": shown.clone(),
+            return Some(
+                json!({"ok": false, "blocked": "dirty_tree", "files": shown.clone(),
                 "output": format!(
                     "Refusing to pull: {} uncommitted change(s) in {}.\n{}\n\n\
                      This is a shared checkout — those edits may belong to another session \
                      that is not even running. Commit or stash them first.",
-                    dirty.len(), dir.display(), shown.join("\n"))}));
+                    dirty.len(), dir.display(), shown.join("\n"))}),
+            );
         }
     }
 
@@ -236,25 +545,42 @@ pub(crate) async fn preflight(dir: &Path) -> Option<serde_json::Value> {
     None
 }
 
-async fn pull() -> Response {
-    match install_channel().0 {
-        "brew" => {
-            return Json(json!({"ok": false, "channel": "brew",
-                "output": "Installed via Homebrew — update with: brew upgrade amux"}))
-            .into_response()
-        }
-        "pip" => {
-            return Json(json!({"ok": false, "channel": "pip",
-                "output": "Installed via pip/pipx — update with: pipx upgrade amux (or pip install -U amux)"}))
-            .into_response()
-        }
-        _ => {}
+/// What to tell a copy installed by a retired package channel. Homebrew and
+/// PyPI are retired (site/llms.txt), so `brew upgrade amux` and `pipx upgrade
+/// amux` no longer bring a new version; the installer replaces the old copy.
+fn retired_channel_hint(channel: &str) -> String {
+    let how = if channel == "brew" { "Homebrew" } else { "pip/pipx" };
+    format!(
+        "Installed via {how}, which no longer publishes amux. Update with the installer, \
+         which replaces this copy: curl -fsSL https://amux.io/install.sh | bash"
+    )
+}
+
+async fn pull_checkout() -> Response {
+    let channel = install_channel().0;
+    if matches!(channel, "brew" | "pip") {
+        tracing::warn!(channel, measured = true, n_considered = 1, verdict = "pull_retired_install_channel",
+            "Pull pressed on a copy installed by a retired package channel; pointed at the installer");
+        return Json(json!({"ok": false, "channel": channel, "output": retired_channel_hint(channel)}))
+            .into_response();
     }
 
     let Some(dir) = repo_dir() else {
-        return Json(json!({"ok": false, "channel": "standalone",
-            "output": "No git repo here — updates deploy automatically.\n\
-                       (If this IS a source install, set AMUX_REPO_DIR to the checkout.)"}))
+        // Say only what is known. This used to promise "updates deploy
+        // automatically", which nothing here can check, and on a hand-installed
+        // host (sandbox.amux.io, 2026-10-11) nothing updated it at all.
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "an unknown path".into());
+        tracing::warn!(exe = %exe, measured = true, n_considered = 1, verdict = "pull_no_checkout",
+            "Pull from remote pressed on a server with no git checkout; nothing to update");
+        return Json(json!({"ok": false, "channel": "standalone", "exe": exe,
+            "output": format!(
+                "This server runs a standalone binary ({exe}) with no git checkout, so this \
+                 button has nothing to pull. It updates only when whatever installed that \
+                 binary replaces it.\n\
+                 To update from here: set AMUX_REPO_DIR to an amux checkout and run the amux \
+                 builder (install.sh sets both up); a pull then deploys.")}))
         .into_response();
     };
 
@@ -269,7 +595,8 @@ async fn pull() -> Response {
                 "mode": "fetch_only",
                 "local_blocked": refusal["blocked"],
                 "output": output,
-            })).into_response(),
+            }))
+            .into_response(),
             Err(fetch_error) => Json(json!({
                 "ok": false,
                 "blocked": refusal["blocked"],
@@ -277,13 +604,15 @@ async fn pull() -> Response {
                     "{}\n\nThe safe fetch-only fallback also failed: {fetch_error}",
                     refusal["output"].as_str().unwrap_or("Local pull was refused.")
                 ),
-            })).into_response(),
+            }))
+            .into_response(),
         };
     }
 
     // ---- the pull itself ---------------------------------------------------
     let Some(o) = git(&dir, &["pull", "--ff-only"], GIT_TIMEOUT).await else {
-        return Json(json!({"ok": false, "output": "git pull timed out after 30s"})).into_response();
+        return Json(json!({"ok": false, "output": "git pull timed out after 30s"}))
+            .into_response();
     };
     let output = out_of(&o);
     if o.status.success() {
@@ -295,10 +624,15 @@ async fn pull() -> Response {
     // user's git credentials. A cron/launchd env with no SSH agent was silently
     // failing hourly (2026-07-17); retry anonymously over HTTPS.
     let lower = output.to_lowercase();
-    let auth_failed = ["permission denied", "authentication failed", "could not read from remote",
-                       "publickey", "terminal prompts disabled"]
-        .iter()
-        .any(|k| lower.contains(k));
+    let auth_failed = [
+        "permission denied",
+        "authentication failed",
+        "could not read from remote",
+        "publickey",
+        "terminal prompts disabled",
+    ]
+    .iter()
+    .any(|k| lower.contains(k));
     if auth_failed {
         let url = git(&dir, &["remote", "get-url", "origin"], GIT_TIMEOUT)
             .await
@@ -312,7 +646,14 @@ async fn pull() -> Response {
                 .unwrap_or_else(|| "main".into());
             if let Some(o2) = git(
                 &dir,
-                &["-c", "credential.helper=", "pull", "--ff-only", &https, &branch],
+                &[
+                    "-c",
+                    "credential.helper=",
+                    "pull",
+                    "--ff-only",
+                    &https,
+                    &branch,
+                ],
                 GIT_TIMEOUT,
             )
             .await
@@ -352,7 +693,96 @@ fn https_equiv(url: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod deploy_summary_tests {
+    use super::{deploy_summary, push_to_live};
+    use serde_json::json;
+
+    const LIVE: &str = "08c8c6973e71ba5b391ec2a553c550e1fe350248";
+    const TIP: &str = "3e0f0823a30bf324737e596bda94673ef82efea7";
+
+    /// push_to_live: percentiles over the measured deploys only, the rest
+    /// counted, and an empty log reads as unmeasured rather than fast.
+    #[test]
+    fn push_to_live_reports_percentiles_and_counts_the_unmeasured() {
+        let raw = (1..=10).map(|i| format!("{{\"sha\":\"s{i}\",\"at\":{i},\"from_push_s\":{}}}", i * 20))
+            .chain(["{\"sha\":\"x\",\"at\":11,\"from_push_s\":null}".to_string(), "not json".into()])
+            .collect::<Vec<_>>().join("\n");
+        let v = push_to_live(&raw, 50);
+        assert_eq!(v["measured"], json!(true));
+        assert_eq!(v["n_considered"], json!(11));
+        assert_eq!(v["unmeasured"], json!(1));
+        assert_eq!(v["p50_s"], json!(100));
+        assert_eq!(v["p90_s"], json!(180));
+        assert_eq!(v["max_s"], json!(200));
+        assert_eq!(v["under_120_s"], json!(5));
+        assert_eq!(v["last"]["sha"], json!("x"));
+        // Only deploys that needed a new binary count toward `built`.
+        let kinds = "{\"sha\":\"r\",\"at\":1,\"from_push_s\":30,\"kind\":\"restamp\"}\n\
+                     {\"sha\":\"c\",\"at\":2,\"from_push_s\":150,\"kind\":\"compiled\"}\n\
+                     {\"sha\":\"p\",\"at\":3,\"from_push_s\":100,\"kind\":\"prebuilt\"}";
+        let k = push_to_live(kinds, 50);
+        assert_eq!(k["n_considered"], json!(3));
+        assert_eq!(k["built"]["n_considered"], json!(2));
+        assert_eq!(k["built"]["max_s"], json!(150));
+        assert_eq!(k["built"]["under_120_s"], json!(1));
+        let last3 = push_to_live(&raw, 3);
+        assert_eq!(last3["n_considered"], json!(3));
+        let none = push_to_live("", 50);
+        assert_eq!(none["measured"], json!(false));
+        assert_eq!(none["p50_s"], json!(null));
+    }
+
+    #[test]
+    fn every_state_names_what_runs_and_why() {
+        let (s, m) = deploy_summary(LIVE, None, false, 0, None);
+        assert_eq!(s, "unmeasured", "{m}");
+        let (s, m) = deploy_summary(LIVE, Some(LIVE), true, 0, None);
+        assert_eq!(s, "current", "{m}");
+        // The 2026-10-24 morning: a fork build live, a green main commit to replace it.
+        let g = json!({"target": LIVE, "tip_state": "pending"});
+        let (s, m) = deploy_summary("03adc2a58cf4a7f3430f0166268d2487166b1e70", Some(TIP), false, 0, Some(&g));
+        assert_eq!(s, "off_main", "{m}");
+        assert!(m.contains("not on main") && m.contains("08c8c6973"), "{m}");
+        // Live is the newest green; main is ahead and red.
+        let g = json!({"target": LIVE, "tip_state": "red"});
+        let (s, m) = deploy_summary(LIVE, Some(TIP), true, 62, Some(&g));
+        assert_eq!(s, "held", "{m}");
+        assert!(m.contains("62 commit(s) ahead") && m.contains("failing CI at 3e0f0823a"), "{m}");
+        // A newer green exists than what runs: deploying.
+        let g = json!({"target": TIP, "tip_state": "green"});
+        let (s, m) = deploy_summary(LIVE, Some(TIP), true, 62, Some(&g));
+        assert_eq!(s, "deploying", "{m}");
+        // Off main with nothing green: say there is nothing to replace it with.
+        let (s, m) = deploy_summary("03adc2a58", Some(TIP), false, 0, Some(&json!({"target": "", "tip_state": "red"})));
+        assert_eq!(s, "off_main");
+        assert!(m.contains("nothing to replace it with"), "{m}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    /// AF-1127: through the real default path, with nothing injected. The
+    /// builder writes $HOME/.amux/activation-gate.json and home() is $HOME/.amux.
+    #[test]
+    fn gate_state_reads_the_file_the_builder_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::write(dir.path().join("activation-gate.json"), r#"{"verdict":"ci_gate_held_back","target":"abc"}"#).unwrap();
+        let gate = gate_state().expect("the gate state is read from home()");
+        assert_eq!(gate["verdict"], "ci_gate_held_back");
+    }
+
+    #[test]
+    fn a_retired_package_install_is_pointed_at_the_installer() {
+        for channel in ["brew", "pip"] {
+            let hint = super::retired_channel_hint(channel);
+            assert!(hint.contains("curl -fsSL https://amux.io/install.sh | bash"), "{hint}");
+            for dead in ["brew upgrade", "pipx upgrade", "pip install -U"] {
+                assert!(!hint.contains(dead), "{channel} hint still says {dead}: {hint}");
+            }
+        }
+    }
+
     use super::*;
 
     /// A throwaway repo with one commit and an upstream, so `@{u}..HEAD` is a
@@ -361,22 +791,32 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let run = |args: &[&str], cwd: &Path| {
             std::process::Command::new("git")
-                .args(args).current_dir(cwd)
-                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-                .output().unwrap()
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
         };
         // A bare "remote" so the branch can have a real upstream.
         let remote = d.path().join("remote.git");
         std::fs::create_dir_all(&remote).unwrap();
-        run(&["init", "--bare", "-b", "main", remote.to_str().unwrap()], d.path());
+        run(
+            &["init", "--bare", "-b", "main", remote.to_str().unwrap()],
+            d.path(),
+        );
         let work = d.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         run(&["init", "-b", "main"], &work);
         std::fs::write(work.join("a.txt"), "one\n").unwrap();
         run(&["add", "."], &work);
         run(&["commit", "-m", "first"], &work);
-        run(&["remote", "add", "origin", remote.to_str().unwrap()], &work);
+        run(
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+            &work,
+        );
         run(&["push", "-u", "origin", "main"], &work);
         d
     }
@@ -388,10 +828,15 @@ mod tests {
         let d = repo();
         let work = d.path().join("work");
         // CONTROL: clean and level with the remote — nothing to refuse.
-        assert!(preflight(&work).await.is_none(), "a clean, up-to-date repo must pull");
+        assert!(
+            preflight(&work).await.is_none(),
+            "a clean, up-to-date repo must pull"
+        );
 
         std::fs::write(work.join("a.txt"), "edited by a peer\n").unwrap();
-        let r = preflight(&work).await.expect("a dirty tree must be refused");
+        let r = preflight(&work)
+            .await
+            .expect("a dirty tree must be refused");
         assert_eq!(r["blocked"], "dirty_tree");
         // The FILE, not just a count — "1 file" tells nobody what to look at.
         assert_eq!(r["files"][0].as_str().unwrap().trim(), "M a.txt");
@@ -405,32 +850,52 @@ mod tests {
         let peer = d.path().join("peer");
         let run = |args: &[&str], cwd: &Path| {
             std::process::Command::new("git")
-                .args(args).current_dir(cwd)
-                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-                .output().unwrap()
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap()
         };
 
-        run(&["clone", remote.to_str().unwrap(), peer.to_str().unwrap()], d.path());
+        run(
+            &["clone", remote.to_str().unwrap(), peer.to_str().unwrap()],
+            d.path(),
+        );
         std::fs::write(peer.join("remote.txt"), "new remote bytes\n").unwrap();
         run(&["add", "."], &peer);
         run(&["commit", "-m", "remote advance"], &peer);
         run(&["push", "origin", "main"], &peer);
         let remote_head = String::from_utf8_lossy(&run(&["rev-parse", "HEAD"], &peer).stdout)
-            .trim().to_string();
+            .trim()
+            .to_string();
 
         std::fs::write(work.join("a.txt"), "peer's uncommitted edit\n").unwrap();
         let before_head = String::from_utf8_lossy(&run(&["rev-parse", "HEAD"], &work).stdout)
-            .trim().to_string();
+            .trim()
+            .to_string();
         let output = fetch_upstream_for_activation(&work).await.unwrap();
 
-        assert_eq!(std::fs::read_to_string(work.join("a.txt")).unwrap(),
-                   "peer's uncommitted edit\n");
-        assert_eq!(String::from_utf8_lossy(&run(&["rev-parse", "HEAD"], &work).stdout).trim(),
-                   before_head, "fetch-only must not move the shared checkout");
-        assert_eq!(String::from_utf8_lossy(&run(&["rev-parse", "origin/main"], &work).stdout).trim(),
-                   remote_head, "the activation authority must see the fetched revision");
-        assert!(output.contains("shared checkout was left unchanged"), "{output}");
+        assert_eq!(
+            std::fs::read_to_string(work.join("a.txt")).unwrap(),
+            "peer's uncommitted edit\n"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["rev-parse", "HEAD"], &work).stdout).trim(),
+            before_head,
+            "fetch-only must not move the shared checkout"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run(&["rev-parse", "origin/main"], &work).stdout).trim(),
+            remote_head,
+            "the activation authority must see the fetched revision"
+        );
+        assert!(
+            output.contains("shared checkout was left unchanged"),
+            "{output}"
+        );
     }
 
     #[tokio::test]
@@ -439,10 +904,15 @@ mod tests {
         let work = d.path().join("work");
         std::fs::write(work.join("b.txt"), "two\n").unwrap();
         for args in [vec!["add", "."], vec!["commit", "-m", "local only"]] {
-            std::process::Command::new("git").args(&args).current_dir(&work)
-                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-                .output().unwrap();
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&work)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
         }
         assert!(
             preflight(&work).await.is_none(),
@@ -467,7 +937,9 @@ mod tests {
         let d = repo();
         let work = d.path().join("work");
         std::fs::write(work.join(".git/MERGE_HEAD"), "deadbeef\n").unwrap();
-        let r = preflight(&work).await.expect("an in-progress merge must be refused");
+        let r = preflight(&work)
+            .await
+            .expect("an in-progress merge must be refused");
         assert_eq!(r["blocked"], "operation_in_progress");
         assert!(r["output"].as_str().unwrap().contains("a merge"));
     }
@@ -492,5 +964,21 @@ mod tests {
         assert_eq!(https_equiv("git@github.com"), None, "no colon, no path");
         assert_eq!(https_equiv(""), None);
         assert_eq!(https_equiv("/local/path/repo.git"), None);
+    }
+}
+
+#[cfg(test)]
+mod contribute_tests {
+    use super::contribute_result;
+
+    #[test]
+    fn reads_the_last_contribute_line_and_nothing_else() {
+        let out = "  local commits not on origin/main: 1\n  Pull request: https://github.com/mixpeek/amux/pull/7\n\
+            AMUX_CONTRIBUTE {\"verdict\": \"pr_opened\", \"exit\": 0, \"pr_url\": \"https://github.com/mixpeek/amux/pull/7\"}\n";
+        let v = contribute_result(out).unwrap();
+        assert_eq!(v["verdict"], "pr_opened");
+        assert_eq!(v["pr_url"], "https://github.com/mixpeek/amux/pull/7");
+        assert!(contribute_result("no result line\n").is_none());
+        assert!(contribute_result("AMUX_CONTRIBUTE not json\n").is_none());
     }
 }

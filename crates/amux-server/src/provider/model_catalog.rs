@@ -14,7 +14,7 @@
 
 use serde::Serialize;
 
-pub const CATALOG_UPDATED_AT: &str = "2026-09-08";
+pub const CATALOG_UPDATED_AT: &str = "2026-10-18";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ModelDescriptor {
@@ -62,6 +62,8 @@ pub fn catalog() -> Vec<ModelDescriptor> {
         true,
         &[
             "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
             "gpt-5.6-sol",
             "gpt-5.6-terra",
             "gpt-5.6-luna",
@@ -69,7 +71,6 @@ pub fn catalog() -> Vec<ModelDescriptor> {
             "gpt-5.5-pro",
             "gpt-5.4",
             "gpt-5.4-pro",
-            "gpt-5.4-mini",
             "gpt-5.4-nano",
             "gpt-5.2",
             "gpt-5.2-pro",
@@ -79,6 +80,18 @@ pub fn catalog() -> Vec<ModelDescriptor> {
             "gpt-5-mini",
             "gpt-5-nano",
         ],
+    );
+    // Still an OpenAI API model, but Codex 0.163 refuses it and puts a
+    // model-migration prompt in front of a new worker (Cloud C6-2,
+    // 2026-10-18). Kept in the catalog so the live OpenAI listing finds this
+    // entry and inherits `worker_selectable: false` instead of re-offering it.
+    add(
+        &mut out,
+        "openai",
+        "codex",
+        "retired-for-agents",
+        false,
+        &["gpt-5.4-mini"],
     );
     add(
         &mut out,
@@ -319,6 +332,7 @@ pub fn catalog() -> Vec<ModelDescriptor> {
         "opus",
         true,
         &[
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-opus-5[1m]",
             "claude-opus-4-8",
@@ -553,6 +567,11 @@ pub fn catalog() -> Vec<ModelDescriptor> {
         ],
     );
 
+    // xAI / Grok Build. Ids match `GrokAdapter::models()` in
+    // static_providers.rs; kept in sync by hand until Grok Build ships its own
+    // catalog endpoint the way Muse does.
+    add(&mut out, "xai", "grok", "grok", true, &["grok-4.6", "grok-4.5"]);
+
     out
 }
 
@@ -624,6 +643,7 @@ mod tests {
             "gpt-realtime-2.1",
             "text-embedding-3-large",
             "claude-fable-5-1",
+            "claude-opus-5-5",
             "claude-opus-5",
             "claude-sonnet-5",
             "gemini-3.8-flash",
@@ -652,6 +672,17 @@ mod tests {
                 "missing model type {model_type}"
             );
         }
+    }
+
+    #[test]
+    fn a_model_codex_retired_is_not_offered_to_a_new_worker() {
+        let models = catalog();
+        let retired: Vec<_> = models.iter().filter(|m| m.id == "gpt-5.4-mini").collect();
+        assert_eq!(retired.len(), 1, "kept once so the live listing inherits it");
+        assert!(!retired[0].worker_selectable);
+        assert!(models
+            .iter()
+            .any(|m| m.id == "gpt-6-luna" && m.provider == "codex" && m.worker_selectable));
     }
 
     #[test]

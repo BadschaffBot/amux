@@ -106,7 +106,7 @@ async fn git_toplevel(dir: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-async fn git_output(repo: &str, args: &[&str]) -> Option<std::process::Output> {
+pub(crate) async fn git_output(repo: &str, args: &[&str]) -> Option<std::process::Output> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("-C")
         .arg(repo)
@@ -114,7 +114,10 @@ async fn git_output(repo: &str, args: &[&str]) -> Option<std::process::Output> {
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await.ok()?.ok()
+    tokio::time::timeout(GIT_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()
 }
 
 /// Word-boundary match for a card id inside a commit message.
@@ -145,10 +148,7 @@ fn ids_in_text(text: &str, known: &BTreeSet<&str>) -> BTreeSet<String> {
 }
 
 /// One bounded `git log` per repo. Returns (sha, subject, ids).
-async fn scan_repo(
-    repo: &str,
-    ids: &BTreeSet<&str>,
-) -> (Vec<CommitHit>, bool) {
+async fn scan_repo(repo: &str, ids: &BTreeSet<&str>) -> (Vec<CommitHit>, bool) {
     let mut hits: Vec<CommitHit> = Vec::new();
     let fmt = format!("--format=%H{UNIT}%s{UNIT}%B{REC}");
     let max = format!("--max-count={MAX_SCANNED_COMMITS}");
@@ -167,8 +167,7 @@ async fn scan_repo(
         }
         scanned += 1;
         let mut parts = rec.splitn(3, UNIT);
-        let (Some(sha), Some(subject), Some(body)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(sha), Some(subject), Some(body)) = (parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
@@ -186,6 +185,73 @@ async fn scan_repo(
     }
     let matched_cap = hits.len() >= MAX_MATCHED_COMMITS;
     (hits, scanned >= MAX_SCANNED_COMMITS || matched_cap)
+}
+
+/// One hit of [`scan_tokens`]: (token, short sha, subject, repo).
+pub(crate) type TokenHit = (String, String, String, String);
+
+/// The same bounded history walk as the endpoint, for arbitrary word-bounded
+/// tokens (AMUX-5238 passes `MSG-<n>` ids), over the repos behind `owners`.
+/// `None` when the session list or the overall deadline failed, so a caller
+/// can tell "scanned, nothing found" from "could not look". The bool is true
+/// when any scan was truncated.
+pub(crate) async fn scan_tokens(
+    state: &AppState,
+    owners: &BTreeSet<String>,
+    tokens: &BTreeSet<String>,
+) -> Option<(Vec<TokenHit>, bool)> {
+    if owners.is_empty() || tokens.is_empty() {
+        return Some((vec![], false));
+    }
+    let sessions = super::sessions_legacy::legacy_sessions_values(state.store.clone())
+        .await
+        .ok()?;
+    let dirs: BTreeSet<String> = sessions
+        .iter()
+        .filter_map(|v| {
+            let name = v["name"].as_str()?;
+            owners
+                .contains(name)
+                .then(|| v["dir"].as_str().unwrap_or("").to_string())
+        })
+        .filter(|d| !d.is_empty())
+        .collect();
+    let known: BTreeSet<&str> = tokens.iter().map(String::as_str).collect();
+    let scan = async {
+        use futures::stream::{self, StreamExt};
+        let truncated_dirs = dirs.len() > MAX_REPO_CANDIDATE_DIRS;
+        let tops: Vec<Option<String>> = stream::iter(
+            dirs.into_iter()
+                .take(MAX_REPO_CANDIDATE_DIRS)
+                .map(|dir| async move { git_toplevel(&dir).await }),
+        )
+        .buffer_unordered(GIT_CONCURRENCY)
+        .collect()
+        .await;
+        let repos: BTreeSet<String> = tops.into_iter().flatten().collect();
+        let scans: Vec<RepoScan> = stream::iter(repos.iter().cloned().map(|repo| {
+            let known = &known;
+            async move {
+                let (hits, truncated) = scan_repo(&repo, known).await;
+                (repo, hits, truncated)
+            }
+        }))
+        .buffer_unordered(GIT_CONCURRENCY)
+        .collect()
+        .await;
+        let mut out: Vec<TokenHit> = Vec::new();
+        let mut truncated = truncated_dirs;
+        for (repo, hits, t) in scans {
+            truncated |= t;
+            for (sha, subject, ids) in hits {
+                for id in ids {
+                    out.push((id, sha.clone(), subject.clone(), repo.clone()));
+                }
+            }
+        }
+        (out, truncated)
+    };
+    tokio::time::timeout(OVERALL_SCAN_TIMEOUT, scan).await.ok()
 }
 
 /// The HTTP shell. The body is [`mentions_payload`] so a JOB can ask the same
@@ -285,17 +351,16 @@ async fn mentions_payload_with(state: &AppState, p: Params) -> (StatusCode, Valu
         let resolution_failed = tops.iter().any(Option::is_none);
         let repos: BTreeSet<String> = tops.into_iter().flatten().collect();
 
-        let scans: Vec<RepoScan> =
-            stream::iter(repos.iter().cloned().map(|repo| {
-                let known = &known;
-                async move {
-                    let (hits, truncated) = scan_repo(&repo, known).await;
-                    (repo, hits, truncated)
-                }
-            }))
-            .buffer_unordered(GIT_CONCURRENCY)
-            .collect()
-            .await;
+        let scans: Vec<RepoScan> = stream::iter(repos.iter().cloned().map(|repo| {
+            let known = &known;
+            async move {
+                let (hits, truncated) = scan_repo(&repo, known).await;
+                (repo, hits, truncated)
+            }
+        }))
+        .buffer_unordered(GIT_CONCURRENCY)
+        .collect()
+        .await;
 
         let mut by_card: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         let mut truncated_any = dirs_truncated || resolution_failed;

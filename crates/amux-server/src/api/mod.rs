@@ -4,71 +4,170 @@
 //! in the OpenAPI spec (RR checklist) and — for legacy-compat paths — in the
 //! alias registry (RR-0018a).
 
+pub mod agent_limit_resume;
 pub mod alerts;
-pub mod branding;
-pub mod channels;
-pub mod stats;
-pub mod usage;
 pub mod aliases;
 pub mod auth;
+pub mod avatars;
+pub mod whereabouts;
 pub mod board;
+pub mod boundaries;
+pub mod bridge;
+pub mod contract;
+pub mod deep_links;
+pub mod scratchpad;
+pub(crate) mod send_profile;
+pub(crate) mod board_groom;
+pub mod prompt_block;
+pub mod land_approvals;
+pub mod calls;
+pub mod land_queue;
+pub mod land_red;
+pub mod worker_identity;
+pub mod app_identity;
+pub mod capabilities;
+pub mod cli_sandbox;
+pub mod customer_isolation;
+pub mod at_rest;
+pub mod approval_cards;
+pub mod outbound;
+pub mod schedule_authority;
+pub mod connector_scope;
+pub mod email_scope;
+pub mod human_proof;
+pub mod loopback_trust;
+pub mod contract_fresh;
+pub mod prod_change;
+pub mod runner;
+pub mod done_line;
 pub mod board_intake;
 pub mod board_lifecycle;
-pub mod criteria;
-pub mod dependency_audit;
+pub mod board_themes;
+pub mod branding;
+pub mod brex;
 pub mod browser;
 pub mod browser_import;
+pub mod browser_watch;
+pub mod audit;
+pub mod browser_routing;
+pub mod cdp_proxy;
+pub mod browser_scope;
 pub mod calendar;
+pub mod channels;
+pub mod chat_stream;
+pub mod chat_delegate;
+pub mod chat_context;
+pub mod chat_worker;
+pub mod commit_mentions;
+pub mod computer;
+pub mod computer_mac;
+pub mod config_iac;
+pub mod move_bundle;
+pub mod connection;
+pub mod gcal;
 pub mod connectors;
+pub mod criteria;
+pub mod crm;
+pub mod crm_accounts;
+pub mod crm_agent;
+pub mod crm_outbound;
+pub mod crm_voice;
+pub mod crm_signups;
+pub mod deleted_substrate;
+pub mod dependency_audit;
 pub mod dictation;
-pub mod tts;
 pub mod email;
 pub mod email_approval;
+pub mod email_links;
+pub mod email_intel;
+pub mod env_config;
 pub mod file_viewer;
+pub mod media_hls;
 pub mod files;
+pub mod file_visits;
 pub mod fs;
 pub mod git_guard;
-pub mod email_intel;
-pub mod grants;
+pub mod gmail;
 pub mod gmail_auth;
 pub mod google_sa;
-pub mod groups;
-pub mod crm;
-pub mod speedtest;
-pub mod habits;
-pub mod health;
-pub mod env_config;
-pub mod gmail;
+pub mod grants;
+pub mod vault;
+pub mod vault_secrets;
+pub mod vault_spend;
+pub mod chatgpt_app;
 pub mod graph;
+pub mod groups;
+pub mod habits;
 pub mod harness;
+pub mod health;
 pub mod history;
 pub mod history_ask;
-pub mod reports;
-pub mod terminal;
-pub mod invariants_api;
-pub mod brex;
+pub mod history_ask_rank;
+pub mod history_backfill;
 pub mod interactions;
+pub mod ledger;
+pub mod ledger_checkpoint;
+pub mod trace;
+pub mod instruction_provenance;
+pub mod agent_commit;
+pub mod cli_telemetry;
+pub mod invariants_api;
 pub mod journal;
+pub mod launch_context;
 pub mod layout_presets;
+pub mod social;
+pub mod social_browser;
+pub mod social_devto;
+pub mod social_publish;
+pub mod governance;
+// Governance PR 21: access review and incident timeline for the compliance skill.
+pub mod compliance;
+pub mod mfa;
+pub mod scim;
+pub mod sso;
 pub mod log_search;
+pub mod lookup;
+pub mod location;
 pub mod map;
-pub mod measured;
+pub mod map_store;
+pub mod mcp;
 pub mod mdai;
+pub mod measured;
+pub mod decision_digest;
+pub mod directive;
+pub mod needs_input;
+pub mod needs_input_auto;
 pub mod memories;
+pub mod messages;
+pub(crate) mod native_status;
+pub(crate) mod claude_config;
+pub(crate) mod cross_site;
 pub mod metrics;
+pub mod traces;
 pub mod observability;
 pub mod offline_origin;
-pub mod messages;
+pub mod orchestrate;
+pub mod orchestrations;
 pub mod org;
-pub mod prefs;
-pub mod recordings;
-pub mod policy;
+pub(crate) mod pane_prompts;
+pub mod pages;
+pub mod photos;
+pub mod palette;
+pub mod palette_history;
+pub mod pinned;
 pub mod planning;
-pub mod proxies;
-pub mod tunnel;
+pub mod policy;
+pub mod prefs;
 pub mod py_proxy;
 pub mod reclaim;
+pub(crate) mod reclaim_owner;
+pub mod tiering;
 pub mod reconciliation;
+pub mod recording_live;
+pub mod recording_sessions;
+pub mod recordings;
+pub(crate) mod transcription;
+pub mod reports;
 pub mod request_log;
 pub mod review;
 pub mod saved_messages;
@@ -77,36 +176,59 @@ pub mod scope;
 pub mod screen;
 pub mod search;
 pub mod self_update;
+pub(crate) mod repeat_ask;
+pub(crate) mod send_probe;
 pub mod session_verbs;
-pub mod telegram;
-pub mod board_themes;
-pub mod lookup;
-pub mod orchestrate;
-pub mod simple;
-pub mod config_iac;
-pub mod skin;
-pub mod commit_mentions;
-pub mod deleted_substrate;
 pub mod sessions_git;
 pub mod sessions_legacy;
 pub mod settings;
-pub mod mcp;
+pub mod simple;
+pub mod skill_examples;
 pub mod skills;
+pub mod signals;
+pub mod event_subs;
+pub mod standing_approvals;
+pub mod skin;
+pub mod speedtest;
 pub mod sql;
 pub mod sse;
+pub mod typing;
+pub mod rt;
+pub mod conversations;
+pub mod converse;
 pub mod static_files;
+pub mod stats;
+pub mod velocity;
 pub mod sync;
+pub mod telegram;
+pub mod tailnet_join;
+pub mod terminal;
 pub mod torrents;
+pub mod tts;
+pub mod tunnel;
+pub(crate) mod goal_loop;
+pub(crate) mod promise_nudge;
+pub(crate) mod turn_end;
 pub mod upload;
+pub mod usage;
+pub mod usage_accounts;
 pub mod verify;
 pub mod why;
 pub mod worker_create;
+pub mod outcome_plan;
+pub mod intent;
+pub mod intent_store;
+pub mod intent_items;
+pub mod intent_record;
+pub mod worker_exec;
 pub mod workers;
+mod worker_messaging;
+mod mention_grants;
 pub mod workers_deadletters;
 
 use crate::db::SharedStore;
 use axum::Router;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 use tower_http::compression::CompressionLayer;
 
 /// Shared application state for handlers.
@@ -126,15 +248,38 @@ pub struct AppState {
     pub reconciled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// The apps origin's router: `/app/<id>/` and nothing else
+/// (static_files/apps_origin.rs). Served on its own listener.
+pub fn apps_router() -> Router {
+    static_files::apps_origin::router()
+}
+
 pub fn router(state: AppState) -> Router {
+    router_with_connector_transport(state, Arc::new(crate::integrations::email::ReqwestTransport::new()))
+}
+
+/// Supply the connector network boundary while retaining production authentication,
+/// routing and storage. Private provider rigs use this; production uses reqwest.
+pub fn router_with_connector_transport(
+    state: AppState,
+    http: Arc<dyn crate::integrations::email::HttpTransport>,
+) -> Router {
+    let connector_ctx = Arc::new(connectors::ConnectorsCtx {
+        http: http.clone(), home: crate::config::amux_home(),
+    });
+    let gmail_ctx = Arc::new(gmail_auth::GmailAuthCtx::new(http.clone(), crate::config::amux_home()));
     // For the request-log layer below — `state` itself is consumed by
     // `.with_state` before the outermost wrap.
     let store_for_reqlog = state.store.clone();
+    capabilities::install_store(state.store.clone());
+    approval_cards::install_store(state.store.clone());
+    schedule_authority::install_store(state.store.clone());
     let state_for_member_identity = state.clone();
     let protected = Router::new()
         .route("/api/sync", axum::routing::get(sync::delta_sync))
         .route("/api/events", axum::routing::get(sse::events))
         .nest("/api/board", board::routes())
+        .nest("/api/board-groom", board_groom::routes())
         // Dead-letter routes merge into the workers nest (RR-0068): same
         // /api/workers prefix, second nest at one path is an axum conflict.
         .nest(
@@ -146,9 +291,24 @@ pub fn router(state: AppState) -> Router {
             axum::routing::get(workers::ollama_models),
         )
         .route("/api/models", axum::routing::get(workers::model_catalog))
+        .route("/api/peek/steps", axum::routing::get(session_verbs::peek_steps))
+        .route("/api/session-renames", axum::routing::get(session_verbs::session_renames))
+        .route("/api/sessions/{name}/task-history", axum::routing::get(sessions_legacy::task_history))
+        .route("/api/sessions/{name}/quota", axum::routing::get(agent_limit_resume::worker_quota))
+        .route("/api/task-history", axum::routing::get(sessions_legacy::task_list))
+        .route("/api/task-history/at", axum::routing::get(sessions_legacy::task_at_batch))
+        .route("/api/task-history/links", axum::routing::get(sessions_legacy::task_links))
+        .route("/api/task-history/requests", axum::routing::get(sessions_legacy::owner_requests))
+        .route("/api/scratchpad/config", axum::routing::get(scratchpad::get_config).put(scratchpad::put_config))
         .nest("/api/memories", memories::routes())
+        .nest("/api/traces", traces::routes())
         .nest("/api/messages", messages::routes())
         .nest("/api/schedules", schedules::routes())
+        // AMUX-5237: named clearance signals. A card waits with
+        // blocked_on="signal:<name>"; POST /api/signals/<name> raises it,
+        // clears those waits and wakes their lanes.
+        .nest("/api/signals", signals::routes())
+        .nest("/api/subscriptions", signals::subscription_routes())
         // RR-0110: universal FTS5 search across cards (incl. their log lines),
         // messages, memories, workers, journal and schedules. Net-new — there
         // was never a /api/search in the Python server or the SPA.
@@ -158,6 +318,8 @@ pub fn router(state: AppState) -> Router {
         // turn ledger). The CLI verb is a printer over this; the correlation
         // lives here so there is one place to be wrong.
         .nest("/api/why", why::routes())
+        // One worker's browser, tool and API actions, newest first (audit.rs).
+        .nest("/api/audit", audit::routes())
         .nest("/api/verify", verify::routes())
         .nest(
             "/api/harness",
@@ -171,21 +333,31 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
         .nest("/api/reclaim", reclaim::routes())
+        .nest("/api/tiering", tiering::routes())
         .nest("/api/usage", usage::routes())
+        .nest("/api/velocity", velocity::routes())
         .nest("/api/review", review::routes())
         .nest("/api/channels", channels::routes())
         .nest("/api/alert", alerts::routes())
         .route("/api/stats/daily", axum::routing::get(stats::daily))
         // The writer for the baseline `daily` already reads (AMUX-2871).
         .route("/api/stats/reset", axum::routing::post(stats::reset))
-        .route("/api/branding", axum::routing::get(branding::get_branding)
-            .post(branding::post_branding).delete(branding::delete_branding))
+        .route(
+            "/api/branding",
+            axum::routing::get(branding::get_branding)
+                .post(branding::post_branding)
+                .delete(branding::delete_branding),
+        )
         // base64 icons: the handler's own 5MB check must answer (Python's
         // 400), not axum's 2MB default 413.
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
-        .route("/api/branding/asset/{fname}", axum::routing::get(branding::serve_asset))
+        .route(
+            "/api/branding/asset/{fname}",
+            axum::routing::get(branding::serve_asset),
+        )
         .nest("/api/email", email::routes())
         .nest("/api/cal-events", calendar::routes())
+        .nest("/api/gcal", gcal::routes())
         // Legacy SHAPE (not just path): the SPA renders this array (RR-0075).
         // POST creates a FLEET worker (an env file), which is a different
         // substrate from POST /api/workers (a `workers` table row) — the
@@ -200,7 +372,17 @@ pub fn router(state: AppState) -> Router {
         // fleet substrate (env files + tmux + shared DB), api/session_verbs.rs.
         // Was PROXIED_FAMILIES' SessionVerbs row; the rust-worker 501 pointer
         // guard moved into the module's dispatch.
+        // The Photos tab's BYO Mixpeek connection (api/photos.rs).
+        .merge(photos::routes())
+        .merge(palette::routes())
+        .merge(palette_history::routes())
         .merge(session_verbs::routes())
+        .merge(typing::routes())
+        .merge(boundaries::routes())
+        // Realtime rooms (api/rt.rs): one WebSocket per tab multiplexing
+        // ephemeral per-resource rooms, with an SSE + POST fallback.
+        .merge(rt::routes())
+        .merge(conversations::routes())
         // Identity is config-introspection over server.env + ~/.claude.json
         // this server already reads — NATIVE, not a fleet capability
         // (AMUX-2597 addendum: the SPA's _initIdentity boot call 404'd here).
@@ -217,6 +399,9 @@ pub fn router(state: AppState) -> Router {
         // standing proof of the cutover. Matrix:
         // docs/rust-migration/server-boundary.md.
         .nest("/api/browser", browser::routes())
+        // Rung 3 of the access ladder (AMUX-5300): CUA computer-use sandboxes,
+        // one Docker desktop per lane. api/computer.rs.
+        .nest("/api/computer", computer::routes())
         // Server-machine screen capture (AMUX-4661): a real macOS Screen
         // Recording permission grant needs the OS's own native prompt, not a
         // manually-added System Settings entry — see screen.rs header for why.
@@ -239,11 +424,20 @@ pub fn router(state: AppState) -> Router {
         // field, open/mkdir/rename/read/list/search/delete on ABSOLUTE
         // paths) — a different contract from /api/files above. NATIVE port
         // of the python handlers (api/fs.rs), same wire shapes.
-        .nest("/api/fs", fs::routes())
+        .nest("/api/fs", fs::routes().layer(axum::middleware::from_fn(capabilities::fs_gate)))
+        .route("/api/workers/{name}/capabilities", axum::routing::get(capabilities::view))
+        .route("/api/workers/{name}/sandbox", axum::routing::get(cli_sandbox::view))
+        .route("/api/workers/{name}/isolation", axum::routing::get(customer_isolation::view))
+        .route("/api/security/at-rest", axum::routing::get(at_rest::view))
+        .route("/api/security/at-rest/decrypt", axum::routing::post(at_rest::decrypt))
+        .route("/api/workers/{name}/history", axum::routing::get(instruction_provenance::view))
         // The SPA Files BROWSER's listing + dir autocomplete — native, same
         // module (top-level paths in python, so top-level here).
         .route("/api/ls", axum::routing::any(fs::ls))
-        .route("/api/autocomplete/dir", axum::routing::any(fs::autocomplete_dir))
+        .route(
+            "/api/autocomplete/dir",
+            axum::routing::any(fs::autocomplete_dir),
+        )
         // Chunked upload: /api/upload/start, /api/upload/:id/chunk/:n,
         // /api/upload/:id/finish — native Rust (no Python proxy).
         .nest("/api/upload", upload::routes())
@@ -257,19 +451,66 @@ pub fn router(state: AppState) -> Router {
         // CRM: a PORT of the python contract, not a new feature — the schema and
         // 308 live contacts survived the cutover with no routes to reach them
         // (AMUX-2929).
-        .nest("/api/crm", crm::routes())
+        .nest("/api/crm", crm::routes().merge(crm_accounts::routes()).merge(crm_agent::routes()).merge(crm_outbound::routes()).merge(crm_voice::routes()))
         .nest("/api/speedtest", speedtest::routes())
         .nest("/api/layout-presets", layout_presets::routes())
+        // Social posting and results (AA-42): YouTube first, the rest report their gate.
+        .nest("/api/social", social::routes())
+        .nest("/api/pinned", pinned::routes())
         // The New Worker / Connect modals' supporting reads (AMUX-2871).
         .merge(worker_create::routes())
+        .merge(outcome_plan::routes())
+        .merge(intent::routes())
+        .merge(intent_store::routes())
+        .merge(intent_items::routes())
+        .merge(worker_exec::routes())
         .nest("/api/saved-messages", saved_messages::routes())
         .merge(habits::routes())
         .merge(observability::routes())
-        .merge(connectors::routes())
-        .nest("/api/telegram", telegram::routes())
+        // Writes that used to sit in the public debug routers below, where a LAN
+        // or tailnet peer reached them with no credential: the nudges switch sets
+        // CC_STANDING_ORDERS at any scope, and run ticks any system job.
+        .route(
+            "/api/board/nudges",
+            axum::routing::get(crate::runtime_jobs::board_drive::get_nudges)
+                .patch(crate::runtime_jobs::board_drive::patch_nudges),
+        )
+        .route(
+            "/api/system-jobs/{id}/run",
+            axum::routing::post(crate::runtime_jobs::registry::run_system_job),
+        )
+        .merge(connectors::routes_with(connector_ctx.clone()))
+        .nest("/api/telegram", telegram::routes_with(http))
         .merge(grants::routes())
+        // AMUX-5270: the owner's standing answers to escalations.
+        .merge(standing_approvals::routes())
+        // AMUX-5286: the owner's one-at-a-time triage queue.
+        .merge(needs_input::routes())
+        .merge(needs_input_auto::routes())
+        .merge(decision_digest::routes())
+        .merge(directive::routes())
+        .merge(contract::routes())
+        .merge(land_approvals::routes())
+        // Outbound phone calls (calls.rs, docs/design/phone-calls.md).
+        .merge(calls::routes())
+        .merge(approval_cards::routes())
+        .merge(outbound::routes())
+        .merge(schedule_authority::routes())
+        .merge(mfa::routes())
+        .merge(sso::routes())
+        .merge(scim::routes())
+        .merge(compliance::routes())
+        .merge(bridge::routes())
+        .merge(land_queue::routes())
+        .merge(vault::routes())
+        .merge(vault_secrets::routes())
+        // People's pictures beside their names (avatars.rs).
+        .merge(avatars::routes())
+        // What each person has open right now, behind every avatar (whereabouts.rs).
+        .merge(whereabouts::routes())
+        .merge(chatgpt_app::routes())
+        .merge(chat_delegate::routes())
         .merge(self_update::routes())
-        .nest("/api/proxies", proxies::routes())
         // AMUX-2888: the client controls the SPA and CLI already call. Status
         // answers 200 with ported:false; start/stop answer an honest 501.
         .nest("/api/tunnel", tunnel::routes())
@@ -277,14 +518,18 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())
         .nest("/api/sql", sql::routes())
+        .nest("/api/pages", pages::api_routes())
         .nest("/api/slash-commands", skills::slash_routes())
         .nest("/api/map", map::routes())
+        // Read-only shared map lists (/s/map/{token}, /api/share/map/{token}).
+        .merge(map::public_routes())
         // Map tab's graph mode: mind-map store + Obsidian import + the fleet
         // org-chart projection (AMUX-2886 — tables existed, routes did not).
         .nest("/api/graph", graph::routes())
         // Workspace tab web-terminal panes: local-shell PTY over base64 I/O +
         // long-poll output (AMUX-2885 — every keystroke 404'd since cutover).
         .nest("/api/terminal", terminal::routes())
+        .nest("/api/tailnet", tailnet_join::routes())
         // Metrics tab report cards: CRUD + registry + ops-server refresh
         // (AMUX-2884 — the table kept its rows, the routes never mounted).
         .nest("/api/reports", reports::routes())
@@ -296,12 +541,19 @@ pub fn router(state: AppState) -> Router {
         // the structured request log + tracing tail (api/request_log.rs).
         .nest("/api/logs", request_log::routes())
         .merge(interactions::routes())
+        .merge(ledger::routes())
+        .merge(trace::routes())
+        .merge(cli_telemetry::routes())
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
         // Record tab (AMUX-4624): device recordings synced into a folder and
         // transcribed locally. The folder is the store; see the module docs.
         .nest("/api/recordings", recordings::routes())
+        // Converse tab: the log of hands-free voice conversations with a
+        // worker, replay and expiry. The folder is the store (api/converse.rs).
+        .merge(converse::routes())
         .nest("/api/dictation", dictation::routes())
+        .merge(transcription::routes())
         // Transcription lives at the TOP-LEVEL /api/dictate (python parity);
         // the dictation module owns it and answers NATIVELY (AMUX-2598:
         // whisper worker + gemini fallback in this process). Body limit off:
@@ -322,7 +574,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/org", org::routes())
         // Absolute-path routes (merged, not nested): the gmail callback
         // below is public, and a nest wildcard at /api/gmail would shadow it.
-        .merge(gmail_auth::routes())
+        .merge(gmail_auth::routes_with(gmail_ctx.clone()))
         // The mailbox half — labels/inbox/thread/send over GmailClient
         // (AMUX-2883: the Mail view's calls 404'd since the python retirement).
         .merge(gmail::routes())
@@ -330,8 +582,14 @@ pub fn router(state: AppState) -> Router {
         // here. Each 404 body deserialized cleanly into the client's success
         // path, so all three failed silently: no branch badges, per-worker
         // gates rendering as deleted, and an unactionable red offline banner.
-        .route("/api/sessions-git", axum::routing::get(sessions_git::sessions_git))
-        .route("/api/board/themes", axum::routing::get(board_themes::board_themes))
+        .route(
+            "/api/sessions-git",
+            axum::routing::get(sessions_git::sessions_git),
+        )
+        .route(
+            "/api/board/themes",
+            axum::routing::get(board_themes::board_themes),
+        )
         .route("/api/lookup", axum::routing::post(lookup::lookup))
         .route(
             "/api/lookup/bulk",
@@ -343,6 +601,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/skin", axum::routing::get(skin::get_skin))
         .route("/api/config/export", axum::routing::get(config_iac::export))
         .route("/api/config/apply", axum::routing::put(config_iac::apply))
+        // The move bundle (cloud-self-service.md 7.1): config plus allowlisted
+        // data, one document. A real board with years of card history exported
+        // at 239 MB and the old 100 MB ceiling answered 413 (amux Cloud e2e,
+        // 2026-10-18; customer hosts are not behind Cloudflare's proxy, so its
+        // cap never applied). `amux import` sends it gzipped (about 4x
+        // smaller), and the handler caps the decompressed JSON too.
+        .route("/api/move/export", axum::routing::get(move_bundle::export))
+        .route(
+            "/api/move/import",
+            axum::routing::post(move_bundle::import)
+                .layer(axum::extract::DefaultBodyLimit::max(move_bundle::MAX_IMPORT_BYTES)),
+        )
         .route(
             "/api/board/commit-mentions",
             axum::routing::get(commit_mentions::commit_mentions),
@@ -378,12 +648,21 @@ pub fn router(state: AppState) -> Router {
         // AF-123: OBSERVED edit records from the Bash hook pair — mtimes that
         // moved during a command, reported rather than parsed, so a heredoc
         // or an extensionless path cannot hide a write from attribution.
-        .route("/api/git/observed-edits", axum::routing::post(git_guard::observed_edits))
+        .route(
+            "/api/git/observed-edits",
+            axum::routing::post(git_guard::observed_edits),
+        )
         // AF-127: the per-verdict OUTCOME instrument. The guard records its
         // verdict as a row; the hook reports what resolved a block (declared
         // override / observed trim); the debug read computes the mix.
-        .route("/api/git/guard-outcome", axum::routing::post(git_guard::guard_outcome))
-        .route("/api/debug/guard-outcomes", axum::routing::get(git_guard::guard_outcomes_debug))
+        .route(
+            "/api/git/guard-outcome",
+            axum::routing::post(git_guard::guard_outcome),
+        )
+        .route(
+            "/api/debug/guard-outcomes",
+            axum::routing::get(git_guard::guard_outcomes_debug),
+        )
         // Client diagnostic beacons (AR-128): the SPA sends geometry/tap
         // traces for mobile layout debugging.
         //
@@ -414,10 +693,57 @@ pub fn router(state: AppState) -> Router {
             "/api/offline-origin",
             axum::routing::get(offline_origin::offline_origin),
         )
+        // Public links to an app's port (static_files/public_links.rs). The
+        // list and its changes are the owner's; only /pub/<id>/ is public.
+        .route(
+            "/api/page-links",
+            axum::routing::get(static_files::public_links::list).post(static_files::public_links::create),
+        )
+        .route(
+            "/api/page-links/{id}",
+            axum::routing::delete(static_files::public_links::revoke).patch(static_files::public_links::rename),
+        )
+        .route(
+            "/api/page-links/{id}/approve",
+            axum::routing::post(static_files::public_links::approve),
+        )
+        // A published app's own amux access and credential (app_identity.rs).
+        .route(
+            "/api/page-links/{id}/api",
+            axum::routing::post(static_files::public_links::set_api),
+        )
+        .route(
+            "/api/page-links/{id}/app-token",
+            axum::routing::post(static_files::public_links::new_app_token),
+        )
+        // A one-time link that opens an app inside amux on the apps origin.
+        .route(
+            "/api/page-links/{id}/open",
+            axum::routing::post(static_files::apps_origin::open),
+        )
+        // An HTML file from the Files tab, opened as its folder's website on
+        // the apps origin.
+        .route(
+            "/api/page-links/site-view",
+            axum::routing::post(static_files::apps_origin::site_view),
+        )
+        // The address copied links are built on (deep_links.rs).
+        .merge(deep_links::routes())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             policy::enforce,
         ))
+        // The owner's kill switch (governance.rs): while engaged, no worker,
+        // app or policy publishes, sends email or mints a connector token.
+        .layer(axum::middleware::from_fn(governance::kill_gate))
+        // Contract rule 10 (AH-387): a claimed worker identity carries that
+        // worker's minted token. Inside require_bearer, so it sees only
+        // admitted requests.
+        .layer(axum::middleware::from_fn(worker_identity::enforce))
+        // The ledger's actor (ledger.rs): resolved just inside auth, so the
+        // owner proof it stamps is visible, and carried out to the interaction
+        // receipt on the response.
+        .layer(axum::middleware::from_fn(ledger::stamp))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
@@ -445,10 +771,17 @@ pub fn router(state: AppState) -> Router {
         // until now. Public like its debug siblings (lane names and timings).
         .route("/api/debug/scan", axum::routing::get(health::debug_scan))
         .route("/api/debug/sse", axum::routing::get(debug_sse))
-        .route("/api/debug/downtime", axum::routing::get(health::debug_downtime))
+        .route("/api/debug/send-profile", axum::routing::get(send_profile::debug_send_profile))
+        .route(
+            "/api/debug/downtime",
+            axum::routing::get(health::debug_downtime),
+        )
         // Per-session logging health + a computed stale verdict (AMUX-2628).
         // Public like its debug siblings: session names and byte counts only.
-        .route("/api/debug/logs", axum::routing::get(session_verbs::debug_logs))
+        .route(
+            "/api/debug/logs",
+            axum::routing::get(session_verbs::debug_logs),
+        )
         // Compaction generations per lane (AMUX-3742): the instrument that
         // could not express "amux claude performs worse than raw claude".
         // Public like its debug siblings — lane names and counts only.
@@ -461,7 +794,10 @@ pub fn router(state: AppState) -> Router {
         // natively, which proxy to python and why, and the cutover exit for
         // each. Route names only — nothing secret, so public like its
         // debug sibling above.
-        .route("/api/debug/boundary", axum::routing::get(py_proxy::boundary))
+        .route(
+            "/api/debug/boundary",
+            axum::routing::get(py_proxy::boundary),
+        )
         // Legacy-port retirement counter (ethos rule 4): "can we stop
         // answering 8822 yet?" as a number rather than a guess — hit count,
         // which IPs/user-agents are still calling it, and the exit condition
@@ -482,7 +818,10 @@ pub fn router(state: AppState) -> Router {
         // The routing truth (AMUX-2610): the ROUTE_TABLE as JSON, so "is X
         // routed, with which methods" is a GET, not a grep. Public like its
         // debug siblings (route names only, nothing secret).
-        .route("/api/debug/routes", axum::routing::get(request_log::debug_routes))
+        .route(
+            "/api/debug/routes",
+            axum::routing::get(request_log::debug_routes),
+        )
         // Public: calendar fetchers (Google/Apple) cannot send bearer tokens.
         .route("/api/calendar.ics", axum::routing::get(calendar::ics_feed))
         // Dynamic manifest: PWA name/color follow the branding prefs (the
@@ -492,15 +831,37 @@ pub fn router(state: AppState) -> Router {
         // admits it via the localhost auth bypass; require_bearer has no
         // such bypass, so the callback must sit outside it (single-use
         // server-minted state is the guard).
-        .merge(gmail_auth::callback_routes())
+        .merge(gmail_auth::callback_routes_with(gmail_ctx))
         // Same rationale: the connectors broker's callback receives provider
         // redirects (Google/Slack), which cannot carry a bearer.
-        .merge(connectors::callback_routes())
+        .merge(connectors::callback_routes_with(connector_ctx))
         // Public local invite landing + acceptance. A successful POST installs
         // a revocable member cookie; the outer identity layer below resolves
         // it before auth and request logging.
         .merge(org::public_routes())
-        .route("/api/_clear_sw", axum::routing::get(static_files::clear_sw_landing))
+        // Single sign-on, the second-factor page and SCIM provisioning
+        // (governance PR 20): each authenticates for itself (single-use
+        // state + PKCE, the caller's own session, the provider's SCIM token).
+        .merge(sso::public_routes())
+        .merge(mfa::public_routes())
+        .merge(scim::public_routes())
+        // Copied file links (/f/<path>) and the file that lets the iOS app
+        // claim them; neither reveals anything (deep_links.rs).
+        .merge(deep_links::public_routes())
+        // The ChatGPT app (AMUX-5396): /mcp and its OAuth server. Outside
+        // require_bearer on purpose; each route authenticates for itself and
+        // the loopback bypass earns nothing here (chatgpt_app.rs, trust rule).
+        .merge(chatgpt_app::public_routes())
+        .merge(connection::routes(
+            crate::config::ServerConfig::from_process_env().tls_dir(),
+        ))
+        .route(
+            "/api/_clear_sw",
+            axum::routing::get(static_files::clear_sw_landing),
+        )
+        // Standalone pages (/pages/<name>) check owner access in the handler,
+        // the same check the dashboard shell's bootstrap uses.
+        .merge(pages::view_routes())
         .merge(static_files::routes())
         .merge(protected)
         .with_state(state);
@@ -530,8 +891,20 @@ pub fn router(state: AppState) -> Router {
     // Synthesizes ONLY into an empty body: a handler that returned its own 405
     // with prose knows more than this layer does and must not be overwritten.
     let app = app.layer(axum::middleware::from_fn(explain_method_not_allowed));
+    // A browser acting for another site may not change anything (cross_site.rs):
+    // on amux Cloud every server is under amux.io, so the door cookie alone
+    // would let one customer's page act on another's server.
+    let app = app.layer(axum::middleware::from_fn(cross_site::guard));
+    // A chat delegate may only read (AMUX-5432): refused before any handler.
+    let app = app.layer(axum::middleware::from_fn(chat_delegate::delegate_read_only));
     let app = app.layer(axum::middleware::from_fn_with_state(
-        store_for_reqlog.clone(), interactions::middleware));
+        store_for_reqlog.clone(),
+        interactions::middleware,
+    ));
+    // Every request runs inside its trace (trace.rs): inherited from its
+    // `traceparent`, else minted here at the origin. Outside the interaction
+    // receipt so the ledger row it writes carries the trace.
+    let app = app.layer(axum::middleware::from_fn(trace::layer));
 
     // Transparent gzip compression for every response whose client sends
     // Accept-Encoding: gzip. Board slim drops from 690KB to 162KB,
@@ -623,14 +996,31 @@ async fn explain_method_not_allowed(
 /// Python's `_PLACEHOLDER_API_KEYS` (py:77268), verbatim: obvious
 /// template/dummy values that must not count as "a key is configured".
 const PLACEHOLDER_API_KEYS: &[&str] = &[
-    "changeme", "change-me", "change_me",
-    "your-api-key", "your_api_key", "your-key", "yourkey",
-    "your_key_here", "your-key-here", "your-api-key-here",
-    "placeholder", "dummy", "example", "sample",
-    "test", "test-key", "testkey",
-    "replace-me", "replace_me",
-    "xxx", "xxxx",
-    "sk-ant-xxx", "sk-ant-your-key", "sk-ant-example", "sk-ant-placeholder",
+    "changeme",
+    "change-me",
+    "change_me",
+    "your-api-key",
+    "your_api_key",
+    "your-key",
+    "yourkey",
+    "your_key_here",
+    "your-key-here",
+    "your-api-key-here",
+    "placeholder",
+    "dummy",
+    "example",
+    "sample",
+    "test",
+    "test-key",
+    "testkey",
+    "replace-me",
+    "replace_me",
+    "xxx",
+    "xxxx",
+    "sk-ant-xxx",
+    "sk-ant-your-key",
+    "sk-ant-example",
+    "sk-ant-placeholder",
 ];
 
 /// The 500 every API module was spelling for itself (AMUX-2919).
@@ -721,7 +1111,7 @@ pub(crate) fn py_truthy(v: &serde_json::Value) -> bool {
 /// it a table (D1: "in-memory state is fiction").
 /// GET /api/debug/sse — is the realtime backbone actually carrying the fleet?
 ///
-/// AF-262. `.claude/rules/sse-realtime.md` states the failure mode plainly:
+/// AF-262. `crates/amux-dashboard/CLAUDE.md (Realtime)` states the failure mode plainly:
 /// clients declare SSE stale after 18s of silence and FALL BACK TO POLLING,
 /// and the fallback fetches both sessions and board. So an SSE degradation
 /// shows up as a rise in ordinary poll traffic, which is indistinguishable
@@ -740,7 +1130,10 @@ async fn debug_sse(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::Json<serde_json::Value> {
     let (live, opened) = crate::api::sse::conn_stats();
-    let since_h: f64 = q.get("since_h").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let since_h: f64 = q
+        .get("since_h")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24.0);
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
@@ -761,11 +1154,18 @@ async fn debug_sse(
                 .iter()
                 .filter(|v| {
                     v.get("kind").and_then(|k| k.as_str()) == Some("sse-stale-reconnect")
-                        && v.get("ts").and_then(serde_json::Value::as_f64).unwrap_or(0.0) >= cutoff
+                        && v.get("ts")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0)
+                            >= cutoff
                 })
                 .collect();
             let n = hits.len();
-            (n, hits.into_iter().rev().take(5).cloned().collect::<Vec<_>>(), Some(scanned))
+            (
+                n,
+                hits.into_iter().rev().take(5).cloned().collect::<Vec<_>>(),
+                Some(scanned),
+            )
         }
         Err(_) => (0, Vec::new(), None),
     };
@@ -813,7 +1213,73 @@ async fn debug_sse(
 
 static CLIENT_DEBUG_RING: std::sync::Mutex<Vec<serde_json::Value>> =
     std::sync::Mutex::new(Vec::new());
+
+/// UI-STUCK SIGNALS (owner, 2026-10-29: "make sure we have verbose logging,
+/// profiling, monitoring etc. in amux so we can automatically identify these
+/// bugs and fix them via a sweep"). The verdicts a client sends when a control
+/// or a view stayed stuck: a button held disabled, a request whose receipt
+/// never settled, a microphone nobody answered. Counted per verdict for the
+/// life of this process, outside the 500-entry ring that routine beacons
+/// churn through in minutes, logged at WARN so /api/logs/analyze groups them,
+/// and read by the invariant `ui.controls_do_not_stick`.
+pub(crate) const UI_STUCK_VERDICTS: &[&str] = &[
+    "composer_send_stuck", "press_busy_released_unsettled", "interaction_ack_timeout",
+    "interaction_ack_failed", "interaction_ack_slow", "mic_permission_slow",
+    "outbox_replay_lock_stalled", "attachment-save-stalled", "history_failed", "task_toggle_unmatched",
+    "outbox_flight_stalled", "message_queue_stalled_sent_direct", "outbox_upload_list_timeout",
+];
+type StuckTally = crate::invariants::checks::StuckRows;
+static UI_STUCK: std::sync::Mutex<StuckTally> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Every stuck-UI verdict seen since this process started, or None when the
+/// tally could not be read (so the invariant says unmeasured, not clear).
+pub(crate) fn ui_stuck_snapshot() -> Option<StuckTally> {
+    UI_STUCK.lock().ok().map(|t| t.clone())
+}
+/// Whether a stuck-UI beacon counts toward `ui.controls_do_not_stick`.
+///
+/// A HIDDEN TAB IS NOT A STUCK CONTROL (AF-1031). The invariant's claim is
+/// that no client reports a control or view that stayed stuck; in a tab
+/// nobody is looking at there is no control to see, and WebKit throttles a
+/// hidden tab's IndexedDB and timers, so its outbox reads time out on their
+/// own (about 650 of 2,500 outbox reports on 2026-10-29 carried hidden=1).
+/// One such report from a background tab failed the fleet invariant and
+/// filed a card. The tab retries when it is shown, and a stall that a person
+/// can see arrives with hidden=0. Still logged, at INFO, with the reason.
+///
+/// A BOUNDED WAIT THAT RECOVERED IS NOT A STUCK CONTROL EITHER (AF-1050). A
+/// beacon whose own `waited_ms` is under [`UI_STUCK_MIN_WAIT_MS`] reports a
+/// designed recovery: the outbox steals a frozen window's replay lock after
+/// 1.5 s and sends (`action:"stole"`), and storage already known dead is given
+/// 250 ms before the pass goes on. On 2026-10-30, after AF-1008 shipped, those
+/// two were 19 of the 22 reports keeping this invariant red, all from one Mac
+/// app. Every other stuck verdict waits 3 s or more (storage steal 3 s, queue
+/// 3 s, attachment save 8 s, delivery steal 30 s), and a first storage timeout
+/// still holds the send 5 s, so those still count.
+pub(crate) fn counts_as_stuck(body: &serde_json::Value) -> bool {
+    let hidden = matches!(body.get("hidden"), Some(v) if v.as_i64() == Some(1) || v.as_bool() == Some(true));
+    let recovered = body.get("waited_ms").and_then(|v| v.as_i64()).is_some_and(|ms| ms < UI_STUCK_MIN_WAIT_MS);
+    !hidden && !recovered
+}
+
+/// Below this, a stuck-UI beacon's own wait was a designed recovery (AF-1050).
+pub(crate) const UI_STUCK_MIN_WAIT_MS: i64 = 2_000;
+
 const CLIENT_DEBUG_RING_MAX: usize = 500;
+
+/// The client beacons of one `kind` still in the ring, oldest first, or None
+/// when the ring could not be read (so a caller can say "unmeasured" rather
+/// than report zero). Used by `/api/debug/rt` to join the client half
+/// (socket failed, fell back, resynced) with the server's counters.
+pub(crate) fn client_debug_of_kind(kind: &str) -> Option<Vec<serde_json::Value>> {
+    let ring = CLIENT_DEBUG_RING.lock().ok()?;
+    Some(
+        ring.iter()
+            .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some(kind))
+            .cloned()
+            .collect(),
+    )
+}
 
 async fn client_debug_post(
     headers: axum::http::HeaderMap,
@@ -833,14 +1299,44 @@ async fn client_debug_post(
     // The WHOLE body, at INFO. The payload is the entire point of the beacon;
     // logging just `kind` is how 299 of these arrived carrying real device
     // geometry and told us nothing.
-    tracing::info!(kind = %kind, ua = %ua, payload = %body, "client-debug beacon");
+    // Which browser INSTANCE, not just which family: the dashboard's stable
+    // per-browser id, APP_VER, engine and PWA-standalone (see request_log's
+    // `client` column). Empty when a caller predates the header.
+    let client = headers
+        .get("x-amux-client")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.chars().take(160).collect::<String>())
+        .unwrap_or_default();
+    tracing::info!(kind = %kind, ua = %ua, client = %client, payload = %body, "client-debug beacon");
 
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // A stuck control or view: counted and said at WARN (see UI_STUCK_VERDICTS).
+    let verdict = body.get("verdict").or_else(|| body.get("action")).and_then(|v| v.as_str()).unwrap_or("");
+    if UI_STUCK_VERDICTS.contains(&verdict) && !counts_as_stuck(&body) {
+        let reason = if body.get("waited_ms").and_then(|v| v.as_i64()).is_some_and(|ms| ms < UI_STUCK_MIN_WAIT_MS) {
+            "recovered within its bounded wait"
+        } else {
+            "hidden tab"
+        };
+        tracing::info!(kind = %kind, verdict, client = %client, measured = true, n_considered = 1,
+            payload = %body, reason,
+            "client UI stall that a person did not see stuck: logged, not counted (ui.controls_do_not_stick)");
+    } else if UI_STUCK_VERDICTS.contains(&verdict) {
+        tracing::warn!(kind = %kind, verdict, client = %client, measured = true, n_considered = 1,
+            payload = %body, "client UI stuck: a control or view did not settle (ui.controls_do_not_stick)");
+        if let Ok(mut t) = UI_STUCK.lock() {
+            let e = t.entry(verdict.to_string()).or_insert((0, 0, String::new(), String::new()));
+            e.0 += 1;
+            e.1 = ts;
+            e.2 = kind.clone();
+            e.3 = client.chars().take(120).collect();
+        }
+    }
     if let Ok(mut ring) = CLIENT_DEBUG_RING.lock() {
-        ring.push(serde_json::json!({ "ts": ts, "kind": kind, "ua": ua, "body": body }));
+        ring.push(serde_json::json!({ "ts": ts, "kind": kind, "ua": ua, "client": client, "body": body }));
         let n = ring.len();
         if n > CLIENT_DEBUG_RING_MAX {
             ring.drain(0..n - CLIENT_DEBUG_RING_MAX);
@@ -900,17 +1396,26 @@ async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Valu
         .to_string();
     // has_api_key counts ONLY server.env (python's comment: never
     // Docker-injected process env), and only non-placeholder values.
-    let home = std::env::var("AMUX_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
-    });
+    let home = std::env::var("AMUX_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
+        });
     let mut has_key_in_env = false;
     let mut base = String::new();
     let mut tok = String::new();
+    let env_text_all = std::fs::read_to_string(home.join("server.env")).unwrap_or_default();
+    let user_home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    let model_auth = model_auth_status(&env_text_all, &user_home);
     if let Ok(env_text) = std::fs::read_to_string(home.join("server.env")) {
         for l in env_text.lines() {
             let l = l.trim();
             if let Some(val) = l.strip_prefix("ANTHROPIC_API_KEY=") {
-                let v = val.trim().trim_matches('"').trim_matches('\'').to_lowercase();
+                let v = val
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_lowercase();
                 if !v.is_empty() && !PLACEHOLDER_API_KEYS.contains(&v.as_str()) {
                     has_key_in_env = true;
                 }
@@ -946,12 +1451,161 @@ async fn identity(headers: axum::http::HeaderMap) -> axum::Json<serde_json::Valu
         "is_local_member": is_local_member,
         "access_scope": access_scope,
         "team": team,
-        "has_api_key": has_key_in_env || has_oauth || has_proxy,
+        "has_api_key": has_key_in_env || has_oauth || has_proxy
+            || model_auth["claude"]["subscription_token"].as_bool().unwrap_or(false),
         "has_oauth": has_oauth,
+        // Any provider at all: an OpenAI key or a Codex sign-in runs Codex workers, so a server
+        // with one must not be told "no key" (amux Cloud e2e, 2026-10-18).
+        "has_any_model": has_key_in_env || has_oauth || has_proxy || any_model_auth(&model_auth),
+        "model_auth": model_auth,
+        // Kept out of model_auth: a GitHub sign-in runs no worker. It is what
+        // `amux contribute` (Pull from remote on a cloud server) needs.
+        "github": {"signed_in": github_signed_in(&user_home)},
         "managed_upstream": has_proxy,
         "key_valid": serde_json::Value::Null,
         "key_error": "",
+        "account_url": account_url(&env_text_all, is_local_member),
     }))
+}
+
+/// Where the server's owner manages billing and deletes the account. An amux
+/// Cloud server gets AMUX_ACCOUNT_URL from its signup (cloud/desktop/bootstrap.sh);
+/// a self-hosted one has none. Invited members never see it: the account and its
+/// server belong to the person paying.
+fn account_url(env_text: &str, is_local_member: bool) -> Option<String> {
+    if is_local_member {
+        return None;
+    }
+    env_text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("AMUX_ACCOUNT_URL="))
+        .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+        .rfind(|v| v.starts_with("https://"))
+}
+
+/// Which model sign-ins this server holds, for the first-run "Connect a model"
+/// screen (docs/design/cloud-self-service.md 8.4). Each CLI keeps its own
+/// credential in its own store; this only reports presence, never a value.
+/// `claude.subscription_token` is `claude setup-token`'s one-year token saved
+/// as CLAUDE_CODE_OAUTH_TOKEN; `claude.oauth` is an interactive /login.
+pub(crate) fn model_auth_status(env_text: &str, user_home: &std::path::Path) -> serde_json::Value {
+    let set = |key: &str| {
+        env_text.lines().any(|l| {
+            l.trim()
+                .strip_prefix(key)
+                .and_then(|r| r.strip_prefix('='))
+                .map(|v| {
+                    let v = v.trim().trim_matches('"').trim_matches('\'').to_lowercase();
+                    !v.is_empty() && !PLACEHOLDER_API_KEYS.contains(&v.as_str())
+                })
+                .unwrap_or(false)
+        })
+    };
+    let nonempty = |p: std::path::PathBuf| std::fs::metadata(p).map(|m| m.len() > 2).unwrap_or(false);
+    let claude_oauth = std::fs::read_to_string(user_home.join(".claude.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .map(|v| py_truthy(&v["oauthAccount"]))
+        .unwrap_or(false)
+        || nonempty(user_home.join(".claude").join(".credentials.json"));
+    serde_json::json!({
+        "claude": {
+            "api_key": set("ANTHROPIC_API_KEY"),
+            "subscription_token": set("CLAUDE_CODE_OAUTH_TOKEN"),
+            "oauth": claude_oauth,
+        },
+        "codex": {
+            "api_key": set("OPENAI_API_KEY"),
+            "signed_in": nonempty(user_home.join(".codex").join("auth.json")),
+        },
+        "gemini": {
+            "api_key": set("GEMINI_API_KEY") || set("GOOGLE_API_KEY"),
+            "signed_in": nonempty(user_home.join(".gemini").join("oauth_creds.json")),
+        },
+    })
+}
+
+/// True when `gh` holds a github.com sign-in: its hosts.yml names the host with
+/// a user or a token (the token sits in a keyring on a desktop, in the file on
+/// a server). Presence only; nothing is read out.
+pub(crate) fn github_signed_in(user_home: &std::path::Path) -> bool {
+    let dir = std::env::var_os("GH_CONFIG_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| user_home.join(".config"))
+            .join("gh")
+    });
+    github_hosts_signed_in(&std::fs::read_to_string(dir.join("hosts.yml")).unwrap_or_default())
+}
+
+fn github_hosts_signed_in(hosts: &str) -> bool {
+    let mut in_github = false;
+    for line in hosts.lines() {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_github = line.trim_end() == "github.com:";
+        } else if in_github {
+            let t = line.trim();
+            if (t.starts_with("user:") || t.starts_with("oauth_token:")) && t.split_once(':').is_some_and(|(_, v)| !v.trim().is_empty()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when any provider in a [`model_auth_status`] answer has a credential.
+pub(crate) fn any_model_auth(v: &serde_json::Value) -> bool {
+    v.as_object().is_some_and(|providers| {
+        providers.values().any(|p| p.as_object().is_some_and(|f| f.values().any(|b| b.as_bool() == Some(true))))
+    })
+}
+
+#[cfg(test)]
+mod model_auth_tests {
+    use super::{account_url, any_model_auth, model_auth_status};
+
+    #[test]
+    fn the_owner_of_a_cloud_server_gets_its_account_page_and_a_member_does_not() {
+        let env = "AMUX_AUTH_TOKEN=none\nAMUX_ACCOUNT_URL='https://amux.io/start/billing/?email=a%40b.co'\n";
+        assert_eq!(account_url(env, false).as_deref(), Some("https://amux.io/start/billing/?email=a%40b.co"));
+        assert_eq!(account_url(env, true), None, "an invited member cannot delete the owner's account");
+        assert_eq!(account_url("AMUX_AUTH_TOKEN=none\n", false), None, "self-hosted: no account page");
+        assert_eq!(account_url("AMUX_ACCOUNT_URL=javascript:alert(1)\n", false), None, "only an https link");
+    }
+
+    #[test]
+    fn github_sign_in_is_read_from_gh_hosts_file() {
+        use super::github_hosts_signed_in as s;
+        assert!(s("github.com:\n    users:\n        tester:\n    git_protocol: https\n    user: tester\n"));
+        assert!(s("github.com:\n    oauth_token: gho_fake\n"));
+        assert!(!s(""), "no file");
+        assert!(!s("github.com:\n    git_protocol: https\n"), "host listed, nobody signed in");
+        assert!(!s("ghe.example.com:\n    user: tester\n"), "another host");
+    }
+
+    #[test]
+    fn an_openai_key_alone_is_a_connected_model() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!any_model_auth(&model_auth_status("", home.path())), "nothing set");
+        assert!(any_model_auth(&model_auth_status("OPENAI_API_KEY=sk-proj-abc123\n", home.path())));
+        assert!(!any_model_auth(&model_auth_status("OPENAI_API_KEY=changeme\n", home.path())), "placeholder");
+    }
+
+    #[test]
+    fn reports_presence_per_provider_and_ignores_placeholders() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".codex/auth.json"), r#"{"tokens":{"x":1}}"#).unwrap();
+        let env = "ANTHROPIC_API_KEY=changeme\nCLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-abc\nGEMINI_API_KEY=\n";
+        let v = model_auth_status(env, home.path());
+        assert_eq!(v["claude"]["api_key"], false, "placeholder key is not a key");
+        assert_eq!(v["claude"]["subscription_token"], true);
+        assert_eq!(v["claude"]["oauth"], false);
+        assert_eq!(v["codex"]["signed_in"], true);
+        assert_eq!(v["codex"]["api_key"], false);
+        assert_eq!(v["gemini"]["api_key"], false, "empty value is not a key");
+        assert_eq!(v["gemini"]["signed_in"], false);
+    }
 }
 
 // ---- /api/memory/global ----
@@ -971,19 +1625,32 @@ async fn global_memory_get() -> axum::Json<serde_json::Value> {
 }
 
 async fn global_memory_post(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let content = body
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let content = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let path = global_memory_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     match std::fs::write(&path, content) {
-        Ok(_) => axum::Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(_) => {
+            // "Global memory saved: all workers will see it" is the UI's
+            // promise. Every worker's composed context is rewritten and the
+            // running ones are told to re-read it (session_verbs::refresh_scoped_context).
+            let reached = session_verbs::workers_in_scope("global", "");
+            let origin = session_verbs::hdr_worker(&headers);
+            let live = session_verbs::refresh_scoped_context(&state, &reached, "memory (global scope)", &origin).await;
+            axum::Json(serde_json::json!({
+                "ok": true,
+                "affected_workers": reached,
+                "delivered_live": live,
+                "takes_effect": session_verbs::SCOPED_CONTEXT_TAKES_EFFECT,
+            }))
+            .into_response()
+        }
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(serde_json::json!({"error": e.to_string()})),
@@ -1003,7 +1670,13 @@ mod truthy_reachability {
     /// u64/i64/f64 and `as_f64()` casts lossily rather than failing.
     #[test]
     fn as_f64_never_none_without_arbitrary_precision() {
-        for s in ["18446744073709551615", "-9223372036854775808", "0", "1", "1.5"] {
+        for s in [
+            "18446744073709551615",
+            "-9223372036854775808",
+            "0",
+            "1",
+            "1.5",
+        ] {
             let v: serde_json::Value = serde_json::from_str(s).unwrap();
             let n = v.as_number().expect("parsed as a number");
             assert!(
@@ -1035,14 +1708,23 @@ mod slow_ok_tests {
         // THE CONTROL THAT MATTERS. A fast model inside a slow request leaves
         // time that is amux's own, and it must STILL be measured — otherwise
         // this is a route exemption wearing a per-request header.
-        assert!(!dominated_by_external(11_000, 200), "5s+ of amux time must still file");
-        assert!(!dominated_by_external(10_000, 6_000), "60% is not dominated");
+        assert!(
+            !dominated_by_external(11_000, 200),
+            "5s+ of amux time must still file"
+        );
+        assert!(
+            !dominated_by_external(10_000, 6_000),
+            "60% is not dominated"
+        );
 
         // And a fast request declares nothing: a 3ms call stamping the header
         // would put a permanent exemption on the route by another name.
         assert!(!dominated_by_external(3, 3));
         assert!(!dominated_by_external(999, 999), "under the floor");
-        assert!(dominated_by_external(1_000, 1_000), "at the floor, fully external");
+        assert!(
+            dominated_by_external(1_000, 1_000),
+            "at the floor, fully external"
+        );
     }
 
     /// The reason string is the only thing a human sees when asking why a slow
@@ -1050,9 +1732,97 @@ mod slow_ok_tests {
     /// bare label (ethos rule 4).
     #[test]
     fn the_slow_ok_reason_carries_what_it_was_measured_on() {
-        let r = slow_ok(axum::response::Response::new(axum::body::Body::empty()), "helper-model claude:haiku 6900ms");
-        let v = r.headers().get("x-amux-slow-ok").and_then(|v| v.to_str().ok()).unwrap_or("");
-        assert!(v.contains("6900ms"), "the excluded-on measurement must be in it: {v}");
-        assert!(v.contains("helper-model"), "and what consumed the time: {v}");
+        let r = slow_ok(
+            axum::response::Response::new(axum::body::Body::empty()),
+            "helper-model claude:haiku 6900ms",
+        );
+        let v = r
+            .headers()
+            .get("x-amux-slow-ok")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            v.contains("6900ms"),
+            "the excluded-on measurement must be in it: {v}"
+        );
+        assert!(
+            v.contains("helper-model"),
+            "and what consumed the time: {v}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ui_stuck_hidden_tests {
+    /// AF-1031: a stall reported from a hidden tab is not counted; one from a
+    /// shown tab, or with no visibility recorded, still is.
+    #[test]
+    fn a_hidden_tab_stall_does_not_count_as_a_stuck_control() {
+        use serde_json::json;
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout", "hidden": 1})));
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_flight_stalled", "hidden": true})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout", "hidden": 0})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "composer_send_stuck"})), "no visibility recorded still counts");
+    }
+
+    /// AF-1050: the outbox's designed recoveries (a 1.5 s lock steal, the 250 ms
+    /// dead-storage wait) are not stuck controls; a 5 s first storage timeout,
+    /// and every verdict with no wait recorded, still are.
+    #[test]
+    fn a_bounded_wait_that_recovered_does_not_count_as_a_stuck_control() {
+        use serde_json::json;
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_replay_lock_stalled",
+            "action": "stole", "waited_ms": 1500, "hidden": 0})));
+        assert!(!super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout",
+            "after_reset": 1, "waited_ms": 250, "hidden": 0})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "outbox_upload_list_timeout",
+            "after_reset": 0, "waited_ms": 5000, "hidden": 0})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "message_queue_stalled_sent_direct", "waited_ms": 3000})));
+        assert!(super::counts_as_stuck(&json!({"verdict": "outbox_flight_stalled", "hidden": 0})));
+    }
+}
+
+#[cfg(test)]
+mod public_write_tests {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// The routers merged beside the public debug reads carried two writes: the
+    /// nudges switch, which sets CC_STANDING_ORDERS at any scope, and the
+    /// on-demand system-job tick. Both answered a LAN or tailnet peer with no
+    /// credential. Pinned through the real router, with bodies the handlers
+    /// refuse before writing anything, so the old code answers 400/404 here
+    /// and never touches the amux home.
+    #[tokio::test]
+    async fn public_debug_routers_carry_no_unauthenticated_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("w.db")).unwrap();
+        let app = crate::api::router(super::AppState {
+            store: Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: Some("test-bearer".into()),
+            reconciled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+        let send = |method: &str, uri: &str, body: &str| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        for (method, uri, body) in [
+            ("PATCH", "/api/board/nudges", r#"{"level":"worker","name":"","enabled":false}"#),
+            ("POST", "/api/system-jobs/no-such-job/run", "{}"),
+        ] {
+            let st = app.clone().oneshot(send(method, uri, body)).await.unwrap().status();
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{method} {uri} must need the bearer");
+        }
+        // The reads beside them stay public, as their comments promise.
+        let st = app.clone().oneshot(send("GET", "/api/system-jobs", "")).await.unwrap().status();
+        assert_ne!(st, StatusCode::UNAUTHORIZED, "GET /api/system-jobs stays public");
     }
 }

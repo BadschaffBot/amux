@@ -52,5 +52,6 @@ pub mod stall;
 pub mod task_graph;
 pub mod turn;
 pub mod verification;
-pub mod workflow;
 pub mod worker;
+pub mod worker_type;
+pub mod workflow;

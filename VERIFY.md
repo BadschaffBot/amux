@@ -71,12 +71,24 @@ or substitute for a real compiler check of the private link-output path.
 
 ```bash
 node --check crates/amux-dashboard/static/app.js
+npm run build:state
+bash scripts/spa-lint.sh
+npm run test:state
 ```
 
-Then bump `APP_VER` (`app.js`) and `CACHE` (`sw.js`) **together**. A change to
-one without the other ships code nobody's browser will fetch.
+Commit the regenerated `static/state/control-registry.json` and `kernel.js`
+when handlers change. `spa-lint.sh` checks their freshness before ESLint; a
+targeted Playwright configuration can skip that preflight and pass against a
+stale interaction bundle. When testing candidate assets against a running
+server, set `AMUX_E2E_STATE_KERNEL` (and `AMUX_E2E_CONTROL_REGISTRY` when
+handlers changed) alongside the candidate app/HTML/CSS paths.
 
-Pass: `node --check` silent, and both constants moved in the same commit.
+No version bump: `APP_VER` (`app.js`) and `CACHE` (`sw.js`) hold the
+`__AMUX_ASSET_VER__` placeholder, and the server stamps a content hash of
+`static/` into both when serving them.
+
+Pass: `node --check` silent, and `curl -sk "$(amux url)/app.js" | grep -m1 'const APP_VER'`
+shows a 12-hex-digit hash after the server adopts the commit.
 
 ## Anything with a UI
 
@@ -109,6 +121,60 @@ Pass: the spec name and `N passed`. If e2e infra is genuinely unavailable, say
 so in the evidence and why — that is a legitimate `verified` note, not a failure
 to hide.
 
+## Mac app (`desktop/`)
+
+```bash
+AMUX_DESKTOP_NO_INSTALL=1 desktop/build-desktop.sh
+desktop/test/workspace-e2e.py
+```
+
+Pass: `Compiled successfully`, then `N passed, 0 failed`. The script runs a
+second copy of the app on this Mac's real window server: windows across three
+Desktops, autosave, `kill -9`, SIGTERM, workspaces, and a virtual monitor
+unplugged and plugged back in. It needs a running amux server and three
+Desktops on the main display; CI cannot run it (no Desktops, no WindowServer).
+
+## Pages (`api/pages.rs`, `static/pages-host.js`)
+
+```bash
+scripts/test-contended.sh -p amux-server --lib api::pages
+npx playwright test --config=e2e/playwright.config.ts e2e/pages.spec.ts
+```
+
+Pass: `test result: ok` for the module tests, which cover sign-in on
+`/pages/<name>`, refused `ATTACH`, and asks delivered once. Then `N passed` on
+desktop, mobile and iOS Safari, including the sandbox probe line
+`api:blocked parent:blocked storage:blocked`.
+
+## Vault secrets (`api/vault_secrets.rs`)
+
+```bash
+AMUX_CHAOS_BINARY=$CARGO_TARGET_DIR/debug/amux-server node e2e/chaos/vault-secrets.mjs
+```
+
+Pass: `VERDICT: PASS` with `28 checks, 0 failed` (the JSON's `n_considered` and
+`failed`). It launches real workers under a fake agent that reports only the
+SHA-256 of each delivered variable, so it proves the worker > group > global
+resolution, the vault winning over a plaintext line, a replaced value arriving
+and a deleted key being unset on relaunch, and it sweeps the server log, audit,
+store, `ps` argv, pane history and database for any value. It runs on the file
+keystore; the Keychain backend is checked once on the live server by adding a
+throwaway item and running `security find-generic-password -s amux-vault-master`
+WITHOUT `-w`, which prints the item's attributes and never the key.
+
+## The land gate (`scripts/land_gate.py`, `land_review.py`, `review-tiers.txt`)
+
+```bash
+python3 scripts/git-hooks/test_land_gate.py
+scripts/land_gate.py            # on a real change: the receipt it prints is the proof
+```
+
+Pass: `land gate: N passed, 0 failed`, and for a real change `verdict=land_gate_pass`
+with every leg's verdict on the same line in `~/.amux/logs/land-gate.log`. A leg that
+reads `_unmeasured` did not run and is not a pass. Changing the reviewer's prompts,
+tools or model: rescore with `scripts/land_review_eval.py --score` and quote its
+`recall ... noise ...` line beside the previous one.
+
 ## A deployed server change
 
 A fix in `git log` is not live until the running binary carries it.
@@ -126,6 +192,42 @@ so bracket every measurement with `build`.
 The hand-run is not the scheduled run: the exec environment differs, and that is
 where the restic chain broke once already (launchd does not inherit shell PATH).
 Evidence is a log line carrying a timestamp from a run nobody started by hand.
+
+## Wake watches (`scripts/wake-watch.py`, `amux watch`, docs/wake-watch.md)
+
+```bash
+python3 scripts/test-wake-watch.py      # -> Ran 15 tests ... OK
+scripts/safe-cargo.sh test -p amux-server --lib -- shell_wake a_wake_exit_action
+```
+
+A pass is `OK` from the first and `test result: ok. 3 passed` from the second.
+Live evidence is a `verdict=watch_fired` line in `~/.amux/logs/wake-watch.log`
+followed by `verdict=shell_wake_delivered` (or `shell_wake_queued`) for the same
+lane in `~/.amux/logs/server-rs.log`.
+
+## The /codex skill (`skills/codex.md`, `skills/codex/scripts/`)
+
+```bash
+~/.amux/scripts/codex-send.py '<chat name>' - --dry-run <<<'probe'
+grep -c "From amux worker <sender>" ~/.codex/sessions/*/*/*/rollout-*<thread id>.jsonl
+sqlite3 -readonly ~/.codex/queue_1.sqlite "select id, thread_id from queued_items"
+```
+
+Pass: the dry run resolves the name to one thread id, the send's `Queued
+message <id>` line is in `~/.amux/logs/codex-send.log`, and the message appears
+in that thread's rollout as a `UserMessage`. `Queued` alone only means the
+message reached Codex's queue. A thread nobody has open can leave it in
+`queued_items` unread, so check the rollout before reporting it delivered.
+
+Recorded pass, 2026-10-18 (amux-helper): `#mxp onboarding flow` resolved to
+`01a05ec4-3e67-7860-9e0e-47c9ef741d5d` out of 275 named threads. Workers had
+used the skill for 14 sends and 2 new named threads (`#mxp lifecycle walk`,
+`ff-e2e live parity review`). momentbench-oss's 8 sends to `#mxp MomentBench`
+are in its rollout (25 matching lines, the last a `UserMessage` at
+05:56Z). Two sends were still in `queued_items` at 06:12Z: 01a14bff to `#mxp
+lifecycle walk`, whose last turn aborted at 23:47Z on 10-17, and 01a14d1f to
+`ff-e2e live parity review`, whose last item completed at 03:29Z. Neither
+had been read yet.
 
 ## When there is genuinely no artifact
 

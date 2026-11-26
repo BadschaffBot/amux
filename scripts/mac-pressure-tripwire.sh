@@ -24,9 +24,13 @@
 #     a trend line from spot reads is not.
 #   - swap free. The last cushion before the kernel has nowhere to put pages.
 #
-# WHAT IT DELIBERATELY DOES NOT DO. It does not kill anything, stop any lane, or
-# restart any daemon. Every remedy for these conditions is Ethan's under the
-# 24/7 rule in ~/Dev/CLAUDE.md, so this reports and pages; it never acts.
+# WHAT IT DOES AND DOES NOT DO. It kills nothing itself, stops no lane and
+# restarts no daemon (those remedies are Ethan's under the 24/7 rule in
+# ~/Dev/CLAUDE.md). It does act early: at the warn level it starts the hourly
+# cleanup pass (SCHED-465) ahead of its slot, which works only inside that
+# pass's own bounded rules. A trip then goes to scripts/host-responder.sh, which
+# wakes the host-health worker first and pages Ethan only at level 4, when no
+# worker can be started, or when the trip outlives the worker's attempt.
 #
 # The alarm is a fire alarm (~/.claude/CLAUDE.md: "USE VERY SPARINGLY"), so it
 # fires only on conditions a human must act on, and at most once per cooldown.
@@ -54,17 +58,31 @@ export PATH
 PRESSURE_ALERT=${AMUX_TRIPWIRE_PRESSURE:-3}       # >= this pages. 2 self-clears, so not 2.
 FSEVENTSD_GB=${AMUX_TRIPWIRE_FSEVENTSD_GB:-20}    # 12.8 GB seen 09-14; 20 is a real escalation
 SWAP_FREE_MB=${AMUX_TRIPWIRE_SWAP_FREE_MB:-512}   # last cushion
-COOLDOWN_S=${AMUX_TRIPWIRE_COOLDOWN_S:-10800}     # 3h, so a 15m schedule cannot spam
-STATE=${AMUX_TRIPWIRE_STATE:-$HOME/.amux/mac-pressure-tripwire.last}
+COOLDOWN_S=${AMUX_TRIPWIRE_COOLDOWN_S:-10800}     # 3h between pages, so a 15m schedule cannot spam
+export AMUX_RESPONDER_PAGE_COOLDOWN_S=${AMUX_RESPONDER_PAGE_COOLDOWN_S:-$COOLDOWN_S}
+ACT_PRESSURE=${AMUX_TRIPWIRE_ACT_PRESSURE:-2}     # >= this starts the cleanup; it acts, so 2 is fine
+CLEANUP_SCHEDULE=${AMUX_TRIPWIRE_CLEANUP_SCHEDULE:-SCHED-465}
+ACT_COOLDOWN_S=${AMUX_TRIPWIRE_ACT_COOLDOWN_S:-3600}
+ACT_STATE=${AMUX_TRIPWIRE_ACT_STATE:-$HOME/.amux/mac-pressure-tripwire.act}
+ACT_TRIGGER_CMD=${AMUX_TRIPWIRE_ACT_TRIGGER_CMD:-act_trigger_default}
 DRY=0
 [ "${1:-}" = "--dry-run" ] && DRY=1
 
-level=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+# AMUX_TRIPWIRE_LEVEL stands in for the kernel reading (tests only).
+level=${AMUX_TRIPWIRE_LEVEL:-$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)}
 [ -n "$level" ] || level=-1
-swap_line=$(sysctl -n vm.swapusage 2>/dev/null)
+# AMUX_TRIPWIRE_SWAP_LINE stands in for the sysctl reading (tests only).
+swap_line=${AMUX_TRIPWIRE_SWAP_LINE:-$(sysctl -n vm.swapusage 2>/dev/null)}
 swap_free=$(printf '%s' "$swap_line" | sed -E 's/.*free = ([0-9.]+)M.*/\1/')
 swap_used=$(printf '%s' "$swap_line" | sed -E 's/.*used = ([0-9.]+)M.*/\1/')
+swap_total=$(printf '%s' "$swap_line" | sed -E 's/.*total = ([0-9.]+)M.*/\1/')
 case "$swap_free" in ''|*[!0-9.]*) swap_free=-1 ;; esac
+case "$swap_total" in ''|*[!0-9.]*) swap_total=-1 ;; esac
+# NO SWAP FILE IS NOT EXHAUSTED SWAP. macOS creates swap files on demand, so a
+# box that has not needed any since boot reads "total = 0.00M free = 0.00M".
+# Free 0 of total 0 paged URGENT on 2026-10-30 with 72% of RAM free.
+swap_none=0
+awk -v t="$swap_total" 'BEGIN{exit !(t+0 == 0)}' && swap_none=1
 # RECLAIMABLE, not "free". On macOS `Pages free` is routinely near zero on a
 # perfectly healthy box because the OS keeps pages resident until something
 # wants them; measured here 0.38 GB free beside 22.76 GB inactive. Reporting
@@ -100,33 +118,77 @@ awk_ge() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 >= b+0)}'; }
   add "kernel memory pressure level $level (4 = critical, jetsam kills largest-first)"
 awk_ge "$fse_gb" "$FSEVENTSD_GB" && \
   add "fseventsd at ${fse_gb} GB (SIP-protected, unkillable; only a reboot clears it)"
-[ "$swap_free" != "-1" ] && awk -v a="$swap_free" -v b="$SWAP_FREE_MB" 'BEGIN{exit !(a+0 <= b+0)}' && \
+[ "$swap_free" != "-1" ] && [ "$swap_none" = 0 ] && awk -v a="$swap_free" -v b="$SWAP_FREE_MB" 'BEGIN{exit !(a+0 <= b+0)}' && \
   add "swap free ${swap_free} MB of the ${swap_used} MB in use"
 
-echo "mac-tripwire: measured=$measured level=$level reclaimable=${reclaim_gb}GB free=${free_gb}GB fseventsd=${fse_gb}GB(median of 3) swap_free=${swap_free}MB swap_used=${swap_used}MB"
+echo "mac-tripwire: measured=$measured level=$level reclaimable=${reclaim_gb}GB free=${free_gb}GB fseventsd=${fse_gb}GB(median of 3) swap_free=${swap_free}MB swap_used=${swap_used}MB swap_total=${swap_total}MB$([ "$swap_none" = 1 ] && echo " swap=none_allocated")"
+
+# ACT BEFORE PAGING (Ethan 2026-10-22: "make sure its proactive"). The page tier
+# above waits for level 3, where only a human can help. At the warn level the
+# hourly cleanup (SCHED-465: idle VMs, stale shells, test orphans, build output,
+# renice) can still free memory, so start it now instead of waiting up to an
+# hour for its slot. It is the same bounded pass that runs every hour, so an
+# early start costs one extra pass at most, and the cooldown keeps a level that
+# oscillates 1 <-> 2 from starting it more than once an hour.
+act_trigger_default() { # prints the HTTP status of the run request
+  curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X POST -H "X-Amux-Session: desktop" \
+    "$(amux url 2>/dev/null || echo https://localhost:8824)/api/schedules/$CLEANUP_SCHEDULE/run"
+}
+if [ "$level" != "-1" ] && awk_ge "$level" "$ACT_PRESSURE" || [ -n "$reasons" ]; then
+  act_last=0
+  [ -f "$ACT_STATE" ] && act_last=$(cat "$ACT_STATE" 2>/dev/null || echo 0)
+  case "$act_last" in ''|*[!0-9]*) act_last=0 ;; esac
+  act_since=$(( $(date +%s) - act_last ))
+  if [ "$DRY" = "1" ]; then
+    echo "mac-tripwire: level $level >= $ACT_PRESSURE: would start the cleanup ($CLEANUP_SCHEDULE) (dry run)"
+  elif [ "$act_since" -lt "$ACT_COOLDOWN_S" ]; then
+    echo "mac-tripwire: level $level >= $ACT_PRESSURE: cleanup started ${act_since}s ago, under ${ACT_COOLDOWN_S}s (verdict=cleanup_cooldown)"
+  else
+    acode=$($ACT_TRIGGER_CMD 2>/dev/null)
+    case "$acode" in
+      2??) printf '%s' "$(date +%s)" > "$ACT_STATE" 2>/dev/null
+           echo "mac-tripwire: level $level >= $ACT_PRESSURE: started the cleanup ($CLEANUP_SCHEDULE) (verdict=cleanup_triggered)" ;;
+      *)   echo "mac-tripwire: level $level >= $ACT_PRESSURE: could not start the cleanup (http ${acode:-none}) (verdict=cleanup_trigger_failed)" ;;
+    esac
+  fi
+fi
+
+# HAND OFF BEFORE PAGING (Ethan 2026-10-30: "this worker and/or amux core needs
+# to be proactive with these things"). A trip goes to host-responder.sh, which
+# wakes the host-health worker first and pages only at the critical level, when
+# no worker can be started, or when the trip outlives the worker's attempt.
+responder() { # args passed through to host-responder.sh
+  if [ -n "${AMUX_RESPONDER_BIN:-}" ]; then
+    bash "$AMUX_RESPONDER_BIN" "$@"; return
+  fi
+  local here sib snap
+  here=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+  sib="$here/host-responder.sh"
+  if [ -f "$sib" ]; then bash "$sib" "$@"; return; fi
+  # The schedule runs a snapshot of this file from a temp path, so the sibling
+  # is not beside it: run the committed responder the same way.
+  snap=$(mktemp "${TMPDIR:-/tmp}/host-responder.XXXXXX") || return
+  if git -C "${AMUX_REPO_DIR:-$HOME/Dev/amux}" show origin/main:scripts/host-responder.sh > "$snap" 2>/dev/null; then
+    bash "$snap" "$@"
+  else
+    echo "host-responder: unavailable (verdict=responder_missing)"
+    [ "${1:-}" = "clear" ] || amux alert "$4" "$1: host-responder.sh missing" >/dev/null 2>&1
+  fi
+  rm -f -- "$snap"
+}
 
 if [ -z "$reasons" ]; then
   echo "mac-tripwire: no threshold tripped (pressure>=$PRESSURE_ALERT, fseventsd>=${FSEVENTSD_GB}GB, swap_free<=${SWAP_FREE_MB}MB)"
-  exit 0
-fi
-
-now=$(date +%s)
-last=0
-[ -f "$STATE" ] && last=$(cat "$STATE" 2>/dev/null || echo 0)
-case "$last" in ''|*[!0-9]*) last=0 ;; esac
-since=$(( now - last ))
-if [ "$since" -lt "$COOLDOWN_S" ]; then
-  echo "mac-tripwire: TRIPPED ($reasons) but within cooldown, ${since}s of ${COOLDOWN_S}s — not paging again"
+  [ "$DRY" = "1" ] || responder clear mac-memory
   exit 0
 fi
 
 msg="Mac memory tripwire: $reasons. Reclaimable ${reclaim_gb} GB (free ${free_gb} GB), swap ${swap_used} MB used with ${swap_free} MB free, fseventsd ${fse_gb} GB. Nothing was killed or stopped; every remedy here is yours under the 24/7 rule (MO-3326)."
-why="Jetsam kills largest-first at level 4, which on this box is fseventsd then the claude sessions."
+sev=warn
+[ "$level" != "-1" ] && awk_ge "$level" 4 && sev=critical
 if [ "$DRY" = "1" ]; then
-  echo "mac-tripwire: DRY RUN, would page:"; echo "  $msg"
+  echo "mac-tripwire: DRY RUN, would hand off (severity=$sev):"; echo "  $msg"
 else
-  amux alert "$msg" "$why" >/dev/null 2>&1 && echo "mac-tripwire: PAGED Ethan — $reasons" \
-    || echo "mac-tripwire: TRIPPED ($reasons) but the alert call FAILED — check amux alert"
-  printf '%s' "$now" > "$STATE" 2>/dev/null
+  responder mac-memory "$sev" "$reasons" "$msg"
 fi
 exit 0

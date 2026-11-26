@@ -69,10 +69,20 @@ async fn inbox(
 ) -> Response {
     let label = {
         let l = qp(&q, "label");
-        if l.is_empty() { "INBOX" } else { l }
+        if l.is_empty() {
+            "INBOX"
+        } else {
+            l
+        }
     };
     let out = client
-        .list_messages(qp(&q, "account"), label, qp(&q, "page_token"), qp(&q, "q"), 50)
+        .list_messages(
+            qp(&q, "account"),
+            label,
+            qp(&q, "page_token"),
+            qp(&q, "q"),
+            50,
+        )
         .await;
     Json(out).into_response()
 }
@@ -90,8 +100,29 @@ async fn send(
     headers: axum::http::HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
+    // The Mail view's own send is the owner's. A worker (or an unproven
+    // caller where proof is enforced) sends through /api/email/send or
+    // /reply, which hold an outside recipient for the owner; this legacy
+    // route has no hold, so it used to be a way around it (owner, 2026-11-25:
+    // all direct outbound goes through the approval flow).
+    if let Some(worker) = super::email::hdr_lane(&headers) {
+        tracing::warn!(worker = %worker, measured = true, n_considered = 1, verdict = "gmail_send_worker_refused",
+            "gmail: a worker called the Mail view's send, which has no approval hold; refused");
+        return (axum::http::StatusCode::FORBIDDEN, Json(json!({
+            "ok": false, "code": "use_email_api",
+            "error": "this is the Mail view's send for the owner; a worker sends through /api/email/send or /api/email/reply, which holds an outside recipient for the owner's approval",
+        }))).into_response();
+    }
+    if let super::human_proof::Verdict::Refused = super::human_proof::check(&headers, "gmail_send") {
+        return super::human_proof::refusal("gmail_send");
+    }
     let body = body.map(|Json(v)| v).unwrap_or(Value::Null);
-    let s = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let s = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let (account, to) = (s("account"), s("to"));
     let reply_id = s("reply_to_message_id");
     let result = client

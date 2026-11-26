@@ -8,7 +8,6 @@
 //! the shell WITHOUT that bearer and continues through its revocable cookie.
 
 use super::AppState;
-use amux_dashboard::DashboardAssets;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -79,6 +78,12 @@ pub fn routes() -> Router<AppState> {
         // never existed, from two lanes; each got 405 and nothing to act on,
         // while the equivalent GET answers `{"error": "not found"}`.
         // `serve_path` still refuses to hand the SPA shell to a non-GET.
+        // Public links (public_links.rs): anyone with the link, no sign-in.
+        .route("/pub/{id}", axum::routing::any(public_links::serve))
+        // `{*rest}` never matches an empty tail, so the app's root needs its own
+        // route or it falls through to the dashboard shell.
+        .route("/pub/{id}/", axum::routing::any(public_links::serve))
+        .route("/pub/{id}/{*rest}", axum::routing::any(public_links::serve))
         .route("/{*path}", axum::routing::any(serve_path))
 }
 
@@ -104,7 +109,19 @@ async fn index(
     peer: Peer,
     legacy: Legacy,
 ) -> Response {
-    serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await
+    // The owner's own address, so workers link to it (public_links.rs). Only an
+    // owner's request: a stranger's Host header must not steer workers' links.
+    if state.auth_token.is_none() || has_owner_session(&state, &headers) {
+        public_links::learn_public_url(&crate::config::amux_home(), &headers);
+    }
+    serve_shell(
+        &state,
+        legacy_port_of(legacy),
+        &headers,
+        &uri,
+        peer_ip(peer),
+    )
+    .await
 }
 
 async fn serve_path(
@@ -130,6 +147,17 @@ async fn serve_path(
         )
             .into_response();
     }
+    // The public-link namespace is never the dashboard shell. The routes above
+    // claim every canonical `/pub/{id}...`, so whatever reaches this fallback
+    // with that prefix (bare `/pub` or `/pub/`, or a case variant such as
+    // `/PUB/` or `/Pub/x` that a case-insensitive proxy rule lets through)
+    // is not a link. Serving the shell there put the dashboard, and on a
+    // tunnelled host the owner bearer, behind a path the owner had opened
+    // to anyone.
+    let lower = path.to_ascii_lowercase();
+    if lower == "pub" || lower.starts_with("pub/") {
+        return public_links::not_found();
+    }
     // Non-API, non-GET: 405 as before. The SPA shell is a GET-only artifact and
     // handing it back for a POST would be worse than the bare 405 this replaces
     // — the whole point of the JSON 404 above is that a caller can tell "no such
@@ -138,34 +166,94 @@ async fn serve_path(
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     if matches!(path, "business" | "business/" | "business/index.html") {
-        return serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await;
+        return serve_shell(
+            &state,
+            legacy_port_of(legacy),
+            &headers,
+            &uri,
+            peer_ip(peer),
+        )
+        .await;
     }
-    match DashboardAssets::get(path) {
+    // `asset`, not the raw embed: app.js and sw.js carry the
+    // `__AMUX_ASSET_VER__` placeholder, and the served bytes must hold the real
+    // content hash so the SW cache name moves on every deploy and the SSE
+    // ping's version (sse.rs) matches what this page will compare it with.
+    // Revalidate every dashboard file against the dashboard's content hash.
+    // These URLs carry no version, so a long max-age would pin stale code;
+    // with no validator at all, every load without the service worker sent
+    // app.js again in full (1MB gzipped, recompressed per request). The hash
+    // covers all of static/, so any change moves every file's ETag.
+    let etag = format!("\"d-{}\"", amux_dashboard::asset_version());
+    let cache = cache_control_for(uri.query());
+    let fresh = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+    if fresh && amux_dashboard::asset(path).is_some() {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [(header::ETAG, etag), (header::CACHE_CONTROL, cache.to_string())],
+        )
+            .into_response();
+    }
+    match amux_dashboard::asset(path) {
         Some(content) => {
             let mime = mime_for(path);
-            let mut resp =
-                ([(header::CONTENT_TYPE, mime)], content.data.into_owned()).into_response();
-            if path == "sw.js" {
-                resp.headers_mut().insert(
-                    header::CACHE_CONTROL,
-                    "no-cache".parse().unwrap(),
-                );
+            // Compressed once per deploy, not per request: app.js is ~6 MB and
+            // gzipping it took ~55 ms of every cold page load, once for each
+            // of the Mac app's tabs. CompressionLayer leaves a response that
+            // already names its encoding alone.
+            let gz = accepts_gzip(&headers)
+                .then(|| gzipped(path, &content))
+                .flatten();
+            let mut resp = match gz {
+                Some(bytes) => (
+                    [
+                        (header::CONTENT_TYPE, mime),
+                        (header::CONTENT_ENCODING, "gzip"),
+                        (header::VARY, "accept-encoding"),
+                    ],
+                    bytes,
+                )
+                    .into_response(),
+                None => ([(header::CONTENT_TYPE, mime)], content.into_owned()).into_response(),
+            };
+            if let Ok(v) = HeaderValue::from_str(&etag) {
+                resp.headers_mut().insert(header::ETAG, v);
             }
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
             resp
         }
         // SPA fallback: unknown NON-API paths get the shell so client routing
         // works offline-first.
-        None => serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await,
+        None => {
+            serve_shell(
+                &state,
+                legacy_port_of(legacy),
+                &headers,
+                &uri,
+                peer_ip(peer),
+            )
+            .await
+        }
     }
 }
 
+// Every `cookie` field, not the first: over HTTP/2 a browser may send each
+// cookie as its own field (RFC 7540 8.1.2.5), and reading only the first
+// missed the owner cookie whenever another cookie came ahead of it.
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(header::COOKIE).and_then(|v| v.to_str().ok()).and_then(|cookies| {
-        cookies.split(';').find_map(|part| {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|cookies| cookies.split(';'))
+        .find_map(|part| {
             let (cookie_name, value) = part.trim().split_once('=')?;
             (cookie_name == name && !value.is_empty()).then_some(value)
         })
-    })
 }
 
 fn owner_session_value(state: &AppState) -> Option<String> {
@@ -176,7 +264,10 @@ fn owner_session_value(state: &AppState) -> Option<String> {
 }
 
 fn has_owner_session(state: &AppState, headers: &HeaderMap) -> bool {
-    match (owner_session_value(state), cookie_value(headers, OWNER_COOKIE)) {
+    match (
+        owner_session_value(state),
+        cookie_value(headers, OWNER_COOKIE),
+    ) {
         (Some(expected), Some(provided)) => {
             super::auth::constant_time_eq(provided.as_bytes(), expected.as_bytes())
         }
@@ -196,13 +287,12 @@ pub(crate) fn owner_session_status(state: &AppState, headers: &HeaderMap) -> &'s
     }
 }
 
-fn establish_owner_session(state: &AppState) -> Response {
+pub(crate) fn establish_owner_session(state: &AppState) -> Response {
     let Some(value) = owner_session_value(state) else {
         return Redirect::to("/").into_response();
     };
-    let cookie = format!(
-        "{OWNER_COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000"
-    );
+    let cookie =
+        format!("{OWNER_COOKIE}={value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000");
     // Redirect to /api/_clear_sw, which is outside the SW's intercept scope
     // (the SW passes through all /api/* paths). That page unregisters the
     // stale SW, clears caches, then redirects to /. Without this, an old SW
@@ -225,31 +315,111 @@ fn establish_owner_session(state: &AppState) -> Response {
 /// then redirects to /. Served at /api/_clear_sw so the old SW (which
 /// passes through /api/* paths) cannot intercept it.
 pub async fn clear_sw_landing() -> Response {
+    // EVERY STEP IS BOUNDED AND THE PAGE ALWAYS LEAVES (AMUX-5385).
+    //
+    // Ethan's iPhone app sat on a black screen with its load bar on
+    // 2026-09-30: the owner-session exchange redirected it here at 08:29:16,
+    // and it made no further request. This page used to `await`
+    // serviceWorker.getRegistrations() and caches.keys() unbounded, then
+    // navigate. Inside an app's WKWebView with an older build's stored state,
+    // either can fail to settle, and the page had no other exit. It also
+    // painted nothing that reads on a dark app, so a hang was a black void.
+    //
+    // Now: each step races a timeout, a backstop navigates regardless, a
+    // per-tab counter stops a redirect loop after three passes with a visible
+    // Try again, and every pass reports which step finished, timed out or
+    // failed (client-debug kind=clear-sw), so the next failure names itself.
+    // `/?_fresh=1` is fetched from the network even if a service worker
+    // survives (sw.js passes it through).
     const PAGE: &str = r#"<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>amux</title></head><body>
-<p style="font-family:system-ui;text-align:center;margin-top:40vh">Refreshing...</p>
+<meta name="color-scheme" content="dark light"><title>amux</title>
+<style>body{font-family:system-ui,sans-serif;text-align:center;margin:38vh 16px 0;background:#0d1117;color:#c9d1d9}a{color:#58a6ff}</style>
+</head><body><p id="m">Refreshing&hellip;</p>
+<noscript><p><a href="/?_fresh=1">Continue</a></p></noscript>
 <script>
-(async () => {
-  try {
-    const regs = await navigator.serviceWorker.getRegistrations();
-    await Promise.all(regs.map(r => r.unregister()));
-  } catch(e) {}
-  try {
-    const keys = await caches.keys();
-    await Promise.all(keys.map(k => caches.delete(k)));
-  } catch(e) {}
-  location.replace('/');
+(function () {
+  var t0 = Date.now(), steps = [], left = false;
+  function beacon(verdict) {
+    try {
+      var body = JSON.stringify({kind: 'clear-sw', verdict: verdict, steps: steps, ms: Date.now() - t0,
+        has_sw: !!navigator.serviceWorker, has_caches: typeof caches !== 'undefined', measured: true, n_considered: steps.length});
+      // keepalive outlives the navigation that follows; a string body is
+      // readable everywhere (a sendBeacon Blob arrived empty under WebKit).
+      fetch('/api/client-debug', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: body, keepalive: true});
+    } catch (e) {}
+  }
+  // The page's own link (#peek=worker&tab=chat) comes along: signing in from a
+  // deep link used to land on the home view (2026-10-26). A redirect keeps the
+  // fragment, and the fragment never reaches a server.
+  var hash = /^#[A-Za-z0-9_=&%.~+\-]*$/.test(location.hash) ? location.hash : '';
+  function leave(verdict) {
+    if (left) return; left = true;
+    beacon(verdict);
+    location.replace('/?_fresh=1' + hash);
+  }
+  function bounded(name, run, ms) {
+    return new Promise(function (resolve) {
+      var done = false;
+      setTimeout(function () { if (!done) { done = true; steps.push(name + ':timeout'); resolve(); } }, ms);
+      Promise.resolve().then(run).then(
+        function () { if (!done) { done = true; steps.push(name + ':ok'); resolve(); } },
+        function () { if (!done) { done = true; steps.push(name + ':error'); resolve(); } });
+    });
+  }
+  var n = 0;
+  try { n = Number(sessionStorage.getItem('amux_clear_sw_n') || 0) + 1; sessionStorage.setItem('amux_clear_sw_n', String(n)); } catch (e) {}
+  if (n > 3) {
+    document.getElementById('m').innerHTML = 'amux could not finish loading. <a href="/?_fresh=1">Try again</a>';
+    try { sessionStorage.removeItem('amux_clear_sw_n'); } catch (e) {}
+    beacon('loop_stopped');
+    return;
+  }
+  setTimeout(function () { leave('backstop'); }, 5000);
+  bounded('sw', function () {
+    return navigator.serviceWorker.getRegistrations().then(function (regs) {
+      return Promise.all(regs.map(function (r) { return r.unregister(); }));
+    });
+  }, 1500).then(function () {
+    return bounded('caches', function () {
+      return caches.keys().then(function (keys) { return Promise.all(keys.map(function (k) { return caches.delete(k); })); });
+    }, 1500);
+  }).then(function () { leave('navigating'); });
 })();
 </script></body></html>"#;
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8"),
-         (header::CACHE_CONTROL, "no-store")],
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         PAGE,
-    ).into_response()
+    )
+        .into_response()
 }
 
-mod tailnet_auth;
+#[cfg(test)]
+mod clear_sw_landing_tests {
+    /// AMUX-5385: the landing page must always leave, never loop forever, and
+    /// report where it got to. Pinned on the served bytes.
+    #[tokio::test]
+    async fn the_landing_page_is_bounded_and_reports_itself() {
+        let resp = super::clear_sw_landing().await;
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let page = String::from_utf8(body.to_vec()).unwrap();
+        for needle in ["setTimeout(function () { leave('backstop'); }, 5000)", "bounded('sw'", "bounded('caches'",
+            "amux_clear_sw_n", "n > 3", "kind: 'clear-sw'", "location.replace('/?_fresh=1' + hash)", "#0d1117"] {
+            assert!(page.contains(needle), "landing page lost {needle:?}");
+        }
+        assert!(!page.contains("await navigator.serviceWorker"), "an unbounded await is back");
+    }
+}
+
+pub(crate) mod app_ports;
+pub(crate) mod app_relay;
+pub(crate) mod apps_origin;
+pub(crate) mod public_links;
+pub(crate) mod public_origin;
+pub(crate) mod tailnet_auth;
 
 async fn serve_shell(
     state: &AppState,
@@ -267,11 +437,14 @@ async fn serve_shell(
     // Same-owner Tailscale devices may opt into the existing HttpOnly owner
     // session. Use the real socket peer and daemon identity, never a forwarded
     // IP, hostname, or a claim supplied by the browser. Invitees remain scoped.
-    if state.auth_token.is_some() && !has_owner_session(state, headers)
+    if state.auth_token.is_some()
+        && !has_owner_session(state, headers)
         && !super::org::has_local_member_cookie(headers)
     {
         if let Some(ip) = peer {
-            if tailnet_auth::verified(ip).await { return establish_owner_session(state); }
+            if tailnet_auth::verified(ip).await {
+                return establish_owner_session(state);
+            }
         }
     }
     serve_index(state, legacy, headers, uri, peer)
@@ -283,6 +456,19 @@ fn request_authority(headers: &HeaderMap, uri: &Uri) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
         .or_else(|| uri.authority().map(|authority| authority.to_string()))
+}
+
+/// Owner access for a page view (api/pages.rs): the same decision that gives
+/// the dashboard shell the owner bearer.
+pub(crate) fn owner_access(state: &AppState, headers: &HeaderMap, uri: &Uri, peer: Option<IpAddr>) -> bool {
+    owner_bootstrap_allowed(state, headers, uri, peer)
+}
+
+/// The shell's bootstrap block for another trusted amux document (the
+/// standalone page host), decided the same way as for the shell.
+pub(crate) fn bootstrap_for(html: &str, state: &AppState, headers: &HeaderMap, uri: &Uri, peer: Option<IpAddr>) -> String {
+    let owner = owner_bootstrap_allowed(state, headers, uri, peer);
+    inject_bootstrap(html, state, None, owner)
 }
 
 fn owner_bootstrap_allowed(
@@ -311,7 +497,15 @@ fn owner_bootstrap_allowed(
     }
 
     let authority = request_authority(headers, uri);
-    let local = super::fs::browser_is_on_this_machine(peer, authority.as_deref());
+    // AMUX_RS_SHELL_AS_REMOTE=1 serves this machine's own browser as a remote
+    // one: no owner token in the shell until it signs in. Every address of a
+    // host is "this machine", so without it no test on one Mac can open a
+    // dashboard the way a phone or another computer does, through the sign-in
+    // and its session cookie (desktop/test/split-button-e2e.py). It only
+    // removes trust; the API's own check is AMUX_RS_NO_LOOPBACK_BYPASS.
+    let local = super::fs::browser_is_on_this_machine(peer, authority.as_deref())
+        && !std::env::var("AMUX_RS_SHELL_AS_REMOTE").is_ok_and(|v| v == "1")
+        && !relayed_without_front_door(headers);
     if let Some((peer_field, authority_field)) = withheld_bootstrap_record(
         state.auth_token.is_some(),
         local,
@@ -340,6 +534,32 @@ fn owner_bootstrap_allowed(
         );
     }
     local
+}
+
+/// Proxy headers that mean the socket peer is a relay, not the browser.
+/// cloudflared sends `Cf-Connecting-Ip` and `X-Forwarded-For`; Caddy and
+/// nginx send `X-Forwarded-For` or `Forwarded`. A browser talking to this
+/// server directly sends none of them.
+const RELAY_HEADERS: &[&str] = &["forwarded", "x-forwarded-for", "x-real-ip", "cf-connecting-ip"];
+
+/// A request that came through a reverse proxy is not "this machine", even
+/// though the proxy connects from loopback.
+///
+/// A tunnel (cloudflared, ngrok, a local Caddy) connects to amux from
+/// 127.0.0.1, so before this every browser that reached the shell through one
+/// was handed the owner bearer. That was safe only while the proxy's own
+/// sign-in covered every path. A proxy rule that opens `/pub/*` to everyone
+/// for public links also opens the shell, because unknown paths fall back to
+/// it, and a case-insensitive rule opens `/PUB/` and `/Pub/x` too. The owner
+/// still gets in through a tunnel by signing in once (`?_token=`, which sets
+/// the HttpOnly owner session), the same way a remote browser does.
+///
+/// A host behind amux's own sign-in front door (loopback_trust.rs) keeps the
+/// old behaviour: its Caddy always forwards, and the door already stands in
+/// front of every path there.
+fn relayed_without_front_door(headers: &HeaderMap) -> bool {
+    RELAY_HEADERS.iter().any(|h| headers.contains_key(*h))
+        && !super::loopback_trust::front_door_active()
 }
 
 /// Whether this shell-serve is the withheld case, and the two fields the log
@@ -386,10 +606,10 @@ fn serve_index(
     } else {
         "index.html"
     };
-    let Some(index) = DashboardAssets::get(asset) else {
+    let Some(index) = amux_dashboard::asset(asset) else {
         return (StatusCode::NOT_FOUND, "dashboard not embedded").into_response();
     };
-    let html = String::from_utf8_lossy(&index.data).into_owned();
+    let html = String::from_utf8_lossy(&index).into_owned();
     let owner_access = owner_bootstrap_allowed(state, headers, uri, peer);
     let member_verified = super::org::is_verified_local_member(headers);
     let owner_session = owner_session_status(state, headers);
@@ -410,12 +630,7 @@ fn serve_index(
         // Deliberately no URL/query, cookie, or credential values.
         "dashboard bootstrap access decision"
     );
-    let injected = inject_bootstrap(
-        &html,
-        state,
-        legacy,
-        owner_access,
-    );
+    let injected = inject_bootstrap(&html, state, legacy, owner_access);
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         injected,
@@ -446,7 +661,12 @@ fn serve_index(
 /// `_AMUX_LEGACY_PORT` is 0 on the canonical listener, so the SPA's check is
 /// "did the server say I am on the retired port", not "does my URL look odd" —
 /// the client never has to know either number.
-fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_access: bool) -> String {
+fn inject_bootstrap(
+    html: &str,
+    state: &AppState,
+    legacy: Option<u16>,
+    owner_access: bool,
+) -> String {
     const BEGIN: &str = "<!-- AMUX-BOOTSTRAP-BEGIN";
     const END: &str = "<!-- AMUX-BOOTSTRAP-END -->";
     let (Some(b), Some(e)) = (html.find(BEGIN), html.find(END)) else {
@@ -456,7 +676,11 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
     // Invited and anonymous remote browsers never inherit the owner's bearer
     // from the public SPA bootstrap. Locality or an explicitly supplied owner
     // credential is required.
-    let auth = if owner_access { owner_auth.clone() } else { String::new() };
+    let auth = if owner_access {
+        owner_auth.clone()
+    } else {
+        String::new()
+    };
     let ui_token = if owner_auth.is_empty() {
         String::new()
     } else {
@@ -480,7 +704,7 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
          window._AMUX_POSTHOG_KEY={};window._AMUX_POSTHOG_HOST={};window._AMUX_USER_EMAIL={};\
          window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};\
          window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};\
-         window._AMUX_AUTH_WITHHELD={};window._AMUX_MDAI_ROOT={};</script>\n",
+         window._AMUX_AUTH_WITHHELD={};window._AMUX_MDAI_ROOT={};window._AMUX_DATA_DIR={};</script>\n",
         jstr(&ical_subscribe_url()),
         jstr(&auth),
         jstr(&home),
@@ -506,25 +730,89 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
         // root instead of $HOME when a `mdai_root` pref points elsewhere
         // (AMUX-4477).
         jstr(&crate::api::mdai::mdai_root_str()),
+        // The amux data directory (AMUX_HOME, default ~/.amux). The Draw tab
+        // keeps its shared library and recent-drawings list under `draw/`
+        // here, so they follow the server rather than one browser.
+        jstr(&crate::config::amux_home().to_string_lossy()),
     );
     let with_bootstrap = format!("{}{}{}", &html[..b], block, &html[e..]);
     // Client update adoption is the SSE ping's job, exactly like Python
-    // (amux-server.py:65292): every ping carries `v` = the embedded APP_VER
-    // (see sse.rs::ping_payload) and the SPA self-reloads on mismatch,
+    // (amux-server.py:65292): every ping carries `v` = the derived asset
+    // version, amux_dashboard::asset_version() (see sse.rs::ping_payload) and the SPA self-reloads on mismatch,
     // rate-limited and SW-nudged. The earlier /health-polling banner is
     // deliberately GONE (Ethan 2026-08-09: "frontend clients should also
     // restart just like the python server") — a banner on backend-only
     // build changes was noise Python never showed, and the reload it
     // offered is now automatic when it matters (client code changed).
-    // CRM is removed from the Rust build (Ethan, 2026-08-09): hide its tab
-    // and view via the serve-time layer — the extracted SPA stays
-    // byte-identical, the decision lives HERE where it is one greppable
-    // line to reverse.
-    let crm_hide = r#"<style>/* AMUX-FEATURE-FLAGS (injected) */
-[onclick="switchView('crm')"], #crm-view { display: none !important; }
-</style>
-"#;
-    with_bootstrap.replacen("</body>", &format!("{crm_hide}</body>"), 1)
+    // The CRM tab was hidden here from 2026-08-09 (AMUX-2590) to 2026-11-23,
+    // when the owner asked for it back ("build the CRM tab", docs/design/crm.md).
+    with_bootstrap
+}
+
+/// A URL that names the dashboard's current content hash (`/app.js?v=<hash>`,
+/// stamped into index.html at serve time) can never change under that name:
+/// a deploy moves the hash and with it the URL. So it is cached for a year
+/// and a reload does not even ask (a WKWebView tab of the Mac app revalidated
+/// it on every load). Any other URL, and a stale `v`, revalidates as before.
+fn cache_control_for(query: Option<&str>) -> &'static str {
+    let current = amux_dashboard::asset_version();
+    let versioned = query.is_some_and(|q| {
+        q.split('&')
+            .any(|kv| kv.strip_prefix("v=").is_some_and(|v| v == current))
+    });
+    if versioned {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| {
+            let mut parts = t.trim().split(';');
+            parts.next().is_some_and(|n| n.trim().eq_ignore_ascii_case("gzip"))
+                && !parts.any(|p| {
+                    // q=0, q=0.0, Q=0.000: a weight of zero declines it.
+                    let p = p.trim();
+                    p.len() > 2
+                        && p[..2].eq_ignore_ascii_case("q=")
+                        && p[2..].trim().parse::<f32>().is_ok_and(|q| q == 0.0)
+                })
+        })
+}
+
+/// The gzip of one dashboard file at the current content hash, made the first
+/// time it is asked for. Only text worth compressing; `None` means send it
+/// as is (CompressionLayer may still compress it).
+fn gzipped(path: &str, content: &[u8]) -> Option<Vec<u8>> {
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static GZ: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
+    let mime = mime_for(path);
+    let text = mime.starts_with("text/") || mime == "application/json" || mime == "image/svg+xml";
+    if content.len() < 1024 || !text {
+        return None;
+    }
+    let key = format!("{}:{path}", amux_dashboard::asset_version());
+    let map = GZ.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(b) = map.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return Some(b.clone());
+    }
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(content).ok()?;
+    let bytes = enc.finish().ok()?;
+    let mut m = map.lock().unwrap_or_else(|p| p.into_inner());
+    // A deploy moves the hash: drop the old version's entries.
+    let ver = format!("{}:", amux_dashboard::asset_version());
+    m.retain(|k, _| k.starts_with(&ver));
+    m.insert(key, bytes.clone());
+    Some(bytes)
 }
 
 fn mime_for(path: &str) -> &'static str {
@@ -537,6 +825,10 @@ fn mime_for(path: &str) -> &'static str {
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("webmanifest") => "application/manifest+json",
+        // The Draw tab's vendored editor (static/vendor/draw) ships fonts and
+        // a lazily loaded font-subsetting module.
+        Some("woff2") => "font/woff2",
+        Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
     }
 }
@@ -544,19 +836,70 @@ fn mime_for(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_current_versioned_url_is_cached_for_a_year() {
+        let v = amux_dashboard::asset_version();
+        let year = "public, max-age=31536000, immutable";
+        assert_eq!(cache_control_for(Some(&format!("v={v}"))), year);
+        assert_eq!(cache_control_for(Some(&format!("x=1&v={v}"))), year);
+        assert_eq!(cache_control_for(Some("v=0000stale")), "no-cache");
+        assert_eq!(cache_control_for(Some(&format!("vv={v}"))), "no-cache");
+        assert_eq!(cache_control_for(None), "no-cache");
+    }
+
+    #[test]
+    fn gzip_is_sent_only_to_a_client_that_takes_it() {
+        let mut h = HeaderMap::new();
+        assert!(!accepts_gzip(&h));
+        h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("br, gzip, deflate"));
+        assert!(accepts_gzip(&h));
+        h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip;q=0, br"));
+        assert!(!accepts_gzip(&h));
+        h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("GZIP;q=0.5"));
+        assert!(accepts_gzip(&h));
+        for declined in ["gzip;q=0.0", "gzip; Q=0", "gzip;q=0.000"] {
+            h.insert(header::ACCEPT_ENCODING, HeaderValue::from_static(declined));
+            assert!(!accepts_gzip(&h), "{declined}");
+        }
+    }
+
+    #[test]
+    fn a_dashboard_file_is_gzipped_once_and_decodes_to_itself() {
+        use std::io::Read;
+        let body = "console.log('amux');\n".repeat(400);
+        let a = gzipped("probe-test.js", body.as_bytes()).expect("text over 1 KB is gzipped");
+        let b = gzipped("probe-test.js", body.as_bytes()).expect("cached");
+        assert_eq!(a, b);
+        let mut out = String::new();
+        flate2::read::GzDecoder::new(&a[..]).read_to_string(&mut out).unwrap();
+        assert_eq!(out, body);
+        assert!(gzipped("tiny.js", b"x").is_none(), "too small to bother");
+        assert!(gzipped("icon.png", &[0u8; 4096]).is_none(), "binary passes through");
+    }
     use std::sync::Arc;
     use std::time::Instant;
+
+    #[test]
+    fn the_owner_cookie_is_found_in_any_http2_cookie_field() {
+        let mut h = HeaderMap::new();
+        h.append(header::COOKIE, HeaderValue::from_static("appsid=1"));
+        h.append(header::COOKIE, HeaderValue::from_static("__Host-amux_owner=abc; theme=dark"));
+        assert_eq!(cookie_value(&h, OWNER_COOKIE), Some("abc"), "a later field still carries the owner cookie");
+        assert_eq!(cookie_value(&h, "appsid"), Some("1"));
+        assert_eq!(cookie_value(&h, "missing"), None);
+    }
 
     fn state(token: Option<&str>) -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         AppState {
             store,
             started: Instant::now(),
             build_hash: "test".into(),
             auth_token: token.map(String::from),
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -569,15 +912,26 @@ mod tests {
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(header::HOST, host.parse().unwrap());
-            let response = serve_path(State(state.clone()), headers,
-                axum::http::Method::GET, "/business/".parse().unwrap(),
-                Some(Extension(ConnectInfo(address.parse().unwrap()))), None).await;
+            let response = serve_path(
+                State(state.clone()),
+                headers,
+                axum::http::Method::GET,
+                "/business/".parse().unwrap(),
+                Some(Extension(ConnectInfo(address.parse().unwrap()))),
+                None,
+            )
+            .await;
             assert_eq!(response.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(response.into_body(), 100_000).await.unwrap();
+            let bytes = axum::body::to_bytes(response.into_body(), 100_000)
+                .await
+                .unwrap();
             let body = String::from_utf8(bytes.to_vec()).unwrap();
             assert!(body.contains("<title>Amux Business</title>"));
             assert!(body.contains("/business/assets/"));
-            assert_eq!(body.contains("window._AMUX_AUTH_TOKEN=\"business-test-owner-token\""), expected);
+            assert_eq!(
+                body.contains("window._AMUX_AUTH_TOKEN=\"business-test-owner-token\""),
+                expected
+            );
         }
     }
 
@@ -594,7 +948,10 @@ mod tests {
         // AMUX-4658: the placeholder used to be the word `old`, and `out` embeds
         // $HOME. A parallel test points HOME at a macOS tempdir under
         // /var/folders, which contains "old", so this failed on local runs.
-        assert!(!out.contains("STALE-BOOTSTRAP-PLACEHOLDER"), "placeholder block replaced: {out}");
+        assert!(
+            !out.contains("STALE-BOOTSTRAP-PLACEHOLDER"),
+            "placeholder block replaced: {out}"
+        );
     }
 
     #[test]
@@ -603,10 +960,19 @@ mod tests {
         let owner = inject_bootstrap(html, &state(Some("tok123")), None, true);
         let member = inject_bootstrap(html, &state(Some("tok123")), None, false);
         assert!(member.contains("window._AMUX_AUTH_TOKEN=\"\""), "{member}");
-        assert!(!member.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{member}");
-        let owner_guard = owner.split("window._AMUX_UI_TOKEN=").nth(1)
-            .and_then(|value| value.split(';').next()).unwrap();
-        assert!(member.contains(&format!("window._AMUX_UI_TOKEN={owner_guard}")), "{member}");
+        assert!(
+            !member.contains("window._AMUX_AUTH_TOKEN=\"tok123\""),
+            "{member}"
+        );
+        let owner_guard = owner
+            .split("window._AMUX_UI_TOKEN=")
+            .nth(1)
+            .and_then(|value| value.split(';').next())
+            .unwrap();
+        assert!(
+            member.contains(&format!("window._AMUX_UI_TOKEN={owner_guard}")),
+            "{member}"
+        );
     }
 
     /// AF-639. A remote browser is denied the owner bearer on purpose, and
@@ -618,8 +984,9 @@ mod tests {
         let peer: std::net::IpAddr = "203.0.113.5".parse().unwrap();
 
         // The case that produced the 28k refusals: auth on, browser remote.
-        let (p, a) = withheld_bootstrap_record(true, false, Some(peer), Some("desktop.example:8824"))
-            .expect("a remote browser denied the bearer must be reported");
+        let (p, a) =
+            withheld_bootstrap_record(true, false, Some(peer), Some("desktop.example:8824"))
+                .expect("a remote browser denied the bearer must be reported");
         assert_eq!(p, "203.0.113.5", "the peer is half the predicate");
         assert_eq!(a, "desktop.example:8824", "the authority is the other half");
 
@@ -659,7 +1026,10 @@ mod tests {
         let peer: std::net::IpAddr = "203.0.113.5".parse().unwrap();
 
         let allowed = owner_bootstrap_allowed(&state(Some("tok123")), &headers, &uri, Some(peer));
-        assert!(!allowed, "a remote browser must not be bootstrapped with the owner bearer");
+        assert!(
+            !allowed,
+            "a remote browser must not be bootstrapped with the owner bearer"
+        );
         assert!(
             withheld_bootstrap_record(true, allowed, Some(peer), Some("amux.invalid")).is_some(),
             "the same inputs that withhold the bearer must also produce the log record"
@@ -670,7 +1040,27 @@ mod tests {
         let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let shell = inject_bootstrap(html, &state(Some("tok123")), None, allowed);
         assert!(shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{shell}");
-        assert!(shell.contains("window._AMUX_AUTH_WITHHELD=true;"), "{shell}");
+        assert!(
+            shell.contains("window._AMUX_AUTH_WITHHELD=true;"),
+            "{shell}"
+        );
+    }
+
+    /// The shipped path for the outside report: a remote peer whose Host is
+    /// its own IP literal (which the real resolver maps to itself) must get a
+    /// tokenless shell. TEST-NET-3 is assigned to no interface anywhere.
+    #[test]
+    fn a_remote_peer_naming_itself_in_host_is_not_bootstrapped_with_the_owner_bearer() {
+        let peer: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let uri: Uri = "/".parse().unwrap();
+        for host in ["203.0.113.5", "203.0.113.5:8824"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, host.parse().unwrap());
+            assert!(
+                !owner_bootstrap_allowed(&state(Some("tok123")), &headers, &uri, Some(peer)),
+                "Host {host} from that same remote peer must not unlock the owner bearer"
+            );
+        }
     }
 
     /// AF-639, client half. An empty `_AMUX_AUTH_TOKEN` has two causes with
@@ -683,14 +1073,26 @@ mod tests {
         let withheld = inject_bootstrap(html, &state(Some("tok123")), None, false);
         let no_auth = inject_bootstrap(html, &state(None), None, false);
 
-        assert!(owner.contains("window._AMUX_AUTH_WITHHELD=false;"), "{owner}");
-        assert!(withheld.contains("window._AMUX_AUTH_WITHHELD=true;"), "{withheld}");
+        assert!(
+            owner.contains("window._AMUX_AUTH_WITHHELD=false;"),
+            "{owner}"
+        );
+        assert!(
+            withheld.contains("window._AMUX_AUTH_WITHHELD=true;"),
+            "{withheld}"
+        );
 
         // Auth disabled: the token is empty here too and NOTHING will 401.
         // Reporting "withheld" would put a permanent banner in front of every
         // user of a tokenless server.
-        assert!(no_auth.contains("window._AMUX_AUTH_TOKEN=\"\""), "{no_auth}");
-        assert!(no_auth.contains("window._AMUX_AUTH_WITHHELD=false;"), "{no_auth}");
+        assert!(
+            no_auth.contains("window._AMUX_AUTH_TOKEN=\"\""),
+            "{no_auth}"
+        );
+        assert!(
+            no_auth.contains("window._AMUX_AUTH_WITHHELD=false;"),
+            "{no_auth}"
+        );
     }
 
     /// The bootstrap block is one Rust string literal held together by
@@ -726,8 +1128,9 @@ mod tests {
         let out = inject_bootstrap(html, &s, None, true);
         assert!(!out.contains("AMUX-UPDATE-WATCH"));
         assert!(!out.contains("amux-update-bar"));
-        // The CRM feature-flag layer still injects.
-        assert!(out.contains("AMUX-FEATURE-FLAGS"));
+        // The CRM tab is shown again (2026-11-23): nothing hides it.
+        assert!(!out.contains("switchView('crm')\"], #crm-view { display: none"));
+        assert!(!out.contains("AMUX-FEATURE-FLAGS"));
     }
 
     /// The migration signal must be ON only for documents actually served by
@@ -777,12 +1180,7 @@ mod tests {
         assert_eq!(inject_bootstrap(html, &state(None), None, false), html);
     }
 
-    async fn shell(
-        app: &Router,
-        uri: &str,
-        cookie: Option<&str>,
-        peer: Option<&str>,
-    ) -> String {
+    async fn shell(app: &Router, uri: &str, cookie: Option<&str>, peer: Option<&str>) -> String {
         use tower::ServiceExt;
         let mut builder = axum::http::Request::builder().uri(uri);
         if let Some(cookie) = cookie {
@@ -795,7 +1193,9 @@ mod tests {
         }
         let response = app.clone().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
@@ -813,7 +1213,10 @@ mod tests {
             Some("127.0.0.1"),
         )
         .await;
-        assert!(local.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{local}");
+        assert!(
+            local.contains("window._AMUX_AUTH_TOKEN=\"tok123\""),
+            "{local}"
+        );
 
         // Deleting a member removes the DB row but their HttpOnly cookie stays
         // in the browser. Even on the owner's machine that stale cookie must
@@ -825,8 +1228,14 @@ mod tests {
             Some("127.0.0.1"),
         )
         .await;
-        assert!(revoked.contains("window._AMUX_AUTH_TOKEN=\"\""), "{revoked}");
-        assert!(!revoked.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{revoked}");
+        assert!(
+            revoked.contains("window._AMUX_AUTH_TOKEN=\"\""),
+            "{revoked}"
+        );
+        assert!(
+            !revoked.contains("window._AMUX_AUTH_TOKEN=\"tok123\""),
+            "{revoked}"
+        );
 
         // A remote owner can still authenticate explicitly. Exchange the URL
         // token for an HttpOnly cookie before serving any credential-bearing
@@ -846,11 +1255,26 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(response.headers()[header::LOCATION], "/api/_clear_sw");
         let set_cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
-        assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("Secure"), "{set_cookie}");
-        assert!(!set_cookie.contains("tok123"), "the raw bearer must not be copied into the cookie");
+        assert!(
+            set_cookie.contains("HttpOnly") && set_cookie.contains("Secure"),
+            "{set_cookie}"
+        );
+        assert!(
+            !set_cookie.contains("tok123"),
+            "the raw bearer must not be copied into the cookie"
+        );
         let owner_cookie = set_cookie.split(';').next().unwrap();
-        let explicit = shell(&app, "https://remote-node.example/", Some(owner_cookie), None).await;
-        assert!(explicit.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{explicit}");
+        let explicit = shell(
+            &app,
+            "https://remote-node.example/",
+            Some(owner_cookie),
+            None,
+        )
+        .await;
+        assert!(
+            explicit.contains("window._AMUX_AUTH_TOKEN=\"tok123\""),
+            "{explicit}"
+        );
     }
 
     /// AF-61: the GET-only version of this test passed for months while every
@@ -877,7 +1301,11 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::NOT_FOUND, "{m} must 404, not 405");
             assert_eq!(
-                res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+                res.headers()
+                    .get(header::CONTENT_TYPE)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
                 "application/json",
                 "{m} must get JSON a caller can parse"
             );
@@ -895,7 +1323,70 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED, "no SPA shell for a POST");
+        assert_eq!(
+            res.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "no SPA shell for a POST"
+        );
+    }
+
+    /// A tunnel (cloudflared, ngrok, Caddy) connects from loopback. Its
+    /// forwarding headers say the browser is elsewhere, so the shell it
+    /// relays must not carry the owner bearer.
+    #[tokio::test]
+    async fn a_shell_relayed_through_a_loopback_proxy_withholds_the_owner_bearer() {
+        use tower::ServiceExt;
+        let app = routes().with_state(state(Some("tok123")));
+        for (name, value) in [
+            ("cf-connecting-ip", "203.0.113.7"),
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-real-ip", "203.0.113.7"),
+            ("forwarded", "for=203.0.113.7"),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .uri("https://amux.example.com/")
+                .header(name, value)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:50000".parse::<SocketAddr>().unwrap()));
+            let res = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{name}");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("tok123"), "{name}: owner bearer leaked through a relay");
+            assert!(body.contains("window._AMUX_AUTH_WITHHELD=true;"), "{name}");
+        }
+        // The same loopback peer with no relay header is still this machine.
+        let local = shell(&app, "https://amux.example.com/", None, Some("127.0.0.1")).await;
+        assert!(local.contains("window._AMUX_AUTH_TOKEN=\"tok123\""), "{local}");
+    }
+
+    /// Anything under the public-link prefix that is not a canonical link is a
+    /// 404, never the dashboard shell: a proxy that opens `/pub/*` to everyone
+    /// (case-insensitively, as Cloudflare Access does) must not open the shell.
+    #[tokio::test]
+    async fn non_link_paths_under_pub_are_404_not_the_shell() {
+        use tower::ServiceExt;
+        let app = routes().with_state(state(Some("tok123")));
+        for uri in ["/pub", "/pub/", "/PUB/", "/Pub", "/pUb/x/", "/PUB/0123456789abcdef0123456789abcdef/"] {
+            let mut request = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo("127.0.0.1:50000".parse::<SocketAddr>().unwrap()));
+            let res = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("tok123") && !body.contains("<!DOCTYPE"), "{uri}: {body}");
+        }
+        // Paths that merely start with the letters are untouched.
+        let shell_page = shell(&app, "/public", None, Some("127.0.0.1")).await;
+        assert!(shell_page.contains("AMUX-BOOTSTRAP"), "/public still falls back to the shell");
     }
 
     #[tokio::test]
@@ -913,10 +1404,16 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "application/json"
         );
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v, serde_json::json!({ "error": "not found" }));
 
@@ -932,7 +1429,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let ct = res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+        let ct = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.starts_with("text/html"), "{ct}");
     }
 }

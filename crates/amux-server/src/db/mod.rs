@@ -16,11 +16,9 @@
 
 pub mod advance;
 pub mod artifact_store;
+pub mod read_manager;
 pub mod attempts;
 pub mod board_store;
-pub mod task_graph_store;
-pub mod trace_store;
-pub mod throughput_store;
 pub mod commands;
 pub mod harness_store;
 pub mod interactions;
@@ -28,18 +26,109 @@ pub mod memories;
 pub mod migrate;
 pub mod queries;
 pub mod replay;
+pub mod task_graph_store;
 pub mod telegram;
+pub mod throughput_store;
+pub mod trace_store;
 pub mod verification_store;
 pub mod workflow_store;
 
 use amux_core::revision::{MutationKind, StateEvent, StateRevision};
-use r2d2_sqlite::SqliteConnectionManager;
+use read_manager::SqliteConnectionManager;
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 
 pub type ReadPool = r2d2::Pool<SqliteConnectionManager>;
+
+/// Who holds each checked-out read connection, so a starved pool names its
+/// holders instead of only its victims (AMUX-6589). Every starvation report
+/// said "the routes are victims; look at what was HOLDING connections", and
+/// nothing recorded what was. `read()` is `#[track_caller]` and leaves its
+/// caller in a thread-local; r2d2 fires checkout on that same thread, inside
+/// `get()`, so the handler can file the connection under its caller.
+#[derive(Clone, Copy)]
+enum ReadSite {
+    Caller(&'static std::panic::Location<'static>),
+    /// `read_async`: the closure's type name, which names the function that
+    /// wrote it (the caller's location would always be `read_async` itself).
+    Closure(&'static str),
+}
+
+impl std::fmt::Display for ReadSite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadSite::Caller(l) => write!(f, "{}:{}", l.file(), l.line()),
+            ReadSite::Closure(n) => f.write_str(n.trim_end_matches("::{{closure}}")),
+        }
+    }
+}
+
+thread_local! {
+    static READ_SITE: std::cell::Cell<Option<ReadSite>> = const { std::cell::Cell::new(None) };
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ReadHolders {
+    held: std::sync::Mutex<std::collections::HashMap<u64, (ReadSiteDebug, std::time::Instant)>>,
+}
+
+/// `HandleEvent` requires `Debug`; a site prints as its Display form.
+#[derive(Clone, Copy)]
+struct ReadSiteDebug(Option<ReadSite>);
+
+impl std::fmt::Debug for ReadSiteDebug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(site) => write!(f, "{site}"),
+            None => f.write_str("unattributed"),
+        }
+    }
+}
+
+impl ReadHolders {
+    /// The sites holding connections now, most connections first, as
+    /// `site x<count> max_held_ms=<ms>`; `unattributed` is a checkout that
+    /// did not come through `read()` / `read_async`.
+    pub(crate) fn summary(&self, top: usize) -> (usize, String) {
+        let Ok(held) = self.held.lock() else { return (0, "holders unreadable (lock poisoned)".into()) };
+        let mut by: std::collections::HashMap<String, (usize, u128)> = std::collections::HashMap::new();
+        for (site, at) in held.values() {
+            let e = by.entry(format!("{site:?}")).or_default();
+            e.0 += 1;
+            e.1 = e.1.max(at.elapsed().as_millis());
+        }
+        let mut rows: Vec<_> = by.into_iter().collect();
+        rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(b.1 .1.cmp(&a.1 .1)));
+        let n = held.len();
+        let text = rows
+            .iter()
+            .take(top)
+            .map(|(site, (count, ms))| format!("{site} x{count} max_held_ms={ms}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        (n, text)
+    }
+}
+
+#[derive(Debug)]
+struct ReadHolderEvents(Arc<ReadHolders>);
+
+impl r2d2::HandleEvent for ReadHolderEvents {
+    fn handle_checkout(&self, event: r2d2::event::CheckoutEvent) {
+        let site = READ_SITE.with(|c| c.get());
+        if let Ok(mut held) = self.0.held.lock() {
+            held.insert(event.connection_id(), (ReadSiteDebug(site), std::time::Instant::now()));
+        }
+    }
+
+    fn handle_checkin(&self, event: r2d2::event::CheckinEvent) {
+        if let Ok(mut held) = self.0.held.lock() {
+            held.remove(&event.connection_id());
+        }
+    }
+}
 
 pub(crate) enum ProjectionRead {
     Dedicated(Connection),
@@ -89,8 +178,21 @@ pub struct PendingEvent {
 
 type WriteFn = Box<dyn FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send>;
 
+/// Only these fixed maintenance operations may use the serialized writer
+/// outside a transaction. Pooled readers stay query-only.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Maintenance {
+    Checkpoint,
+    Vacuum,
+}
+
+enum WriteWork {
+    Mutation(WriteFn),
+    Maintenance(Maintenance),
+}
+
 struct WriteRequest {
-    work: WriteFn,
+    work: WriteWork,
     origin: &'static str,
     /// AMUX-4781: WHERE the write was issued, not just which function.
     /// `origin` is `type_name::<F>()`, and every closure inside one function
@@ -119,6 +221,8 @@ pub struct Store {
     /// only testable by holding every connection, and the paths that must hold
     /// it (`api::policy::enforce`) live in other modules.
     pub(crate) read_pool: ReadPool,
+    /// Who holds each checked-out read connection (AMUX-6589).
+    pub(crate) read_holders: Arc<ReadHolders>,
     /// AF-937: held only for its lifetime -- an RAII guard, not state. An
     /// flock on a sidecar file next to `db_path`, acquired in
     /// [`claim_sole_writer`] at open time. The OS releases it automatically
@@ -227,9 +331,9 @@ pub(crate) enum WriterLockOutcome {
 /// nothing said so for 13 hours (both processes reported healthy the whole
 /// time; SQLite's own WAL locking serializes the writes correctly, so this
 /// was never about corruption, only a silent second writer). This makes that
-/// coexistence loud. It never blocks or fails startup: a probe that cannot
-/// even open the sidecar file degrades to `HeldByOther(None)` treated as
-/// "unknown", not a reason to refuse.
+/// coexistence explicit and prevents a second scheduler from acting on the
+/// same workers. Refuse startup if exclusive ownership cannot be established;
+/// read-only clients must use the running server rather than start another driver.
 fn claim_sole_writer(db_path: &Path) -> WriterLockOutcome {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::io::AsRawFd;
@@ -266,15 +370,57 @@ fn claim_sole_writer(db_path: &Path) -> WriterLockOutcome {
     let mut buf = String::new();
     let mut f = &file;
     let _ = f.read_to_string(&mut buf);
-    let existing = serde_json::from_str::<serde_json::Value>(&buf).ok().map(|v| ExistingWriter {
-        pid: v.get("pid").and_then(serde_json::Value::as_u64).map(|x| x as u32),
-        port: v.get("port").and_then(serde_json::Value::as_u64).map(|x| x as u16),
-    });
+    let existing = serde_json::from_str::<serde_json::Value>(&buf)
+        .ok()
+        .map(|v| ExistingWriter {
+            pid: v
+                .get("pid")
+                .and_then(serde_json::Value::as_u64)
+                .map(|x| x as u32),
+            port: v
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .map(|x| x as u16),
+        });
     if existing.as_ref().and_then(|e| e.pid) == Some(std::process::id()) {
         WriterLockOutcome::HeldBySelf
     } else {
         WriterLockOutcome::HeldByOther(existing)
     }
+}
+
+/// Tokio worker threads, which is also what `available_parallelism` returns.
+pub(crate) fn worker_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
+}
+
+/// Read connections, DECOUPLED from the tokio worker count (AMUX-4955).
+///
+/// This was exactly `available_parallelism`, which is ALSO tokio's default
+/// worker count. The comment on the builder has said since AF-640 that such a
+/// pool "can pin every worker at once" and that the result "is
+/// self-sustaining" — and it is, because a worker blocked in `read()` waiting
+/// for a connection cannot release the connection it is waiting behind.
+///
+/// Measured 2026-09-23 over ~57k blocking-poll samples: 824
+/// `read_pool_slow_acquire` events, 97% of them with `idle=0` at 28/28, waits
+/// up to 4.3s — the 5s `connection_timeout` is what bounds them, not demand.
+/// With the pool strictly LARGER than the worker count, a tokio worker cannot
+/// be made to wait for a read connection by other tokio workers, which removes
+/// the self-sustaining half of that loop.
+///
+/// HEADROOM, NOT A GUARANTEE, and the difference is worth stating: `read_async`
+/// runs on spawn_blocking threads that draw from this same pool, and there are
+/// far more of those than workers. This bounds worker-to-worker starvation; it
+/// does not bound the pool.
+pub(crate) fn read_pool_size() -> u32 {
+    std::env::var("AMUX_READ_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| worker_threads().saturating_mul(2).max(8))
 }
 
 impl Store {
@@ -303,7 +449,7 @@ impl Store {
                      falls onto the compiled-in default port and can silently collide with \
                      the real server on this exact db_path"
                 );
-                None
+                anyhow::bail!("database runtime ownership unavailable for {} (holder pid {:?}, port {:?}); use the existing server or a separate AMUX_HOME", db_path.display(), existing.as_ref().and_then(|e|e.pid), existing.as_ref().and_then(|e|e.port));
             }
         };
         // Migrations run on a dedicated connection before anything else may
@@ -311,6 +457,10 @@ impl Store {
         let mut conn = Connection::open(db_path)?;
         configure_connection(&conn)?;
         migrate::apply_all_guarded(&mut conn, db_path)?;
+        // AMUX_LEDGER into the table the receipt trigger reads (api/ledger.rs).
+        if let Err(e) = crate::api::ledger::configure(&conn) {
+            tracing::warn!(error = %e, verdict = "ledger_config_unwritten", "AMUX_LEDGER not applied to the receipt trigger");
+        }
 
         let (write_tx, write_rx) = mpsc::channel::<WriteRequest>();
         let (events_tx, _) = tokio::sync::broadcast::channel(4096);
@@ -331,8 +481,10 @@ impl Store {
             c.pragma_update(None, "query_only", "ON")?;
             Ok(())
         });
+        let read_holders = Arc::new(ReadHolders::default());
         let read_pool = r2d2::Pool::builder()
-            .max_size(std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(4))
+            .max_size(read_pool_size())
+            .event_handler(Box::new(ReadHolderEvents(read_holders.clone())))
             // FAIL FAST, because a blocked acquire pins a tokio worker (AF-640).
             //
             // r2d2's default is 30 SECONDS and it was never set, which is why
@@ -341,9 +493,10 @@ impl Store {
             // waited half a minute to be told no.
             //
             // WHY WAITING IS WORSE THAN FAILING HERE. `read()` is synchronous
-            // and there is no `read_async` to match `write_async`, whose own
-            // doc says it exists so a handler "can await a write without
-            // pinning a runtime worker". So every one of the ~440 `read()` call
+            // and — when this was written — there was no `read_async` to match
+            // `write_async`. There is one now, used in five modules, so the
+            // claim below is narrower than it reads: it holds for the ~440
+            // BLOCKING `read()` sites, not for the codebase (AMUX-4955). So every one of the ~440 `read()` call
             // sites blocks its thread for the whole acquire. The pool's
             // max_size is `available_parallelism`, which is ALSO tokio's default
             // worker count, so a saturated pool can pin every worker at once
@@ -383,6 +536,7 @@ impl Store {
         Ok(Store {
             write_tx,
             read_pool,
+            read_holders,
             writer_lock,
             db_path: Arc::new(db_path.to_path_buf()),
             health_probe: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -412,7 +566,11 @@ impl Store {
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
-        self.write_correlated(f, interactions::current_id(), std::panic::Location::caller())
+        self.write_correlated(
+            f,
+            interactions::current_id(),
+            std::panic::Location::caller(),
+        )
     }
 
     fn write_correlated<F>(
@@ -424,6 +582,21 @@ impl Store {
     where
         F: FnOnce(&Connection) -> rusqlite::Result<WriteOutcome> + Send + 'static,
     {
+        self.submit_write(
+            WriteWork::Mutation(Box::new(f)),
+            std::any::type_name::<F>(),
+            site,
+            interaction_id,
+        )
+    }
+
+    fn submit_write(
+        &self,
+        work: WriteWork,
+        origin: &'static str,
+        site: &'static std::panic::Location<'static>,
+        interaction_id: Option<String>,
+    ) -> anyhow::Result<WriteReply> {
         use std::sync::atomic::Ordering;
         let (reply_tx, reply_rx) = mpsc::channel();
         self.write_inflight.fetch_add(1, Ordering::Relaxed);
@@ -431,8 +604,8 @@ impl Store {
         let sent = self
             .write_tx
             .send(WriteRequest {
-                work: Box::new(f),
-                origin: std::any::type_name::<F>(),
+                work,
+                origin,
                 site,
                 queued_at: std::time::Instant::now(),
                 interaction_id,
@@ -465,7 +638,8 @@ impl Store {
         // These two atomics are readable on /api/health at any instant, which
         // is where someone looks while a POST is hanging in front of them.
         let waited_ms = started.elapsed().as_millis() as u64;
-        self.write_wait_max_ms.fetch_max(waited_ms, Ordering::Relaxed);
+        self.write_wait_max_ms
+            .fetch_max(waited_ms, Ordering::Relaxed);
         out
     }
 
@@ -489,23 +663,23 @@ impl Store {
         let queued = std::time::Instant::now();
         let site = std::panic::Location::caller();
         async move {
-        tokio::task::spawn_blocking(move || {
-            // TIME SPENT WAITING FOR A BLOCKING THREAD, which every other
-            // instrument on this path is structurally blind to (AMUX-4744).
-            //
-            // `writer_slow` and `write_wait_max_ms` are both measured INSIDE
-            // `write_correlated`, which by then is already running on a blocking
-            // thread. Neither can see the wait to GET that thread. So if the
-            // blocking pool is saturated, a request stalls for a minute and
-            // every existing verdict stays silent and truthful.
-            //
-            // That makes this the discriminator rather than another counter:
-            // a 90s request with a small `queued_ms` and a large value here
-            // means the writer was never the problem.
-            record_blocking_dispatch(&dispatch, queued.elapsed());
-            this.write_correlated(f, interaction_id, site)
-        })
-        .await?
+            tokio::task::spawn_blocking(move || {
+                // TIME SPENT WAITING FOR A BLOCKING THREAD, which every other
+                // instrument on this path is structurally blind to (AMUX-4744).
+                //
+                // `writer_slow` and `write_wait_max_ms` are both measured INSIDE
+                // `write_correlated`, which by then is already running on a blocking
+                // thread. Neither can see the wait to GET that thread. So if the
+                // blocking pool is saturated, a request stalls for a minute and
+                // every existing verdict stays silent and truthful.
+                //
+                // That makes this the discriminator rather than another counter:
+                // a 90s request with a small `queued_ms` and a large value here
+                // means the writer was never the problem.
+                record_blocking_dispatch(&dispatch, queued.elapsed());
+                this.write_correlated(f, interaction_id, site)
+            })
+            .await?
         }
     }
 
@@ -549,7 +723,7 @@ impl Store {
             // was introduced, so if the pool is the bottleneck, that change
             // moved reads into the same queue as writes rather than out of it.
             record_blocking_dispatch(&dispatch, queued.elapsed());
-            let conn = this.read()?;
+            let conn = this.read_from(ReadSite::Closure(std::any::type_name::<F>()))?;
             f(&conn)
         })
         .await?
@@ -559,6 +733,28 @@ impl Store {
     /// `connection_timeout` so the warning arrives BEFORE the failures do, which
     /// is the difference between a signal and a post-mortem.
     const SLOW_ACQUIRE: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Submit fixed SQLite maintenance to the same writer as mutations. It
+    /// cannot run in an Immediate transaction and must never relax query_only
+    /// on a pooled reader. No domain revision or event is fabricated.
+    pub(crate) async fn maintenance_async(&self, operation: Maintenance) -> anyhow::Result<()> {
+        let store = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            store.submit_write(
+                WriteWork::Maintenance(operation),
+                "storage-maintenance",
+                std::panic::Location::caller(),
+                None,
+            )
+        }).await?;
+        match &result {
+            Ok(_) => tracing::info!(?operation, measured=true, n_considered=1,
+                verdict="storage_maintenance_completed", "serialized maintenance completed outside a transaction"),
+            Err(error) => tracing::warn!(?operation, %error, measured=true, n_considered=1,
+                verdict="storage_maintenance_failed", "maintenance failed; readers remain query-only"),
+        }
+        result.map(|_| ())
+    }
 
     /// Borrow a read-only connection from the pool.
     ///
@@ -571,20 +767,33 @@ impl Store {
     /// Silent on the happy path: a healthy acquire is microseconds, so the
     /// threshold below is never reached in normal operation and this stays off
     /// a hot path rather than logging 200k times a day.
+    #[track_caller]
     pub fn read(&self) -> anyhow::Result<r2d2::PooledConnection<SqliteConnectionManager>> {
+        self.read_from(ReadSite::Caller(std::panic::Location::caller()))
+    }
+
+    fn read_from(&self, site: ReadSite) -> anyhow::Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         let t0 = std::time::Instant::now();
-        let got = self.read_pool.get();
+        let got = READ_SITE.with(|c| {
+            c.set(Some(site));
+            let got = self.read_pool.get();
+            c.set(None);
+            got
+        });
         let waited = t0.elapsed();
         match got {
             Ok(conn) => {
                 if waited >= Self::SLOW_ACQUIRE {
                     let st = self.read_pool.state();
+                    let (attributed, holders) = self.read_holders.summary(5);
                     tracing::warn!(
                         verdict = "read_pool_slow_acquire",
                         waited_ms = waited.as_millis() as u64,
                         connections = st.connections,
                         idle = st.idle_connections,
                         max_size = self.read_pool.max_size(),
+                        holders_attributed = attributed,
+                        holders = %holders,
                         "read pool acquire was slow; the pool is saturated and every waiter                          is pinning a thread (AF-640)"
                     );
                 }
@@ -592,12 +801,15 @@ impl Store {
             }
             Err(e) => {
                 let st = self.read_pool.state();
+                let (attributed, holders) = self.read_holders.summary(5);
                 tracing::warn!(
                     verdict = "read_pool_exhausted",
                     waited_ms = waited.as_millis() as u64,
                     connections = st.connections,
                     idle = st.idle_connections,
                     max_size = self.read_pool.max_size(),
+                    holders_attributed = attributed,
+                    holders = %holders,
                     error = %e,
                     "read pool acquire FAILED; callers are getting 500s (AF-640)"
                 );
@@ -607,6 +819,14 @@ impl Store {
     }
 
     /// Health must report pool exhaustion without waiting behind fleet probes.
+    /// The database file this store opened; identifies the store in
+    /// process-wide caches without relying on an address that can be reused.
+    pub(crate) fn db_path(&self) -> &Path {
+        self.db_path.as_path()
+    }
+
+    /// Not attributed: r2d2's `try_get` fires no checkout event, so these
+    /// show as the gap between `holders_attributed` and `connections`.
     pub fn try_read(&self) -> Option<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.read_pool.try_get()
     }
@@ -627,21 +847,52 @@ impl Store {
         if self.db_path.as_path() == Path::new(":memory:") {
             return Ok(ProjectionRead::Pooled(self.read()?));
         }
-        let conn = Connection::open_with_flags(
+        // A NEW read-only connection can fail where the pool cannot
+        // (AMUX-6434): GET /api/sessions answered 500 "unable to open database
+        // file" in bursts, while pooled reads kept working on connections opened
+        // earlier. A read-only connection cannot create the WAL side files, and
+        // SQLite opens lazily, so the failure surfaces at the first read. Probe
+        // with that read here and fall back to the request pool, logged, rather
+        // than failing the projection.
+        let opened = Connection::open_with_flags(
             self.db_path.as_ref(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.pragma_update(None, "query_only", "ON")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        Ok(ProjectionRead::Dedicated(conn))
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .and_then(|conn| {
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            conn.pragma_update(None, "query_only", "ON")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            conn.query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))?;
+            Ok(conn)
+        });
+        match opened {
+            Ok(conn) => Ok(ProjectionRead::Dedicated(conn)),
+            Err(e) => {
+                let side = |ext: &str| {
+                    let mut p = self.db_path.as_os_str().to_owned();
+                    p.push(ext);
+                    Path::new(&p).exists()
+                };
+                tracing::warn!(
+                    verdict = "dedicated_read_fell_back_to_pool",
+                    path = %self.db_path.display(),
+                    error = %e,
+                    wal_exists = side("-wal"),
+                    shm_exists = side("-shm"),
+                    measured = true,
+                    n_considered = 1,
+                    "a dedicated read-only connection could not open; served from the request pool"
+                );
+                Ok(ProjectionRead::Pooled(self.read()?))
+            }
+        }
     }
 
     /// Current global revision.
     pub fn current_rev(&self) -> anyhow::Result<StateRevision> {
         let conn = self.read()?;
-        let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
+        let rev: u64 =
+            conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
         Ok(StateRevision(rev))
     }
 
@@ -655,7 +906,11 @@ impl Store {
     /// in the event journal the client must full-sync rather than trust a
     /// silently incomplete delta (Invariant 40 — an omission must announce
     /// itself).
-    pub fn events_since(&self, since: StateRevision, limit: usize) -> anyhow::Result<(Vec<StateEvent>, bool)> {
+    pub fn events_since(
+        &self,
+        since: StateRevision,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<StateEvent>, bool)> {
         let conn = self.read()?;
         let oldest: Option<u64> = conn
             .query_row("SELECT MIN(rev) FROM _amux_state_events", [], |r| r.get(0))
@@ -687,8 +942,7 @@ impl Store {
                 rev: StateRevision(rev),
                 entity_type: parse_entity_type(&entity_type),
                 entity_id,
-                mutation: serde_json::from_str(&mutation)
-                    .unwrap_or(MutationKind::Updated),
+                mutation: serde_json::from_str(&mutation).unwrap_or(MutationKind::Updated),
                 at: at.parse().unwrap_or_default(),
             });
         }
@@ -778,12 +1032,17 @@ fn writer_loop(
         // A panicking caller must not kill the sole writer and strand every
         // later mutation. The transaction guard rolls back during unwinding.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            apply_write(&conn, req.work, &events_tx, req.interaction_id.as_deref())
-        })).unwrap_or_else(|_| {
+            match req.work {
+                WriteWork::Mutation(work) => apply_write(&conn, work, &events_tx, req.interaction_id.as_deref()),
+                WriteWork::Maintenance(operation) => apply_maintenance(&conn, operation),
+            }
+        }))
+        .unwrap_or_else(|_| {
             tracing::error!(target: "store", verdict = "writer_mutation_panicked",
                 "mutation panicked; transaction rolled back, writer remains available");
             Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::other("writer mutation panicked; transaction rolled back"))))
+                std::io::Error::other("writer mutation panicked; transaction rolled back"),
+            )))
         });
         let work_ms = started.elapsed().as_millis() as u64;
         // SPLIT THE HOLD (AMUX-4830, corrected by AMUX-4837). This comment used
@@ -854,6 +1113,29 @@ static LAST_COMMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// thread-local reads 0 forever from a test's own thread.
 static LAST_BEGIN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+fn apply_maintenance(conn: &Connection, operation: Maintenance) -> rusqlite::Result<WriteReply> {
+    // Checkpoint reports contention in its result row, not as a SQL error.
+    // Maintenance must yield immediately to readers, rather than occupy the
+    // only writer for its normal five-second lock timeout. Restore the policy
+    // even when SQLite returns an error; ordinary mutations still need it.
+    let timeout_ms: u64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+    conn.busy_timeout(std::time::Duration::ZERO)?;
+    let checkpoint = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get::<_, i64>(0));
+    conn.busy_timeout(std::time::Duration::from_millis(timeout_ms))?;
+    let busy = checkpoint?;
+    if busy != 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("checkpoint deferred by an active reader; maintenance not completed".into()),
+        ));
+    }
+    if matches!(operation, Maintenance::Vacuum) {
+        conn.execute_batch("VACUUM;")?;
+    }
+    let rev = conn.query_row("SELECT rev FROM _amux_rev WHERE id=1", [], |row| row.get(0))?;
+    Ok(WriteReply { applied:false, rev:StateRevision(rev), events:vec![] })
+}
+
 fn apply_write(
     conn: &Connection,
     work: WriteFn,
@@ -867,8 +1149,12 @@ fn apply_write(
     // busy handler sleeps. Stamping after `work` would fold the lock wait back
     // into statement time, which is the conflation this split exists to end.
     let begin_started = std::time::Instant::now();
-    let transaction = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    LAST_BEGIN_MS.store(begin_started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    LAST_BEGIN_MS.store(
+        begin_started.elapsed().as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let outcome = work(&transaction)?;
     let mut committed_events = Vec::new();
     let rev = if outcome.applied {
@@ -876,12 +1162,19 @@ fn apply_write(
         // from this transaction shares the revision, which is what makes
         // "give me everything after rev N" exact.
         conn.execute("UPDATE _amux_rev SET rev = rev + 1 WHERE id = 1", [])?;
-        let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
+        let rev: u64 =
+            conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
         let now = chrono::Utc::now();
         if let Some(id) = interaction_id {
-            conn.execute("UPDATE _amux_interactions SET applied_writes=applied_writes+1,
+            conn.execute(
+                "UPDATE _amux_interactions SET applied_writes=applied_writes+1,
                 unjournaled_writes=unjournaled_writes+?2, updated_at=?3 WHERE id=?1",
-                rusqlite::params![id, i64::from(outcome.events.is_empty()), now.timestamp_millis()])?;
+                rusqlite::params![
+                    id,
+                    i64::from(outcome.events.is_empty()),
+                    now.timestamp_millis()
+                ],
+            )?;
         }
         for ev in outcome.events {
             // The COLUMN stores the BARE tag ("worker", "task",
@@ -928,12 +1221,16 @@ fn apply_write(
         }
         StateRevision(rev)
     } else {
-        let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
+        let rev: u64 =
+            conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))?;
         StateRevision(rev)
     };
     let commit_started = std::time::Instant::now();
     transaction.commit()?;
-    LAST_COMMIT_MS.store(commit_started.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    LAST_COMMIT_MS.store(
+        commit_started.elapsed().as_millis() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // Publish only after commit: a subscriber must never see an event whose
     // transaction later rolled back.
     for ev in &committed_events {
@@ -995,6 +1292,37 @@ mod amux4739_pool_startup_tests {
         );
     }
 
+    /// AMUX-6589: a starved pool names who holds it. Two connections held at
+    /// one line of this file and one held inside a `read_async` closure must
+    /// show up as those two sites; a returned connection must drop out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_starved_pool_names_its_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("holders.db")).unwrap();
+        let (a, b) = (store.read().unwrap(), store.read().unwrap()); let here = line!();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let bg = store.clone();
+        let task = tokio::spawn(async move {
+            bg.read_async(move |_conn| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        held_rx.recv().unwrap();
+        let (n, text) = store.read_holders.summary(5);
+        assert_eq!(n, 3, "{text}");
+        assert!(text.contains(&format!("src/db/mod.rs:{here} x2")), "{text}");
+        assert!(text.contains("a_starved_pool_names_its_holders"), "the read_async closure names its function: {text}");
+        drop((a, b));
+        release_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        let (n, text) = store.read_holders.summary(5);
+        assert_eq!(n, 0, "returned connections are no longer holders: {text}");
+    }
+
     /// The acquisition bound AF-640 set must survive this change. Startup and
     /// acquisition read the same field, so it is exactly the kind of pair where
     /// fixing one silently relaxes the other.
@@ -1054,7 +1382,10 @@ mod amux4744_write_queue_tests {
             std::thread::spawn(move || {
                 s.write(move |_conn| {
                     std::thread::sleep(hold);
-                    Ok(WriteOutcome { applied: false, events: vec![] })
+                    Ok(WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    })
                 })
             })
         };
@@ -1065,11 +1396,17 @@ mod amux4744_write_queue_tests {
         store
             .write(|conn| {
                 conn.execute_batch("CREATE TABLE IF NOT EXISTS wq_probe (id INTEGER)")?;
-                Ok(WriteOutcome { applied: false, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                })
             })
             .expect("the queued write still completes");
         let observed = started.elapsed();
-        blocker.join().expect("blocker joins").expect("blocker write");
+        blocker
+            .join()
+            .expect("blocker joins")
+            .expect("blocker write");
 
         assert!(
             observed >= std::time::Duration::from_millis(WRITE_WAIT_WARN_MS),
@@ -1156,8 +1493,14 @@ mod amux4744_write_queue_tests {
         // `stmt_ms` arithmetic above the macro, so a version of this that
         // scanned the whole body stayed GREEN when the field was deleted from
         // the warn itself. Measured: that mutation passed.
-        let warn_at = body.find("writer_slow").expect("the verdict is in this function");
-        let warn = &body[warn_at..body[warn_at..].find(");").map(|i| warn_at + i).unwrap_or(body.len())];
+        let warn_at = body
+            .find("writer_slow")
+            .expect("the verdict is in this function");
+        let warn = &body[warn_at
+            ..body[warn_at..]
+                .find(");")
+                .map(|i| warn_at + i)
+                .unwrap_or(body.len())];
         for field in [
             "queued_ms",
             "work_ms",
@@ -1193,7 +1536,10 @@ mod amux4744_write_queue_tests {
             .write(|conn| {
                 conn.execute("CREATE TABLE IF NOT EXISTS t_split (k INTEGER)", [])?;
                 conn.execute("INSERT INTO t_split (k) VALUES (1)", [])?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
 
@@ -1254,15 +1600,22 @@ mod amux4744_write_queue_tests {
         store
             .write(|conn| {
                 conn.execute("CREATE TABLE IF NOT EXISTS t_begin (k INTEGER)", [])?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
 
         // A SECOND connection holds the write lock for a while. The store's
         // writer must sit in BEGIN IMMEDIATE until this one commits.
         let blocker = Connection::open(&path).unwrap();
-        blocker.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
-        blocker.execute_batch("BEGIN IMMEDIATE; INSERT INTO t_begin (k) VALUES (99);").unwrap();
+        blocker
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        blocker
+            .execute_batch("BEGIN IMMEDIATE; INSERT INTO t_begin (k) VALUES (99);")
+            .unwrap();
 
         let (tx, rx) = mpsc::channel();
         let held_ms = 400;
@@ -1275,10 +1628,14 @@ mod amux4744_write_queue_tests {
         store
             .write(|conn| {
                 conn.execute("INSERT INTO t_begin (k) VALUES (1)", [])?;
-                Ok(WriteOutcome { applied: true, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
-        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("blocker committed");
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("blocker committed");
 
         let begin = LAST_BEGIN_MS.load(std::sync::atomic::Ordering::Relaxed);
         // Generous floor: the point is that the wait lands in `begin_ms` at all,
@@ -1314,7 +1671,10 @@ mod amux4744_write_queue_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("sites.db")).unwrap();
         let noop = |_: &Connection| {
-            Ok(WriteOutcome { applied: false, events: vec![] })
+            Ok(WriteOutcome {
+                applied: false,
+                events: vec![],
+            })
         };
         // Two calls, two LINES, one identical closure body: `origin` cannot
         // separate these and `site` must.
@@ -1353,7 +1713,12 @@ mod amux4744_write_queue_tests {
         let store = Store::open(&dir.path().join("wq2.db")).unwrap();
         for _ in 0..20 {
             store
-                .write(|_conn| Ok(WriteOutcome { applied: false, events: vec![] }))
+                .write(|_conn| {
+                    Ok(WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    })
+                })
                 .expect("write");
         }
         let recorded = store.write_wait_max_ms.load(Ordering::Relaxed);
@@ -1368,6 +1733,31 @@ mod amux4744_write_queue_tests {
 #[cfg(test)]
 mod af640_read_pool_tests {
     use super::*;
+
+    /// AMUX-6434: when a NEW read-only connection cannot open the database,
+    /// the projection read falls back to the pool's already-open connections
+    /// instead of failing the request with "unable to open database file".
+    #[test]
+    fn a_dedicated_read_that_cannot_open_falls_back_to_the_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cantopen.db");
+        let store = Store::open(&path).unwrap();
+        // Warm the pool so an already-open connection exists to fall back to.
+        drop(store.read().unwrap());
+        assert!(matches!(store.dedicated_read().unwrap(), ProjectionRead::Dedicated(_)), "normally a dedicated reader");
+        // Move the database out from under the path. A chmod does not do it:
+        // SQLite's unix VFS reuses a descriptor it already holds for the same
+        // inode. The pool keeps its open connections; a new read-only open of
+        // the path cannot create the file, so it fails with CANTOPEN.
+        let moved = dir.path().join("moved.db");
+        std::fs::rename(&path, &moved).unwrap();
+        let got = store.dedicated_read();
+        std::fs::rename(&moved, &path).unwrap();
+        let got = got.expect("falls back instead of failing");
+        assert!(matches!(got, ProjectionRead::Pooled(_)), "served from the pool");
+        let v: i64 = got.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
+        assert!(v >= 0);
+    }
 
     /// AF-640 / AMUX-4744: a read must not pin the runtime worker that awaits it.
     ///
@@ -1398,7 +1788,8 @@ mod af640_read_pool_tests {
 
             let s2 = store.clone();
             let reader = tokio::spawn(async move {
-                s2.read_async(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?)).await
+                s2.read_async(|c| Ok(c.query_row("SELECT 1", [], |r| r.get::<_, i64>(0))?))
+                    .await
             });
 
             // THE POINT: while that read waits for a connection, the single
@@ -1416,7 +1807,11 @@ mod af640_read_pool_tests {
 
             drop(held);
             let got = reader.await.expect("join");
-            assert_eq!(got.unwrap(), 1, "the read still returns once a connection frees");
+            assert_eq!(
+                got.unwrap(),
+                1,
+                "the read still returns once a connection frees"
+            );
         });
     }
 
@@ -1431,8 +1826,10 @@ mod af640_read_pool_tests {
     fn a_saturated_pool_reports_its_state_under_greppable_verdicts() {
         let src = include_str!("mod.rs");
         let body = src
-            .split_once("\n    pub fn read(&self)")
-            .expect("Store::read exists")
+            // `read()` is a one-line `#[track_caller]` shim; the acquire and
+            // its warnings live in `read_from` (AMUX-6589).
+            .split_once("\n    fn read_from(&self")
+            .expect("Store::read_from exists")
             .1;
         let body = body.split_once("\n    }\n").expect("its closing brace").0;
 
@@ -1454,7 +1851,7 @@ mod af640_read_pool_tests {
         }
         // The state is what makes it diagnosable. A verdict with no numbers is
         // the 30-second 500 again, wearing a better name.
-        for field in ["connections", "idle", "max_size", "waited_ms"] {
+        for field in ["connections", "idle", "max_size", "waited_ms", "holders_attributed", "holders"] {
             assert!(
                 body.contains(&format!("{field} =")),
                 "the warn must carry `{field}`; without it nobody can tell a saturated \
@@ -1477,14 +1874,23 @@ mod af640_read_pool_tests {
         assert!(max >= 1, "a pool with no connections cannot be exhausted");
 
         // Hold every connection, so the next acquire has nowhere to go.
-        let held: Vec<_> = (0..max).map(|_| store.read().expect("initial fill")).collect();
-        assert_eq!(store.read_pool.state().idle_connections, 0, "the pool must be empty");
+        let held: Vec<_> = (0..max)
+            .map(|_| store.read().expect("initial fill"))
+            .collect();
+        assert_eq!(
+            store.read_pool.state().idle_connections,
+            0,
+            "the pool must be empty"
+        );
 
         let t0 = std::time::Instant::now();
         let denied = store.read();
         let waited = t0.elapsed();
 
-        assert!(denied.is_err(), "an exhausted pool must refuse, not hand out a 29th connection");
+        assert!(
+            denied.is_err(),
+            "an exhausted pool must refuse, not hand out a 29th connection"
+        );
         // THE POINT: it fails in ~5s, not r2d2's default 30s. The upper bound is
         // what this card is about; the lower bound catches a timeout set so
         // small that ordinary contention would start failing.
@@ -1502,7 +1908,10 @@ mod af640_read_pool_tests {
 
         // CONTROL: after releasing, a read must succeed again. Without this the
         // assertions above are satisfied by a pool that is simply broken.
-        assert!(store.read().is_ok(), "the pool must recover once connections are returned");
+        assert!(
+            store.read().is_ok(),
+            "the pool must recover once connections are returned"
+        );
     }
 }
 
@@ -1557,14 +1966,13 @@ mod af937_writer_lock_tests {
         use std::io::Write;
         use std::os::unix::io::AsRawFd;
         let lock_path = holder_lock_path(db_path);
-        let file =
-            std::fs::OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-                .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(rc, 0, "test setup must win an uncontended lock");
         let mut f = &file;
@@ -1581,7 +1989,10 @@ mod af937_writer_lock_tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("t.db");
         let (store, logs) = with_captured_logs(|| Store::open(&db_path).unwrap());
-        assert!(store.holds_writer_lock(), "the only opener must win the lock");
+        assert!(
+            store.holds_writer_lock(),
+            "the only opener must win the lock"
+        );
         assert!(
             !logs.contains("concurrent_writer_detected"),
             "a lone opener must not warn about contention: {logs}"
@@ -1590,21 +2001,18 @@ mod af937_writer_lock_tests {
 
     /// The defect this card fixes: a second process (simulated here by a
     /// planted foreign lock, not this test's own pid) already has db_path
-    /// open. Opening must still SUCCEED (never refuse to start) and must log
-    /// a WARN naming the other pid/port.
+    /// open. A second scheduler must not start; log and return the owning
+    /// pid/port before touching the database.
     #[test]
-    fn a_foreign_holder_produces_a_named_warn_and_does_not_block_startup() {
+    fn a_foreign_holder_blocks_duplicate_driver_before_database_open() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("t.db");
         let fake_pid = std::process::id().wrapping_add(9973); // never our own pid
         let _foreign = plant_foreign_holder(&db_path, fake_pid, 8823);
 
         let (opened, logs) = with_captured_logs(|| Store::open(&db_path));
-        let store = opened.expect("a contended writer-lock must not fail startup");
-        assert!(
-            !store.holds_writer_lock(),
-            "the loser of the flock must not report holding it"
-        );
+        assert!(opened.is_err(), "a second runtime must not start");
+        assert!(!db_path.exists(), "refusal must precede migrations and writer startup");
         assert!(
             logs.contains("concurrent_writer_detected"),
             "must warn under the greppable verdict: {logs}"
@@ -1613,7 +2021,48 @@ mod af937_writer_lock_tests {
             logs.contains(&fake_pid.to_string()),
             "the warning must name the OTHER process's pid, not just that one exists: {logs}"
         );
-        assert!(logs.contains("8823"), "the warning must carry the other process's port too: {logs}");
+        assert!(
+            logs.contains("8823"),
+            "the warning must carry the other process's port too: {logs}"
+        );
+        drop(_foreign);
+        assert!(Store::open(&db_path).unwrap().holds_writer_lock(), "ownership recovers when the prior process exits");
+    }
+
+    /// A stale sidecar can outlive its writer after a crash. The PID text is
+    /// not the lock: when the kernel lock is free, startup must acquire it,
+    /// replace the stale identity, and avoid reporting a live contender.
+    #[test]
+    fn a_dead_pid_in_an_unlocked_sidecar_is_reconciled_on_startup() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let lock_path = holder_lock_path(&db_path);
+        let stale_pid = u32::MAX;
+        std::fs::write(
+            &lock_path,
+            format!(r#"{{"pid":{stale_pid},"port":8823}}"#),
+        )
+        .unwrap();
+
+        let (opened, logs) = with_captured_logs(|| Store::open(&db_path));
+        let store = opened.expect("stale holder metadata must not block startup");
+        assert!(store.holds_writer_lock(), "free kernel lock must be acquired");
+        assert!(
+            !logs.contains("concurrent_writer_detected"),
+            "stale metadata alone must not look like a live writer: {logs}"
+        );
+
+        let mut payload = String::new();
+        std::fs::File::open(lock_path)
+            .unwrap()
+            .read_to_string(&mut payload)
+            .unwrap();
+        let holder: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(holder["pid"], std::process::id());
+        assert_ne!(holder["pid"], stale_pid);
+        assert_eq!(holder["port"], crate::config::canonical_port());
     }
 
     /// The false-positive this design specifically avoids: the SAME process
@@ -1708,5 +2157,190 @@ mod pragma_decision_tests {
                  reads as an oversight and gets 'fixed'"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod read_pool_sizing_tests {
+    use super::*;
+
+    /// These two tests MUTATE AND READ the same process env var, so they must
+    /// not run concurrently — `cargo` runs them on parallel threads in one
+    /// process. Caught by mutation: reverting the pool size reddened only the
+    /// tunable test, because the other had already observed the 64 its
+    /// neighbour set. That is AMUX-4963's defect, in a test I was about to
+    /// ship while fixing it elsewhere.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// AMUX-4955. The property, not the number: the read pool must be able to
+    /// serve every tokio worker at once.
+    ///
+    /// It used to be exactly `available_parallelism`, which is also tokio's
+    /// default worker count, so a saturated pool could pin every worker
+    /// simultaneously — the builder's own comment calls that self-sustaining,
+    /// because a worker blocked waiting for a connection cannot release the one
+    /// it is waiting behind. Measured 2026-09-23: 824 read_pool_slow_acquire
+    /// events, 97% with idle=0 at 28/28.
+    #[test]
+    fn the_read_pool_is_strictly_larger_than_the_worker_count() {
+        let _env = env_guard();
+        std::env::remove_var("AMUX_READ_POOL_SIZE");
+        let workers = worker_threads();
+        assert!(
+            read_pool_size() > workers,
+            "a pool no larger than the worker count lets workers starve each other: \
+             pool {} vs {workers} workers",
+            read_pool_size()
+        );
+        // A tiny box must still get a usable pool rather than 2.
+        assert!(read_pool_size() >= 8);
+    }
+
+    /// Operable without a rebuild: the measurement that justified the default
+    /// came from one box, and the next one may disagree.
+    #[test]
+    fn the_read_pool_size_is_tunable_and_rejects_nonsense() {
+        let _env = env_guard();
+        std::env::set_var("AMUX_READ_POOL_SIZE", "64");
+        assert_eq!(read_pool_size(), 64);
+        // Garbage and zero fall back to the computed default rather than
+        // configuring a pool nobody can acquire from.
+        for bad in ["0", "-1", "", "lots"] {
+            std::env::set_var("AMUX_READ_POOL_SIZE", bad);
+            assert!(
+                read_pool_size() > worker_threads(),
+                "bad value {bad:?} must fall back"
+            );
+        }
+        std::env::remove_var("AMUX_READ_POOL_SIZE");
+    }
+}
+
+#[cfg(test)]
+mod storage_maintenance_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn maintenance_uses_writer_without_weakening_readers_or_creating_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("maintenance.db")).unwrap();
+        store.write_async(|c| {
+            c.execute_batch("CREATE TABLE maintenance_fixture(id INTEGER PRIMARY KEY, body BLOB); INSERT INTO maintenance_fixture VALUES(1,zeroblob(16384));")?;
+            Ok(WriteOutcome{applied:true,events:vec![]})
+        }).await.unwrap();
+        let rev = store.current_rev().unwrap();
+        assert!(
+            store
+                .read_async(|c| {
+                    c.execute_batch("VACUUM")?;
+                    Ok(())
+                })
+                .await
+                .is_err(),
+            "negative control: readers must remain query-only"
+        );
+        // Maintenance yields to any reader still holding a snapshot (by design,
+        // production retries next tick). The negative-control reader above can
+        // still be releasing on a loaded CI runner, so retry the deferral the
+        // way the scheduler would. Any other error still fails.
+        for operation in [Maintenance::Checkpoint, Maintenance::Vacuum] {
+            let mut attempt = 0;
+            loop {
+                match store.maintenance_async(operation).await {
+                    Ok(_) => break,
+                    Err(e) if attempt < 100 && e.to_string().contains("deferred by an active reader") => {
+                        attempt += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    Err(e) => panic!("maintenance failed after {attempt} deferrals: {e:?}"),
+                }
+            }
+        }
+        assert_eq!(
+            store.current_rev().unwrap(),
+            rev,
+            "maintenance is not a domain mutation"
+        );
+        store
+            .read_async(|c| {
+                assert_eq!(
+                    c.query_row("PRAGMA query_only", [], |r| r.get::<_, i64>(0))?,
+                    1
+                );
+                assert_eq!(
+                    c.query_row(
+                        "SELECT length(body) FROM maintenance_fixture WHERE id=1",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )?,
+                    16384
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store
+            .write_async(|c| {
+                c.execute(
+                    "INSERT INTO maintenance_fixture VALUES(2,'after maintenance')",
+                    [],
+                )?;
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            store.current_rev().unwrap().0 > rev.0,
+            "subsequent ordinary writes still commit"
+        );
+    }
+
+    #[test]
+    fn maintenance_history_queries_use_covering_indexes_without_live_only_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("history-index.db")).unwrap();
+        let c = store.read().unwrap();
+        let (query, index) = ("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM steering_history WHERE queued_at>=0", "idx_steering_history_queued_at");
+        let plan = c.prepare(query).unwrap().query_map([], |r| r.get::<_,String>(3)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap().join("; ");
+        assert!(plan.contains(index) && plan.contains("COVERING INDEX"), "{plan}");
+    }
+
+    #[test]
+    fn maintenance_checkpoint_contention_is_not_reported_as_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE example(n); INSERT INTO example VALUES(1);",
+            )
+            .unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT * FROM example;")
+            .unwrap();
+        writer.execute("INSERT INTO example VALUES(2)", []).unwrap();
+        let started = std::time::Instant::now();
+        let error = match apply_maintenance(&writer, Maintenance::Checkpoint) {
+            Err(error) => error,
+            Ok(_) => panic!("active snapshot should defer checkpoint"),
+        };
+        assert!(error.to_string().contains("checkpoint deferred"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "maintenance must not wait behind an active snapshot");
+        assert_eq!(writer.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0)).unwrap(), 5000);
+        writer.execute("INSERT INTO example VALUES(3)", []).unwrap();
+        assert_eq!(writer.query_row("SELECT COUNT(*) FROM example", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert!(writer.is_autocommit());
+        reader.execute_batch("ROLLBACK").unwrap();
     }
 }

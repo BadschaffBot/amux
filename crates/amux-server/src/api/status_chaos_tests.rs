@@ -1,27 +1,44 @@
 //! Replays of provider chrome through the actual status/preview projection.
 //! Model names and effort labels are inputs, never classification rules.
-use super::*;
 use super::tests::signals;
-use crate::backend::adapter::{TerminalAdapter, claude_auto_resume_banner};
-use amux_core::provider::ProviderId;
+use super::*;
+use crate::backend::adapter::{claude_auto_resume_banner, TerminalAdapter};
 use amux_core::protocol::WorkerEvent;
+use amux_core::provider::ProviderId;
 
 const AUTO: &str = "⏺ Usage limit reached · continuing automatically at 6:10pm · esc or type to cancel\n✻ Baked for 1m 57s · done 2:33 PM\n✔ Update installed · Restart to update\n❯\n⚠ Usage limit reached · continuing automatically at 6:10pm · esc to cancel\n⚠ /limit-reset to reset your session limit now · uses weekly limit · 1/week\n⚠ /usage-credits to continue now\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← 5 agents\n/rc failed";
-const ASK: &str = "Which output format?\n❯ 1. JSON\n  2. Plain text\nEnter to select · Esc to cancel";
+const ASK: &str =
+    "Which output format?\n❯ 1. JSON\n  2. Plain text\nEnter to select · Esc to cancel";
 
 #[test]
 fn quota_never_becomes_a_human_question_after_preview() {
     for model in ["claude-sonnet-5", "claude-opus-5", "claude-haiku-4-5"] {
-        for previous in ["active", "idle", "waiting", "blocked", "rate_limited", "api_error"] {
-            for raw in [AUTO.to_string(), format!("Model: {model} low\n{AUTO}"), format!("\x1b[31m{AUTO}\x1b[0m"), AUTO.replace(" · esc to cancel", "\n · esc to cancel")] {
-                let mut v = json!({"name":"chaos", "model":model, "running":true, "status":previous});
+        for previous in [
+            "active",
+            "idle",
+            "waiting",
+            "blocked",
+            "rate_limited",
+            "api_error",
+        ] {
+            for raw in [
+                AUTO.to_string(),
+                format!("Model: {model} low\n{AUTO}"),
+                format!("\x1b[31m{AUTO}\x1b[0m"),
+                AUTO.replace(" · esc to cancel", "\n · esc to cancel"),
+            ] {
+                let mut v =
+                    json!({"name":"chaos", "model":model, "running":true, "status":previous});
                 apply_preview_waiting_status(&mut v, &raw);
                 assert_eq!(v["status"], "rate_limited", "{model}/{previous}: {v}");
                 assert_eq!(v["waiting_reason"], "rate_limit");
                 assert!(v["rate_limited_until"].as_i64().unwrap() > 0);
                 assert_eq!(v["credit_limited"], false);
                 let events = TerminalAdapter::new(ProviderId::new("claude")).scan(&raw);
-                assert!(matches!(events.as_slice(), [WorkerEvent::RateLimited(_)]), "{events:?}");
+                assert!(
+                    matches!(events.as_slice(), [WorkerEvent::RateLimited(_)]),
+                    "{events:?}"
+                );
             }
         }
     }
@@ -30,11 +47,26 @@ fn quota_never_becomes_a_human_question_after_preview() {
 #[test]
 fn preview_cancellation_is_not_input_across_models() {
     let cases = [
-        ("claude-sonnet-5", "✻ Thinking… (2s · 40 tokens)\n❯\n⏵⏵ bypass permissions on · esc to interrupt"),
-        ("gpt-5 low", "• Working (1s • esc to interrupt)\n›\ngpt-5 low · ~/test"),
-        ("gemini-2.5-flash-lite", "⠙ Thinking... (esc to cancel, 9s)\n│ Type your message"),
-        ("gemini-2.5-flash", "✦ Thinking about the request (esc to cancel)"),
-        ("claude-sonnet-5", "Continuing automatically at 6:10pm · esc to cancel\n❯\n⏵⏵ bypass permissions on"),
+        (
+            "claude-sonnet-5",
+            "✻ Thinking… (2s · 40 tokens)\n❯\n⏵⏵ bypass permissions on · esc to interrupt",
+        ),
+        (
+            "gpt-5 low",
+            "• Working (1s • esc to interrupt)\n›\ngpt-5 low · ~/test",
+        ),
+        (
+            "gemini-2.5-flash-lite",
+            "⠙ Thinking... (esc to cancel, 9s)\n│ Type your message",
+        ),
+        (
+            "gemini-2.5-flash",
+            "✦ Thinking about the request (esc to cancel)",
+        ),
+        (
+            "claude-sonnet-5",
+            "Continuing automatically at 6:10pm · esc to cancel\n❯\n⏵⏵ bypass permissions on",
+        ),
     ];
     for (model, raw) in cases {
         assert_eq!(derive_waiting_reason(raw), "", "{model}: {raw}");
@@ -69,13 +101,25 @@ fn current_questions_survive_but_quoted_questions_do_not() {
 
 #[test]
 fn quota_footer_recovery_and_stale_transcript_chaos() {
-    for suffix in ["\n⏺ Resumed\n❯\n⏵⏵ bypass permissions on", "\n❯\n⏵⏵ bypass permissions on · esc to interrupt"] {
+    for suffix in [
+        "\n⏺ Resumed\n❯\n⏵⏵ bypass permissions on",
+        "\n❯\n⏵⏵ bypass permissions on · esc to interrupt",
+    ] {
         let recovered = format!("{AUTO}{suffix}");
         assert!(claude_auto_resume_banner(&recovered).is_none());
         assert_ne!(derive_waiting_reason(&recovered), "rate_limit");
     }
-    assert!(claude_auto_resume_banner("⚠ Usage limit reached · continuing automatically at 6:10pm · esc to cancel").is_none(), "unowned prose cannot declare provider state");
-    for raw in [AUTO.to_string(), format!("{}\n{AUTO}", "old output\n".repeat(1000))] {
+    assert!(
+        claude_auto_resume_banner(
+            "⚠ Usage limit reached · continuing automatically at 6:10pm · esc to cancel"
+        )
+        .is_none(),
+        "unowned prose cannot declare provider state"
+    );
+    for raw in [
+        AUTO.to_string(),
+        format!("{}\n{AUTO}", "old output\n".repeat(1000)),
+    ] {
         let mut s = signals();
         s.activity.insert("amux-chaos".into(), s.now as i64);
         s.panes.insert("chaos".into(), raw);
@@ -85,8 +129,13 @@ fn quota_footer_recovery_and_stale_transcript_chaos() {
             assert_eq!(status, "rate_limited", "{report}: {ex}");
             assert_eq!(ex["decided_by"], "provider_auto_resume_quota");
             assert_eq!(s.derive_status("chaos", false), "");
-            s.activity.insert("amux-chaos".into(), (s.now - 7200.0) as i64);
-            assert_eq!(s.derive_status("chaos", true), "rate_limited", "a quiet quota footer is still current evidence");
+            s.activity
+                .insert("amux-chaos".into(), (s.now - 7200.0) as i64);
+            assert_eq!(
+                s.derive_status("chaos", true),
+                "rate_limited",
+                "a quiet quota footer is still current evidence"
+            );
         }
     }
 }
@@ -115,14 +164,24 @@ fn quoted_limit_menu_does_not_override_recovery_or_allow_an_automatic_keypress()
 fn auto_resume_observation_retains_the_clock_across_reset_and_restart() {
     use crate::api::session_verbs::observe_claude_limit;
     use chrono::TimeZone;
-    let now = chrono::Local.with_ymd_and_hms(2026, 9, 11, 17, 0, 0).single().unwrap();
-    let reset = chrono::Local.with_ymd_and_hms(2026, 9, 11, 18, 10, 0).single().unwrap().timestamp();
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 9, 11, 17, 0, 0)
+        .single()
+        .unwrap();
+    let reset = chrono::Local
+        .with_ymd_and_hms(2026, 9, 11, 18, 10, 0)
+        .single()
+        .unwrap()
+        .timestamp();
     let before = observe_claude_limit(AUTO, 0, now).unwrap();
     assert_eq!(before.kind, "auto-resume");
     assert!(!before.menu, "no key may be pressed into an automatic wait");
     assert_eq!(before.reset_at, reset);
     let after = observe_claude_limit(AUTO, reset, now + chrono::Duration::hours(2)).unwrap();
-    assert_eq!(after.reset_at, reset, "a stale warning must not roll its reset forward a day");
+    assert_eq!(
+        after.reset_at, reset,
+        "a stale warning must not roll its reset forward a day"
+    );
     assert!(observe_claude_limit("❯\n⏵⏵ bypass permissions on", reset, now).is_none());
 }
 
@@ -152,11 +211,21 @@ fn low_effort_model_status_chaos_matrix() {
                 sig.panes.insert("matrix".into(), frame.clone());
                 // An idle provider has a fresh stop report; an active provider
                 // contradicts an old one. Neither is an input request.
-                if expected == "idle" { sig.reports["matrix"]["ts"] = json!(sig.now - 1.0); }
+                if expected == "idle" {
+                    sig.reports["matrix"]["ts"] = json!(sig.now - 1.0);
+                }
                 let (status, ex) = sig.derive_status_explain("matrix", true);
                 assert_eq!(status, expected, "{model}/variant={variant}: {ex}");
-                assert_eq!(derive_waiting_reason(&frame), "", "{model}/variant={variant}");
-                assert_eq!(sig.derive_status("matrix", false), "", "death outranks retained chrome");
+                assert_eq!(
+                    derive_waiting_reason(&frame),
+                    "",
+                    "{model}/variant={variant}"
+                );
+                assert_eq!(
+                    sig.derive_status("matrix", false),
+                    "",
+                    "death outranks retained chrome"
+                );
             }
         }
     }
@@ -164,10 +233,63 @@ fn low_effort_model_status_chaos_matrix() {
 
 #[test]
 fn all_core_states_project_by_tag_not_model_output_or_reason() {
-    for state in ["active", "idle", "waiting", "rate_limited", "error", "starting", "stopped"] {
+    for state in [
+        "active",
+        "idle",
+        "waiting",
+        "rate_limited",
+        "error",
+        "starting",
+        "stopped",
+    ] {
         for detail in ["active", "idle", "waiting", "rate_limited", "error"] {
             let raw = json!({"state":state,"detail":detail,"reason":detail}).to_string();
-            assert_eq!(python_status(&raw), if state == "stopped" { "" } else { state }, "{raw}");
+            assert_eq!(
+                python_status(&raw),
+                if state == "stopped" { "" } else { state },
+                "{raw}"
+            );
         }
     }
+}
+
+#[test]
+fn split_quota_footer_with_live_children_is_current_clocked_capacity() {
+    use crate::api::session_verbs::observe_claude_limit;
+    use chrono::TimeZone;
+    // gs12-planes, 2026-10-08 06:26Z. The warning is below a measured
+    // empty composer; the parent is done while one shell and five agents live.
+    let raw = "✻ Crunched for 27m 16s · done 2:16 AM · 1 shell still running\n────────────────\n❯\u{a0}\n────────────────\n  ⚠ Usage limit reached · limit resets 4:50am · clau.de/wrap-up\n    Continuing automatically at 4:50am · esc to cancel · /usage-credits to continue now\n  ⏵⏵ bypass permissions on · 1 shell · ← 5 agents · ↓ to manage";
+    let now = chrono::Local.with_ymd_and_hms(2026,10,8,2,20,0).single().unwrap();
+    let expected = chrono::Local.with_ymd_and_hms(2026,10,8,4,50,0).single().unwrap().timestamp();
+    for frame in [raw.to_string(),format!("\x1b[31m{raw}\x1b[0m")] {
+        assert!(claude_auto_resume_banner(&frame).is_some());
+        let limit = observe_claude_limit(&frame,0,now).expect("split footer must be observed without a transcript fallback");
+        assert_eq!(limit.kind,"auto-resume");
+        assert_eq!(limit.reset_at,expected);
+        assert!(!limit.menu);
+        assert!(matches!(TerminalAdapter::new(ProviderId::new("claude")).scan(&frame).as_slice(),[WorkerEvent::RateLimited(_)]));
+        let mut v = json!({"running":true,"model":"claude-opus-5","status":"active"});
+        apply_preview_waiting_status(&mut v,&frame);
+        assert_eq!(v["status"],"rate_limited");
+        assert_eq!(v["credit_limited"],false);
+        let mut state = signals();
+        state.panes.insert("chaos".into(),frame);
+        state.provider_child_activity.insert("chaos".into());
+        state.reports = json!({"chaos":{"state":"active","ts":state.now-5.0}});
+        assert_eq!(state.derive_status("chaos",true),"rate_limited");
+    }
+    for frame in [format!("{raw}\n⏺ Resumed\n❯\n⏵⏵ bypass permissions on"),raw.replace("⏵⏵ bypass permissions on","⏵⏵ bypass permissions on · esc to interrupt"),"⚠ Usage limit reached · limit resets 4:50am\nContinuing automatically at 4:50am · esc to cancel".into()] {
+        assert!(claude_auto_resume_banner(&frame).is_none(),"scrollback, active turns and unowned prose must not become a current quota footer");
+    }
+}
+
+/// gtm-engine, 2026-10-20 13:00 ET: the newer wording of the same footer.
+#[test]
+fn the_continuing_shortly_footer_is_the_same_quota_banner() {
+    let raw = "  \u{23bf}  You've hit your session limit \u{b7} resets 1pm (America/New_York)\n\n\u{23fa} Usage limit reached \u{b7} continuing automatically at 1pm \u{b7} esc to cancel\n\n\u{273b} Worked for 1m 2s \u{b7} done 12:54 PM\n\u{2500}\u{2500}\u{2500}\n\u{276f} \n\u{2500}\u{2500}\u{2500}\n  \u{26a0} Usage limit reached \u{b7} limit resets 1pm\n    Continuing shortly \u{b7} esc to cancel\n  usemixpeek \u{b7} wk 26%\n  \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 5 agents";
+    let banner = claude_auto_resume_banner(raw).expect("the footer is recognised");
+    let now = chrono::Local::now();
+    let reset = crate::api::session_verbs::parse_rate_limit_reset_at(&banner, now).expect("its reset time parses, so a hold can expire");
+    assert!(reset > 0);
 }

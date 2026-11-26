@@ -20,13 +20,21 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rusqlite.workspace = true
 r2d2.workspace = true
-r2d2_sqlite.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 ulid.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
 regex.workspace = true
+# boundaries.toml is written for Python's `re`: three rules use lookbehind or
+# lookahead, which `regex` cannot compile — so those rules were silently inert
+# (including the one that refuses `tmux kill-server`). `fancy-regex` is already
+# in the graph via syntect's `regex-fancy`, so this adds no build.
+fancy-regex = "0.16"
+# Peek syntax highlighting (diffs and fenced code) rendered server-side to
+# ANSI: zero client JS, and cached with the transcript. Pure-Rust regex engine,
+# no C dependency.
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy", "parsing"] }
 rcgen.workspace = true
 reqwest.workspace = true
 cron.workspace = true
@@ -43,12 +51,16 @@ sha2.workspace = true
 sha1.workspace = true
 hex.workspace = true
 p256.workspace = true
+getrandom.workspace = true
 hkdf.workspace = true
 aes-gcm.workspace = true
 aes.workspace = true
 cbc.workspace = true
 pbkdf2.workspace = true
 hmac.workspace = true
+# Ed25519 signing of ledger checkpoints (governance PR 10). Already in the
+# tree through rustls, jsonwebtoken and rcgen at this version.
+ring = "0.17"
 base64.workspace = true
 toml.workspace = true
 futures.workspace = true

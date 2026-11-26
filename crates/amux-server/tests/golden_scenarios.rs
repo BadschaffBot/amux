@@ -60,16 +60,6 @@ fn rig() -> Rig {
     std::env::set_var("AMUX_NEEDSYOU_ASK_REQUIRED", "0");
     std::env::set_var("AMUX_TODO_WIP_LIMIT", "0");
     std::env::set_var("AMUX_CONTINUATION_REQUIRED", "0");
-    // AF-921: golden_dependency_chain deliberately builds a cross-worker
-    // dependency chain (a parent owned by one session depending on children
-    // owned by three others) to exercise the orchestrator's own resolution
-    // logic -- the parent must stay Waiting(Dependency) until all three
-    // cross-owner leases complete. board.rs::foreign_dependencies refuses
-    // that at create time by default (cross_board_dependency_forbidden,
-    // b18789f9); its own refusal has separate coverage in
-    // tests/board_ownership.rs. Same escape hatch tests/board_request.rs
-    // already uses to opt a rig out of the create-time policy.
-    std::env::set_var("AMUX_BOARD_DELEGATION", "1");
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("golden.db")).unwrap());
     let state = AppState {
@@ -77,7 +67,7 @@ fn rig() -> Rig {
         started: std::time::Instant::now(),
         build_hash: "golden-test".into(),
         auth_token: None,
-    reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     Rig {
         app: router(state),
@@ -199,7 +189,13 @@ async fn patch_ok(app: &axum::Router, sem: &str, body: Value, actor: &str) -> Va
 /// wholesale, the done gate is satisfied with the EXACT type-derived
 /// criteria (`gate_checked` must match every criterion — AMUX-1719).
 async fn drive_to_done(app: &axum::Router, sem: &str, actor: &str) {
-    let v = patch_ok(app, sem, json!({ "status": "doing", "gate_ack": true }), actor).await;
+    let v = patch_ok(
+        app,
+        sem,
+        json!({ "status": "doing", "gate_ack": true }),
+        actor,
+    )
+    .await;
     assert_eq!(v["status"], json!("doing"), "{v}");
     let v = patch_ok(
         app,
@@ -228,25 +224,13 @@ async fn store_command_criterion(app: &axum::Router, sem: &str, cmd: &str) -> u3
         "authored_by": { "kind": "document" },
         "version": 1
     });
-    let (st, v) = send_with(
-        app,
-        "PUT",
-        &format!("/api/criteria/{sem}"),
-        Some(body),
-        &[],
-    )
-    .await;
+    let (st, v) = send_with(app, "PUT", &format!("/api/criteria/{sem}"), Some(body), &[]).await;
     assert_eq!(st, StatusCode::OK, "store criteria for {sem}: {v}");
     1
 }
 
 /// POST /api/verify/{id} against an immutable stored criteria version.
-async fn run_verify(
-    app: &axum::Router,
-    sem: &str,
-    criteria_version: u32,
-    actor: &str,
-) -> Value {
+async fn run_verify(app: &axum::Router, sem: &str, criteria_version: u32, actor: &str) -> Value {
     let (st, v) = send_with(
         app,
         "POST",
@@ -307,7 +291,10 @@ fn expire_lease(store: &SharedStore, task_id: &str) {
                 "UPDATE _amux_leases SET expires_at = ?2 WHERE task_id = ?1",
                 params![t, (Utc::now() - chrono::Duration::hours(1)).to_rfc3339()],
             )?;
-            Ok(WriteOutcome { applied: true, events: vec![] })
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
         })
         .unwrap();
 }
@@ -427,13 +414,22 @@ fn core_snapshot(store: &SharedStore) -> (Vec<Task>, Vec<Worker>, Vec<Lease>) {
 /// (Invariant 34 step 5 — TurnCompleted is the confirmation signal).
 async fn report_turn(store: &SharedStore, worker: &WorkerId) {
     let turn = TurnId::from_ulid(ulid::Ulid::new());
-    wevents::process_event(store, worker, WorkerEvent::TurnStarted { turn_id: turn.clone() })
-        .await
-        .unwrap();
     wevents::process_event(
         store,
         worker,
-        WorkerEvent::TurnCompleted(TurnResult { turn_id: turn, outcome: "completed".into() }),
+        WorkerEvent::TurnStarted {
+            turn_id: turn.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    wevents::process_event(
+        store,
+        worker,
+        WorkerEvent::TurnCompleted(TurnResult {
+            turn_id: turn,
+            outcome: "completed".into(),
+        }),
     )
     .await
     .unwrap();
@@ -462,11 +458,15 @@ async fn golden_failure_and_retry() {
     let mut rx = rig.store.subscribe();
 
     let wid = register_worker(app, &rig.protocol, "golden-worker").await;
-    let sem = create_task(app, "harden the flaky retry path", Some("golden-worker"), &[]).await;
+    let sem = create_task(
+        app,
+        "harden the flaky retry path",
+        Some("golden-worker"),
+        &[],
+    )
+    .await;
     let fixed_marker = rig._dir.path().join("retry-fixed");
-    let marker_arg = fixed_marker
-        .to_string_lossy()
-        .replace('\'', "'\\''");
+    let marker_arg = fixed_marker.to_string_lossy().replace('\'', "'\\''");
     let criteria_version =
         store_command_criterion(app, &sem, &format!("test -f '{marker_arg}'")).await;
     let tid = board_store::internal_id(&sem);
@@ -495,10 +495,22 @@ async fn golden_failure_and_retry() {
             // The pump delivers the immutable compiled context and typed
             // handoff, not a serialized command. The task identity and
             // objective remain visible in that richer assignment brief.
-            assert!(prompt.text.contains("AMUX CONTEXT SNAPSHOT"), "{}", prompt.text);
-            assert!(prompt.text.contains("--- handoff [trusted;"), "{}", prompt.text);
+            assert!(
+                prompt.text.contains("AMUX CONTEXT SNAPSHOT"),
+                "{}",
+                prompt.text
+            );
+            assert!(
+                prompt.text.contains("--- handoff [trusted;"),
+                "{}",
+                prompt.text
+            );
             assert!(prompt.text.contains(tid.as_str()), "{}", prompt.text);
-            assert!(prompt.text.contains("harden the flaky retry path"), "{}", prompt.text);
+            assert!(
+                prompt.text.contains("harden the flaky retry path"),
+                "{}",
+                prompt.text
+            );
             assert!(prompt.text.contains("(board task"), "{}", prompt.text);
         }
         other => panic!("expected SendPrompt, got {other:?}"),
@@ -508,13 +520,21 @@ async fn golden_failure_and_retry() {
 
     // The agent "works": TurnStarted/TurnCompleted stream through the real
     // event processor — worker lands Idle, the delivered command Confirmed.
-    let handle = wevents::spawn_event_processor(rig.store.clone(), rig.protocol.clone(), wid.clone());
+    let handle =
+        wevents::spawn_event_processor(rig.store.clone(), rig.protocol.clone(), wid.clone());
     let turn = TurnId::from_ulid(ulid::Ulid::new());
-    rig.protocol
-        .emit(&wid, WorkerEvent::TurnStarted { turn_id: turn.clone() });
     rig.protocol.emit(
         &wid,
-        WorkerEvent::TurnCompleted(TurnResult { turn_id: turn, outcome: "completed".into() }),
+        WorkerEvent::TurnStarted {
+            turn_id: turn.clone(),
+        },
+    );
+    rig.protocol.emit(
+        &wid,
+        WorkerEvent::TurnCompleted(TurnResult {
+            turn_id: turn,
+            outcome: "completed".into(),
+        }),
     );
     {
         let store = rig.store.clone();
@@ -522,7 +542,10 @@ async fn golden_failure_and_retry() {
         wait_until(move || {
             let conn = store.read().unwrap();
             let idle = matches!(
-                queries::get_worker(&conn, wid.as_str()).unwrap().unwrap().state,
+                queries::get_worker(&conn, wid.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .state,
                 WorkerState::Idle { .. }
             );
             let confirmed: i64 = conn
@@ -547,14 +570,24 @@ async fn golden_failure_and_retry() {
     let v = run_verify(app, &sem, criteria_version, "golden-verifier").await;
     assert_eq!(v["verdict"]["kind"], json!("failed"), "{v}");
     assert!(
-        v["verdict"]["reason"].as_str().unwrap().contains("exited 1"),
+        v["verdict"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("exited 1"),
         "{v}"
     );
     assert_eq!(v["new_status"], json!("doing"), "{v}");
     let d = detail(app, &sem).await;
-    assert_eq!(d["status"], json!("doing"), "failed verification revokes the done claim");
+    assert_eq!(
+        d["status"],
+        json!("doing"),
+        "failed verification revokes the done claim"
+    );
     let log = d["log"].as_str().unwrap();
-    assert!(log.contains("verification FAILED"), "rejection reason must be in the log: {log}");
+    assert!(
+        log.contains("verification FAILED"),
+        "rejection reason must be in the log: {log}"
+    );
     assert!(log.contains("exited 1"), "log: {log}");
 
     // Retry: the worker fixes it, claims done again, verification PASSES.
@@ -590,10 +623,15 @@ async fn golden_failure_and_retry() {
             && matches!(e.mutation, MutationKind::Created)),
         "board create event missing"
     );
-    assert!(has_lease_created(&events, tid.as_str()), "lease event missing");
     assert!(
-        events.iter().any(|e| e.entity_type == EntityType::Other("context_snapshot".into())
-            && matches!(e.mutation, MutationKind::Created)),
+        has_lease_created(&events, tid.as_str()),
+        "lease event missing"
+    );
+    assert!(
+        events.iter().any(
+            |e| e.entity_type == EntityType::Other("context_snapshot".into())
+                && matches!(e.mutation, MutationKind::Created)
+        ),
         "context snapshot event missing (Invariant 27)"
     );
     assert_eq!(count_status_changes(&events, &sem, "todo", "doing"), 1);
@@ -615,8 +653,10 @@ async fn golden_failure_and_retry() {
         "worker idle event from TurnCompleted missing"
     );
     assert!(
-        events.iter().any(|e| e.entity_type == EntityType::Other("command".into())
-            && matches!(&e.mutation,
+        events
+            .iter()
+            .any(|e| e.entity_type == EntityType::Other("command".into())
+                && matches!(&e.mutation,
                 MutationKind::StatusChanged { to, .. } if to == "confirmed")),
         "command confirmation event missing (Invariant 34)"
     );
@@ -648,13 +688,24 @@ async fn golden_dependency_chain() {
     for child in [&c1, &c2, &c3] {
         store_command_criterion(app, child, "true").await;
     }
-    let parent = create_task(
-        app,
-        "parent integration",
-        Some("parent-owner"),
-        &[c1.clone(), c2.clone(), c3.clone()],
-    )
-    .await;
+    let parent = create_task(app, "parent integration", Some("parent-owner"), &[]).await;
+    // Historical boards can still contain foreign edges. Seed that legacy
+    // specimen directly: production writes must refuse it, while the runtime
+    // must continue to read existing graphs honestly until they are repaired.
+    let legacy_deps = json!([c1, c2, c3]).to_string();
+    let legacy_parent = parent.clone();
+    rig.store
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE issues SET depends_on=?1 WHERE id=?2",
+                params![legacy_deps, legacy_parent],
+            )?;
+            Ok(WriteOutcome {
+                applied: true,
+                events: vec![],
+            })
+        })
+        .unwrap();
     let ptid = board_store::internal_id(&parent);
 
     let rt = runtime(&rig, false);
@@ -701,10 +752,20 @@ async fn golden_dependency_chain() {
     // way first_unmet_dependency's contract demands (the FULL board), now
     // resolves the parent Runnable and assigns it to its owner.
     let (tasks, workers, leases) = core_snapshot(&rig.store);
-    let parent_task = tasks.iter().find(|t| t.id == ptid).expect("parent on board");
-    assert_eq!(parent_task.depends_on.len(), 3, "edges intact, deps satisfied by status");
+    let parent_task = tasks
+        .iter()
+        .find(|t| t.id == ptid)
+        .expect("parent on board");
+    assert_eq!(
+        parent_task.depends_on.len(),
+        3,
+        "edges intact, deps satisfied by status"
+    );
     assert!(
-        matches!(disposition(parent_task, &tasks, &[]), TaskDisposition::Runnable),
+        matches!(
+            disposition(parent_task, &tasks, &[]),
+            TaskDisposition::Runnable
+        ),
         "all deps Done/Verified -> parent Runnable (Invariant 4)"
     );
     let fleet = FleetState::Normal;
@@ -722,6 +783,7 @@ async fn golden_dependency_chain() {
         lease_secs: 600,
         wip_limit: 1,
         provider_states: &providers,
+        already_dispatched: &BTreeSet::new(),
     });
     let asg = plan
         .assignments
@@ -772,7 +834,10 @@ fn assert_no_capacity_stall(
     let todo =
         board_store::list_issues(&conn, &["todo".into()], &[], ArchivedFilter::ActiveOnly).unwrap();
     for (wid, name) in roster {
-        let state = queries::get_worker(&conn, wid.as_str()).unwrap().unwrap().state;
+        let state = queries::get_worker(&conn, wid.as_str())
+            .unwrap()
+            .unwrap()
+            .state;
         let available = matches!(
             state,
             WorkerState::Idle { .. } | WorkerState::Stopped | WorkerState::Starting
@@ -806,7 +871,10 @@ async fn golden_no_stall() {
 
     let w1 = register_worker(app, &rig.protocol, "alpha").await;
     let w2 = register_worker(app, &rig.protocol, "beta").await;
-    let roster = [(w1.clone(), "alpha".to_string()), (w2.clone(), "beta".to_string())];
+    let roster = [
+        (w1.clone(), "alpha".to_string()),
+        (w2.clone(), "beta".to_string()),
+    ];
     // Boot both workers to Idle through the real event path — the plan's
     // stall check only examines Idle workers, so Stopped workers would make
     // the heartbeat's stall counter structurally unable to fire (ethos 7).
@@ -857,7 +925,9 @@ async fn golden_no_stall() {
         // capacity (see expire_lease docs).
         let mut worked = false;
         for (task_id, _worker) in live_leases(&rig.store) {
-            let Some(sem) = tid_to_sem.get(&task_id) else { continue };
+            let Some(sem) = tid_to_sem.get(&task_id) else {
+                continue;
+            };
             let d = detail(app, sem).await;
             if d["status"] == json!("todo") {
                 drive_to_done(app, sem, "golden-runner").await;
@@ -918,13 +988,20 @@ async fn golden_no_stall() {
     for call in rig.protocol.calls() {
         if let RecordedCall::SendPrompt { prompt, .. } = call {
             prompts += 1;
-            assert!(prompt.text.contains("AMUX CONTEXT SNAPSHOT"), "{}", prompt.text);
+            assert!(
+                prompt.text.contains("AMUX CONTEXT SNAPSHOT"),
+                "{}",
+                prompt.text
+            );
             assert!(prompt.text.contains("(board task"), "{}", prompt.text);
             let named = tid_to_sem
                 .keys()
                 .find(|t| prompt.text.contains(t.as_str()))
                 .unwrap_or_else(|| panic!("prompt names no known task: {}", prompt.text));
-            assert!(executed.insert(named.clone()), "task double-executed: {named}");
+            assert!(
+                executed.insert(named.clone()),
+                "task double-executed: {named}"
+            );
         }
     }
     assert_eq!(prompts, 5, "five deliveries, one per task");

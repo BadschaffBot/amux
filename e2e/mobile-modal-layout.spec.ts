@@ -32,12 +32,11 @@ test('long dialogs keep their actions visible and content scrollable at phone an
  }
 });
 
-test('orchestrator and connection history have visible close controls; proxy opens interactively',async({page})=>{
+// The orchestrator overlay was retired with the orchestration view (c5601217).
+test('connection history has a visible close control',async({page})=>{
  await page.setViewportSize({width:375,height:667});
  for(const [open,root,close] of [
-  ['_orchOpen()','#orch-overlay','button[aria-label="Close orchestrator"]'],
   ['showConnHistory()','#conn-hist-modal','#conn-modal-close'],
-  ["switchView('proxies');_proxyOpenForm()",'#proxy-form-overlay','button[onclick="_proxyCloseForm()"]'],
  ]){
   await page.evaluate(code=>(0,eval)(code),open);
   const control=page.locator(root).locator(close);await expect(control).toBeVisible();
@@ -68,21 +67,24 @@ test('scope discard cancellation preserves edits and explicit discard closes bot
  await expect(page.locator('#scope-edit-backdrop')).not.toBeVisible();
 });
 
-test('calendar subscription remains dismissible while status hangs and reports the timeout',async({page})=>{
- const held: import('@playwright/test').Route[]=[];
- await page.route('**/api/tunnel/status',r=>{held.push(r);});
- const beacon=page.waitForRequest(r=>r.url().endsWith('/api/client-debug')&&r.postDataJSON()?.kind==='tunnel-status-unavailable');
+// The general tunnel is retired (MSG-95893): the subscribe dialog renders at
+// once, offers the download, and asks the tunnel for nothing.
+test('calendar subscription renders without the retired tunnel and stays dismissible',async({page})=>{
+ const tunnelCalls:string[]=[];
+ page.on('request',r=>{if(r.url().includes('/api/tunnel/'))tunnelCalls.push(r.url());});
  await page.evaluate(()=>{(window as any).showIcalInfo();});
- const close=page.locator('[data-ical-modal] button[onclick*="remove()"]');await expect(close).toBeVisible();
- const data=(await beacon).postDataJSON();expect(data.reason).toBe('timeout');expect(data.measured).toBe(true);expect(data.n_considered).toBe(1);
- await expect(page.locator('[data-ical-box]')).toContainText('Tunnel status is unavailable');
+ const box=page.locator('[data-ical-box]');
+ await expect(box.locator('a[download="amux.ics"]')).toBeVisible();
+ await expect(box).not.toContainText(/tunnel/i);
+ const close=page.locator('[data-ical-modal] button[onclick*="remove()"]').first();await expect(close).toBeVisible();
  await close.click();await expect(page.locator('[data-ical-modal]')).toHaveCount(0);
- for(const r of held)await r.abort().catch(()=>{});
+ expect(tunnelCalls).toEqual([]);
 });
 
 test('dialog surfaces are opaque and readable in both themes and report theme regressions',async({page})=>{
+ // Switch themes the way the app does: a theme sets every token, not just the class.
  for(const light of [true,false]){
-  await page.evaluate(light=>document.body.classList.toggle('light',light),light);
+  await page.evaluate(light=>(window as any).themeActivate(light?'amux-light':'amux-dark',{local:true}),light);
   for(const [open,root] of [
    ["_connScopePicker('github','worker',true)",'.conn-picker-overlay'],
    ['_jrnlShowConfig()','#jrnl-config-overlay'],
@@ -95,6 +97,13 @@ test('dialog surfaces are opaque and readable in both themes and report theme re
    await page.locator(root).evaluate(e=>e.remove());
   }
  }
+ // Themed colors arrive as color(srgb ...) with 0-1 channels; an unreadable
+ // dialog in that form must still be reported (680b0ecd3's CI red came from
+ // reading them as 0-255, which flagged a readable one).
+ await page.evaluate(()=>{(0,eval)("_upgradeModalShown=false;_showUpgradeModal({error:'trial_expired'})");});
+ await page.locator('#upgrade-modal > div').evaluate(e=>{e.style.color='color-mix(in srgb, '+getComputedStyle(e).backgroundColor+' 96%, white)';});
+ await expect.poll(()=>page.evaluate(()=>(window as any)._modalLayoutCheck().clipped)).toContain('upgrade-modal:low-contrast');
+ await page.locator('#upgrade-modal').evaluate(e=>e.remove());
  await page.evaluate(()=>{(window as any)._jrnlShowConfig();});
  const beacon=page.waitForRequest(r=>r.url().endsWith('/api/client-debug')&&r.postDataJSON()?.clipped?.includes('jrnl-config-overlay:transparent'));
  await page.locator('#jrnl-config-overlay > div').evaluate(e=>{e.style.background='transparent';});await page.evaluate(()=>window.dispatchEvent(new Event('resize')));
@@ -106,4 +115,29 @@ test('video close remains visible when playback controls hide',async({page})=>{
  const close=page.getByRole('button',{name:'Close video',exact:true});
  await expect(close).toBeVisible();const b=(await close.boundingBox())!;expect(b.height).toBeGreaterThanOrEqual(44);
  await close.click();await expect(page.locator('#video-overlay')).not.toBeVisible();
+});
+
+// A form (showFormModal) scrolls as one page with its buttons after the last
+// field; a confirm opened after it keeps the pinned buttons (owner, 2026-11-22).
+test('a form dialog scrolls as one page and a later confirm keeps pinned buttons',async({page},info)=>{
+ const phone=(info.project.use.viewport?.width||1280)<=600;
+ await page.evaluate(()=>{(window as any).showFormModal('Long form','<div id="long-form">'+'<p>Field</p>'.repeat(80)+'</div>','Start');});
+ const box=page.locator('#modal-backdrop .modal-box'),msg=page.locator('#modal-msg');
+ await expect(page.locator('#long-form')).toBeVisible();
+ const m=await box.evaluate(b=>{const s=getComputedStyle(b),msg=b.querySelector('#modal-msg') as HTMLElement;
+  return {boxScrolls:b.scrollHeight>b.clientHeight,msgScrolls:msg.scrollHeight>msg.clientHeight,padX:parseFloat(s.paddingLeft),width:b.getBoundingClientRect().width,vw:innerWidth};});
+ expect(m.boxScrolls).toBe(true);expect(m.msgScrolls).toBe(false);
+ if(phone){expect(m.padX).toBeLessThanOrEqual(12);expect(m.width).toBeGreaterThanOrEqual(m.vw-16-1);}
+ else{expect(m.padX).toBe(20);expect(m.width).toBeLessThanOrEqual(480);}
+ const start=page.locator('#modal-btns button',{hasText:'Start'});
+ const vh=page.viewportSize()!.height;
+ expect((await start.boundingBox())!.y).toBeGreaterThan(vh);
+ await box.evaluate(b=>{b.scrollTop=b.scrollHeight;});
+ await expect(start).toBeInViewport();
+ await page.locator('#modal-btns button',{hasText:'Cancel'}).click();
+ await expect(page.locator('#modal-backdrop')).not.toBeVisible();
+ await page.evaluate(()=>{(window as any).showConfirm('Long confirmation with evidence. '.repeat(200));});
+ await expect(box).not.toHaveClass(/modal-form/);
+ expect(await msg.evaluate(e=>e.scrollHeight>e.clientHeight)).toBe(true);
+ await expect(page.locator('#modal-btns button[onclick="_modalClose(false)"]')).toBeInViewport();
 });

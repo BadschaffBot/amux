@@ -6,15 +6,34 @@
 # not: the thresholds, the label guard, and dry run. Each cell fails if its
 # guard is removed — the point is that it CAN go red (ethos rule 7).
 set -euo pipefail
+export AMUX_CLEANUP_OPEN_WRITERS_CMD=false   # a disk bundle must not read the live lsof
 HERE=$(cd "$(dirname "$0")" && pwd)
 TICK="$HERE/mac-cleanup-tick.sh"
 FIX=$(mktemp -d)                      # never a fixed name: /tmp is shared
+export AMUX_CLEANUP_FSEVENTSD_CMD=true   # the live fseventsd must not decide a test (DESKT-81)
+export AMUX_CLEANUP_SQLITE_PS_CMD=true   # the live process table must not decide a test (DESKT-94)
+export AMUX_CLEANUP_HEALTH_PROBES=off    # the health probes must not stop or read live processes in a test
+export AMUX_CLEANUP_CLAUDE_TMP_ROOT="$FIX/no-claude-tmp"   # never the live session temp tree (DESKT-77)
 trap 'rm -rf -- "$FIX"' EXIT
 fails=0
 [ -x "$TICK" ] || { echo "FAIL: $TICK missing or not executable — no cell below ran"; exit 1; }
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; else echo "  FAIL $1: expected '$2', got '$3'"; fails=$((fails+1)); fi; }
 
+# The cargo-target arm scans real roots and DELETES real idle targets (DESKT-51). Nothing in this
+# file tests it (scripts/test-mac-cleanup-targets.sh does), and its end-to-end cells run the whole
+# tick for real, so point the arm at a root that does not exist: a test of the purge arm must
+# never reap a build directory on the machine running it, or spend minutes scanning ~/Dev.
+export AMUX_CLEANUP_TARGET_ROOTS="$FIX/no-such-root"
+# Same reason for the assess stage (DESKT-57): its end-to-end runs must neither
+# message a real lane nor move the real burn-rate state file.
+export AMUX_CLEANUP_STATE_DIR="$FIX/assess-state" AMUX_CLEANUP_RECLAIM_TRIGGER_CMD="${RECLAIM_TRIGGER_STUB:-echo 204}" AMUX_CLEANUP_DEMOTE_PS_CMD=true AMUX_CLEANUP_ESCALATE_CMD="true" AMUX_CLEANUP_HISTORY_CMD="true" AMUX_CLEANUP_CARD_CMD="true" AMUX_CLEANUP_VM_LIST_CMD="true"
+
 # Library mode must define the decisions without running a single probe.
+export AMUX_CLEANUP_SCOPE_FILE=/dev/null   # the live global scope must not configure a test (DESKT-72)
+export AMUX_CLEANUP_VM_IMAGE_PRUNE_CMD=true     # never prune the live VMs' images from a test
+export AMUX_CLEANUP_USER_TMP=0                 # never reap the live per-user temp dir from a test
+export AMUX_CLEANUP_LANE_TMP=0                 # nor the live lane temp dirs under ~/.amux/tmp
+export AMUX_CLEANUP_SESSIONS_CMD=false        # the VM-reference report must not read the live fleet (AMUX-5491)
 AMUX_CLEANUP_LIB_ONLY=1 . "$TICK"
 check "library mode defines should_purge" "yes" "$(type should_purge >/dev/null 2>&1 && echo yes || echo no)"
 
@@ -55,10 +74,72 @@ case "$(classify_owner root /System/Library/Frameworks/Virtualization.framework/
   *"macOS daemon"*) echo "  ok   a system daemon is named as reboot-only" ;;
   *) echo "  FAIL a system daemon is misattributed"; fails=$((fails+1)) ;;
 esac
+# DESKT-44. Apple's VM helper lives under /System/Library/Frameworks, so the
+# /System/* arm above claimed it was SIP-protected and reboot-only. It runs as
+# the invoking user and stops from userspace. Measured 2026-09-19: pid 9701,
+# user ethan, 31 GB resident, reported as reboot-only on a box that runs 24/7.
+# The argv below is that process's real one, copied from `ps -axo command`.
+VMXPC=/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine
+case "$(classify_owner ethan "$VMXPC")" in
+  *"guest VM"*) echo "  ok   a user's guest VM is named as a VM, not a daemon" ;;
+  *) echo "  FAIL a user's guest VM is misattributed: $(classify_owner ethan "$VMXPC")"; fails=$((fails+1)) ;;
+esac
+# THE HALF THAT COST THE REBOOT, asserted separately: naming it correctly is
+# worth nothing if the line still sends the owner to a restart.
+#
+# Matched on "reboot only", the daemon arm's own phrasing, NOT on the bare word
+# "reboot". The first version of this cell used `*reboot*` and went red against
+# a correct fix, because the remedy says "no reboot" and a substring cannot tell
+# a instruction to reboot from a statement that none is needed.
+case "$(classify_owner ethan "$VMXPC")" in
+  *"reboot only"*) echo "  FAIL a stoppable VM still asks for a reboot: $(classify_owner ethan "$VMXPC")"; fails=$((fails+1)) ;;
+  *) echo "  ok   a stoppable VM is not called reboot-only" ;;
+esac
+# AND IT MUST CARRY A COMMAND, or the cell above passes on a line that names no
+# remedy at all, which is the same dead end in a politer sentence.
+case "$(classify_owner ethan "$VMXPC")" in
+  *"stop"*) echo "  ok   a stoppable VM carries the command that stops it" ;;
+  *) echo "  FAIL a stoppable VM names no remedy: $(classify_owner ethan "$VMXPC")"; fails=$((fails+1)) ;;
+esac
+# AND THE BOUNDARY: the narrow case must not swallow the arm above it. A real
+# SIP-protected binary under the SAME framework stays reboot-only, so this
+# cell goes red if the new pattern is widened to /System/*Virtualization*.
+case "$(classify_owner root /System/Library/Frameworks/Virtualization.framework/Versions/A/Resources/vmnetd)" in
+  *"macOS daemon"*) echo "  ok   a real daemon under the same framework is untouched" ;;
+  *) echo "  FAIL the VM case swallowed a genuine SIP daemon"; fails=$((fails+1)) ;;
+esac
 check "a user's own app" "user process" "$(classify_owner ethan /Applications/Google Chrome.app/Contents/MacOS/Chrome)"
 case "$(classify_owner ethan /Applications/Ollama.app/Contents/Resources/llama-server)" in
   *"ollama stop"*) echo "  ok   an ollama model server carries its unload command" ;;
   *) echo "  FAIL an ollama model server is not named with its remedy"; fails=$((fails+1)) ;; esac
+
+echo "5b. the label comes from the FULL command line of a live process, not a truncated one"
+# The lima VM helper is 173 characters and its name starts after column 80. A
+# fixture that hands classify_owner the whole path passes while the shipped call
+# sites cut the command first, so this spawns a REAL process and asks about its pid.
+LONGD="$FIX/$(printf 'd%.0s' $(seq 1 50))"; mkdir -p "$LONGD"
+cat > "$LONGD/com.apple.Virtualization.VirtualMachine.xpc" <<'VM'
+#!/bin/bash
+sleep 30
+VM
+chmod +x "$LONGD/com.apple.Virtualization.VirtualMachine.xpc"
+"$LONGD/com.apple.Virtualization.VirtualMachine.xpc" &
+VPID=$!
+sleep 1
+VCMD=$(ps -o command= -p "$VPID" 2>/dev/null)
+VPOS=$(awk -v s="$VCMD" 'BEGIN{ print index(s, "Virtualization.VirtualMachine.xpc") }')
+# Positive control: without this the cell proves nothing, because a short path
+# would match even with the truncation still in place.
+check "fixture puts the VM name past column 80" "yes" "$([ "${VPOS:-0}" -gt 80 ] && echo yes || echo no)"
+case "$(owner_label_for_pid "$VPID")" in
+  *"guest VM"*) echo "  ok   a live VM helper is labelled a user-owned guest VM" ;;
+  *) echo "  FAIL live VM helper mislabelled: $(owner_label_for_pid "$VPID")"; fails=$((fails+1)) ;;
+esac
+kill "$VPID" 2>/dev/null || true; wait "$VPID" 2>/dev/null || true
+# Source-level pin of the defect CLASS, because the two call sites are inline and
+# a behavioural cell cannot reach them: no `ps -o command=` may feed a cut.
+check "no call site truncates the command it classifies" "0" \
+  "$(grep -c -E 'ps -o command=.*\| *cut ' "$TICK" || true)"
 
 echo "6. the reboot line appears only when fseventsd is actually large"
 check "small fseventsd asks for no reboot" "no"  "$(needs_reboot 8 20 && echo yes || echo no)"
@@ -134,6 +215,10 @@ cat > "$FIX/fake-thin.sh" <<EOF
 echo "\$@" >> "$TREC"
 EOF
 chmod +x "$FIX/fake-thin.sh"
+# A listing with ONE snapshot, so the thin arm has something to act on (DESKT-49
+# skips the thin when there is none, and a real Mac may have none at test time).
+printf 'Snapshots for disk /:\ncom.apple.TimeMachine.2026-09-26-120000.local\n' > "$FIX/one-snap.txt"
+export AMUX_CLEANUP_SNAP_LIST_CMD="cat $FIX/one-snap.txt"
 : > "$TREC"
 AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=999999 \
   AMUX_CLEANUP_SNAPSHOT_RECLAIM_GB=7 AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 \
@@ -151,6 +236,15 @@ AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FL
   AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
   AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" >/dev/null 2>&1
 check "no thin when the disk has room" "0" "$(wc -l < "$TREC" | tr -d ' ')"
+: > "$TREC"
+printf 'Snapshots for disk /:\n' > "$FIX/no-snap.txt"
+out=$(AMUX_CLEANUP_SNAP_LIST_CMD="cat $FIX/no-snap.txt" AMUX_CLEANUP_THIN_CMD="$FIX/fake-thin.sh BYTES URGENCY" AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=999999 \
+  AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
+  AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" 2>&1)
+check "with no snapshots under the floor, tmutil is not run" "0" "$(wc -l < "$TREC" | tr -d ' ')"
+check "and the line says there was nothing to thin (DESKT-49)" "1" "$(printf '%s\n' "$out" | grep -c 'snapshots none to thin')"
+check "and never prints thinned 0 -> 0" "0" "$(printf '%s\n' "$out" | grep -c 'thinned 0 -> 0' || true)"
+unset AMUX_CLEANUP_SNAP_LIST_CMD
 
 echo "7c. end to end: the family line names a parent and its child count"
 out=$(AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
@@ -163,6 +257,37 @@ out=$(AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRES
       AMUX_CLEANUP_FAMILY_SHARE_PCT=99.9 AMUX_CLEANUP_FAMILY_AGE_H=99999 "$TICK" 2>&1)
 case "$out" in *"largest family"*"under the"*) echo "  ok   under both thresholds it reports without firing" ;;
   *) echo "  FAIL no under-threshold family line: $(printf '%s' "$out" | tail -3)"; fails=$((fails+1)) ;; esac
+
+echo "7c2. this suite never lets the cargo-target arm near the real tree"
+out=$(AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 AMUX_CLEANUP_PRESSURE_PURGE=99 \
+      AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=999999 AMUX_CLEANUP_AGENTS="" AMUX_CLEANUP_REPORT_GB=99999 "$TICK" --dry-run 2>&1)
+check "the arm scanned no roots under this suite" "yes" "$(printf '%s' "$out" | grep -q 'cargo targets: found 0 under 0 root(s)' && echo yes || echo no)"
+
+echo "7d. the stale-process arm parses 08 and 09 in elapsed times (bash reads them as octal)"
+# 2026-09-24: SCHED-465 printed "value too great for base" because this arm did its
+# own bash arithmetic on fields like 08 and 09, then reported found=0. Fixture times
+# below all contain one, and two are past the 6h floor.
+cat > "$FIX/fake-ps.sh" <<'FPS'
+#!/bin/bash
+echo "12345 08:09:07 /bin/bash -c source /x/.claude/shell-snapshots/snapshot-bash-1.sh"
+echo "12346 1-09:08:09 /bin/bash -c source /x/.claude/shell-snapshots/snapshot-bash-2.sh"
+echo "12347 00:09 /bin/bash -c source /x/.claude/shell-snapshots/snapshot-bash-3.sh"
+FPS
+chmod +x "$FIX/fake-ps.sh"
+# 12345 is an orphan (its session ended); 12346 still has its claude parent.
+printf '#!/bin/bash\ncase "$1" in 12345) echo "    1";; 12346) echo " 4242";; *) echo "    1";; esac\n' > "$FIX/fake-ppid.sh"; chmod +x "$FIX/fake-ppid.sh"
+out=$(AMUX_CLEANUP_STALE_PPID_CMD="$FIX/fake-ppid.sh" AMUX_CLEANUP_STALE_PS_CMD="$FIX/fake-ps.sh" AMUX_CLEANUP_PURGE_CMD=true AMUX_CLEANUP_FREE_FLOOR_GB=0 \
+      AMUX_CLEANUP_PRESSURE_PURGE=99 AMUX_CLEANUP_SNAPSHOT_FLOOR_GB=0 AMUX_CLEANUP_AGENTS="" \
+      AMUX_CLEANUP_REPORT_GB=99999 "$TICK" --dry-run 2>&1)
+check "no octal error on 08/09 fields" "0" "$(printf '%s\n' "$out" | grep -c 'value too great')"
+check "both stale times are found, the 9-second one is not" "2" \
+  "$(printf '%s\n' "$out" | sed -n 's/.*shell-snapshots found=\([0-9]*\) .*/\1/p')"
+check "the orphan would be killed" "1" "$(printf '%s\n' "$out" | grep -c 'stale shell-snapshot pid=12345 .*would be killed')"
+check "a live session's shell is kept, however old" "1" "$(printf '%s\n' "$out" | grep -c 'kept shell-snapshot pid=12346 .*verdict=stale_shell_kept_live_session')"
+check "the summary counts it as kept" "1" "$(printf '%s\n' "$out" | sed -n 's/.*kept_live=\([0-9]*\) .*/\1/p')"
+case "$out" in *"pid=12345 age=08:09:07"*"pid=12346 age=1-09:08:09"*) echo "  ok   each stale process is named with its age" ;;
+  *) echo "  FAIL stale processes not named with their ages: $(printf '%s' "$out" | grep -E 'stale shell|shell-snapshots' | head -3)"; fails=$((fails+1)) ;; esac
+check "dry run killed nothing" "0" "$(printf '%s\n' "$out" | sed -n 's/.*shell-snapshots found=[0-9]* killed=\([0-9]*\) .*/\1/p')"
 
 echo "8. end to end: an agent restart goes through the knob, and only past the floor"
 AREC="$FIX/restart-calls"

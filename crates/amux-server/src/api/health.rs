@@ -55,8 +55,20 @@ pub struct Health {
     /// uncommitted changes under crates/ at build time (the local builder
     /// compiles the working tree, so a bare sha would overclaim);
     /// "unknown" outside a git checkout (the cloud image).
+    ///
+    /// Since a commit with no compile-input change deploys without a compile,
+    /// this is the commit SERVED: the builder's receipt names it when the
+    /// receipt is for these exact bytes (`activation::served`).
+    /// `build_commit` is the commit the bytes were compiled at.
     pub commit: &'static str,
     pub commit_full: &'static str,
+    pub build_commit: &'static str,
+    /// Where the dashboard bytes come from: "embedded" (compiled in) or
+    /// "dir" (a deployed snapshot or `AMUX_DASHBOARD_DIR`), and their version.
+    /// The builder re-stamps a dashboard-only commit only for a server that
+    /// reports this.
+    pub dashboard_source: &'static str,
+    pub dashboard_version: &'static str,
     pub uptime_s: u64,
     pub rev: Option<u64>,
     pub store: &'static str,
@@ -230,7 +242,12 @@ pub fn disk_health() -> DiskHealth {
         // healthy one, and reporting it as ok is how a silent probe gets trusted.
         // No path answered, so there is nothing to name. `None` here is
         // honestly different from a path with no reading.
-        None => DiskHealth { free_gb: None, total_gb: None, state: disk_state_with_thresholds(None, critical_gb, warn_gb), measured_path: None },
+        None => DiskHealth {
+            free_gb: None,
+            total_gb: None,
+            state: disk_state_with_thresholds(None, critical_gb, warn_gb),
+            measured_path: None,
+        },
     }
 }
 
@@ -253,9 +270,15 @@ const DISK_WARN_GB_DEFAULT: f64 = 75.0;
 /// in scale, not different in kind.
 fn disk_thresholds() -> (f64, f64) {
     let get = |key: &str, default: f64| {
-        std::env::var(key).ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(default)
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(default)
     };
-    (get("AMUX_DISK_CRITICAL_GB", DISK_CRITICAL_GB_DEFAULT), get("AMUX_DISK_WARN_GB", DISK_WARN_GB_DEFAULT))
+    (
+        get("AMUX_DISK_CRITICAL_GB", DISK_CRITICAL_GB_DEFAULT),
+        get("AMUX_DISK_WARN_GB", DISK_WARN_GB_DEFAULT),
+    )
 }
 
 /// The threshold decision at amux's fleet-wide DEFAULTS, split out so it is
@@ -268,7 +291,11 @@ pub(crate) fn disk_state(free_gb: Option<f64>) -> &'static str {
     disk_state_with_thresholds(free_gb, DISK_CRITICAL_GB_DEFAULT, DISK_WARN_GB_DEFAULT)
 }
 
-pub(crate) fn disk_state_with_thresholds(free_gb: Option<f64>, critical_gb: f64, warn_gb: f64) -> &'static str {
+pub(crate) fn disk_state_with_thresholds(
+    free_gb: Option<f64>,
+    critical_gb: f64,
+    warn_gb: f64,
+) -> &'static str {
     match free_gb {
         Some(g) if g < critical_gb => "critical",
         Some(g) if g < warn_gb => "warn",
@@ -318,11 +345,18 @@ fn statvfs_exact(path: &std::path::Path) -> Option<(f64, f64)> {
     // f_frsize is the fragment size the f_* block counts are expressed in;
     // f_bsize is the preferred IO size and is NOT always the same number.
     // Using the wrong one silently scales every reading.
-    let unit = if st.f_frsize > 0 { st.f_frsize as f64 } else { st.f_bsize as f64 };
+    let unit = if st.f_frsize > 0 {
+        st.f_frsize as f64
+    } else {
+        st.f_bsize as f64
+    };
     const GB: f64 = 1_073_741_824.0;
     // f_bavail, not f_bfree: bfree counts root-reserved blocks that amux (which
     // does not run as root) can never actually use.
-    Some((st.f_bavail as f64 * unit / GB, st.f_blocks as f64 * unit / GB))
+    Some((
+        st.f_bavail as f64 * unit / GB,
+        st.f_blocks as f64 * unit / GB,
+    ))
 }
 
 /// Whether the host has room to admit ANOTHER worker right now.
@@ -368,17 +402,33 @@ pub enum Admission {
     Deny,
 }
 
-/// The admission decision, as a pure function of the two signals, so it is
+/// The admission decision, as a pure function of its signals, so it is
 /// testable without a machine in any particular state.
 ///
 /// `pressure_level` is the kernel's own verdict (1 normal, 2 warn, 4 critical).
 /// `swap_used_mb` is absolute rather than a fraction on purpose: macOS GROWS the
 /// swap file on demand, so "percent of swap used" stays flat as the problem gets
 /// worse and is close to useless as a signal.
+///
+/// `swap_growth_mb` is how much swap grew over the recent window (`None` until
+/// there is a window to measure). It exists because `swap_used_mb` alone is a
+/// HIGH-WATER MARK on macOS: pages swapped out hours ago stay counted until
+/// whatever owns them is touched or exits. 2026-10-17: swap read 20.4 GB at
+/// noon and 20.8 GB at 14:55 with the kernel at `normal` and 86% of RAM free
+/// throughout, so the old swap-alone rule refused every start all afternoon
+/// and, after a tmux server kill at 14:51, refused to bring 19 lanes back. A
+/// gate that denies on the healthy baseline is ethos rule 7's failure.
+///
+/// So with the kernel at `normal`, heavy swap denies only while it is still
+/// GROWING, which is the "working set no longer fits" case that the swap rule
+/// was written to catch. A stale balance under normal pressure is `Strained`:
+/// logged, not blocked. With the kernel at `warn` or unreadable, heavy swap
+/// still denies on its own.
 pub(crate) fn admission_for(
     pressure_level: Option<u32>,
     swap_used_mb: Option<f64>,
     swap_deny_mb: f64,
+    swap_growth_mb: Option<f64>,
 ) -> Admission {
     // Unknown must not deny: a host where these are unreadable (non-macOS, a
     // sandbox) would otherwise be unable to start any worker at all.
@@ -386,12 +436,46 @@ pub(crate) fn admission_for(
         return Admission::Deny;
     }
     if swap_used_mb.is_some_and(|mb| mb >= swap_deny_mb) {
-        return Admission::Deny;
+        if pressure_level != Some(1) {
+            return Admission::Deny;
+        }
+        if swap_growth_mb.is_some_and(|g| g >= SWAP_GROWTH_DENY_MB) {
+            return Admission::Deny;
+        }
+        return Admission::Strained;
     }
     if pressure_level == Some(2) {
         return Admission::Strained;
     }
     Admission::Allow
+}
+
+/// Swap growth over [`SWAP_GROWTH_WINDOW`] at or above which heavy swap under
+/// `normal` kernel pressure counts as active swapping rather than a stale
+/// balance. 512 MB in five minutes is a working set spilling, not noise.
+const SWAP_GROWTH_DENY_MB: f64 = 512.0;
+const SWAP_GROWTH_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Record one swap reading and return how much swap grew across the window,
+/// or `None` until the oldest retained reading is at least a minute old.
+/// Readings come from every `admission()` call (/health polls it), so the
+/// window fills on its own without a background job.
+fn swap_growth_mb(now_mb: Option<f64>) -> Option<f64> {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static SAMPLES: Mutex<VecDeque<(Instant, f64)>> = Mutex::new(VecDeque::new());
+    let now_mb = now_mb?;
+    let now = Instant::now();
+    let mut q = SAMPLES.lock().ok()?;
+    while q.front().is_some_and(|(t, _)| now.duration_since(*t) > SWAP_GROWTH_WINDOW) {
+        q.pop_front();
+    }
+    if q.back().is_none_or(|(t, _)| now.duration_since(*t).as_secs() >= 10) {
+        q.push_back((now, now_mb));
+    }
+    let (t0, mb0) = *q.front()?;
+    (now.duration_since(t0).as_secs() >= 60).then_some(now_mb - mb0)
 }
 
 /// Swap in use, in MB, at or above which amux stops admitting workers.
@@ -408,7 +492,14 @@ pub fn swap_deny_mb() -> f64 {
 /// Live admission check against this host.
 pub fn admission() -> Admission {
     let m = mem_health();
-    admission_for(m.pressure_level, m.swap_used_mb, swap_deny_mb())
+    let growth = swap_growth_mb(m.swap_used_mb);
+    let verdict = admission_for(m.pressure_level, m.swap_used_mb, swap_deny_mb(), growth);
+    if verdict == Admission::Strained && m.pressure_level == Some(1) {
+        tracing::debug!(target: "amux::admission", swap_used_mb = ?m.swap_used_mb,
+            swap_growth_mb = ?growth, verdict = "swap_stale_admitted",
+            "heavy swap under normal kernel pressure and not growing: admitted as strained");
+    }
+    verdict
 }
 
 /// A fixed admission verdict for one router, used in place of the live host
@@ -476,8 +567,12 @@ fn pressure_level() -> Option<u32> {
 
 #[cfg(target_os = "macos")]
 fn swap_usage() -> Option<(f64, f64)> {
-    sysctl_by_name::<libc::xsw_usage>("vm.swapusage")
-        .map(|x| (x.xsu_used as f64 / 1048576.0, x.xsu_total as f64 / 1048576.0))
+    sysctl_by_name::<libc::xsw_usage>("vm.swapusage").map(|x| {
+        (
+            x.xsu_used as f64 / 1048576.0,
+            x.xsu_total as f64 / 1048576.0,
+        )
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -519,13 +614,20 @@ fn fd_ceiling() -> f64 {
 /// the same resource as the fault?).
 fn fd_health() -> Option<FdHealth> {
     let open = std::fs::read_dir("/dev/fd").ok()?.count();
-    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: getrlimit writes into a fully-initialised local; no aliasing.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 || rl.rlim_cur == 0 {
         return None;
     }
     let limit = rl.rlim_cur;
-    Some(FdHealth { open, limit, ratio: open as f64 / limit as f64 })
+    Some(FdHealth {
+        open,
+        limit,
+        ratio: open as f64 / limit as f64,
+    })
 }
 
 #[derive(Serialize)]
@@ -605,12 +707,18 @@ fn decode_completion(raw: u64) -> Option<u64> {
 // Monotonic, process-local timestamps: zero is reserved for "not measured".
 fn probe_clock_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1
 }
 
 struct ProbeFlight(std::sync::Arc<std::sync::atomic::AtomicU64>);
 impl Drop for ProbeFlight {
-    fn drop(&mut self) { self.0.store(0, std::sync::atomic::Ordering::Relaxed); }
+    fn drop(&mut self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>) {
@@ -622,7 +730,10 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
     let phase = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     let result = match state.store.health_probe.clone().try_acquire_owned() {
         Ok(permit) => {
-            state.store.health_probe_started.store(probe_clock_ms(), std::sync::atomic::Ordering::Relaxed);
+            state
+                .store
+                .health_probe_started
+                .store(probe_clock_ms(), std::sync::atomic::Ordering::Relaxed);
             let store = state.store.clone();
             let phase = phase.clone();
             let task = tokio::task::spawn_blocking(move || {
@@ -633,19 +744,36 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
                 // Readability alone concealed a dead writer for hours while
                 // every queued mutation failed. Exercise the serialized write
                 // path without changing the revision or creating an event.
-                store.write(|_| Ok(crate::db::WriteOutcome { applied: false, events: vec![] }))
+                store
+                    .write(|_| {
+                        Ok(crate::db::WriteOutcome {
+                            applied: false,
+                            events: vec![],
+                        })
+                    })
                     .map_err(|_| "writer_probe_failed")?;
                 let conn = store.try_read().ok_or("read_pool_exhausted")?;
                 phase.store(2, std::sync::atomic::Ordering::Relaxed);
-                let rev: u64 = conn.query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))
+                let rev: u64 = conn
+                    .query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))
                     .map_err(|_| "revision_read_failed")?;
                 phase.store(3, std::sync::atomic::Ordering::Relaxed);
                 let board = match crate::db::board_store::probe_board_read(&conn) {
-                    Ok(n) => BoardProbe { measured: true, ok: true, rows_mapped: n, error: None },
+                    Ok(n) => BoardProbe {
+                        measured: true,
+                        ok: true,
+                        rows_mapped: n,
+                        error: None,
+                    },
                     Err(e) => {
                         tracing::warn!(target: "health", error = %e, verdict = "board_mapper_failed",
                             "health board row mapper failed (AF-332)");
-                        BoardProbe { measured: true, ok: false, rows_mapped: 0, error: Some(e.to_string()) }
+                        BoardProbe {
+                            measured: true,
+                            ok: false,
+                            rows_mapped: 0,
+                            error: Some(e.to_string()),
+                        }
                     }
                 };
                 // A timed-out JoinHandle keeps running, but used to discard
@@ -655,10 +783,14 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
                 // A cancelled probe keeps running, so this is the only place
                 // the real duration of a slow probe is ever known.
                 let took_ms = probe_started.elapsed().as_millis() as u64;
-                LAST_PROBE_COMPLETION_RAW
-                    .store(encode_completion(took_ms), std::sync::atomic::Ordering::Relaxed);
+                LAST_PROBE_COMPLETION_RAW.store(
+                    encode_completion(took_ms),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if board.ok {
-                    store.health_probe_last_success.store(probe_clock_ms(), std::sync::atomic::Ordering::Relaxed);
+                    store
+                        .health_probe_last_success
+                        .store(probe_clock_ms(), std::sync::atomic::Ordering::Relaxed);
                     if took_ms >= PROBE_BUDGET_MS {
                         tracing::info!(target:"health", verdict="slow_probe_completed",
                             measured=true, elapsed_ms=took_ms, budget_ms=PROBE_BUDGET_MS,
@@ -667,7 +799,9 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
                 }
                 Ok((rev, board))
             });
-            match tokio::time::timeout(std::time::Duration::from_millis(PROBE_BUDGET_MS), task).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(PROBE_BUDGET_MS), task)
+                .await
+            {
                 Ok(Ok(result)) => result,
                 Ok(Err(_)) => Err("probe_task_failed"),
                 Err(_) => Err("probe_deadline_exceeded"),
@@ -681,23 +815,44 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             tracing::warn!(target: "health", verdict = reason, measured = false,
                 phase = phase.load(std::sync::atomic::Ordering::Relaxed),
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                commit = env!("AMUX_BUILD_COMMIT"), build = %state.build_hash,
+                commit = %crate::activation::served().short, build = %state.build_hash,
                 pid = std::process::id(), "health store probe unavailable; returning identity without blocking the runtime");
-            (None, "hung", StatusCode::SERVICE_UNAVAILABLE,
-                BoardProbe { measured: false, ok: false, rows_mapped: 0, error: Some(reason.into()) })
+            (
+                None,
+                "hung",
+                StatusCode::SERVICE_UNAVAILABLE,
+                BoardProbe {
+                    measured: false,
+                    ok: false,
+                    rows_mapped: 0,
+                    error: Some(reason.into()),
+                },
+            )
         }
     };
     let now = probe_clock_ms();
     let age = |value: u64| (value != 0).then(|| now.saturating_sub(value));
     let store_probe = StoreProbeProgress {
-        last_success_age_ms: age(state.store.health_probe_last_success.load(std::sync::atomic::Ordering::Relaxed)),
-        in_flight_age_ms: age(state.store.health_probe_started.load(std::sync::atomic::Ordering::Relaxed)),
+        last_success_age_ms: age(state
+            .store
+            .health_probe_last_success
+            .load(std::sync::atomic::Ordering::Relaxed)),
+        in_flight_age_ms: age(state
+            .store
+            .health_probe_started
+            .load(std::sync::atomic::Ordering::Relaxed)),
         probe_budget_ms: PROBE_BUDGET_MS,
         last_completion_ms: decode_completion(
             LAST_PROBE_COMPLETION_RAW.load(std::sync::atomic::Ordering::Relaxed),
         ),
-        write_inflight: state.store.write_inflight.load(std::sync::atomic::Ordering::Relaxed),
-        write_wait_max_ms: state.store.write_wait_max_ms.load(std::sync::atomic::Ordering::Relaxed),
+        write_inflight: state
+            .store
+            .write_inflight
+            .load(std::sync::atomic::Ordering::Relaxed),
+        write_wait_max_ms: state
+            .store
+            .write_wait_max_ms
+            .load(std::sync::atomic::Ordering::Relaxed),
         blocking_dispatch_max_ms: state
             .store
             .blocking_dispatch_max_ms
@@ -738,8 +893,11 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             },
             board,
             build: state.build_hash.clone(),
-            commit: env!("AMUX_BUILD_COMMIT"),
-            commit_full: env!("AMUX_BUILD_COMMIT_FULL"),
+            commit: crate::activation::served().short.as_str(),
+            commit_full: crate::activation::served().full.as_str(),
+            build_commit: env!("AMUX_BUILD_COMMIT_FULL"),
+            dashboard_source: if amux_dashboard::dir_override().is_some() { "dir" } else { "embedded" },
+            dashboard_version: amux_dashboard::asset_version(),
             uptime_s: state.started.elapsed().as_secs(),
             rev,
             store,
@@ -749,8 +907,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             fds,
             confidence: conf.as_str(),
             confidence_age_s: conf_age,
-            downtime_before_boot_s: crate::runtime_jobs::heartbeat::boot_gap()
-                .map(|g| g.seconds),
+            downtime_before_boot_s: crate::runtime_jobs::heartbeat::boot_gap().map(|g| g.seconds),
             downtime_before_boot_cause: crate::runtime_jobs::heartbeat::boot_gap()
                 .and_then(|g| g.cause)
                 .map(|c| c.as_str()),
@@ -758,9 +915,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             admission: admission(),
             disk: disk_health(),
             tailnet: crate::runtime_jobs::tailnet_watch::cached(),
-            reconciled: state
-                .reconciled
-                .load(std::sync::atomic::Ordering::Acquire),
+            reconciled: state.reconciled.load(std::sync::atomic::Ordering::Acquire),
         }),
     )
 }
@@ -781,11 +936,8 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
         "-F",
         "#{session_name}\t#{session_activity}\t#{session_created}",
     ]);
-    let list_result = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        command.output(),
-    )
-    .await;
+    let list_result =
+        tokio::time::timeout(std::time::Duration::from_secs(3), command.output()).await;
     let out = match list_result {
         Ok(out) => out.map_err(|e| e.to_string()),
         Err(_) => {
@@ -819,6 +971,10 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
             "pane_capture_timeouts": pane_timeouts,
             "pane_capture_last_timeout": pane_last,
             "pane_capture_last_timeout_detail": crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().ok().and_then(|last| last.clone()),
+            // MO-3622: how many tmux processes the backend starts, per window.
+            // A reconcile that probed every session once cost 26 spawns/s and
+            // left no trace; `last_window.top_verbs` names the loop.
+            "tmux_spawns": crate::backend::tmux::tmux_spawn_stats(),
             "pane_capture_note": "captures killed on AMUX_PANE_CAPTURE_TIMEOUT_S (default 3s). \
                                   In-memory, so a restart resets it; a non-zero count means \
                                   a probe missed its deadline and some lane previews may be missing. \
@@ -844,7 +1000,8 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
                 "socket_ownership": socket_ownership,
                 "pane_capture_timeouts": pane_timeouts,
                 "pane_capture_last_timeout": pane_last,
-                "pane_capture_last_timeout_detail": crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().ok().and_then(|last| last.clone())
+                "pane_capture_last_timeout_detail": crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT_DETAIL.lock().ok().and_then(|last| last.clone()),
+                "tmux_spawns": crate::backend::tmux::tmux_spawn_stats()
             }),
             "tmux could not be spawned or did not answer within 3s; the fleet was never listed",
         ),
@@ -982,7 +1139,11 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
         );
     }
     let last_beat: Option<f64> = conn
-        .query_row("SELECT beat_at FROM server_heartbeat WHERE id = 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT beat_at FROM server_heartbeat WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
         .ok();
     let query_error_reason = query_error.clone();
     let body = serde_json::json!({
@@ -1058,12 +1219,21 @@ mod disk_tests {
     #[test]
     fn a_reading_taken_from_an_ancestor_names_the_ancestor_not_the_leaf() {
         let base = std::env::temp_dir();
-        let missing = base.join("amux-4746-does-not-exist").join("nor-this").join("nor-this-either");
-        assert!(!missing.exists(), "the fixture path must genuinely not exist");
+        let missing = base
+            .join("amux-4746-does-not-exist")
+            .join("nor-this")
+            .join("nor-this-either");
+        assert!(
+            !missing.exists(),
+            "the fixture path must genuinely not exist"
+        );
 
         let (free, total, named) =
             statvfs_free_total(&missing).expect("the walk must reach an existing ancestor");
-        assert!(free >= 0.0 && total > 0.0, "the ancestor gave a real reading");
+        assert!(
+            free >= 0.0 && total > 0.0,
+            "the ancestor gave a real reading"
+        );
         assert_ne!(
             named,
             missing.display().to_string(),
@@ -1087,7 +1257,10 @@ mod disk_tests {
     #[test]
     fn naming_the_path_did_not_soften_the_verdict() {
         let (crit, warn) = (5.0, 20.0);
-        assert_eq!(disk_state_with_thresholds(Some(1.0), crit, warn), "critical");
+        assert_eq!(
+            disk_state_with_thresholds(Some(1.0), crit, warn),
+            "critical"
+        );
         assert_eq!(disk_state_with_thresholds(Some(10.0), crit, warn), "warn");
         assert_eq!(disk_state_with_thresholds(Some(500.0), crit, warn), "ok");
         assert_eq!(disk_state_with_thresholds(None, crit, warn), "unknown");
@@ -1124,9 +1297,21 @@ mod disk_tests {
     /// an emergency, and the old numbers would have under-called it again.
     #[test]
     fn the_2026_08_24_overnight_fall_is_called_at_its_real_severity() {
-        assert_eq!(disk_state(Some(144.0)), "ok", "where the night started — genuinely fine");
-        assert_eq!(disk_state(Some(60.0)), "warn", "falling, with runway to act");
-        assert_eq!(disk_state(Some(13.0)), "critical", "where it actually ended up");
+        assert_eq!(
+            disk_state(Some(144.0)),
+            "ok",
+            "where the night started — genuinely fine"
+        );
+        assert_eq!(
+            disk_state(Some(60.0)),
+            "warn",
+            "falling, with runway to act"
+        );
+        assert_eq!(
+            disk_state(Some(13.0)),
+            "critical",
+            "where it actually ended up"
+        );
     }
 
     /// Boundaries pinned so a later refactor cannot slide them silently.
@@ -1147,7 +1332,11 @@ mod disk_tests {
         // Same 19 GB free that read "critical" against the fleet defaults on
         // a 35 GB disk (this exact box, this exact day) reads "ok" once the
         // thresholds are recalibrated for its real size.
-        assert_eq!(disk_state(Some(19.0)), "critical", "unscaled default still fires, correctly");
+        assert_eq!(
+            disk_state(Some(19.0)),
+            "critical",
+            "unscaled default still fires, correctly"
+        );
         assert_eq!(disk_state_with_thresholds(Some(19.0), 5.0, 10.0), "ok");
         assert_eq!(disk_state_with_thresholds(Some(7.0), 5.0, 10.0), "warn");
         assert_eq!(disk_state_with_thresholds(Some(3.0), 5.0, 10.0), "critical");
@@ -1185,7 +1374,10 @@ mod disk_tests {
         assert!(free <= total, "free {free} cannot exceed total {total}");
         // Catches an f_frsize/f_bsize units mix-up, the failure that would
         // silently scale every reading by 8x or 512x.
-        assert!(total < 1_000_000.0, "implausible volume size {total} GB — units wrong?");
+        assert!(
+            total < 1_000_000.0,
+            "implausible volume size {total} GB — units wrong?"
+        );
     }
 
     /// The ancestor walk is the fix for the CI break, so it gets its own test
@@ -1195,7 +1387,10 @@ mod disk_tests {
     #[test]
     fn a_path_that_does_not_exist_yet_still_reports_its_volume() {
         let missing = std::path::Path::new("/this-does-not-exist-9f3a/nor/does/this");
-        assert!(!missing.exists(), "fixture must actually be absent to test anything");
+        assert!(
+            !missing.exists(),
+            "fixture must actually be absent to test anything"
+        );
         assert!(
             statvfs_exact(missing).is_none(),
             "the non-walking reader must fail here, or the walk below proves nothing"
@@ -1212,11 +1407,16 @@ mod disk_tests {
     #[test]
     fn disk_health_never_reports_unknown_on_a_working_host() {
         let h = disk_health();
-        let free = h.free_gb.expect("disk_health must report free space on any host");
+        let free = h
+            .free_gb
+            .expect("disk_health must report free space on any host");
         let total = h.total_gb.expect("disk_health must report total space");
         assert!(free > 0.0 && total > 0.0, "free {free} total {total}");
         assert!(free <= total, "free {free} cannot exceed total {total}");
-        assert_ne!(h.state, "unknown", "a readable volume must not report unknown");
+        assert_ne!(
+            h.state, "unknown",
+            "a readable volume must not report unknown"
+        );
     }
 }
 
@@ -1229,7 +1429,10 @@ mod admission_tests {
     /// dead and gets switched off within the hour (ethos rule 7).
     #[test]
     fn the_healthy_2026_08_28_baseline_allows() {
-        assert_eq!(admission_for(Some(1), Some(2207.4), 8192.0), Admission::Allow);
+        assert_eq!(
+            admission_for(Some(1), Some(2207.4), 8192.0, None),
+            Admission::Allow
+        );
     }
 
     /// The kernel's own critical verdict denies. This is the signal preferred over
@@ -1237,23 +1440,52 @@ mod admission_tests {
     /// page accounting.
     #[test]
     fn a_kernel_critical_verdict_denies() {
-        assert_eq!(admission_for(Some(4), Some(0.0), 8192.0), Admission::Deny);
+        assert_eq!(admission_for(Some(4), Some(0.0), 8192.0, None), Admission::Deny);
     }
 
     /// Kernel `warn` is reported, not blocked. Refusing on warn would deny during
     /// ordinary heavy builds, and a gate that cries wolf is a gate people disable.
     #[test]
     fn kernel_warn_is_strained_not_denied() {
-        assert_eq!(admission_for(Some(2), Some(100.0), 8192.0), Admission::Strained);
+        assert_eq!(
+            admission_for(Some(2), Some(100.0), 8192.0, None),
+            Admission::Strained
+        );
     }
 
-    /// Heavy sustained swap denies on its own, because the kernel's pressure level
-    /// can still read `normal` while the working set has stopped fitting.
+    /// Heavy swap that is still GROWING denies even when the kernel says
+    /// normal: the working set has stopped fitting.
     #[test]
-    fn heavy_swap_denies_even_when_the_kernel_says_normal() {
-        assert_eq!(admission_for(Some(1), Some(9000.0), 8192.0), Admission::Deny);
-        assert_eq!(admission_for(Some(1), Some(8192.0), 8192.0), Admission::Deny, "boundary is inclusive");
-        assert_eq!(admission_for(Some(1), Some(8191.9), 8192.0), Admission::Allow);
+    fn heavy_growing_swap_denies_even_when_the_kernel_says_normal() {
+        assert_eq!(admission_for(Some(1), Some(9000.0), 8192.0, Some(600.0)), Admission::Deny);
+        assert_eq!(
+            admission_for(Some(1), Some(8192.0), 8192.0, Some(512.0)),
+            Admission::Deny,
+            "both boundaries are inclusive"
+        );
+        assert_eq!(admission_for(Some(1), Some(8191.9), 8192.0, Some(5000.0)), Admission::Allow);
+    }
+
+    /// The 2026-10-17 reading: 20.8 GB of swap left over from hours earlier, the
+    /// kernel at normal, swap flat. The old rule denied this and kept 19 lanes
+    /// down after a crash. It must admit, as strained.
+    #[test]
+    fn a_stale_swap_balance_under_normal_pressure_is_strained_not_denied() {
+        assert_eq!(admission_for(Some(1), Some(20832.75), 8192.0, Some(3.0)), Admission::Strained);
+        assert_eq!(admission_for(Some(1), Some(20832.75), 8192.0, Some(-400.0)), Admission::Strained);
+        assert_eq!(
+            admission_for(Some(1), Some(20832.75), 8192.0, None),
+            Admission::Strained,
+            "no window yet (just after a restart) must not deny either"
+        );
+    }
+
+    /// Heavy swap with the kernel at warn, or with no kernel verdict at all,
+    /// still denies on the balance alone.
+    #[test]
+    fn heavy_swap_still_denies_under_warn_or_unknown_pressure() {
+        assert_eq!(admission_for(Some(2), Some(9000.0), 8192.0, Some(0.0)), Admission::Deny);
+        assert_eq!(admission_for(None, Some(9000.0), 8192.0, None), Admission::Deny);
     }
 
     /// UNKNOWN must never deny. On a host where these are unreadable — Linux, the
@@ -1261,9 +1493,9 @@ mod admission_tests {
     /// worker at all, which is a far worse failure than not having the gate.
     #[test]
     fn unreadable_signals_allow_rather_than_brick_the_fleet() {
-        assert_eq!(admission_for(None, None, 8192.0), Admission::Allow);
-        assert_eq!(admission_for(None, Some(100.0), 8192.0), Admission::Allow);
-        assert_eq!(admission_for(Some(1), None, 8192.0), Admission::Allow);
+        assert_eq!(admission_for(None, None, 8192.0, None), Admission::Allow);
+        assert_eq!(admission_for(None, Some(100.0), 8192.0, None), Admission::Allow);
+        assert_eq!(admission_for(Some(1), None, 8192.0, None), Admission::Allow);
     }
 
     /// And the live check must not be denying right now, or every lane start on
@@ -1346,9 +1578,7 @@ mod amux4739_probe_budget_tests {
         LAST_PROBE_COMPLETION_RAW.store(0, Ordering::Relaxed);
         let dir = tempfile::tempdir().unwrap();
         let state = AppState {
-            store: std::sync::Arc::new(
-                crate::db::Store::open(&dir.path().join("h.db")).unwrap(),
-            ),
+            store: std::sync::Arc::new(crate::db::Store::open(&dir.path().join("h.db")).unwrap()),
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,

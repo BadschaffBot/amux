@@ -12,7 +12,12 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
 #[derive(Parser)]
-#[command(name = "amux-rs", version, about = "amux command-line interface (Rust server)")]
+#[command(
+    name = "amux-rs",
+    // The source this was built from (build.rs), not the workspace placeholder.
+    version = env!("AMUX_CLI_VERSION"),
+    about = "amux command-line interface (Rust server)"
+)]
 struct Cli {
     /// Server base URL. Falls back to $AMUX_URL, then the local server.
     #[arg(long, env = "AMUX_RS_URL")]
@@ -57,9 +62,14 @@ enum Cmd {
         /// stay phrases, punctuation is literal.
         query: Option<String>,
         /// Restrict to entity types, comma-separated
-        /// (task,message,memory,worker,journal,schedule).
+        /// (task,message,memory,worker,journal,schedule,prompt). The log
+        /// families are searched only when named: history (every message
+        /// sent to a worker), log (terminal scrollback), transcript.
         #[arg(long)]
         types: Option<String>,
+        /// Only hits from this session.
+        #[arg(long)]
+        session: Option<String>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Index health: per-type index counts vs the live tables.
@@ -177,7 +187,10 @@ impl Client {
             .unwrap_or_else(|_| {
                 std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux")
             })
-            .join("auth-token")
+            // `auth_token`, underscore: the server's file (api/auth.rs). This
+            // read `auth-token` and so never sent the owner credential, which
+            // only worked while loopback counted as one (governance PR 3).
+            .join("auth_token")
             .pipe(|p| std::fs::read_to_string(p).ok())
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
@@ -202,6 +215,12 @@ impl Client {
         if let Some(s) = &self.session {
             r = r.header("X-Amux-Session", s);
         }
+        // Inside a worker, its minted identity (contract rule 10).
+        if let Ok(t) = std::env::var("AMUX_WORKER_TOKEN") {
+            if !t.trim().is_empty() {
+                r = r.header("X-Amux-Worker-Token", t.trim());
+            }
+        }
         r
     }
 
@@ -209,7 +228,12 @@ impl Client {
         Ok(self.req(reqwest::Method::GET, path).send()?.json()?)
     }
 
-    fn send_json(&self, method: reqwest::Method, path: &str, body: Value) -> anyhow::Result<(u16, Value)> {
+    fn send_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> anyhow::Result<(u16, Value)> {
         let resp = self.req(method, path).json(&body).send()?;
         let status = resp.status().as_u16();
         let v = resp.json().unwrap_or(Value::Null);
@@ -313,12 +337,40 @@ fn run(cmd: &Cmd, c: &Client) -> anyhow::Result<i32> {
         Cmd::Workers { cmd } => workers(cmd, c),
         Cmd::Schedules { cmd } => schedules(cmd, c),
         Cmd::Delegate { cmd } => delegate(cmd, c),
-        Cmd::Search { query, types, limit, status, reindex, json } => {
-            search(query.as_deref(), types.as_deref(), *limit, *status, *reindex, *json, c)
-        }
-        Cmd::Why { kind, id, since, until, limit, json } => {
-            why(kind, id.as_deref(), since.as_deref(), until.as_deref(), *limit, *json, c)
-        }
+        Cmd::Search {
+            query,
+            types,
+            session,
+            limit,
+            status,
+            reindex,
+            json,
+        } => search(
+            query.as_deref(),
+            types.as_deref(),
+            session.as_deref(),
+            *limit,
+            *status,
+            *reindex,
+            *json,
+            c,
+        ),
+        Cmd::Why {
+            kind,
+            id,
+            since,
+            until,
+            limit,
+            json,
+        } => why(
+            kind,
+            id.as_deref(),
+            since.as_deref(),
+            until.as_deref(),
+            *limit,
+            *json,
+            c,
+        ),
         Cmd::Send { worker, text } => {
             let body_text = match text {
                 Some(t) => t.clone(),
@@ -347,7 +399,12 @@ fn run(cmd: &Cmd, c: &Client) -> anyhow::Result<i32> {
 
 fn delegate(cmd: &DelegateCmd, c: &Client) -> anyhow::Result<i32> {
     match cmd {
-        DelegateCmd::Read { question, task, files, json: as_json } => {
+        DelegateCmd::Read {
+            question,
+            task,
+            files,
+            json: as_json,
+        } => {
             if question.trim().is_empty() {
                 eprintln!("delegate read requires a non-empty --question");
                 return Ok(2);
@@ -383,7 +440,9 @@ fn delegate(cmd: &DelegateCmd, c: &Client) -> anyhow::Result<i32> {
             if !(200..300).contains(&status) {
                 eprintln!(
                     "delegate read failed ({status}): {}",
-                    value["error"].as_str().unwrap_or("non-JSON or empty response")
+                    value["error"]
+                        .as_str()
+                        .unwrap_or("non-JSON or empty response")
                 );
                 return Ok(3);
             }
@@ -409,7 +468,12 @@ fn delegate(cmd: &DelegateCmd, c: &Client) -> anyhow::Result<i32> {
 
 fn board(cmd: &BoardCmd, c: &Client) -> anyhow::Result<i32> {
     match cmd {
-        BoardCmd::Add { title, desc, status, r#type } => {
+        BoardCmd::Add {
+            title,
+            desc,
+            status,
+            r#type,
+        } => {
             let mut body = json!({"title": title, "status": status});
             if let Some(d) = desc {
                 body["desc"] = json!(d);
@@ -542,14 +606,19 @@ fn schedules(cmd: &SchedCmd, c: &Client) -> anyhow::Result<i32> {
     match cmd {
         SchedCmd::List => {
             let v = c.get("/api/schedules")?;
-            let items = v.as_array().cloned().unwrap_or_else(|| {
-                v["items"].as_array().cloned().unwrap_or_default()
-            });
+            let items = v
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| v["items"].as_array().cloned().unwrap_or_default());
             for s in items {
                 println!(
                     "{:<10} {:<3} {:<24} {}",
                     s["id"].as_str().unwrap_or("?"),
-                    if s["enabled"].as_i64().unwrap_or(0) == 1 { "on" } else { "off" },
+                    if s["enabled"].as_i64().unwrap_or(0) == 1 {
+                        "on"
+                    } else {
+                        "off"
+                    },
                     s["schedule_expr"].as_str().unwrap_or("?"),
                     s["title"].as_str().unwrap_or("")
                 );
@@ -619,6 +688,7 @@ fn urlencode(s: &str) -> String {
 fn search(
     query: Option<&str>,
     types: Option<&str>,
+    session: Option<&str>,
     limit: usize,
     status: bool,
     reindex: bool,
@@ -643,7 +713,8 @@ fn search(
         let consistent = v["consistent"].as_bool().unwrap_or(false);
         outln!(
             "index: {} docs, {} fts rows — {}",
-            v["docs_total"], v["fts_rows"],
+            v["docs_total"],
+            v["fts_rows"],
             if consistent { "consistent" } else { "DRIFTED" }
         );
         for f in v["families"].as_array().cloned().unwrap_or_default() {
@@ -652,7 +723,11 @@ fn search(
                 f["type"].as_str().unwrap_or("?"),
                 f["indexed"],
                 f["live"],
-                if f["consistent"].as_bool().unwrap_or(false) { "ok" } else { "MISMATCH" }
+                if f["consistent"].as_bool().unwrap_or(false) {
+                    "ok"
+                } else {
+                    "MISMATCH"
+                }
             );
         }
         // A drifted index is a failure the caller should be able to branch on,
@@ -661,12 +736,17 @@ fn search(
     }
 
     let Some(q) = query else {
-        eprintln!("usage: amux-rs search <query> [--types t1,t2] [--limit N] | --status | --reindex");
+        eprintln!(
+            "usage: amux-rs search <query> [--types t1,t2] [--session S] [--limit N] | --status | --reindex"
+        );
         return Ok(2);
     };
     let mut path = format!("/api/search?q={}&limit={limit}", urlencode(q));
     if let Some(t) = types {
         path.push_str(&format!("&types={}", urlencode(t)));
+    }
+    if let Some(s) = session {
+        path.push_str(&format!("&session={}", urlencode(s)));
     }
     let v = c.get(&path)?;
     if as_json {
@@ -762,20 +842,33 @@ fn why(
     if let Some(err) = v["error"].as_str() {
         eprintln!("error: {err}");
         if let Some(kinds) = v["kinds"].as_array() {
-            eprintln!("kinds: {}", kinds.iter().filter_map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
+            eprintln!(
+                "kinds: {}",
+                kinds
+                    .iter()
+                    .filter_map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         return Ok(2);
     }
 
     let verdict = v["verdict"].as_str().unwrap_or("?");
     outln!("subject: {}", serde_json::to_string(&v["subject"])?);
-    outln!("verdict: {verdict} — {}", v["verdict_reason"].as_str().unwrap_or(""));
+    outln!(
+        "verdict: {verdict} — {}",
+        v["verdict_reason"].as_str().unwrap_or("")
+    );
     outln!();
 
     outln!("timeline:");
     for e in v["timeline"].as_array().cloned().unwrap_or_default() {
         let at = e["at"].as_str().unwrap_or("(no recorded time)");
-        let actor = e["actor"].as_str().map(|a| format!(" [{a}]")).unwrap_or_default();
+        let actor = e["actor"]
+            .as_str()
+            .map(|a| format!(" [{a}]"))
+            .unwrap_or_default();
         let src = &e["source"];
         // Every line carries its table, which is the difference between a
         // story and a checkable claim.

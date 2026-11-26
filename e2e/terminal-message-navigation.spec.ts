@@ -1,4 +1,4 @@
-import { test, expect, Page } from './fixtures';
+import { test, expect, Page, allowUnusedRoute } from './fixtures';
 
 async function sourceFilter(page: Page, kind: string) {
   await page.getByRole('button', {name:'Filter messages', exact:true}).click();
@@ -17,7 +17,9 @@ test.beforeEach(async ({ page }) => {
   await page.evaluate(() => {
     document.querySelector('.wt-overlay')?.remove();
     eval("peekSession = 'nav-probe'; _peekMsgRowsFor = peekSession; _peekMsgRows = []; _peekMsgNavKind = 'all'; _peekMsgIndex = -1;");
-    document.getElementById('peek-overlay')!.classList.add('active');
+    { // Open it the way openPeek does: since 90bedca6 the overlay starts hidden, inert and aria-hidden.
+      const ov = document.getElementById('peek-overlay')!; ov.hidden = false; ov.inert = false;
+      ov.setAttribute('aria-hidden', 'false'); ov.classList.add('active'); }
     (window as any)._stopPeekPoll();
   });
 });
@@ -43,6 +45,55 @@ test('separate Codex/Claude blocks, multiline origin matching, and late scoped h
   expect(result.first).toContain('Keep this paragraph together.');
   expect(result.leakedReply).toBeFalsy();
   expect(new Set(result.colors).size).toBe(3);
+});
+
+test('a table pasted into a message stays inside it, and the message closes before the reply', async ({ page }) => {
+  // Ethan, 2026-10-18 ("why is this all blue"): the message ended between the
+  // table's top border and its first row, the box wrapper straddled the
+  // message's closing tag, and the blue message tint ran to the end.
+  const result = await page.evaluate(() => {
+    const w = window as any;
+    const body = document.getElementById('peek-body')!;
+    const bg = '\x1b[48;5;237m';
+    const raw = [
+      bg + '\u276f \x1b[38;5;231madd this to our datacenter folder\x1b[39m',
+      '',
+      '  ' + bg + '  What one lab run needs',
+      '',
+      '    \u250c\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2510',
+      '    \u2502 CPU \u2502 4   \u2502',
+      '    \u251c\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2500\u2524',
+      '    \u2502 RAM \u2502 15G \u2502',
+      '    \u2514\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2518',
+      '',
+      '    What to provision: 8 cores.',
+      '',
+      '\u23fa Bash(ls Datacenter/)',
+      '  \u23bf  ls: Datacenter/: No such file or directory',
+      '',
+      '\u276f add these dates to my calendar',
+      '',
+      '\u23fa Done.',
+    ].join('\n');
+    body.innerHTML = w._peekHtml(raw);
+    const prompts = [...body.querySelectorAll('.peek-prompt')];
+    return {
+      count: prompts.length,
+      nested: body.querySelectorAll('.peek-prompt .peek-prompt').length,
+      firstHasTable: prompts[0]?.textContent?.includes('RAM') ?? false,
+      firstHasProvision: prompts[0]?.textContent?.includes('What to provision') ?? false,
+      firstHasReply: prompts[0]?.textContent?.includes('Bash(') ?? true,
+      boxInside: !!prompts[0]?.querySelector('.peek-box'),
+      secondHasReply: prompts[1]?.textContent?.includes('Done.') ?? true,
+    };
+  });
+  expect(result.count).toBe(2);
+  expect(result.nested).toBe(0);
+  expect(result.firstHasTable).toBe(true);
+  expect(result.boxInside).toBe(true);
+  expect(result.firstHasProvision).toBe(true);
+  expect(result.firstHasReply).toBe(false);
+  expect(result.secondHasReply).toBe(false);
 });
 
 test('header arrows land at the start of a long message and hold through refresh', async ({ page }) => {
@@ -344,6 +395,57 @@ test('an explicit empty navigation loads earlier output and lands on its message
   await expect(page.locator('#toast')).not.toHaveClass(/visible/);
 });
 
+// AMUX-5377: peer messages delivered mid-turn exist only in conversation
+// pages, often several pages back in a tool-heavy session. Picking Workers
+// must reach them, and up from the oldest match must keep going back.
+test('the Workers filter searches earlier pages until it finds a peer message', async ({ page }) => {
+  const beacons: any[] = [];
+  await page.route('**/api/client-debug', async route => {
+    beacons.push(route.request().postDataJSON());
+    await route.fulfill({ json: { ok: true } });
+  });
+  let served = 0;
+  await page.route('**/api/sessions/nav-probe/log?*', route => {
+    served++;
+    // Three pages of tool output, then a page holding two peer messages, then the start.
+    const body = served <= 3 ? 'tool output page ' + served + '\n'.repeat(3)
+      : served === 4 ? '› [amux-origin: peer-a — server-verified]\n  first peer note\nassistant\n› [amux-origin: peer-b — server-verified]\n  second peer note\n'
+      : '› [amux-origin: peer-c — server-verified]\n  oldest peer note\n';
+    return route.fulfill({ status: 200, body,
+      headers: { 'Content-Type': 'text/plain', 'X-Log-Remaining': served >= 5 ? '0' : '1000', 'X-Amux-Session': 'nav-probe' } });
+  });
+  await page.evaluate(() => {
+    eval('peekSearchQuery = ""; _peekMsgNavKind = "all"; _peekEarlier = { chunks: [], loadedKb: 0, done: false, hidden: false, loading: false }; _peekHistoryHTML = ""; _lastLiveHTML = ""; lastPeekHTML = "";');
+    document.getElementById('peek-body')!.innerHTML = '';
+  });
+  await page.evaluate(() => (window as any)._peekMsgNavSelect('session'));
+  await expect.poll(() => page.locator('#peek-body .peek-prompt[data-msg-kind="session"]').count()).toBe(2);
+  expect(served).toBe(4);
+  // Stand on the oldest loaded match, then go up: it must load the next page
+  // back and land there, not wrap round to the newest.
+  await page.evaluate(() => document.querySelector('#peek-body .peek-prompt[data-msg-kind="session"]')!.classList.add('peek-msg-current'));
+  await expect(page.locator('.peek-msg-current')).toContainText('first peer note');
+  await page.getByRole('button', { name: 'Previous message', exact: true }).click();
+  await expect(page.locator('.peek-msg-current')).toContainText('oldest peer note');
+  expect(served).toBe(5);
+  expect(beacons.some(b => b.kind === 'peek-earlier-search' && b.found)).toBe(true);
+});
+
+// A Chat-tab relay of the owner's own words is the owner, not a worker.
+test('an owner relay is Human, a wrapped peer envelope is Workers, and harness placeholders classify', async ({ page }) => {
+  const kinds = await page.evaluate(() => {
+    const w = window as any;
+    return [w._classifyPromptKind('[amux-origin: the owner, relayed by amux-chat] hi'),
+      w._classifyPromptKind('[amux-origin: mixpeek-cicd — server-verified] fixed'),
+      w._classifyPromptKind('<pasted_content id="16b1"> [amux-origin: peer-a — server-verified] note </pasted_content>'),
+      w._classifyPromptKind('<pasted_content id="x"> [board note on AMUX-1: title] body'),
+      w._classifyPromptKind('[Image #8] test it and verify'),
+      w._classifyPromptKind('[Image: original 4100x2062, displayed at 2000x1006.]'),
+      w._classifyPromptKind('This session is being continued from a previous conversation that ran out of context.')];
+  });
+  expect(kinds).toEqual(['human', 'session', 'session', 'amux', 'human', 'amux', 'amux']);
+});
+
 test('rapid worker switch and reconnect cannot cross output, draft, status, card, or earlier-log identity', async ({ page }) => {
   const beacons: any[] = [];
   await page.route('**/api/client-debug', async route => {
@@ -480,8 +582,44 @@ test('a worker menu that loses its opening announces the failure', async ({ page
 });
 
 
+const SPECIMEN_CARD = {id:'AMUX-4242', title:'filter specimen', status:'todo'};
+const BOARD_LIST = /\/api\/board\?archived=0(&|$)/;
+
 async function filterSpecimen(page: Page) {
+  // The pushed card below only lasts until the next board refresh. Peers on
+  // the shared server mutate the board, so a refresh can land mid-test and
+  // replace boardItems with a list that has prefixes but no AMUX card, and the
+  // Board references count drops to 0 (ios-safari run 38809617752). Every
+  // board list this page loads therefore carries the specimen card too.
+  await page.route(BOARD_LIST, async route => {
+    const headers = { ...route.request().headers() };
+    delete headers['if-none-match'];
+    // A refresh still in flight when the test ends has nobody to answer.
+    const res = await route.fetch({ headers }).catch(() => null);
+    if (!res) return;
+    const body = await res.json().catch(() => null);
+    const out = { ...res.headers() };
+    delete out['etag']; delete out['content-length'];
+    if (Array.isArray(body) && !body.some((i: any) => i && i.id === SPECIMEN_CARD.id)) body.push(SPECIMEN_CARD);
+    await (Array.isArray(body)
+      ? route.fulfill({ status: res.status(), headers: out, json: body })
+      : route.fulfill({ response: res })).catch(() => {});
+  });
+  // Only fires when a board refresh happens during the test, which is the race
+  // this stub exists for and is not guaranteed in any given run.
+  allowUnusedRoute(page, BOARD_LIST);
+  // A board read that began at page load, before the route above existed, could
+  // still land after the push below and replace boardItems without the card
+  // (mobile CI f2bb59c75: Board references "0", the prompts still on screen).
+  // One read through the route first: fetchBoard drops any older read that
+  // finishes after a newer one has applied.
+  await page.evaluate(() => (window as any).fetchBoard());
   await page.evaluate(() => {
+    // Board references count only for a prefix the loaded board uses. The
+    // shared e2e server's board holds whatever earlier specs created, so name
+    // the referenced card here rather than depend on test order (mobile CI run
+    // 37067255136 counted 0 because no AMUX card had been created yet).
+    eval("if (!boardItems.some(i => i && i.id === 'AMUX-4242')) boardItems.push({id:'AMUX-4242', title:'filter specimen', status:'todo'})");
     eval("peekSessionDir='/tmp/toolbar-probe'; _peekMsgRows=[{session:'nav-probe',type:'direct',text:'Review AMUX-4242 needle in docs/result.md'}, {session:'nav-probe',type:'direct',text:'Check needle at https://example.com/report'}, {session:'nav-probe',type:'direct',text:'Plain needle request'}];");
     const raw = '› Review AMUX-4242 needle in docs/result.md\nAssistant needle reply\n'
       + '❯ [amux-origin:peer] Check AMUX-4242 needle in docs/worker.md\nAssistant\n'
@@ -665,4 +803,44 @@ test('Gemini peer messages remain searchable with the Workers terminal filter', 
     return host.querySelectorAll('.peek-prompt').length;
   }, raw);
   expect(nonGemini).toBe(0);
+});
+
+// AMUX-5501 audit (2026-10-02): real prompts from live panes that the Filters
+// popover mis-sorted. The usage-limit resume also has a WRONG ledger row
+// (delivery=pane, type user -> Human) that must not win.
+test('provider prompts are Harness even with a Human row, owner uploads are Human, the rest stays honest', async ({ page }) => {
+  const kinds = await page.evaluate(() => {
+    const w = window as any;
+    w.eval('peekSession = "cls-probe"');
+    const resume = 'Your claude.ai usage limit has reset. Continue the task you were working on when the limit was reached; do not repeat work that is already complete.';
+    w.eval('_cmdHistory').push({ session: 'cls-probe', text: resume, type: 'user' });
+    const out = [
+      w._classifyPromptKind(resume),
+      w._classifyPromptKind('[Request interrupted by user for tool use]'),
+      w._classifyPromptKind('Goal check-in: «Use the orchestrate skill on research/goal-specs/12-unified-platform-MIGRATION-PLAN.md»'),
+      w._classifyPromptKind('Base directory for this skill: /Users/ethan/.claude/skills/chrome-cdp # chrome-cdp'),
+      w._classifyPromptKind('add these to my cal @/Users/ethan/.amux/uploads/ed317bd75485-upload'),
+      w._classifyPromptKind('@/Users/ethan/.amux/uploads/e80cf4ea8cfe-upload'),
+      w._classifyPromptKind('[amux-origin: gs12-mvs — server-verified] see @/Users/ethan/.amux/uploads/a.png'),
+      w._classifyPromptKind('now it says this worker is blocked'),
+    ];
+    w.eval('_cmdHistory').pop();
+    return out;
+  });
+  expect(kinds).toEqual(['amux', 'amux', 'amux', 'amux', 'human', 'human', 'session', 'unknown']);
+});
+
+test('Board references are real board prefixes, digits included, not UTF-8 or SHA-256', async ({ page }) => {
+  const r = await page.evaluate(() => {
+    const w = window as any;
+    const saved = w.eval('boardItems');
+    w.eval('boardItems = [{ id: "BE1-3" }, { id: "AMUX-5501" }, { id: "GC-57" }]');
+    const out = [w._peekHasBoardRef('blocked on BE1-12 first'), w._peekHasBoardRef('see AMUX-5490 and GC-5'),
+      w._peekHasBoardRef('encode as UTF-8 and hash with SHA-256 on GPT-4')];
+    w.eval('boardItems = []');
+    out.push(w._peekHasBoardRef('see AMUX-5490'));
+    w.eval('boardItems').push(...saved);
+    return out;
+  });
+  expect(r).toEqual([true, true, false, true]);
 });

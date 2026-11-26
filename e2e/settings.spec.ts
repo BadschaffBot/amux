@@ -24,7 +24,7 @@
 // 14  Dark/Light theme toggle                  localStorage amux_theme       TESTED (client-side by design)
 // 15  Tabs display select                      POST /api/prefs tabs_display  TESTED
 // 16  Zoom −/+/Reset                           localStorage amux_zoom        TESTED (client-side by design)
-// 17  Anthropic API key input + Save           GET+PATCH /api/settings/env   TESTED
+// 17  Anthropic API key input + Save           removed 2026-11-11 (an API key is a secret)
 // 18  Commit-guard toggle                      GET+PATCH /api/settings/commit-guard  TESTED
 // 19  Board-awareness (task-guard) toggle      GET+PATCH /api/settings/task-guard    TESTED
 // 20  Notes-folder row                         (no client wiring, no endpoint in EITHER server)  FIXME — not relevant
@@ -57,7 +57,7 @@
 // - Toggle inputs (.theme-toggle input) are opacity:0/size:0 — the USER
 //   clicks the visible .theme-track sibling, so the tests do too.
 import { test, expect } from './fixtures';
-import { E2E_ANTHROPIC_KEY } from './test-env';
+import { cleanup } from './teardown';
 import type { Page, APIRequestContext } from '@playwright/test';
 
 // Deterministic theme baseline: initTheme falls back to prefers-color-scheme
@@ -366,145 +366,6 @@ test('settings_default_model', async ({ page, request }, testInfo) => {
   expect((await get3.json()).model).toBe('sonnet');
 });
 
-test('settings_api_key_anthropic', async ({ page, request }, testInfo) => {
-  // The only test in this file that calls settle() TWICE — it asserts the key
-  // survives a reload, so it pays the SPA's full boot cost (goto + bootstrap +
-  // walkthrough dismissal) twice where every sibling pays it once. On the 30s
-  // file-wide default that fits locally (measured: whole file, both projects,
-  // 1.7m) and does NOT fit on a CI runner, where 92 tests take 6.5m. It failed
-  // on five consecutive rust.yml runs — always this test, always as
-  // "Test timeout of 30000ms exceeded" surfacing at the longest await rather
-  // than as an assertion failure, which is the signature of a budget that is
-  // too small rather than a product defect.
-  //
-  // Sized to the work, not padded past a flake: same precedent as
-  // golden.spec.ts's heavy scenarios, which declare 120s.
-  test.setTimeout(60_000);
-  await settle(page);
-  const token = await appToken(page);
-
-  // Baseline BEFORE the write: effective_env falls back to the test-runner's
-  // process env, so the key may already read as set on a dev machine.
-  const before = (await (
-    await request.get('/api/settings/env', { headers: authHeaders(token) })
-  ).json()) as Record<string, string>;
-
-  await openSettings(page);
-  const input = page.locator('#settings-anthropic-key');
-  await input.fill('sk-ant-e2e-settings-spec-77xy');
-  const [res] = await Promise.all([
-    page.waitForResponse(
-      (r) => r.url().includes('/api/settings/env') && r.request().method() === 'PATCH',
-    ),
-    page.locator('#settings-apikeys-section button', { hasText: 'Save' }).click(),
-  ]);
-  expect(res.status()).toBe(200);
-  expect(await res.json()).toMatchObject({ ok: true });
-
-  // UI reflects the save; the GET refresh serves the MASKED value (last 4 only).
-  await expect(page.locator('#settings-apikey-status')).toHaveText(/Key saved/);
-  await expect(input).toHaveAttribute('placeholder', /77xy$/);
-  const during = (await (
-    await request.get('/api/settings/env', { headers: authHeaders(token) })
-  ).json()) as Record<string, string>;
-  expect(during.ANTHROPIC_API_KEY).toMatch(/\*+77xy$/); // masked, never the value
-
-  // Persistence: reload, panel re-open re-fetches from server.env in the
-  // throwaway AMUX_HOME.
-  await settle(page);
-  await openSettings(page);
-  await expect(page.locator('#settings-anthropic-key')).toHaveAttribute('placeholder', /77xy$/);
-  await expect(page.locator('#settings-apikey-status')).toHaveText(/Key saved/);
-
-  // Restore: the UI has no "clear key" affordance (saveApiKey returns early on
-  // empty input), so restoration goes through the same endpoint the Save
-  // button uses. An empty persisted value SHADOWS the process prerequisite;
-  // restore that known non-secret value explicitly so later specs retain the
-  // same configured-install state this test received.
-  testInfo.annotations.push({
-    type: 'restore-via-api',
-    description:
-      'UI cannot clear a saved key (empty input is a no-op in saveApiKey); restored the isolated harness baseline via PATCH /api/settings/env',
-  });
-  const restore = await request.patch('/api/settings/env', {
-    headers: authHeaders(token),
-    data: { ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY },
-  });
-  expect(restore.status()).toBe(200);
-  const after = (await (
-    await request.get('/api/settings/env', { headers: authHeaders(token) })
-  ).json()) as Record<string, string>;
-  expect(after.ANTHROPIC_API_KEY).toBe(before.ANTHROPIC_API_KEY);
-});
-
-test('settings_api_key_survives_slow_env_refresh', async ({ page, request }) => {
-  // Regression for the settings_api_key_anthropic CI flake (6/8 runs red).
-  // loadApiKeys() runs async when the panel opens and used to do an
-  // unconditional `inp.value = ''` when its GET returned — so on a loaded
-  // runner where the fill BEAT the response, the response then wiped the
-  // typed key and Save hit its empty-value early return: no PATCH was ever
-  // sent, and the sibling test's waitForResponse hung to the 60s budget. The
-  // same race hits a fast human as "my key vanished while I typed".
-  //
-  // This test forces the losing interleaving deterministically: hold the GET
-  // for 800ms, type during the hold, let the delayed response land, and
-  // assert the field still holds the entry — a fast, legible failure
-  // (value '' vs the key) instead of a timeout, on exactly the incident's
-  // ordering.
-  await settle(page);
-  const token = await appToken(page);
-
-  let heldOnce = false;
-  await page.route('**/api/settings/env', async (route) => {
-    if (route.request().method() === 'GET' && !heldOnce) {
-      heldOnce = true;
-      await new Promise((r) => setTimeout(r, 800));
-    }
-    await route.continue();
-  });
-
-  const [delayedGet] = await Promise.all([
-    page.waitForResponse(
-      (r) => r.url().includes('/api/settings/env') && r.request().method() === 'GET',
-    ),
-    (async () => {
-      await openSettings(page);
-      // Type while the GET is still held — the incident's interleaving.
-      await page.locator('#settings-anthropic-key').fill('sk-ant-e2e-race-77zz');
-    })(),
-  ]);
-  expect(delayedGet.ok()).toBeTruthy();
-  // The delayed refresh has landed and run its handler; the entry must survive.
-  await expect(page.locator('#settings-anthropic-key')).toHaveValue('sk-ant-e2e-race-77zz');
-
-  // And Save must actually send it.
-  const [res] = await Promise.all([
-    page.waitForResponse(
-      (r) => r.url().includes('/api/settings/env') && r.request().method() === 'PATCH',
-    ),
-    page.locator('#settings-apikeys-section button', { hasText: 'Save' }).click(),
-  ]);
-  expect(res.status()).toBe(200);
-
-  // Restore the exact shared harness baseline. A present-but-empty value in
-  // server.env deliberately means CLEARED and shadows the process env; writing
-  // '' here used to remove the prerequisite for every later spec in this
-  // project's shared server. On a loaded CI runner settings finished before
-  // the terminal files, so one cleanup turned into 22 unrelated pointer-event
-  // timeouts behind the no-key banner. Keep the postcondition explicit so a
-  // future cleanup cannot silently poison the rest of the project again.
-  await page.unroute('**/api/settings/env');
-  const restore = await request.patch('/api/settings/env', {
-    headers: authHeaders(token),
-    data: { ANTHROPIC_API_KEY: E2E_ANTHROPIC_KEY },
-  });
-  expect(restore.status()).toBe(200);
-  const restored = (await (
-    await request.get('/api/settings/env', { headers: authHeaders(token) })
-  ).json()) as Record<string, string>;
-  expect(restored.ANTHROPIC_API_KEY).toMatch(/cret$/);
-});
-
 test('settings_commit_guard', async ({ page, request }) => {
   await settle(page);
   const token = await appToken(page);
@@ -616,6 +477,17 @@ test('settings_theme_toggle', async ({ page }, testInfo) => {
   testInfo.annotations.push({
     type: 'storage',
     description: 'localStorage amux_theme (device-scoped by design)',
+  });
+  // This tests THIS device's toggle. A fresh page also adopts the server's
+  // ui_theme, which themes.spec sets server-wide (Atom One Light) while one of
+  // its tests runs in a parallel worker on this same e2e server, so this page
+  // booted light (CI 40433057712, mobile). Keep the other spec's theme out.
+  await page.route(/\/api\/prefs$/, async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    const res = await route.fetch();
+    const prefs = await res.json();
+    delete prefs.ui_theme;
+    await route.fulfill({ response: res, json: prefs });
   });
   await settle(page);
   await openSettings(page);
@@ -781,7 +653,7 @@ test('settings_cloud_only_sections_stay_hidden', async ({ page }, testInfo) => {
 //
 // Provider probes are deliberately host-conditional: CI may have none of the
 // three subscription credentials. The invariant is wider than any one host:
-// all four shipped providers have a compact row, and every number/reset the
+// every shipped provider has a compact row, and every number/reset the
 // API measured is reachable by expanding that row. Degradation belongs to one
 // provider and must never hide the others.
 test('settings_usage_meter', async ({ page, request }) => {
@@ -798,8 +670,17 @@ test('settings_usage_meter', async ({ page, request }) => {
   expect(typeof wire.cache_ttl_s).toBe('number');
   expect(Array.isArray(wire.providers), 'usage response must enumerate providers').toBe(true);
   expect(wire.provider_count).toBe(wire.providers.length);
+  // EXACT, not a subset, on purpose: a provider appearing or disappearing from
+  // the meter is a thing to notice, not to tolerate. The cost is that shipping
+  // one makes this cell red, which is how it got here — dd13d663 added the Muse
+  // Code provider (and its own spec) without this list, and settings_usage_meter
+  // failed on all three browser projects for it (AMUX-4865).
+  //
+  // So if you are here because you shipped a provider: add it, that is the
+  // intended maintenance. The comment above says "all shipped providers have a
+  // compact row", and this list is what makes that claim checkable.
   expect(wire.providers.map((provider: any) => provider.id).sort()).toEqual([
-    'claude', 'codex', 'gemini', 'ollama',
+    'claude', 'codex', 'gemini', 'grok', 'muse', 'ollama', 'opencode',
   ]);
 
   await openSettings(page);
@@ -823,7 +704,10 @@ test('settings_usage_meter', async ({ page, request }) => {
     await expect(row, `missing ${provider.id} summary`).toHaveCount(1);
     const summary = row.locator('summary');
     await expect(summary).toContainText(provider.label);
-    if (!provider.available) await expect(summary).toContainText(provider.retry_at || ['rate_limited','probe_failed'].includes(provider.cause) ? 'Checking…' : provider.cause === 'account_quota_not_reported' ? 'Not reported' : 'Connect account');
+    // A signed-in provider whose usage reply was empty (cause unexpected_shape)
+    // reads "Usage not reported", never "Connect account" (MSG-92525).
+    if (!provider.available) await expect(summary).toContainText(provider.retry_at || ['rate_limited','probe_failed'].includes(provider.cause) ? 'Checking…'
+      : provider.cause === 'account_quota_not_reported' ? 'Not reported' : provider.cause === 'unexpected_shape' ? 'Usage not reported' : 'Connect account');
     if (provider.metered === false) await expect(summary).toContainText('Unlimited');
 
     if (!(await row.evaluate((element) => element.hasAttribute('open')))) await summary.click();
@@ -905,10 +789,30 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   const token = await appToken(page);
   await openSettings(page);
 
-  // Panel-open ran loadTeamSection: lazily-created org name + empty members.
+  // Panel-open ran loadTeamSection: lazily-created org name + the members list.
   const nameInput = page.locator('#settings-org-name');
   await expect(nameInput).toHaveValue('My Workspace');
-  await expect(page.locator('#settings-members-list')).toContainText('No members yet');
+
+  // MEMBERS ARE ASSERTED AGAINST WHAT THE SERVER HAS, not against a pristine
+  // one. Every project shares ONE server across the specs that run on it, and
+  // the multiplayer specs add members to this same org, so "No members yet"
+  // only holds when this spec happens to run before them. It did, until the
+  // first-run walkthrough stopped opening in CI and the other specs got ~1.5s
+  // faster, which reordered the interleaving and put "Alpha User" in this list
+  // (AMUX-4987). The assertion was pinned to a run order nothing guaranteed.
+  //
+  // The property still worth holding is that the list RENDERS what the server
+  // reports, in both of its two states, so both are checked here.
+  const memberRes = await request.get('/api/org/members', { headers: authHeaders(token) });
+  const memberRows = await memberRes.json();
+  const members = Array.isArray(memberRows) ? memberRows : [];
+  const membersList = page.locator('#settings-members-list');
+  if (members.length === 0) {
+    await expect(membersList).toContainText('No members yet');
+  } else {
+    await expect(membersList).not.toContainText('No members yet');
+    await expect(membersList).toContainText(String(members[0].name || members[0].email));
+  }
 
   // Rename the workspace through the UI (change commits on blur).
   await nameInput.fill('E2E Workspace');
@@ -933,9 +837,24 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   await expect(emailPrompt).toBeVisible();
   await emailPrompt.fill('invitee@example.com');
   await expect(page.locator('#invite-team-id')).toBeVisible();
-  await expect(page.locator('#invite-team-id')).toHaveValue('team_global');
+  // No team is preselected: an invite into the Global team grants host access,
+  // so the scope is a deliberate choice, and choosing Global asks for an
+  // explicit acknowledgement (grant_host_access, gtm-engine security report).
+  await expect(page.locator('#invite-team-id')).toHaveValue('');
   const teams = await (await request.get('/api/org/teams', { headers: authHeaders(token) })).json();
   expect(teams.some((team: any) => team.id === 'team_global')).toBe(true);
+  await page.locator('#invite-team-id').selectOption('team_global');
+  await expect(page.locator('#host-access-ack')).toBeVisible();
+  // Unticked: the form says what to do and sends nothing, rather than relaying the
+  // server's API wording (amux Cloud e2e C8-2).
+  let posted = 0;
+  const countPost = (r: any) => { if (r.url().endsWith('/api/org/invites') && r.method() === 'POST') posted++; };
+  page.on('request', countPost);
+  await page.locator('#team-scope-submit').click();
+  await expect(page.locator('#team-scope-error')).toContainText('Tick the box above');
+  expect(posted).toBe(0);
+  page.off('request', countPost);
+  await page.locator('#host-access-ack').check();
   const [invRes] = await Promise.all([
     page.waitForResponse(
       (r) => r.url().endsWith('/api/org/invites') && r.request().method() === 'POST',
@@ -983,6 +902,54 @@ test('settings_team_section', async ({ page, request }, testInfo) => {
   expect(patchBack.status()).toBe(200);
   const orgRestored = await (await request.get('/api/org', { headers: authHeaders(token) })).json();
   expect(orgRestored.name).toBe('My Workspace');
+});
+
+// The owner removes a teammate from Settings, and the teammate is signed out
+// (amux Cloud e2e C8-3: People offered only "change", so revoking took the API).
+test('settings_team_member_remove', async ({ page, request, browser }, testInfo) => {
+  await settle(page);
+  const token = await appToken(page);
+  const email = `remove-${Date.now()}@example.com`;
+  const invRes = await request.post('/api/org/invites', {
+    headers: authHeaders(token),
+    data: { email, team_id: 'team_global', grant_host_access: true },
+  });
+  const inv = await invRes.json();
+  expect(invRes.status(), JSON.stringify(inv)).toBe(201);
+  const mateCtx = await browser.newContext({ ignoreHTTPSErrors: true, serviceWorkers: 'block' });
+  const mate = await mateCtx.newPage();
+  try {
+    await mate.goto(`/invite/${inv.token}`);
+    await mate.locator('#name').fill('Removable Mate');
+    await Promise.all([
+      mate.waitForURL((url) => url.pathname === '/'),
+      mate.getByRole('button', { name: 'Join workspace' }).click(),
+    ]);
+    expect(await mate.evaluate(async () => (await fetch('/api/identity')).status)).toBe(200);
+
+    await openSettings(page);
+    const remove = page.locator(`#settings-members-list button[data-member-remove][data-email="${email}"]`);
+    // The People list loads after the panel opens; slow on a busy host.
+    await expect(remove).toBeVisible({ timeout: 20_000 });
+    // Cancel keeps them.
+    await remove.click();
+    await page.locator('#modal-btns button[onclick="_modalClose(false)"]').click();
+    let members = await (await request.get('/api/org/members', { headers: authHeaders(token) })).json();
+    expect(members.some((m: any) => m.email === email)).toBe(true);
+    // Confirm removes them, and their open session stops working.
+    await remove.click();
+    const [del] = await Promise.all([
+      page.waitForResponse((r) => r.url().includes('/api/org/members/') && r.request().method() === 'DELETE'),
+      page.locator('#modal-btns .btn.danger').click(),
+    ]);
+    expect(del.status()).toBe(200);
+    await expect(page.locator(`#settings-members-list [data-email="${email}"]`)).toHaveCount(0);
+    members = await (await request.get('/api/org/members', { headers: authHeaders(token) })).json();
+    expect(members.some((m: any) => m.email === email)).toBe(false);
+    expect(await mate.evaluate(async () => (await fetch('/api/identity')).status)).toBe(401);
+  } finally {
+    await cleanup('close teammate context', () => mateCtx.close(), testInfo);
+  }
 });
 
 // UN-FIXME'd 2026-08-11 (AMUX-2621/AMUX-2587): routed native [GET].

@@ -32,6 +32,22 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P)" || exit 0
 cd "$REPO" 2>/dev/null || exit 0
 git rev-parse --git-dir >/dev/null 2>&1 || exit 0
 
+# CONTRACT RULE 4 (AH-381): a lane the server launched into its own linked
+# worktree (AMUX_RULE4_ISOLATED=1) was cut from origin/main at launch and has no
+# peers in its tree, so the shared-checkout advice below does not apply. Stand
+# down, once-per-hour logged to the server log the contract counters read.
+if [ "${AMUX_RULE4_ISOLATED:-}" = "1" ] \
+   && [ "$(git rev-parse --git-dir 2>/dev/null)" != "$(git rev-parse --git-common-dir 2>/dev/null)" ]; then
+  _h="${AMUX_HOME:-$HOME/.amux}"
+  _mark="$_h/state/rule4-skip-freshness-${AMUX_SESSION:--}-$(( $(date +%s) / 3600 ))"
+  if [ ! -e "$_mark" ]; then
+    mkdir -p "$_h/state" 2>/dev/null && : > "$_mark" 2>/dev/null
+    printf '%s  INFO amux::hook: verdict="shared_guard_skipped_isolated" guard=freshness session=%s worktree=%s measured=true n_considered=1\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${AMUX_SESSION:--}" "$REPO" >> "$_h/logs/server-rs.log" 2>/dev/null
+  fi
+  exit 0
+fi
+
 out=""
 
 # ── Axis 1: is the checkout behind its remote? ───────────────────────────────
@@ -312,7 +328,11 @@ if [ -f "$REPO/amux" ]; then
     [ -f "$cand" ] || continue
     case " $seen_cli " in *" $cand "*) continue ;; esac
     seen_cli="$seen_cli $cand"
-    diff -q "$REPO/amux" "$cand" >/dev/null 2>&1 && continue
+    # install-cli.sh stamps CC_VERSION with the checkout's `git describe`, so an
+    # up-to-date install differs from the source in that one line. Compare with
+    # it put back to the placeholder, or every install would read as stale.
+    sed 's/^CC_VERSION="[^"]*"$/CC_VERSION="__AMUX_CLI_VERSION__"/' "$cand" 2>/dev/null \
+      | diff -q "$REPO/amux" - >/dev/null 2>&1 && continue
     # Installation must validate a snapshot before publishing it (ATE-136).
     # A symlink would publish every mid-edit and merge conflict to the fleet.
     # Difference alone does not authorize publishing this checkout's drafts.
@@ -459,6 +479,17 @@ if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
     out+="  - the PreToolUse large-read router differs from this checkout"$'\n'
     out+="    running: ${_rrd}"$'\n'
     out+=$'    every Read and Bash call on this box runs it; a repo edit reaches nobody until it is installed (AMUX-4544)\n'
+    out+=$'    ./scripts/install-hooks.sh   installs and verifies it now\n'
+  fi
+
+  # The status report hook, same blind spot (2026-10-07: a stale copy without
+  # the worker-token header had every report from rule-10 lanes refused).
+  _rhd="${AMUX_REPORT_HOOK_DEST:-$HOME/.amux/hook-report.sh}"
+  _rhs="$REPO/scripts/hooks/hook-report.sh"
+  if [ -f "$_rhs" ] && [ -f "$_rhd" ] && ! cmp -s "$_rhs" "$_rhd"; then
+    out+="  - the status report hook differs from this checkout"$'\n'
+    out+="    running: ${_rhd}"$'\n'
+    out+=$'    every lane reports its state through it; a repo edit reaches nobody until it is installed\n'
     out+=$'    ./scripts/install-hooks.sh   installs and verifies it now\n'
   fi
 

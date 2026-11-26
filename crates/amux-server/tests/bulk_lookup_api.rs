@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 fn app() -> axum::Router {
-    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let dir = amux_server::test_tempdirs::keep(tempfile::tempdir().unwrap());
     let store = amux_server::db::Store::open(&dir.path().join("bulk-lookup.db")).unwrap();
     router(AppState {
         store: std::sync::Arc::new(store),
@@ -47,7 +47,10 @@ async fn missing_question_is_a_measured_json_refusal() {
     assert_eq!(value["error"], "missing question");
     assert_eq!(value["measured"], false);
     assert_eq!(value["n_considered"], 0);
-    assert!(value["why_unmeasured"].as_str().unwrap().contains("validation"));
+    assert!(value["why_unmeasured"]
+        .as_str()
+        .unwrap()
+        .contains("validation"));
 }
 
 #[tokio::test]

@@ -30,39 +30,70 @@ trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 # instrument tracks, and it moves the numbers ONCE, on the record here.
 sqlite3 "file:${LIVE_DB}?mode=ro" "VACUUM INTO '$WORK/amux.db'"
 
-AMUX_HOME="$WORK" AMUX_DB="$WORK/amux.db" AMUX_RS_PORT=$PORT \
-  "${AMUX_RS_BIN:-./target/release/amux-server}" >"$WORK/server.log" 2>&1 &
-SERVER_PID=$!
-
-for _ in $(seq 1 60); do
-  curl -sk --max-time 2 "https://localhost:$PORT/health" >/dev/null 2>&1 && break
-  sleep 0.5
-done
+boot_server() {
+  AMUX_HOME="$WORK" AMUX_DB="$WORK/amux.db" AMUX_RS_PORT=$PORT \
+    "${AMUX_RS_BIN:-./target/release/amux-server}" >>"$WORK/server.log" 2>&1 &
+  SERVER_PID=$!
+  for _ in $(seq 1 60); do
+    curl -sk --max-time 2 "https://localhost:$PORT/health" >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+}
+boot_server
 
 TOKEN=$(cat "$WORK/auth-token" 2>/dev/null || echo "")
 
-measure() { # name url [auth]
-  local name=$1 url=$2 auth=${3:-}
-  local total=0 worst=0
-  for _ in 1 2 3 4 5; do
-    local t
+# RSS AT BOOT, before any request (AF-1094). rss_mb below is read after five
+# requests per endpoint, one of them the whole board, so it carries that
+# response's serialization high-water mark: the September step (rss 250 -> 388)
+# tracked board_default_bytes (3.7 -> 6.8 MB), not the boot heap. This one
+# moves only with what the server holds once it is up. Reported, not gated,
+# until it has a series of its own.
+RSS_BOOT_MB=$(ps -o rss= -p "$SERVER_PID" | awk '{print int($1/1024)}')
+
+# MEDIAN OF N, judged; average and worst still reported (AMUX-5712). Five
+# averaged samples on a shared runner moved 181 -> 202ms for board between two
+# runs of the SAME code, and health 13 -> 44ms, so the verdict tracked runner
+# weather and one 284ms outlier more than the code. The thresholds are
+# unchanged; only which statistic they are applied to.
+PERF_SAMPLES="${PERF_SAMPLES:-9}"
+# THE MEMORY READING STAYS WHERE IT WAS (AMUX-5833). RSS and dirty are read
+# after FIVE requests per endpoint, as before the median change. Reading them
+# after nine moved the allocator's high-water mark: rss 329-335 MB on the runs
+# before, 345 and 351 MB after (the extra 3.9 MB board reads), and the 350 MB
+# ceiling failed on the sample count, not on the code. So: five samples per
+# endpoint, the memory reading, then the remaining samples; medians over all.
+PERF_RSS_AFTER="${PERF_RSS_AFTER:-5}"
+SAMPLE_DIR="$WORK/perf-samples"; mkdir -p "$SAMPLE_DIR"
+sample() { # name url auth count -> appends ms values to $SAMPLE_DIR/name
+  local name=$1 url=$2 auth=$3 count=$4 t
+  for _ in $(seq 1 "$count"); do
     if [ -n "$auth" ]; then
       t=$(curl -sk -o /dev/null -w '%{time_total}' -H "Authorization: Bearer $TOKEN" "$url")
     else
       t=$(curl -sk -o /dev/null -w '%{time_total}' "$url")
     fi
-    t_ms=$(python3 -c "print(int(float('$t')*1000))")
-    total=$((total + t_ms))
-    [ "$t_ms" -gt "$worst" ] && worst=$t_ms
+    python3 -c "print(int(float('$t')*1000))" >> "$SAMPLE_DIR/$name"
   done
-  echo "\"${name}_avg_ms\": $((total / 5)), \"${name}_worst_ms\": $worst"
 }
-
-M1=$(measure dashboard "https://localhost:$PORT/")
-M2=$(measure health "https://localhost:$PORT/health")
-M3=$(measure board "https://localhost:$PORT/api/board" auth)
-M4=$(measure board_full "https://localhost:$PORT/api/board?done_limit=0" auth)
-M5=$(measure workers "https://localhost:$PORT/api/workers" auth)
+summarize() { # name -> the JSON fields over every sample taken
+  python3 - "$SAMPLE_DIR/$1" "$1" <<'PY'
+import sys
+v = [int(x) for x in open(sys.argv[1]).read().split()]
+n = sys.argv[2]
+s = sorted(v)
+print(f'"{n}_avg_ms": {sum(v)//len(v)}, "{n}_median_ms": {s[(len(s)+1)//2-1]}, "{n}_worst_ms": {max(v)}')
+PY
+}
+ENDPOINTS=(
+  "dashboard|https://localhost:$PORT/|"
+  "health|https://localhost:$PORT/health|"
+  "board|https://localhost:$PORT/api/board|auth"
+  "board_full|https://localhost:$PORT/api/board?done_limit=0|auth"
+  "workers|https://localhost:$PORT/api/workers|auth"
+)
+first=$(( PERF_SAMPLES < PERF_RSS_AFTER ? PERF_SAMPLES : PERF_RSS_AFTER ))
+for e in "${ENDPOINTS[@]}"; do IFS='|' read -r n u a <<<"$e"; sample "$n" "$u" "$a" "$first"; done
 RSS_MB=$(ps -o rss= -p "$SERVER_PID" | awk '{print int($1/1024)}')
 # DIRTY (live) heap alongside RSS (AMUX-3488). Measured 2026-08-22: across
 # repeated identical 30MB responses RSS climbed 176->229MB while malloc-dirty
@@ -73,21 +104,51 @@ RSS_MB=$(ps -o rss= -p "$SERVER_PID" | awk '{print int($1/1024)}')
 # Linux: Private_Dirty from smaps_rollup; macOS: the MALLOC rows' DIRTY
 # column summed. Empty when neither works (never fake a 0 — an absent
 # measurement must not read as a tiny heap).
-DIRTY_MB=""
-if [ -r "/proc/$SERVER_PID/smaps_rollup" ]; then
-  DIRTY_MB=$(awk '/^Private_Dirty:/{print int($2/1024)}' "/proc/$SERVER_PID/smaps_rollup")
-elif command -v vmmap >/dev/null 2>&1; then
-  DIRTY_MB=$(vmmap --summary "$SERVER_PID" 2>/dev/null | awk '
-    /^MALLOC/ {
-      v=$4  # DIRTY SIZE column of the region-type table
-      mult = (v ~ /G$/) ? 1024 : (v ~ /K$/) ? 1/1024 : 1
-      gsub(/[KMG]$/, "", v); total += v * mult
-    }
-    END { if (total > 0) print int(total) }')
+read_dirty() {
+  if [ -r "/proc/$SERVER_PID/smaps_rollup" ]; then
+    awk '/^Private_Dirty:/{print int($2/1024)}' "/proc/$SERVER_PID/smaps_rollup"
+  elif command -v vmmap >/dev/null 2>&1; then
+    vmmap --summary "$SERVER_PID" 2>/dev/null | awk '
+      /^MALLOC/ {
+        v=$4  # DIRTY SIZE column of the region-type table
+        mult = (v ~ /G$/) ? 1024 : (v ~ /K$/) ? 1/1024 : 1
+        gsub(/[KMG]$/, "", v); total += v * mult
+      }
+      END { if (total > 0) print int(total) }'
+  fi
+}
+DIRTY_MB=$(read_dirty)
+rest=$(( PERF_SAMPLES - first ))
+if [ "$rest" -gt 0 ]; then
+  for e in "${ENDPOINTS[@]}"; do IFS='|' read -r n u a <<<"$e"; sample "$n" "$u" "$a" "$rest"; done
 fi
+M1=$(summarize dashboard); M2=$(summarize health); M3=$(summarize board); M4=$(summarize board_full); M5=$(summarize workers)
 BOARD_BYTES=$(curl -sk -H "Authorization: Bearer $TOKEN" "https://localhost:$PORT/api/board" | wc -c | tr -d ' ')
 
-echo "{ $M1, $M2, $M3, $M4, $M5, \"rss_mb\": $RSS_MB, \"dirty_mb\": ${DIRTY_MB:-null}, \"board_default_bytes\": $BOARD_BYTES }"
+# MEDIAN OF FRESH BOOTS, judged (AF-1094). One ps read cannot tell a code change
+# from noise: October nightlies read 310-393 on a 350 ceiling, 4 of 15 at or over
+# it with no code growth, and 2026-11-01 failed at 352. Each extra boot takes the
+# same five requests per endpoint and is untimed, so the latency series above is
+# unchanged. rss_reads carries every read, so a real step stays visible.
+PERF_RSS_BOOTS="${PERF_RSS_BOOTS:-3}"
+RSS_READS="$RSS_MB"; DIRTY_READS="$DIRTY_MB"
+median() { python3 -c 'import sys; v=sorted(int(x) for x in sys.argv[1:]); print(v[len(v)//2] if v else "")' $1; }
+for _ in $(seq 2 "$PERF_RSS_BOOTS"); do
+  kill "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+  boot_server
+  for e in "${ENDPOINTS[@]}"; do
+    IFS='|' read -r n u a <<<"$e"
+    for _ in $(seq 1 "$first"); do
+      if [ -n "$a" ]; then curl -sk -o /dev/null -H "Authorization: Bearer $TOKEN" "$u"; else curl -sk -o /dev/null "$u"; fi
+    done
+  done
+  RSS_READS="$RSS_READS $(ps -o rss= -p "$SERVER_PID" | awk '{print int($1/1024)}')"
+  DIRTY_READS="$DIRTY_READS $(read_dirty)"
+done
+RSS_MB=$(median "$RSS_READS"); DIRTY_MB=$(median "$DIRTY_READS")
+
+echo "{ $M1, $M2, $M3, $M4, $M5, \"rss_mb\": $RSS_MB, \"rss_reads\": [$(echo $RSS_READS | tr ' ' ',')], \"rss_boot_mb\": ${RSS_BOOT_MB:-null}, \"dirty_mb\": ${DIRTY_MB:-null}, \"board_default_bytes\": $BOARD_BYTES }"
 
 # Target assertions — each CAN fail (ethos 7).
 #
@@ -106,10 +167,19 @@ echo "{ $M1, $M2, $M3, $M4, $M5, \"rss_mb\": $RSS_MB, \"dirty_mb\": ${DIRTY_MB:-
 # and route the reader to AMUX-3488.
 RSS_MAX_MB="${PERF_RSS_MAX_MB:-280}"
 fail=0
-avg() { echo "$1" | sed 's/.*_avg_ms": \([0-9]*\).*/\1/'; }
-[ "$(avg "$M1")" -lt 500 ] || { echo "FAIL: dashboard >= 500ms"; fail=1; }
-[ "$(avg "$M2")" -lt 50 ] || { echo "FAIL: health >= 50ms"; fail=1; }
-[ "$(avg "$M3")" -lt 200 ] || { echo "FAIL: board >= 200ms"; fail=1; }
+med() { echo "$1" | sed 's/.*_median_ms": \([0-9]*\).*/\1/'; }
+[ "$(med "$M1")" -lt 500 ] || { echo "FAIL: dashboard median >= 500ms"; fail=1; }
+[ "$(med "$M2")" -lt 50 ] || { echo "FAIL: health median >= 50ms"; fail=1; }
+[ "$(med "$M3")" -lt 200 ] || {
+  echo "FAIL: board median >= 200ms"
+  fail=1
+  # SAY WHERE (AMUX-5374). This gate was red for 30 nights with nothing but a
+  # total, and the time turned out to be in three different places. The server
+  # logs one `board_list_slow` line per slow read, split into
+  # queued/conn/sql/sessions/rows; print it while the log still exists.
+  grep -a "board_list_slow" "$WORK/server.log" | tail -2 | sed 's/^/  server: /' \
+    || echo "  server: no board_list_slow line (the handler itself was under budget; the time is in serialization or transport)"
+}
 [ "$RSS_MB" -lt "$RSS_MAX_MB" ] || { echo "FAIL: RSS ${RSS_MB}MB >= ${RSS_MAX_MB}MB (ceiling: PERF_RSS_MAX_MB, provenance above)"; fail=1; }
 # The LEAK detector (AMUX-3488): dirty is live heap, so on macOS it does not
 # inherit allocator weather — measured 30-45MB there against an RSS of 220+.

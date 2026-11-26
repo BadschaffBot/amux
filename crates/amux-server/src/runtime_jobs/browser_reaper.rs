@@ -200,7 +200,10 @@ pub fn has_real_page(targets: &[serde_json::Value]) -> bool {
         if t.get("type").and_then(serde_json::Value::as_str) != Some("page") {
             return false;
         }
-        let u = t.get("url").and_then(serde_json::Value::as_str).unwrap_or("");
+        let u = t
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         !(u.is_empty() || u == "about:blank" || u.starts_with("chrome://"))
     })
 }
@@ -226,6 +229,23 @@ pub fn should_reap_ttl(started_at: i64, now: f64, ttl: u64) -> bool {
         return false;
     }
     now - started_at as f64 >= ttl as f64
+}
+
+/// A verb this recent means a session is driving the browser right now.
+pub const TTL_IN_USE_GRACE_S: f64 = 300.0;
+
+/// Should the TTL arm wait for a quiet moment instead of killing now?
+///
+/// The TTL is a ceiling for browsers left running with pages open and nobody
+/// driving them (2026-08-30, 20+ Chrome instances in the dock). It was also
+/// killing browsers in active use: on 2026-10-26 a session joined a browser
+/// adopted from an earlier server, `age_s=1717802` against `ttl=14400`, and the
+/// TTL arm released it 90 seconds after the join, mid-login. Age since LAUNCH
+/// says nothing about whether anyone is driving it. A browser with a verb in
+/// the last [`TTL_IN_USE_GRACE_S`] is released at its first quiet tick, so an
+/// abandoned one still goes and a driven one finishes its step.
+pub fn ttl_defers_for_activity(last_verb_at: i64, now: f64) -> bool {
+    now - (last_verb_at as f64) < TTL_IN_USE_GRACE_S
 }
 
 fn now_f64() -> f64 {
@@ -259,7 +279,13 @@ pub async fn reap_stale_profiles(home: &std::path::Path) -> Vec<String> {
     let mut removed = vec![];
     for p in crate::integrations::browser::list_profiles(home, false) {
         let age_days = p.last_used.map(|lu| (now - lu as f64) / 86_400.0);
-        if !should_reap_profile(&p.name, p.registered, running.contains(&p.name), age_days, ttl) {
+        if !should_reap_profile(
+            &p.name,
+            p.registered,
+            running.contains(&p.name),
+            age_days,
+            ttl,
+        ) {
             continue;
         }
         match crate::integrations::browser::delete_profile(home, &p.name) {
@@ -281,7 +307,6 @@ pub async fn reap_stale_profiles(home: &std::path::Path) -> Vec<String> {
     removed
 }
 
-
 /// Why a browser was released. One variant per arm of `tick`, so the notice
 /// cannot drift from the reason the log line gives.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -297,7 +322,10 @@ pub enum ReapReason {
 impl ReapReason {
     fn sentence(&self) -> String {
         match *self {
-            ReapReason::NoActivity { since_verb_s, window_s } => format!(
+            ReapReason::NoActivity {
+                since_verb_s,
+                window_s,
+            } => format!(
                 "nothing had driven it for {}min (the activity window is {}min)",
                 since_verb_s / 60,
                 window_s / 60
@@ -335,10 +363,10 @@ pub fn reap_notice(profile: &str, reason: ReapReason) -> String {
          NOTHING WAS LOST that was saved: the profile's logins, cookies and \
          sessions are on disk and survive. What is gone is the running window and \
          whatever was only in it — an unsubmitted form, an unsaved page.\n\n\
-         IF A PERSON WAS USING THAT WINDOW, TELL THEM. They watched it disappear \
-         and amux has no way to reach them; from where they sit a window vanished \
-         for no reason. Say that amux closed it, say why, and say their logins \
-         survived.\n\n\
+         IF A PERSON WAS USING THAT WINDOW, TELL THEM, in your next reply: \
+         that reply is how they hear from you, and amux has no other way to \
+         reach them. From where they sit a window vanished for no reason. Say \
+         that amux closed it, say why, and say their logins survived.\n\n\
          Reopen it whenever you need it:\n\
          POST /api/browser/start {{\"profile\":\"{profile}\"}}\n\n\
          IF YOU WERE DRIVING IT OVER RAW CDP, that is why: the activity arm counts \
@@ -346,7 +374,11 @@ pub fn reap_notice(profile: &str, reason: ReapReason) -> String {
          reaper cannot see it. Send POST /api/browser/keepalive while you work and \
          the clock resets; `skills/chrome-cdp/scripts/cdp.mjs` does this for you on \
          every command (AMUX-4685).\n\n\
-         To stop this happening mid-task, widen or disable the window: \
+         For a long task, hold it open: `amux browser hold {profile} --for 2h` \
+         (POST /api/browser/hold {{\"profile\":\"{profile}\",\"for_s\":7200}}). \
+         amux also never closes a browser while a page is loading, and warns you \
+         about a minute before an inactivity close. To change the limits for \
+         every browser, widen or disable the window: \
          AMUX_BROWSER_ACTIVITY_REAP_S, AMUX_BROWSER_TTL_S, AMUX_BROWSER_IDLE_REAP_S \
          (0 disables an arm) in ~/.amux/server.env.",
         reason.sentence()
@@ -374,8 +406,25 @@ async fn notify_owner_of_reap(
         return;
     }
     let text = reap_notice(profile, reason);
+    // Joined sessions are driving tabs in this browser and lose them too; they
+    // used to get no notice at all, only a dead websocket on their next call.
+    for joiner in crate::integrations::browser::joiners_of(profile) {
+        if joiner == owner {
+            continue;
+        }
+        match crate::api::session_verbs::steer_enqueue_store(store, &joiner, &text, "browser-reaper", "browser-reaper").await {
+            Ok(_) => tracing::info!(profile = %profile, joiner = %joiner, reason = ?reason, verdict = "browser_reap_joiner_told",
+                "browser: told a joined session its shared browser was released"),
+            Err(e) => tracing::warn!(profile = %profile, joiner = %joiner, reason = ?reason, error = %e,
+                verdict = "browser_reap_joiner_untold", "browser: could not tell a joined session its shared browser was released"),
+        }
+    }
     match crate::api::session_verbs::steer_enqueue_store(
-        store, owner, &text, "browser-reaper", "browser-reaper",
+        store,
+        owner,
+        &text,
+        "browser-reaper",
+        "browser-reaper",
     )
     .await
     {
@@ -398,11 +447,158 @@ async fn tick(home: &std::path::Path, store: Option<&crate::db::SharedStore>) ->
     // pages. Disabling one must not silently disable the other — they were
     // independent knobs the moment there were two of them.
     reap_stale_profiles(home).await;
+    reap_route_chromes(home, activity_reap_s(), now_f64()).await;
+    keep_logins(home).await;
     tick_with_limits(home, store, reap_after_s(), activity_reap_s(), ttl_s()).await
 }
 
-async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::SharedStore>,
-    after_s: u64, activity_ttl: u64, ttl: u64) -> Vec<String> {
+/// Every running profile's session cookies go to disk each tick, so a browser
+/// that dies without a clean stop (a crash, a server restart that took it, a
+/// machine sleep) still comes back signed in. A login made since the last tick
+/// can be lost to a hard kill; a clean stop keeps it too (stop_profile_as).
+async fn keep_logins(_home: &std::path::Path) {
+    let mut kept = 0usize;
+    let mut failed = 0usize;
+    let running = crate::integrations::browser::running_all();
+    for (_profile, _owner, _started, _pid, port, _last_verb) in &running {
+        match crate::integrations::browser::keep_session_cookies(*port).await {
+            Ok(n) => kept += n,
+            Err(_) => failed += 1,
+        }
+    }
+    if kept > 0 || failed > 0 {
+        tracing::info!(kept, failed, profiles = running.len(), verdict = "browser_session_cookies_kept",
+            measured = true, n_considered = running.len(), "browser: session cookies kept on disk so logins survive a stop (values not logged)");
+    }
+}
+
+/// When a browser-routing CDP Chrome was last used, or `None` when unknown.
+///
+/// The driver rewrites a session's receipt on every verb, so a receipt's mtime
+/// is that route's last activity. A dir is in use by a receipt naming it as its
+/// current CDP route or as a retained previous route. `launched_at` (the
+/// DevToolsActivePort mtime) covers a Chrome no receipt names: one whose route
+/// was replaced or whose start never finished. Unknown declines to act.
+///
+/// Pure, so the rule has cells without a Chrome.
+pub fn route_chrome_last_activity(
+    dir: &str,
+    receipts: &[(serde_json::Value, f64)],
+    launched_at: Option<f64>,
+) -> Option<f64> {
+    let names = |r: &serde_json::Value| {
+        r.get("user_data_dir").and_then(serde_json::Value::as_str) == Some(dir)
+    };
+    receipts
+        .iter()
+        .filter(|(r, _)| {
+            names(r)
+                || r.get("previous_routes")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|p| p.iter().any(names))
+        })
+        .map(|(_, mtime)| *mtime)
+        .chain(launched_at)
+        .reduce(f64::max)
+}
+
+fn mtime_secs(path: &std::path::Path) -> Option<f64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs_f64())
+}
+
+/// Release browser-routing CDP Chromes nobody has driven for the activity
+/// window (`AMUX_BROWSER_ACTIVITY_REAP_S`, the same knob as the native arm).
+///
+/// The native arms below only see `running_all()`, and the routing driver
+/// launches its fallback Chrome detached, outside that registry. So these were
+/// never reaped, and on macOS a leftover one takes every link the user clicks
+/// while their own Chrome is closed (2026-10-13, see `stop_route_chrome`).
+///
+/// A route whose Chrome is released recovers on its next verb: the driver's
+/// dead-port error is non-terminal, so it relaunches, and it refuses to replay
+/// an action across the change.
+pub async fn reap_route_chromes(home: &std::path::Path, window_s: u64, now: f64) -> Vec<String> {
+    if window_s == 0 {
+        return vec![];
+    }
+    let root = crate::integrations::browser::route_chrome_root(home);
+    let Ok(dirs) = std::fs::read_dir(&root) else {
+        return vec![];
+    };
+    let receipts: Vec<(serde_json::Value, f64)> =
+        std::fs::read_dir(home.join("browser-routing").join("sessions"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| {
+                let v = serde_json::from_slice(&std::fs::read(e.path()).ok()?).ok()?;
+                Some((v, mtime_secs(&e.path())?))
+            })
+            .collect();
+    let mut reaped = vec![];
+    for dir in dirs.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        // No DevToolsActivePort means no Chrome ever served CDP from this dir.
+        let launched = mtime_secs(&dir.join("DevToolsActivePort"));
+        if launched.is_none() {
+            continue;
+        }
+        let key = format!("route:{}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+        if hold_until(home, &key).is_some_and(|u| u as f64 > now) {
+            continue;
+        }
+        // The same look at Chrome the native arms take: a driver amux never
+        // saw still moves pages or stays attached.
+        let port = std::fs::read_to_string(dir.join("DevToolsActivePort"))
+            .ok()
+            .and_then(|s| s.lines().next().and_then(|l| l.trim().parse::<u16>().ok()));
+        let mut loading = 0;
+        if let Some(port) = port {
+            if let Ok(a) = crate::integrations::browser::page_activity(port).await {
+                if saw_activity(&key, &a) {
+                    ROUTE_ACTIVE.lock().expect("browser reaper ROUTE_ACTIVE poisoned").insert(key.clone(), now);
+                }
+                loading = a.loading;
+            }
+        }
+        let seen = ROUTE_ACTIVE.lock().expect("browser reaper ROUTE_ACTIVE poisoned").get(&key).copied();
+        let last = route_chrome_last_activity(&dir.to_string_lossy(), &receipts, launched)
+            .into_iter()
+            .chain(seen)
+            .reduce(f64::max);
+        if !should_reap(last, now, window_s) {
+            continue;
+        }
+        if defer_for_loading(&key, loading, now) {
+            continue;
+        }
+        let n = crate::integrations::browser::stop_route_chrome(home, &dir).await;
+        if n > 0 {
+            tracing::info!(
+                dir = %dir.display(), pids = n,
+                since_activity_s = last.map(|t| (now - t) as i64).unwrap_or(-1), window_s,
+                "browser: released an idle browser-routing Chrome \
+                 (AMUX_BROWSER_ACTIVITY_REAP_S). Its copied profile stays on disk."
+            );
+            reaped.push(dir.display().to_string());
+        }
+    }
+    reaped
+}
+
+pub(crate) async fn tick_with_limits(
+    home: &std::path::Path,
+    store: Option<&crate::db::SharedStore>,
+    after_s: u64,
+    activity_ttl: u64,
+    ttl: u64,
+) -> Vec<String> {
     let mut reaped = vec![];
     let now = now_f64();
     // `None` when the process never recorded a boot (tests), which the log line
@@ -411,12 +607,49 @@ async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::Shar
     let boot = crate::runtime_jobs::heartbeat::boot_at();
     let prior = read_idle(home);
     let mut next: HashMap<String, f64> = HashMap::new();
-    for (profile, owner, started, _pid, port, last_verb) in crate::integrations::browser::running_all() {
+    for (profile, owner, started, _pid, port, last_verb) in
+        crate::integrations::browser::running_all()
+    {
+        // HELD: the owner asked for it to stay open (`amux browser hold`), so
+        // no arm closes it until the hold ends.
+        if let Some(until) = hold_until(home, &profile).filter(|u| *u as f64 > now) {
+            tracing::debug!(profile = %profile, until, verdict = "browser_reap_held", "browser: held open, no arm applies");
+            continue;
+        }
+        // PARKED FOR THE OWNER: its worker has a card in needsyou, so the
+        // browser is very likely the page the owner was asked to finish.
+        if let Some(card) = store.and_then(|s| parked_for_owner(s, &owner, now as i64, last_verb)) {
+            tracing::info!(profile = %profile, owner = %owner, card = %card, measured = true, n_considered = 1,
+                verdict = "browser_reap_parked_for_owner",
+                "browser: its worker is waiting on the owner (needsyou), held open like a hold");
+            continue;
+        }
+        // What Chrome itself says the pages are doing. A driver amux did not
+        // carry (raw CDP, a polled `route state`) still moves pages or stays
+        // attached, and that is activity (NetSuite, 2026-10-26).
+        let seen = crate::integrations::browser::page_activity(port).await.ok();
+        let mut last_verb = last_verb;
+        if let Some(a) = &seen {
+            if saw_activity(&profile, a) {
+                crate::integrations::browser::touch_verb(&profile);
+                last_verb = now as i64;
+                tracing::debug!(profile = %profile, attached = a.attached, pages = a.pages, verdict = "browser_activity_seen",
+                    "browser: pages changed or a driver is attached; the activity clock moved");
+            }
+        }
+        let loading = seen.as_ref().map_or(0, |a| a.loading);
         // ACTIVITY ARM: no verb for N seconds = abandoned, release it. Checked
         // before the page-presence arms because it fires fastest and the reason
         // is the most actionable ("nobody is driving this") not just "it is old".
         if activity_ttl > 0 {
             let since_verb = now - last_verb as f64;
+            let left = activity_ttl as f64 - since_verb;
+            if left > 0.0 && left <= (tick_secs() + 60) as f64 {
+                warn_before_close(store, &owner, &profile, last_verb, left as i64).await;
+            }
+            if since_verb >= activity_ttl as f64 && defer_for_loading(&profile, loading, now) {
+                continue;
+            }
             if since_verb >= activity_ttl as f64 {
                 tracing::info!(
                     profile = %profile, owner = %owner,
@@ -424,12 +657,19 @@ async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::Shar
                     "browser: no activity for the whole window — releasing \
                      (AMUX_BROWSER_ACTIVITY_REAP_S). Logins survive on disk."
                 );
-                crate::integrations::browser::stop_profile_as(home, &profile, "activity-reaper").await;
+                record_released(home, &owner, &profile, port, "activity").await;
+                crate::integrations::browser::stop_profile_as(home, &profile, "activity-reaper")
+                    .await;
                 if let Some(st) = store {
-                    notify_owner_of_reap(st, &owner, &profile, ReapReason::NoActivity {
-                        since_verb_s: since_verb as i64,
-                        window_s: activity_ttl,
-                    })
+                    notify_owner_of_reap(
+                        st,
+                        &owner,
+                        &profile,
+                        ReapReason::NoActivity {
+                            since_verb_s: since_verb as i64,
+                            window_s: activity_ttl,
+                        },
+                    )
                     .await;
                 }
                 next.remove(&profile);
@@ -441,19 +681,37 @@ async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::Shar
         // browser that hit the TTL is not also logged as "idle" — one reason,
         // one log line (2026-08-30: 20+ Chrome instances in the dock, none
         // caught by the idle arm because they all had at least one open page).
-        if should_reap_ttl(started, now, ttl) {
+        if should_reap_ttl(started, now, ttl) && defer_for_loading(&profile, loading, now) {
+            continue;
+        }
+        if should_reap_ttl(started, now, ttl) && ttl_defers_for_activity(last_verb, now) {
+            tracing::info!(
+                profile = %profile, owner = %owner,
+                age_s = (now - started as f64) as i64, ttl,
+                since_verb_s = (now - last_verb as f64) as i64,
+                verdict = "browser_ttl_deferred_in_use",
+                "browser: past its TTL but driven in the last few minutes — releasing at the \
+                 first quiet tick instead of mid-step"
+            );
+        } else if should_reap_ttl(started, now, ttl) {
             let age_s = now - started as f64;
             tracing::warn!(
                 profile = %profile, owner = %owner, age_s = age_s as i64, ttl,
                 "browser: TTL exceeded — releasing profile (AMUX_BROWSER_TTL_S). \
                  Any open page is lost; saved login is on disk and survives."
             );
+            record_released(home, &owner, &profile, port, "ttl").await;
             crate::integrations::browser::stop_profile_as(home, &profile, "ttl-reaper").await;
             if let Some(st) = store {
-                notify_owner_of_reap(st, &owner, &profile, ReapReason::Ttl {
-                    age_s: age_s as i64,
-                    ttl_s: ttl,
-                })
+                notify_owner_of_reap(
+                    st,
+                    &owner,
+                    &profile,
+                    ReapReason::Ttl {
+                        age_s: age_s as i64,
+                        ttl_s: ttl,
+                    },
+                )
                 .await;
             }
             next.remove(&profile);
@@ -461,7 +719,9 @@ async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::Shar
             continue;
         }
         // Disabling continuous-empty expiry must not disable the two age limits.
-        if after_s == 0 { continue; }
+        if after_s == 0 {
+            continue;
+        }
         // CDP SILENCE IS NOT EMPTINESS. A browser that will not answer is left
         // alone: killing it would turn a transient wedge into a destroyed
         // session, and this job's whole safety argument rests on knowing there
@@ -470,7 +730,10 @@ async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::Shar
         let Ok(listed) = crate::integrations::browser::cdp_list(port).await else {
             continue;
         };
-        let empty = listed.as_array().map(|a| !has_real_page(a)).unwrap_or(false);
+        let empty = listed
+            .as_array()
+            .map(|a| !has_real_page(a))
+            .unwrap_or(false);
         if !empty {
             // One real page anywhere resets the clock: the entry is simply not
             // carried into `next`, which is written back at the end.
@@ -496,10 +759,15 @@ async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::Shar
         // that vanished with nothing on record cost two sessions a morning.
         crate::integrations::browser::stop_profile_as(home, &profile, "idle-reaper").await;
         if let Some(st) = store {
-            notify_owner_of_reap(st, &owner, &profile, ReapReason::Idle {
-                idle_s: idle_s as i64,
-                window_s: after_s,
-            })
+            notify_owner_of_reap(
+                st,
+                &owner,
+                &profile,
+                ReapReason::Idle {
+                    idle_s: idle_s as i64,
+                    window_s: after_s,
+                },
+            )
             .await;
         }
         next.remove(&profile);
@@ -513,13 +781,174 @@ async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::Shar
     reaped
 }
 
+static SEEN: std::sync::LazyLock<std::sync::Mutex<HashMap<String, crate::integrations::browser::PageActivity>>> =
+    std::sync::LazyLock::new(Default::default);
+static LOADING_SINCE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, f64>>> = std::sync::LazyLock::new(Default::default);
+static ROUTE_ACTIVE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, f64>>> = std::sync::LazyLock::new(Default::default);
+static WARNED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, i64>>> = std::sync::LazyLock::new(Default::default);
+
+/// Did this browser's pages show work since the last look? A driver attached
+/// now, or a page whose id, URL or title changed. The first look has nothing
+/// to compare with and is not activity.
+fn saw_activity(key: &str, now: &crate::integrations::browser::PageActivity) -> bool {
+    let mut seen = SEEN.lock().expect("browser reaper SEEN poisoned");
+    let before = seen.insert(key.to_string(), now.clone());
+    activity_between(before.as_ref(), now)
+}
+
+/// Pure half of [`saw_activity`].
+pub fn activity_between(
+    before: Option<&crate::integrations::browser::PageActivity>,
+    now: &crate::integrations::browser::PageActivity,
+) -> bool {
+    now.attached > 0 || before.is_some_and(|b| b.fingerprint != now.fingerprint)
+}
+
+/// How long a reap waits for a loading page, at most. A page that never
+/// finishes (a stream, a hung report) must not hold a browser forever.
+pub fn loading_grace_s() -> f64 {
+    std::env::var("AMUX_BROWSER_LOADING_GRACE_S").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(600.0)
+}
+
+/// True when a due reap should wait: a page is still loading and the grace
+/// has not run out. Logged, so a deferral is never silent.
+fn defer_for_loading(key: &str, loading: usize, now: f64) -> bool {
+    let mut m = LOADING_SINCE.lock().expect("browser reaper LOADING_SINCE poisoned");
+    if loading == 0 {
+        m.remove(key);
+        return false;
+    }
+    let since = *m.entry(key.to_string()).or_insert(now);
+    let wait = loading_defer(since, now, loading_grace_s());
+    tracing::info!(profile = %key, loading, waited_s = (now - since) as i64, verdict = if wait { "browser_reap_deferred_loading" } else { "browser_reap_loading_grace_over" },
+        "browser: a page is still loading; the close {}", if wait { "waits for it" } else { "goes ahead, the grace is over" });
+    wait
+}
+
+/// Pure half of [`defer_for_loading`].
+pub fn loading_defer(since: f64, now: f64, grace_s: f64) -> bool {
+    now - since < grace_s
+}
+
+/// Tell the owning lane its browser closes soon, once per quiet stretch.
+async fn warn_before_close(store: Option<&crate::db::SharedStore>, owner: &str, profile: &str, last_verb: i64, left_s: i64) {
+    {
+        let mut w = WARNED.lock().expect("browser reaper WARNED poisoned");
+        if w.get(profile) == Some(&last_verb) {
+            return;
+        }
+        w.insert(profile.to_string(), last_verb);
+    }
+    tracing::info!(profile = %profile, owner = %owner, left_s, verdict = "browser_close_warned", "browser: told the owner its browser closes soon");
+    let (Some(st), false) = (store, owner.trim().is_empty()) else { return };
+    if let Err(e) = crate::api::session_verbs::steer_enqueue_store(st, owner.trim(), &closing_notice(profile, left_s), "browser-reaper", "browser-reaper").await {
+        tracing::warn!(profile = %profile, owner = %owner, error = %e, "browser: could not warn the owning lane before closing its browser");
+    }
+}
+
+/// The warning a lane gets before its browser is closed for inactivity.
+pub fn closing_notice(profile: &str, left_s: i64) -> String {
+    format!(
+        "[amux] Your browser on profile {profile:?} closes in about {}s: nothing has driven it for a while.\n\n\
+         To keep it open: any `amux browser` command, POST /api/browser/keepalive, or \
+         `amux browser hold {profile} --for 2h` for a long task. A page that is still loading is never closed under you.",
+        left_s.max(0)
+    )
+}
+
+/// The needsyou card a browser's worker is waiting on, if any (AF-1025).
+///
+/// A worker that hands the owner a half-finished page ("finish the Zapier
+/// sign-up") parks its card in needsyou and stops driving the browser, which
+/// is exactly what the activity arm reads as abandoned: on 2026-10-13 the
+/// ethan browser at zapier.com/sign-up closed after 6 minutes, before the
+/// owner opened the link. While the worker has a card in needsyou that
+/// entered that state within [`hold_max_s`], its browsers are treated as held.
+/// Past that, an unanswered ask no longer pins a browser.
+///
+/// AND THE CARD MUST BE THE HANDOFF, not an older ask that happens to be open:
+/// a handoff parks its card as the worker walks away from the page, so it
+/// entered needsyou no earlier than [`HANDOFF_SLACK_S`] before the browser was
+/// last driven. Live on the first deploy, tubescience-parity's TP-212 (a
+/// production-data decision parked 7.8 h earlier, with the browser driven
+/// since) was holding ethan-tubescience open.
+pub const HANDOFF_SLACK_S: i64 = 600;
+
+pub fn parked_for_owner(store: &crate::db::SharedStore, owner: &str, now: i64, last_verb: i64) -> Option<String> {
+    if owner.is_empty() {
+        return None;
+    }
+    let conn = store.read().ok()?;
+    conn.query_row(
+        "SELECT id FROM issues WHERE session = ?1 AND status = 'needsyou' AND deleted IS NULL \
+           AND COALESCE(archived,0) = 0 AND COALESCE(entered_state_at, updated, 0) >= ?2 \
+           AND COALESCE(entered_state_at, updated, 0) >= ?3 \
+         ORDER BY COALESCE(entered_state_at, updated, 0) DESC LIMIT 1",
+        rusqlite::params![owner, now - hold_max_s(), last_verb - HANDOFF_SLACK_S],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+// ── Holds: "keep this browser open for N" (`amux browser hold`) ──
+fn holds_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("browser-holds.json")
+}
+pub fn read_holds(home: &std::path::Path) -> HashMap<String, i64> {
+    std::fs::read(holds_path(home)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+pub fn hold_until(home: &std::path::Path, name: &str) -> Option<i64> {
+    read_holds(home).get(name).copied()
+}
+/// The longest hold amux grants (`AMUX_BROWSER_HOLD_MAX_S`, default 24h).
+pub fn hold_max_s() -> i64 {
+    std::env::var("AMUX_BROWSER_HOLD_MAX_S").ok().and_then(|v| v.trim().parse::<i64>().ok()).unwrap_or(24 * 3600)
+}
+/// Hold `name` open until now + `for_s` (capped), or release it with 0.
+/// Expired holds are pruned on every write. Returns the until it stored.
+pub fn set_hold(home: &std::path::Path, name: &str, for_s: i64, now: i64) -> Option<i64> {
+    let mut m = read_holds(home);
+    m.retain(|_, u| *u > now);
+    let until = (for_s > 0).then(|| now + for_s.min(hold_max_s()));
+    match until {
+        Some(u) => { m.insert(name.to_string(), u); }
+        None => { m.remove(name); }
+    }
+    if let Ok(b) = serde_json::to_vec_pretty(&m) {
+        let tmp = holds_path(home).with_extension("json.tmp");
+        if std::fs::write(&tmp, b).is_ok() {
+            let _ = std::fs::rename(&tmp, holds_path(home));
+        }
+    }
+    until
+}
+
+/// When each running browser will be closed and by which arm, for
+/// `amux browser status` (`closes_at`, unix seconds; None when no arm can).
+pub fn closes_at(home: &std::path::Path, profile: &str, started: i64, last_verb: i64) -> (Option<i64>, &'static str) {
+    if let Some(u) = hold_until(home, profile).filter(|u| *u > crate::integrations::browser::now_secs_i64()) {
+        return (Some(u), "held until");
+    }
+    let mut best: (Option<i64>, &'static str) = (None, "");
+    let mut take = |t: i64, why: &'static str| if best.0.is_none_or(|b| t < b) { best = (Some(t), why) };
+    if activity_reap_s() > 0 { take(last_verb + activity_reap_s() as i64, "no activity"); }
+    if ttl_s() > 0 { take(started + ttl_s() as i64, "age limit"); }
+    if let (Some(first), true) = (read_idle(home).get(profile).copied(), reap_after_s() > 0) {
+        take(first as i64 + reap_after_s() as i64, "no page open");
+    }
+    best
+}
+
 /// How long each running profile has been continuously empty, for
 /// `/api/browser/status` (AMUX-3829). The countdown was invisible: the only way
 /// to know whether a browser was about to be reaped was to read the process's
 /// memory, so a reaper that could never fire looked identical to one that was
 /// about to.
 pub fn idle_ages(home: &std::path::Path, now: f64) -> HashMap<String, f64> {
-    read_idle(home).into_iter().map(|(k, t)| (k, (now - t).max(0.0))).collect()
+    read_idle(home)
+        .into_iter()
+        .map(|(k, t)| (k, (now - t).max(0.0)))
+        .collect()
 }
 
 /// Spawn the loop, registered so a dead reaper is visible on
@@ -544,6 +973,17 @@ pub fn spawn(store: crate::db::SharedStore) {
 
 #[cfg(test)]
 mod tests {
+    /// The TTL arm waits while the browser is being driven and fires once it
+    /// goes quiet (2026-10-26: released 90s after a join, `age_s=1717802`).
+    #[test]
+    fn ttl_waits_for_a_quiet_moment_on_a_driven_browser() {
+        let now = 2_000_000.0;
+        let started = 0; // launched long before the TTL
+        assert!(super::should_reap_ttl(started, now, 14_400), "past its TTL");
+        assert!(super::ttl_defers_for_activity((now - 60.0) as i64, now), "driven a minute ago: wait");
+        assert!(!super::ttl_defers_for_activity((now - 301.0) as i64, now), "quiet for 5 min: release");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -572,7 +1012,10 @@ mod tests {
         // and this test deliberately does not take HomeGuard (see below), so a
         // fleet lane sharing the old literal name ("gtm-engine", paused on the
         // amux host since 2026-09-14) made this fail on that host and pass in CI.
-        let owner = format!("reaper-notice-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let owner = format!(
+            "reaper-notice-{}",
+            ulid::Ulid::new().to_string().to_lowercase()
+        );
 
         // Prove the target exists through the durable worker row that the
         // enqueue chokepoint already understands. Do not take HomeGuard here:
@@ -620,11 +1063,17 @@ mod tests {
             reaped
         })
         .await;
-        assert_eq!(reaped, vec!["hubspot".to_string()], "the activity arm did not fire");
+        assert_eq!(
+            reaped,
+            vec!["hubspot".to_string()],
+            "the activity arm did not fire"
+        );
 
         let rows: Vec<(String, String)> = {
             let conn = store.read().unwrap();
-            let mut st = conn.prepare("SELECT session, text FROM steering_queue").unwrap();
+            let mut st = conn
+                .prepare("SELECT session, text FROM steering_queue")
+                .unwrap();
             let out = st
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .unwrap()
@@ -636,12 +1085,12 @@ mod tests {
         crate::integrations::browser::test_seed_running_port("ttl-only", &owner, u32::MAX, 1);
         let expired = crate::integrations::browser::test_with_kill_capture(async {
             tick_with_limits(home.path(), Some(&store), 0, 0, 1).await
-        }).await;
+        })
+        .await;
         assert_eq!(expired, vec!["ttl-only".to_string()]);
         crate::integrations::browser::test_clear_running();
 
-        let mine: Vec<&(String, String)> =
-            rows.iter().filter(|(s, _)| *s == owner).collect();
+        let mine: Vec<&(String, String)> = rows.iter().filter(|(s, _)| *s == owner).collect();
         assert_eq!(
             mine.len(),
             1,
@@ -654,6 +1103,111 @@ mod tests {
         );
     }
 
+    /// The real tick: a browser past its TTL that was driven a moment ago is
+    /// kept, the same browser once quiet is released, and a session that JOINED
+    /// it is told as well as its owner (2026-10-26: released 90 seconds after a
+    /// join, and the joiner learned it from a dead websocket).
+    #[tokio::test]
+    async fn the_ttl_spares_a_driven_browser_and_the_reap_tells_its_joiners() {
+        let _reg = crate::integrations::browser::TEST_REGISTRY.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let store: crate::db::SharedStore =
+            std::sync::Arc::new(crate::db::Store::open(&db.path().join("t.db")).unwrap());
+        let tag = ulid::Ulid::new().to_string().to_lowercase();
+        let (owner, joiner) = (format!("ttl-owner-{tag}"), format!("ttl-joiner-{tag}"));
+        for (id, name) in [("wrk_ttl_owner", &owner), ("wrk_ttl_joiner", &joiner)] {
+            let (id, name) = (id.to_string(), name.clone());
+            store
+                .write_async(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_workers \
+                         (id, display_name, name_aliases, cwd, provider, model, state, created_at, updated_at) \
+                         VALUES (?1, ?2, '[]', '/tmp', 'claude', 'test', '{\"state\":\"stopped\"}', \
+                                 '2026-10-26T00:00:00Z', '2026-10-26T00:00:00Z')",
+                        [&id, &name],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .await
+                .unwrap();
+        }
+        crate::integrations::browser::test_clear_running();
+        crate::integrations::browser::test_seed_running_port("shared-ttl", &owner, u32::MAX, 1);
+        crate::integrations::browser::JOINED.lock().unwrap().insert(
+            joiner.clone(),
+            crate::integrations::browser::Join { profile: "shared-ttl".into(), tab: "T".into(), pid: 0 },
+        );
+        // Driven just now: started_at 0 is far past ttl=1, and the TTL waits.
+        crate::integrations::browser::touch_verb("shared-ttl");
+        let kept = crate::integrations::browser::test_with_kill_capture(async {
+            tick_with_limits(home.path(), Some(&store), 0, 0, 1).await
+        })
+        .await;
+        assert!(kept.is_empty(), "a browser driven a moment ago was released by the TTL: {kept:?}");
+        // Quiet: the last verb is older than the in-use grace, so the TTL fires.
+        crate::integrations::browser::test_clear_running();
+        crate::integrations::browser::test_seed_running_port("shared-ttl", &owner, u32::MAX, 1);
+        let released = crate::integrations::browser::test_with_kill_capture(async {
+            tick_with_limits(home.path(), Some(&store), 0, 0, 1).await
+        })
+        .await;
+        assert_eq!(released, vec!["shared-ttl".to_string()]);
+        crate::integrations::browser::JOINED.lock().unwrap().remove(&joiner);
+        crate::integrations::browser::test_clear_running();
+        let told: Vec<String> = {
+            let conn = store.read().unwrap();
+            let mut st = conn.prepare("SELECT session FROM steering_queue").unwrap();
+            let v = st.query_map([], |r| r.get(0)).unwrap().filter_map(Result::ok).collect();
+            v
+        };
+        assert!(told.contains(&owner), "the owner was not told: {told:?}");
+        assert!(told.contains(&joiner), "the joined session was not told: {told:?}");
+    }
+
+    /// A routing Chrome's activity is its newest receipt, current or retained,
+    /// and its launch time when no receipt names it (the 2026-10-13 orphan).
+    #[test]
+    fn route_chrome_activity_reads_receipts_and_falls_back_to_launch() {
+        let d = "/h/browser-routing/chrome/abc";
+        let receipts = vec![
+            (json!({"backend":"cdp","user_data_dir":d}), 500.0),
+            (
+                json!({"backend":"amux","previous_routes":[{"user_data_dir":d}]}),
+                900.0,
+            ),
+            (
+                json!({"backend":"cdp","user_data_dir":"/h/browser-routing/chrome/other"}),
+                2000.0,
+            ),
+        ];
+        assert_eq!(
+            route_chrome_last_activity(d, &receipts, Some(100.0)),
+            Some(900.0)
+        );
+        // Orphan: nothing names it, so launch time decides, and it reaps.
+        let orphan =
+            route_chrome_last_activity("/h/browser-routing/chrome/zzz", &receipts, Some(100.0));
+        assert_eq!(orphan, Some(100.0));
+        assert!(should_reap(orphan, 400.0, 300));
+        assert!(!should_reap(orphan, 399.0, 300));
+        // Unknown activity never reaps.
+        assert_eq!(route_chrome_last_activity("/x", &[], None), None);
+        assert!(!should_reap(None, 1e12, 300));
+    }
+
+    /// The stop helper refuses any dir outside the routing root, so the
+    /// user's own Chrome can never be signalled by this arm.
+    #[tokio::test]
+    async fn stop_route_chrome_refuses_dirs_outside_the_routing_root() {
+        let n = crate::integrations::browser::stop_route_chrome(
+            std::path::Path::new("/h"),
+            std::path::Path::new("/Users/x/Library/Application Support/Google/Chrome"),
+        )
+        .await;
+        assert_eq!(n, 0);
+    }
+
     /// THE CELL THIS EXISTS FOR. The reaper already knew the profile, the owner
     /// and the reason and wrote all three to the log; the one party who needed
     /// them got nothing. The notice has to carry each, and it has to tell the
@@ -661,9 +1215,18 @@ mod tests {
     /// and amux has no channel to them.
     #[test]
     fn the_notice_names_the_profile_the_reason_and_asks_the_lane_to_tell_the_person() {
-        let n = reap_notice("hubspot", ReapReason::Idle { idle_s: 1800, window_s: 900 });
+        let n = reap_notice(
+            "hubspot",
+            ReapReason::Idle {
+                idle_s: 1800,
+                window_s: 900,
+            },
+        );
         assert!(n.contains("hubspot"), "the profile is not named: {n}");
-        assert!(n.contains("no page open for 30min"), "the reason is not stated: {n}");
+        assert!(
+            n.contains("no page open for 30min"),
+            "the reason is not stated: {n}"
+        );
         assert!(
             n.contains("IF A PERSON WAS USING THAT WINDOW, TELL THEM"),
             "the notice never asks the lane to pass it on, which is the whole gap: {n}"
@@ -675,13 +1238,28 @@ mod tests {
     #[test]
     fn the_notice_says_the_logins_survived() {
         for r in [
-            ReapReason::Idle { idle_s: 900, window_s: 900 },
-            ReapReason::Ttl { age_s: 7200, ttl_s: 3600 },
-            ReapReason::NoActivity { since_verb_s: 600, window_s: 600 },
+            ReapReason::Idle {
+                idle_s: 900,
+                window_s: 900,
+            },
+            ReapReason::Ttl {
+                age_s: 7200,
+                ttl_s: 3600,
+            },
+            ReapReason::NoActivity {
+                since_verb_s: 600,
+                window_s: 600,
+            },
         ] {
             let n = reap_notice("default", r);
-            assert!(n.contains("survive"), "no reassurance about saved state in {r:?}: {n}");
-            assert!(n.contains("/api/browser/start"), "no way back in {r:?}: {n}");
+            assert!(
+                n.contains("survive"),
+                "no reassurance about saved state in {r:?}: {n}"
+            );
+            assert!(
+                n.contains("/api/browser/start"),
+                "no way back in {r:?}: {n}"
+            );
         }
     }
 
@@ -691,9 +1269,27 @@ mod tests {
     /// news, and a shared sentence would make them read as one.
     #[test]
     fn every_reap_reason_produces_its_own_sentence() {
-        let a = reap_notice("p", ReapReason::NoActivity { since_verb_s: 600, window_s: 600 });
-        let b = reap_notice("p", ReapReason::Ttl { age_s: 7200, ttl_s: 3600 });
-        let c = reap_notice("p", ReapReason::Idle { idle_s: 900, window_s: 900 });
+        let a = reap_notice(
+            "p",
+            ReapReason::NoActivity {
+                since_verb_s: 600,
+                window_s: 600,
+            },
+        );
+        let b = reap_notice(
+            "p",
+            ReapReason::Ttl {
+                age_s: 7200,
+                ttl_s: 3600,
+            },
+        );
+        let c = reap_notice(
+            "p",
+            ReapReason::Idle {
+                idle_s: 900,
+                window_s: 900,
+            },
+        );
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
@@ -718,8 +1314,17 @@ mod tests {
     /// byte what a detached browser answers. The driver has to say so.
     #[test]
     fn the_notice_names_the_keepalive_a_cdp_driver_can_send() {
-        let n = reap_notice("default", ReapReason::NoActivity { since_verb_s: 600, window_s: 600 });
-        assert!(n.contains("/api/browser/keepalive"), "the route is not named: {n}");
+        let n = reap_notice(
+            "default",
+            ReapReason::NoActivity {
+                since_verb_s: 600,
+                window_s: 600,
+            },
+        );
+        assert!(
+            n.contains("/api/browser/keepalive"),
+            "the route is not named: {n}"
+        );
         assert!(n.contains("raw CDP"), "nor the cause it addresses: {n}");
         assert!(
             n.contains("cdp.mjs"),
@@ -733,8 +1338,18 @@ mod tests {
     /// more.
     #[test]
     fn the_notice_names_the_knobs_that_prevent_a_recurrence() {
-        let n = reap_notice("default", ReapReason::Ttl { age_s: 7200, ttl_s: 3600 });
-        for knob in ["AMUX_BROWSER_ACTIVITY_REAP_S", "AMUX_BROWSER_TTL_S", "AMUX_BROWSER_IDLE_REAP_S"] {
+        let n = reap_notice(
+            "default",
+            ReapReason::Ttl {
+                age_s: 7200,
+                ttl_s: 3600,
+            },
+        );
+        for knob in [
+            "AMUX_BROWSER_ACTIVITY_REAP_S",
+            "AMUX_BROWSER_TTL_S",
+            "AMUX_BROWSER_IDLE_REAP_S",
+        ] {
             assert!(n.contains(knob), "{knob} is not offered: {n}");
         }
     }
@@ -751,10 +1366,15 @@ mod tests {
         assert!(!has_real_page(&[page("")]));
         assert!(!has_real_page(&[]), "no targets at all is empty");
         // Non-page targets (iframes, service workers) are not pages.
-        assert!(!has_real_page(&[json!({"type": "iframe", "url": "https://x.com/"})]));
+        assert!(!has_real_page(&[
+            json!({"type": "iframe", "url": "https://x.com/"})
+        ]));
         // CONTROL: one real page among blanks keeps it alive. A predicate that
         // ignored the real one would reap a browser someone is using.
-        assert!(has_real_page(&[page("about:blank"), page("https://x.com/")]));
+        assert!(has_real_page(&[
+            page("about:blank"),
+            page("https://x.com/")
+        ]));
     }
 
     /// Activity arm fires when no verb has been called for the whole window.
@@ -763,11 +1383,15 @@ mod tests {
         let five_min = 300u64;
         let now = 10_000.0f64;
         // Last verb 6 minutes ago -> reap.
-        assert!(should_reap_ttl(now as i64 - 360, now, five_min),
-            "360s silence with 300s window should reap");
+        assert!(
+            should_reap_ttl(now as i64 - 360, now, five_min),
+            "360s silence with 300s window should reap"
+        );
         // Last verb 4 minutes ago -> keep.
-        assert!(!should_reap_ttl(now as i64 - 240, now, five_min),
-            "240s silence with 300s window should keep");
+        assert!(
+            !should_reap_ttl(now as i64 - 240, now, five_min),
+            "240s silence with 300s window should keep"
+        );
         // Disabled (0) -> never.
         assert!(!should_reap_ttl(0, now, 0));
     }
@@ -783,7 +1407,11 @@ mod tests {
         // Started exactly at the boundary -> release (>= not >).
         assert!(should_reap_ttl(now as i64 - four_h as i64, now, four_h));
         // Started 1 second short of the TTL -> keep.
-        assert!(!should_reap_ttl(now as i64 - four_h as i64 + 1, now, four_h));
+        assert!(!should_reap_ttl(
+            now as i64 - four_h as i64 + 1,
+            now,
+            four_h
+        ));
         // TTL disabled (0) -> never reap, regardless of age.
         assert!(!should_reap_ttl(0, now, 0));
     }
@@ -918,5 +1546,252 @@ mod profile_ttl_tests {
         // Worker A is driving `alpha`; worker B's `beta` is ancient junk.
         assert!(!should_reap_profile("alpha", false, true, old, TTL));
         assert!(should_reap_profile("beta", false, false, old, TTL));
+    }
+}
+
+
+// ── Resume after a release (Ethan, 2026-10-02: "make amux browser more robust
+// and reliable"). In 7 days of /api/browser traffic, 93 calls failed with "no
+// amux-launched browser is running", most of them the next verb from a lane
+// whose browser this reaper had just released for being quiet 5 minutes while
+// the lane was thinking or building. The login survives on disk, so the right
+// answer to that next verb is to relaunch the same profile on the page it was
+// on, not a 409. This records what is needed to do that; the relaunch itself
+// is `api::browser::relaunch_released`.
+
+/// One released browser, keyed by the session that owned it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Released {
+    pub profile: String,
+    /// The first real page's URL at release time, or empty.
+    pub url: String,
+    pub released_at: i64,
+    /// Which reaper arm released it (`activity` | `ttl`).
+    pub reason: String,
+}
+
+fn released_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("browser-released.json")
+}
+
+pub fn read_released(home: &std::path::Path) -> HashMap<String, Released> {
+    std::fs::read_to_string(released_path(home))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_released(home: &std::path::Path, m: &HashMap<String, Released>) {
+    let path = released_path(home);
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(body) = serde_json::to_string_pretty(m) {
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// How long after a release the owner's next verb relaunches it.
+/// `AMUX_BROWSER_RELAUNCH_S`, default 6 hours; `0` disables resume.
+pub fn relaunch_window_s() -> i64 {
+    std::env::var("AMUX_BROWSER_RELAUNCH_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(6 * 3600)
+}
+
+/// Pure: the record to resume for `session`, if any is inside the window.
+pub fn resumable(
+    m: &HashMap<String, Released>,
+    session: &str,
+    now: i64,
+    window_s: i64,
+) -> Option<Released> {
+    if window_s <= 0 || session.is_empty() {
+        return None;
+    }
+    m.get(session)
+        .filter(|r| now - r.released_at <= window_s && !r.profile.is_empty())
+        .cloned()
+}
+
+pub fn put_released(home: &std::path::Path, owner: &str, rec: Released) {
+    let mut m = read_released(home);
+    let now = rec.released_at;
+    // Bounded: drop anything already past the window so the file cannot grow.
+    let w = relaunch_window_s().max(0);
+    m.retain(|_, r| now - r.released_at <= w);
+    m.insert(owner.to_string(), rec);
+    write_released(home, &m);
+}
+
+pub fn take_released(home: &std::path::Path, owner: &str) {
+    let mut m = read_released(home);
+    if m.remove(owner).is_some() {
+        write_released(home, &m);
+    }
+}
+
+async fn record_released(home: &std::path::Path, owner: &str, profile: &str, port: u16, reason: &str) {
+    if owner.is_empty() {
+        return; // nobody to resume for; notify_owner_of_reap already logs this case
+    }
+    let url = crate::integrations::browser::cdp_list(port)
+        .await
+        .ok()
+        .and_then(|v| {
+            v.as_array().and_then(|a| {
+                a.iter()
+                    .filter(|t| t.get("type").and_then(|x| x.as_str()) == Some("page"))
+                    .filter_map(|t| t.get("url").and_then(|x| x.as_str()))
+                    .find(|u| u.starts_with("http"))
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_default();
+    put_released(
+        home,
+        owner,
+        Released { profile: profile.to_string(), url, released_at: now_f64() as i64, reason: reason.to_string() },
+    );
+}
+
+#[cfg(test)]
+mod released_tests {
+    use super::*;
+
+    fn rec(at: i64) -> Released {
+        Released { profile: "p".into(), url: "https://x".into(), released_at: at, reason: "activity".into() }
+    }
+
+    #[test]
+    fn a_release_inside_the_window_is_resumable_for_its_owner_only() {
+        let mut m = HashMap::new();
+        m.insert("lane-a".to_string(), rec(1000));
+        assert_eq!(resumable(&m, "lane-a", 1000 + 60, 3600), Some(rec(1000)));
+        assert_eq!(resumable(&m, "lane-b", 1000 + 60, 3600), None, "another lane must not inherit it");
+    }
+
+    #[test]
+    fn a_release_past_the_window_or_with_resume_disabled_is_not_resumed() {
+        let mut m = HashMap::new();
+        m.insert("lane-a".to_string(), rec(1000));
+        assert_eq!(resumable(&m, "lane-a", 1000 + 3601, 3600), None);
+        assert_eq!(resumable(&m, "lane-a", 1000 + 10, 0), None, "0 disables resume");
+    }
+
+    #[test]
+    fn the_record_round_trips_on_disk_and_is_consumed_once() {
+        let dir = tempfile::tempdir().unwrap();
+        put_released(dir.path(), "lane-a", rec(now_f64() as i64));
+        assert!(read_released(dir.path()).contains_key("lane-a"));
+        take_released(dir.path(), "lane-a");
+        assert!(!read_released(dir.path()).contains_key("lane-a"));
+    }
+}
+
+#[cfg(test)]
+mod direct_driving_tests {
+    use super::*;
+    use crate::integrations::browser::PageActivity;
+
+    fn pa(fp: &str, attached: usize, loading: usize) -> PageActivity {
+        PageActivity { pages: 1, attached, loading, fingerprint: fp.into() }
+    }
+
+    /// A worker driving Chrome itself (NetSuite, 2026-10-26) is seen two
+    /// ways: a debugger attached now, or pages that moved since the last look.
+    #[test]
+    fn a_driver_amux_never_saw_still_counts_as_activity() {
+        assert!(activity_between(None, &pa("t1|a|x", 1, 0)), "an attached driver is activity on the first look");
+        assert!(!activity_between(None, &pa("t1|a|x", 0, 0)), "a first look has nothing to compare with");
+        assert!(activity_between(Some(&pa("t1|a|x", 0, 0)), &pa("t1|b|x", 0, 0)), "a page that navigated");
+        assert!(!activity_between(Some(&pa("t1|a|x", 0, 0)), &pa("t1|a|x", 0, 0)), "nothing moved, nobody attached");
+    }
+
+    #[test]
+    fn a_loading_page_holds_a_close_only_for_the_grace() {
+        assert!(loading_defer(100.0, 100.0, 600.0));
+        assert!(loading_defer(100.0, 699.0, 600.0));
+        assert!(!loading_defer(100.0, 700.0, 600.0), "a page that never finishes must not hold the browser forever");
+    }
+
+    #[test]
+    fn a_hold_is_stored_capped_and_released() {
+        let d = tempfile::tempdir().unwrap();
+        let now = 1_000_000;
+        assert_eq!(set_hold(d.path(), "netsuite", 7200, now), Some(now + 7200));
+        assert_eq!(hold_until(d.path(), "netsuite"), Some(now + 7200));
+        assert_eq!(set_hold(d.path(), "big", 10 * 86400, now), Some(now + hold_max_s()), "capped at the maximum");
+        assert_eq!(set_hold(d.path(), "netsuite", 0, now), None);
+        assert_eq!(hold_until(d.path(), "netsuite"), None, "0 releases it");
+        // An expired hold is pruned on the next write.
+        set_hold(d.path(), "old", 10, now);
+        set_hold(d.path(), "other", 10, now + 100);
+        assert_eq!(hold_until(d.path(), "old"), None);
+    }
+
+    #[test]
+    fn status_says_when_and_why_a_browser_closes() {
+        let d = tempfile::tempdir().unwrap();
+        let now = crate::integrations::browser::now_secs_i64();
+        let (at, why) = closes_at(d.path(), "p", now - 10, now - 5);
+        if activity_reap_s() > 0 {
+            assert_eq!(at, Some(now - 5 + activity_reap_s() as i64));
+            assert_eq!(why, "no activity");
+        }
+        set_hold(d.path(), "p", 3600, now);
+        assert_eq!(closes_at(d.path(), "p", now - 10, now - 5), (Some(now + 3600), "held until"));
+    }
+
+    #[test]
+    fn the_warning_names_every_way_to_keep_the_browser() {
+        let n = closing_notice("netsuite", 75);
+        for want in ["netsuite", "75s", "amux browser hold netsuite --for 2h", "/api/browser/keepalive", "loading"] {
+            assert!(n.contains(want), "warning lacks {want:?}: {n}");
+        }
+        let r = reap_notice("netsuite", ReapReason::NoActivity { since_verb_s: 300, window_s: 300 });
+        assert!(r.contains("in your next reply"), "the close notice says how to tell the person: {r}");
+        assert!(r.contains("amux browser hold netsuite --for 2h"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod parked_for_owner_tests {
+    /// AF-1025: a worker with a fresh needsyou card keeps its browser; a card
+    /// in another state, another worker's card, or one parked past the hold
+    /// cap does not.
+    #[tokio::test]
+    async fn a_browser_waiting_on_the_owner_is_held_and_only_while_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("p.db")).unwrap());
+        let now = 1_800_000_000_i64;
+        let old = now - super::hold_max_s() - 60;
+        store
+            .write_async(move |c| {
+                for (id, session, status, entered) in [
+                    ("AF-1", "lane-a", "needsyou", now - 60),
+                    ("AF-2", "lane-b", "todo", now - 60),
+                    ("AF-3", "lane-c", "needsyou", old),
+                ] {
+                    c.execute(
+                        "INSERT INTO issues (id, title, status, session, created, updated, entered_state_at) VALUES (?1, 't', ?2, ?3, ?4, ?4, ?4)",
+                        rusqlite::params![id, status, session, entered],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+        // The browser was last driven 2 min ago; AF-1 was parked 1 min ago: a handoff.
+        let driven = now - 120;
+        assert_eq!(super::parked_for_owner(&store, "lane-a", now, driven).as_deref(), Some("AF-1"));
+        assert_eq!(super::parked_for_owner(&store, "lane-b", now, driven), None, "not waiting on the owner");
+        assert_eq!(super::parked_for_owner(&store, "lane-c", now, driven), None, "parked past the hold cap no longer pins it");
+        assert_eq!(super::parked_for_owner(&store, "lane-x", now, driven), None, "no card");
+        assert_eq!(super::parked_for_owner(&store, "", now, driven), None, "an unowned browser");
+        // TP-212's shape: the card was parked long before the browser was last driven.
+        assert_eq!(super::parked_for_owner(&store, "lane-a", now, now - 60 + super::HANDOFF_SLACK_S + 1), None,
+            "an ask parked before the browser's later use is not its handoff");
     }
 }

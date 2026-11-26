@@ -12,86 +12,155 @@ on:
   pull_request:
 
 jobs:
-  checks:
+  # SHARDED (2026-11-02). Every check below used to run as one step of a single
+  # job, one after another: 136 steps, 14 to 16 minutes per run (845s on
+  # c71df3ef9), with a 20-minute timeout and a warning at 15. The checks are
+  # still listed below, unchanged, under `catalogue`, which never runs. `shard`
+  # runs them in parallel: scripts/ci-checks.py gives each shard a slice,
+  # balanced by the seconds in scripts/ci-checks-durations.json. `checks`
+  # passes only when every catalogue check ran exactly once, in some shard, and
+  # passed. Add a check by adding a step to `catalogue`: `name` and `run` only.
+  shard:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
     steps:
-      # Full history: the client-version guard below diffs against the push's
-      # base, which a shallow clone cannot reach.
+      # Full history, blobs on demand: the client-version guard below diffs
+      # against the push's base, which a shallow clone cannot reach.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          filter: blob:none
+      # What the one serial job used to leave behind for every later step: the
+      # npm packages and a git identity (set by the land-regenerate step).
+      - name: Shared setup for every shard
+        run: |
+          npm ci --ignore-scripts
+          git config --global user.email ci@amux.test; git config --global user.name ci
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+      - name: Checks (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+        run: python3 scripts/ci-checks.py run ${{ matrix.shard }}/${{ strategy.job-total }} --out "$RUNNER_TEMP/checks-shard-${{ matrix.shard }}.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checks-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/checks-shard-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  checks:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/workflows/checks.yml
+            scripts/ci-checks.py
+            scripts/ci-checks-durations.json
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: checks-shard-*
+          path: ${{ runner.temp }}/checks-results
+      - name: Every catalogue check ran exactly once and passed
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet pyyaml
+          python3 scripts/ci-checks.py verify "$RUNNER_TEMP/checks-results"
+          python3 scripts/ci-checks.py durations "$RUNNER_TEMP/checks-results" > "$RUNNER_TEMP/ci-checks-durations.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ci-checks-durations
+          path: ${{ runner.temp }}/ci-checks-durations.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The checks themselves. Never runs as a job: scripts/ci-checks.py reads these
+  # steps and `shard` runs them. Each step is `name` + `run`, nothing else.
+  catalogue:
+    if: false
+    runs-on: ubuntu-latest
+    steps:
       - name: Browser evidence and lifecycle cleanup controls (AF-768, AF-773)
         run: |
           npm ci --ignore-scripts
-          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs tests/e2e-teardown-ratchet.test.mjs
-      # AF-148 / AMUX-3524 follow-up: a client JS change that ships WITHOUT a
-      # version bump reaches no browser holding the cached script, and nothing
-      # said so. dashboard_assets.rs pins that APP_VER and CACHE AGREE — but
-      # 25ba8ea changed app.js and bumped NEITHER, so they still agreed and the
-      # test stayed green. The silent shape is worse than a mismatch: the
-      # author's find-and-replace bump no-opped (a peer had already moved the
-      # version), the functional edits in the same pass succeeded, and the
-      # script printed success. Diffing is the only way to see it.
-      - name: Client JS changes carry a version bump (CLAUDE.md, enforced)
+          # worker-lifecycle-cleanup.test.mjs launches a real Playwright run, so
+          # the headless shell must be on the runner (it failed 2026-10-23:
+          # "Executable doesn't exist ... chrome-headless-shell").
+          npx playwright install --only-shell chromium
+          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs tests/e2e-teardown-ratchet.test.mjs tests/e2e-plan.test.mjs tests/test-server-env.test.mjs
+          npm run test:outbox
+          npm run test:offline
+          npm run test:state
+      # rust.yml lets a PR reuse main's compiled server and tests when this key
+      # matches. A key that missed a compile input would hand a PR a stale
+      # binary and a false green, so its input classes are pinned here.
+      # The shards above run this catalogue; this proves the planner owns every
+      # check once and that `verify` goes red on a missing, doubled or failed one.
+      - name: the checks shards run the whole catalogue (scripts/ci-checks.py)
+        run: python3 scripts/test-ci-checks.py
+      - name: the shared-checkout guard's own matrix
+        run: python3 ./scripts/git-hooks/test_git_shared_guard.py
+      # A public repo: no job a pull request can trigger may run on a self-hosted
+      # runner (docs/design/cicd-two-minutes.md, Z9).
+      - name: no self-hosted job is reachable from a pull request
+        run: python3 scripts/ci-self-hosted-guard.py --self-test && python3 scripts/ci-self-hosted-guard.py
+      - name: a land's push keeps its connection alive through a long hook
+        run: bash scripts/test-land-ssh-keepalive.sh
+      - name: Rust-input cache key (scripts/ci-rust-key.mjs)
+        run: node --test tests/ci-rust-key.test.mjs
+      # Browser methods: the backend ladder, agent selection, and the OpAgent
+      # adapter against fixtures produced by OpAgent's own Python.
+      # One header on every amux.io page: scripts/site-header.html, /nav.css,
+      # /site.js in <head>. Fix drift with: node scripts/site-header.mjs --fix
+      - name: site header is the same on every page
+        run: node --test tests/site-header.test.mjs
+      - name: site funnel source classifier matches site.js
+        run: python3 scripts/site-funnel.py --self-test
+      - name: browser methods registry and agent adapters
+        run: node --test tests/browser-methods.test.mjs
+      # The stall watchdog pages the owner only for a wake that is absent from
+      # the worker's history after a retry, and counts a worker's own sends as
+      # progress (2026-10-26 13:47Z false page).
+      - name: worker stall watchdog wake confirmation
+        run: node --test tests/worker-stall-watch.test.mjs
+      # AMUX-5397: the ChatGPT front door's tenant rules (a grant reaches only
+      # its own workspace; a tunnel answer only from its own org). The real
+      # gateway handler against fake workspaces: no cloud, Clerk or Docker.
+      - name: Cloud gateway ChatGPT front door (tenant rules)
+        run: python3 cloud/tests/test_chatgpt_front.py
+      # The amux Cloud Stripe account move (cloud/start/STRIPE-ACCOUNT-MOVE.md):
+      # the real CLI against fake Stripe and Hetzner. Mixpeek's subscriptions are
+      # never written, and no customer is billed twice.
+      - name: Cloud Stripe account move (dry run, apply, rollback)
+        run: python3 -W ignore cloud/tests/test_stripe_account_move.py
+      # The dashboard version is DERIVED (amux-dashboard build.rs hashes
+      # static/ and the server stamps it into app.js and sw.js at serve time).
+      # This replaced a "both version lines moved" diff guard (AF-148): the
+      # hand-bumped literal made every pair of dashboard PRs conflict on the
+      # same line, and a peer's bump could still no-op an author's. A literal
+      # coming back would silently pin the version again, so this fails on it.
+      # That the placeholder is SUBSTITUTED when served is pinned by
+      # crates/amux-server/tests/dashboard_assets.rs, which runs in rust.yml.
+      - name: Dashboard version is derived, not hand-bumped
         run: |
           set -uo pipefail
-          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
-             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            echo "no reachable base ($BASE) — first push or force-push; guard SKIPPED, honestly"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "$BASE" HEAD -- \
-            crates/amux-dashboard/static/app.js crates/amux-dashboard/static/sw.js)
-          [ -n "$CHANGED" ] || { echo "no client JS in this range — nothing to check"; exit 0; }
-          echo "client JS changed:"; echo "$CHANGED" | sed 's/^/  /'
-          # The VERSION LINES specifically, not the files: a file can change
-          # while its version does not, which is exactly the defect.
-          APP_MOVED=$(git diff "$BASE" HEAD -- crates/amux-dashboard/static/app.js \
-            | grep -c '^[+-].*APP_VER *=' || true)
-          SW_MOVED=$(git diff "$BASE" HEAD -- crates/amux-dashboard/static/sw.js \
-            | grep -c '^[+-].*CACHE *=' || true)
-          if [ "$APP_MOVED" -eq 0 ] || [ "$SW_MOVED" -eq 0 ]; then
-            echo
-            echo "FAIL: client JS shipped without bumping both versions."
-            echo "  APP_VER line changed: $([ "$APP_MOVED" -gt 0 ] && echo yes || echo NO)"
-            echo "  sw.js CACHE changed:  $([ "$SW_MOVED" -gt 0 ] && echo yes || echo NO)"
-            echo "A browser holding the cached script never fetches this change."
-            echo "Bump BOTH (read-then-increment; a literal find-and-replace can"
-            echo "silently no-op when a peer moved the version first - AF-148)."
-            exit 1
-          fi
-          echo "both version lines moved — cached clients will refetch"
-      - name: Secret scan (the pre-commit hook, in CI)
-        run: |
-          set -euo pipefail
-          PATTERNS=(
-            "sk-ant-api[0-9a-zA-Z-]{20,}" "AKIA[0-9A-Z]{16}" "ghp_[A-Za-z0-9]{36}"
-            "sk_(test|live)_[A-Za-z0-9]{20,}"
-            "(R2|AWS)_SECRET(_ACCESS)?_KEY[[:space:]]*=[[:space:]]*[A-Za-z0-9/+]{32,}"
-            "CLERK_SECRET_KEY[[:space:]]*=[[:space:]]*[A-Za-z0-9_-]{20,}"
-            "xox[baprs]-[A-Za-z0-9-]{10,}" "glpat-[A-Za-z0-9_-]{20,}"
-          )
-          # Self-test FIRST: a planted secret must be caught, or a green run
-          # here means nothing (the scanner that missed AC-239 was also green).
-          # Built at RUNTIME, never written literally in this file — a literal
-          # here would be found by the scan below and fail the repo on its own
-          # self-test, forever. (Caught before shipping: the first cut did
-          # exactly that.)
-          printf 'CLERK_SECRET_KEY=sk_%s_%s\n' "test" "$(printf 'A%.0s' $(seq 28))" > /tmp/_probe
-          grep -Eq -e "sk_(test|live)_[A-Za-z0-9]{20,}" /tmp/_probe \
-            || { echo "SELF-TEST FAILED: scanner cannot catch a planted secret"; exit 1; }
-          rm -f /tmp/_probe
+          S=crates/amux-dashboard/static
           fail=0
-          for p in "${PATTERNS[@]}"; do
-            if out=$(grep -REn -e "$p" --include='*.py' --include='*.sh' --include='*.yml' \
-                      --include='*.yaml' --include='*.json' --include='*.ts' --include='*.js' \
-                      --include='*.rs' --include='*.toml' . 2>/dev/null); then
-              echo "SECRET PATTERN MATCHED: $p"; echo "$out" | head -3 | cut -c1-120; fail=1
-            fi
-          done
-          [ "$fail" -eq 0 ] && echo "secret scan clean" || exit 1
+          grep -qE "^const APP_VER = '__AMUX_ASSET_VER__';" "$S/app.js" \
+            || { echo "FAIL: app.js must declare const APP_VER = '__AMUX_ASSET_VER__';"; fail=1; }
+          grep -qE "^const CACHE = 'amux-v__AMUX_ASSET_VER__';" "$S/sw.js" \
+            || { echo "FAIL: sw.js must declare const CACHE = 'amux-v__AMUX_ASSET_VER__';"; fail=1; }
+          [ "$fail" = 0 ] || { echo "Do not hand-bump a version: the server derives it from the static/ contents."; exit 1; }
+          echo "app.js APP_VER and sw.js CACHE both carry the derived-version placeholder"
+      - name: Secret scan (the pre-commit hook, in CI)
+        run: scripts/ci-secret-scan.sh
 
       # frustrations.md structural integrity (AF-28). NOT a reintroduction of the
       # Python-era pytest gate removed above — this validates a committed MARKDOWN
@@ -187,6 +256,10 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-friction-themes.sh
+      # MSG-103437. The advisory watch must never read as clean when it could not
+      # look, and every finding must reach the lane's message.
+      - name: the advisory watch fails closed
+        run: python3 scripts/test-advisory-watch.py
       - name: attachment metadata cannot manufacture cross-repo instructions (AF-888)
         run: python3 scripts/test-friction-attachments.py
       - name: peer collaboration cannot inflate board-drive nudge pressure (AF-890)
@@ -210,6 +283,20 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-claude-scratch-report.sh
+      # The tmux watchdog restarts only Claude workers, leaves isolated ones to
+      # their owner, and holds a worker that dies after every restart. Runs the
+      # real script against fake tmux/pgrep/ps/amux, so no tmux is needed here.
+      - name: the tmux watchdog restarts only what it can judge
+        run: |
+          set -uo pipefail
+          ./scripts/test-tmux-watchdog.sh
+      # A build the server is holding for a shell schedule run is not a failed
+      # boot: the builder waits out that hold before rolling back. Runs the
+      # shipped wait_live_identity with stubbed identity and scheduler.
+      - name: the builder does not roll back a build the server is holding
+        run: |
+          set -uo pipefail
+          ./scripts/test-activation-health-wait.sh
       # AMUX-4732. The report reaches each lane as a CARD now, because the
       # 2026-09-14 attempt went out as peer MESSAGES and the two lanes that were
       # down never received it: both grew ~6 GB more while the one that was up
@@ -237,6 +324,12 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-mac-pressure-tripwire.sh
+      - name: a mac pressure trip wakes the host-health worker first
+        run: |
+          set -uo pipefail
+          # A trip wakes the host-health worker first and pages the owner
+          # only when a worker cannot help (2026-10-30).
+          ./scripts/test-host-responder.sh
       # AMUX-4810. The soak's leak verdict used to be peak-minus-a-30-second
       # baseline, which measured warm-up: it failed on 100% of runs that ever
       # executed, including one whose second HALF was negative. The replacement
@@ -258,6 +351,10 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-cli-worktree-dirty-warn.sh
+      - name: amux start makes no worktree for a start the server owns (DESKT-55)
+        run: |
+          set -uo pipefail
+          ./scripts/test-cli-start-no-orphan-worktree.sh
       # AMUX-4823. The pre-push refusal for an unwired harness. Its first cell
       # is the control that makes the other five mean anything: the fixture's
       # own wired-check always exits non-zero, so an ALLOWED push can only mean
@@ -267,6 +364,36 @@ jobs:
         run: |
           set -uo pipefail
           python3 scripts/git-hooks/test_pre_push_harness_wired.py
+      # Velocity audit 2026-10-26: pre-push runs the dashboard node:test suites
+      # on the pushed commit, so a spa-gates red is caught before main holds
+      # every deploy. Synthetic fixture suites; needs only node.
+      - name: the pre-push SPA gates refuse a dashboard red, and only this push's (velocity audit 2026-10-26)
+        run: |
+          set -euo pipefail
+          python3 scripts/git-hooks/test_pre_push_spa_gates.py
+      # AF-1073: pre-push runs the checks.yml shell tests that name a changed
+      # script, on the pushed commit, since land_gate.py runs none of them.
+      # Governance PR 19: the owner's kill switch stops a worker's push, from
+      # the file the server writes, with no override.
+      - name: the pre-push hook refuses a worker's push while the kill switch is engaged
+        run: |
+          set -euo pipefail
+          python3 scripts/git-hooks/test_pre_push_kill_switch.py
+      - name: the pre-push script tests refuse a script red, and only this push's (AF-1073)
+        run: |
+          set -euo pipefail
+          python3 scripts/git-hooks/test_pre_push_script_tests.py
+      # The land gate (scripts/land_gate.py): the push legs on the real hook
+      # with a fake approvals server, and the review's round rules on a fake
+      # claude. No model, no network.
+      - name: the land gate refuses unreceipted, unapproved and unrevertable pushes; the review converges
+        run: |
+          set -euo pipefail
+          python3 scripts/git-hooks/test_land_gate.py
+      - name: the PR watcher wakes its handler once per change, never on a failed read
+        run: |
+          set -euo pipefail
+          bash scripts/test-pr-watch.sh
       # AF-926 via AMUX-4759, same reasoning as the step below: CI-safe by
       # construction (synthetic fixture in a temp dir, zero network refs, and
       # its own header says it deliberately avoids the real frustrations.md).
@@ -310,10 +437,19 @@ jobs:
       # for AF-346, whose whole incident was a correct guard that did not run.
       # A ratchet against a recorded baseline, so the 32 stay their owners'
       # decision and number 33 cannot arrive quietly.
+      # boundaries.toml: every block/allow example in the registry is run
+      # through the real guard, so a pattern that stops catching its own
+      # example, or starts catching an innocent one, fails here.
+      - name: worker boundaries hold their own examples
+        run: python3 scripts/hooks/test-boundary-guard.py
+      - name: amux resources and amux boundaries print from real-shaped payloads
+        run: ./scripts/test-amux-boundaries-cli.sh
       - name: Corrupt board acknowledgements retain unknown outcomes
         run: python3 scripts/test-board-ack-unknown.py
       - name: Cargo worktrees reuse builds without stale commit identity
         run: python3 scripts/test-cargo-worktree-provenance.py
+      - name: connector account health classifier
+        run: node scripts/test-connector-account-health.mjs
       - name: no harness is written and then never invoked (AF-346)
         run: |
           set -uo pipefail
@@ -330,6 +466,8 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/test-cargo-target-fingerprint.sh
+      - name: one dev profile for bare cargo, safe-cargo and CI (disk RCA 20261030-193722)
+        run: bash scripts/test-dev-profile-debug.sh
       # AF-346 second pass + AF-336. `--test <name>` skips the LIB ENTIRELY and
       # prints the smallest number of any selector, so it is the likeliest to be
       # read as a clean suite; and the worktree clause listed every dirty file
@@ -354,6 +492,114 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-mac-cleanup-tick.sh
+      - name: the lima data-disk report names orphaned VM disks and deletes none (DESKT-47)
+        run: |
+          set -euo pipefail
+          ./scripts/test-mac-cleanup-lima.sh
+          ./scripts/test-mac-cleanup-keep-context.sh
+          ./scripts/test-mac-cleanup-user-tmp.sh
+          ./scripts/test-mac-cleanup-lane-tmp.sh
+          ./scripts/test-mac-cleanup-vmcpu.sh
+          ./scripts/test-ci-fast-gate.sh
+          ./scripts/test-mac-cleanup-vmhog.sh
+          ./scripts/test-mac-cleanup-writers.sh
+      - name: the scheduled disk reclaim moves only idle, unowned build output, through the server (SCHED-783)
+        run: |
+          set -uo pipefail
+          # No -e here, so each line carries its own exit: only the last one counted.
+          ./scripts/test-disk-reclaim-tick.sh || exit 1
+          ./scripts/test-pkill-guard-shim.sh || exit 1
+          ./scripts/test-shim-copies.sh
+      - name: a red main rust run is re-run once only for a flaky e2e spec or a truncated test archive
+        run: ./scripts/test-rust-flake-rerun-classify.sh
+      - name: orch-pace projects the proof rate to its checkpoint
+        run: |
+          ./scripts/test-orch-pace-proof.sh
+          python3 scripts/test-orch-pace-scope.py
+      - name: amux cdp runs the chrome-cdp helper's committed bytes, never a stale working tree (Google sign-out 2026-10-18)
+        run: |
+          set -uo pipefail
+          ./scripts/test-amux-cdp-committed.sh
+      - name: amux sync-checkout --override matches origin and saves what it replaces (/amux-contribute pull)
+        run: |
+          set -uo pipefail
+          ./scripts/test-sync-checkout-override.sh
+          ./scripts/test-contribute.sh
+      - name: amux-cloud opens a Cloud instance's workers over SSH as its amux user, messages byte for byte
+        run: ./scripts/test-amux-cloud.sh
+      - name: The Cloud sign-in door queues a page load's burst instead of dropping it
+        run: python3 cloud/desktop/test_door_backlog.py
+      - name: The sign-in door throttles password guessing and enforces the owner's address allowlist
+        run: python3 -m unittest cloud/desktop/test_door_throttle.py cloud/desktop/test_door_allowlist.py cloud/desktop/test_door_owner_proof.py cloud/desktop/test_door_totp.py
+      - name: Python reading a shared site-packages defaults grpc to fork-safe (Mac crashes RCA 20261018-105230)
+        run: |
+          set -uo pipefail
+          ./scripts/test-python-grpc-defaults.sh
+      - name: the idle cargo-target reaper keeps anything it cannot prove idle and unopened (DESKT-51)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-targets.sh
+          ./scripts/test-mac-cleanup-superseded.sh
+      - name: the Remotion bundle reaper takes only stale, unopened remotion-webpack-bundle dirs (RCA 20261010-211803)
+        run: |
+          set -uo pipefail
+          ./scripts/test-reap-remotion-bundles.sh
+      - name: the deploy builder prunes only superseded incremental trees of crates it rebuilt (RCA 20261011-112249)
+        run: |
+          set -uo pipefail
+          ./scripts/test-prune-superseded-incremental.sh
+      - name: the idle worktree reaper only takes a merged, clean, unheld detached checkout (MO-3631/3633)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-worktrees.sh
+      - name: the assess stage names what is still constrained and escalates it once per cooldown (DESKT-57)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-assess.sh
+      - name: launchd runs the cleanup tick when the scheduler goes quiet, and says so once a day (DESKT-58)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-fallback.sh
+      - name: Claude session temp dirs are removed only when dead, and live ones held to a quota (DESKT-77)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-claude-tmp.sh
+      - name: a hot fseventsd names the directory feeding it and escalates (DESKT-81) (1/2)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-fseventsd.sh
+      - name: a hot fseventsd names the directory feeding it and escalates (DESKT-81) (2/2)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-health-pass.sh
+      - name: cargo tests run at most AMUX_TEST_THREADS threads, and the tick names an uncapped test binary
+        run: |
+          set -uo pipefail
+          ./scripts/test-test-threads-cap.sh
+      - name: an orphaned sqlite .backup of an amux db is stopped, and nothing else (DESKT-94)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-sqlite.sh
+      - name: the system health check restarts only listed helpers and stops only leftover test processes
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-health.sh
+      - name: the cleanup tick keeps inside one deadline and reaches its verdicts when out of time
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-deadline.sh
+      - name: the cleanup tick checks its own run history and escalates when it is failing
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-self.sh
+      - name: the cleanup tick names who is using the CPU and lowers detached trees when busy
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-utilization.sh
+      - name: the agent scratch volume reports each opt-out from what it can read
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-agent-volume.sh
       # AF-677. AF-346's ratchet (above) recorded 31 harnesses as unwired rather
       # than wiring them blind, because that decision belongs to each one's
       # owner (ethos rule 8). This is that decision, made for 28 of the 31:
@@ -397,6 +643,25 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-cli-reviewer-shepherd-guard.sh
+      - name: amux memory add appends to the worker's own memory
+        run: |
+          set -uo pipefail
+          bash scripts/test-cli-memory.sh
+      - name: amux wake creates, lists and cancels the lane's own wakeups
+        run: |
+          set -uo pipefail
+          bash scripts/test-cli-wake.sh
+      - name: amux stop records the stop through the server
+        run: |
+          set -uo pipefail
+          bash scripts/test-cli-stop-recorded.sh
+      # The server's stop keeps the pane (a bare shell), so `amux start` must
+      # tell an empty pane from a live worker. Real tmux on a private socket.
+      - name: amux start relaunches a stopped worker whose pane is still open
+        run: |
+          set -uo pipefail
+          command -v tmux >/dev/null || { sudo apt-get update && sudo apt-get install -y tmux; } || exit 1
+          bash scripts/test-cli-start-after-stop.sh
       - name: the commit-intent manifest round-trips
         run: |
           set -uo pipefail
@@ -413,6 +678,18 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-hook-version-marker.sh
+      - name: pre-commit refuses a migration number that is already taken
+        run: |
+          set -uo pipefail
+          bash scripts/test-pre-commit-migration-guard.sh
+      - name: a commit that cites no owner request names the lane's open ones (post-commit)
+        run: |
+          set -uo pipefail
+          bash scripts/test-post-commit-open-requests.sh
+      - name: a request landed in a repo the server does not deploy reads landed, not "not live" (AF-1058)
+        run: |
+          set -uo pipefail
+          bash scripts/test-requests-landed.sh
       - name: install.sh's hook install references the real source path
         run: |
           set -uo pipefail
@@ -471,12 +748,85 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-send-retry-annotation.sh
+      - name: verbs the docs and access ladder name exist in the shipped CLI
+        run: |
+          set -uo pipefail
+          bash scripts/test-cli-verbs-present.sh
+      - name: a regenerable replay re-renders derived files before the push
+        run: |
+          set -uo pipefail
+          git config --global user.email ci@amux.test; git config --global user.name ci
+          # Two lines: under `bash -e`, a failure inside `a && b` does not stop a step
+          # unless it is the last line, so this test could fail and the step pass.
+          bash scripts/test-land-regenerate.sh
+          NO_REGEN=1 bash scripts/test-land-regenerate.sh
+          bash scripts/test-land-regenerate-delete.sh
+          bash scripts/test-grep-all-pipefail.sh
+          bash scripts/test-land-regenerate-always.sh && bash scripts/test-land-regenerate-always.sh "" conflict && bash scripts/test-land-regenerate-always.sh "" failing && bash scripts/test-land-regenerate-always.sh "" worktree
+      - name: land precheck verdict and attributed cancel (1/8)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-gate-capped.sh && bash scripts/test-land-precheck-verdict.sh && bash scripts/test-land-cancel-for.sh && bash scripts/test-land-blame.sh && bash scripts/test-land-cancel-holder.sh
+      - name: land precheck verdict and attributed cancel (2/8)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-holder-pid-reused.sh && bash scripts/test-land-cancel-shared-checkout.sh && bash scripts/test-land-refusal-spares.sh && bash scripts/test-land-demote-sticks.sh && bash scripts/test-land-to-head.sh
+      - name: land precheck verdict and attributed cancel (3/8)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-resume-place.sh && bash scripts/test-land-shared-config-guard.sh && bash scripts/test-land-heal-core-worktree.sh && bash scripts/test-land-already-landed.sh && bash scripts/test-land-fast-gate.sh
+      - name: two machines share one remote land lease (1/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-remote-lease.sh "" a
+      - name: two machines share one remote land lease (2/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-remote-lease.sh "" b
+      - name: land precheck verdict and attributed cancel (4/8)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-fix-forward.sh && bash scripts/test-land-priority-before-gate.sh && bash scripts/test-land-net-retry.sh && bash scripts/test-land-regenerate-scoped.sh && bash scripts/test-land-regenerate-reuse.sh && bash scripts/test-land-gate-slots.sh
+      - name: a land through the merge queue (1/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-merge-queue.sh "" a
+      - name: a land through the merge queue (2/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-merge-queue.sh "" b
+      - name: land precheck verdict and attributed cancel (5/8)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-leg-summary.sh && bash scripts/test-land-window.sh && bash scripts/test-land-wait-report.sh && bash scripts/test-land-inflight-fixes.sh && bash scripts/test-lane-efficiency.sh && bash scripts/test-land-precheck-base.sh && bash scripts/test-land-precheck-first.sh && bash scripts/test-land-sha-gate.sh && bash scripts/test-land-recheck-head.sh
+      - name: land precheck verdict and attributed cancel (6/8)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-queue-policy.sh && bash scripts/test-ci-wait.sh && bash scripts/test-board-close-tracking.sh && bash scripts/test-cli-stale-url.sh
+      - name: the land guards (freeze, reused message, --json, config, regenerate) hold (1/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-guards.sh "" a
+      - name: the land guards (freeze, reused message, --json, config, regenerate) hold (2/2)
+        run: |
+          set -uo pipefail
+          bash scripts/test-land-guards.sh "" b
+      - name: land precheck verdict and attributed cancel (7/8)
+        run: |
+          set -uo pipefail
+          bash scripts/test-pipeline-bottlenecks-throughput.sh && bash scripts/test-pipeline-bottlenecks-constraints.sh && python3 scripts/test-pipeline-bottlenecks-host.py
+      - name: a lane resumes its own conversation, never whichever peer ran here last
+        run: |
+          set -uo pipefail
+          bash scripts/test-resume-by-identity.sh
       - name: CLI retries retain one identity and never inject an unacknowledged fallback
         run: |
           set -uo pipefail
           python3 scripts/test-send-retry-identity.py
       - name: board help never registers an artifact
         run: python3 scripts/test-board-help.py
+      - name: wake watches fire once, expire, cap, share one CI poller, and never read unreadable as no event
+        run: python3 scripts/test-wake-watch.py
       - name: Board linked source messages
         run: python3 scripts/test-board-show-messages.py
       - name: the shared-checkout guard attributes a block to the real actor
@@ -499,6 +849,29 @@ jobs:
         run: |
           set -uo pipefail
           python3 scripts/test-tmux-start-guard.py
+      # AMUX-5040. Landed unwired in abc9585e and reddened `checks` on main
+      # for 3 consecutive runs via the AF-346 guard, which is the guard doing
+      # its job. Wired rather than baselined because it is hermetic by
+      # construction: pure unittest over tempdirs, no server and no network,
+      # 0.026s locally. One of its three cases asserts that prompt text and
+      # tool_input never reach the spool, which is the kind of claim that has
+      # to keep being re-checked rather than be believed once.
+      - name: the native-status hook producer keeps its ordering and privacy
+        run: |
+          set -uo pipefail
+          python3 scripts/test-native-status.py
+      # Hermetic: parses the shipped dispatch table and runs `amux help` with a
+      # temp HOME, no server. A verb added without a help line fails here.
+      - name: amux help names every dispatched verb
+        run: |
+          set -uo pipefail
+          python3 -m unittest tests/cli_help.py
+      # Hermetic: the shipped CLI against a stub server. `amux post --file`
+      # posted the literal "--file /path" to the owner 21 times (11-09 to 11-10).
+      - name: amux post sends the file or stdin it was given and refuses an unknown flag
+        run: |
+          set -uo pipefail
+          python3 tests/cli_post.py
       - name: the multiplayer browser contract's shape holds
         run: |
           set -uo pipefail
@@ -531,7 +904,7 @@ jobs:
       # pinning is "stays silent when it should" - which no Rust test can see,
       # because the hook is a separate Python file that ships by install, not by
       # build. Language-agnostic, so it belongs here rather than in rust.yml.
-      - name: staged-guard prints noise only when it has something to say (AF-342)
+      - name: staged-guard prints noise only when it has something to say (AF-342) (1/2)
         run: |
           set -uo pipefail
           ./scripts/test-staged-guard-render.sh
@@ -548,6 +921,9 @@ jobs:
           ./scripts/test-commit-stamp.sh
           ./scripts/test-mass-delete-gate.sh
           ./scripts/test-observed-edits-walk.sh
+      - name: staged-guard prints noise only when it has something to say (AF-342) (2/2)
+        run: |
+          set -uo pipefail
           ./scripts/test-hook-drift-notice.sh
           # The shared-checkout guard's own 114-case matrix. It existed and ran
           # NOWHERE: not in CI, not in pre-commit. A safety-critical guard whose
@@ -555,7 +931,9 @@ jobs:
           # AMUX-3932 was a live bypass in it found by hand rather than by this
           # file. Cheap (no cargo), so there is no reason it was not here.
           python3 ./scripts/git-hooks/test_remove_correction.py || exit $?
-          python3 ./scripts/git-hooks/test_git_shared_guard.py
+          python3 ./scripts/git-hooks/test_token_print.py || exit $?
+          python3 ./scripts/git-hooks/test_post_push_verify.py || exit $?
+          python3 ./scripts/git-hooks/test_land_push_guard.py
       # CLI dispatch tests (AEAB-17). Language-agnostic like the two steps above,
       # and they belong HERE rather than in rust.yml because rust.yml is
       # path-filtered to `crates/**`, `Cargo.*` and `e2e/**` — so a change to
@@ -588,6 +966,10 @@ jobs:
       # here said the step above reports only its last script. It does not: run
       # blocks execute under bash -e, so that step fails on its first failing
       # script. Corrected under AMUX-4651.)
+      # Branch hygiene (Ethan 2026-10-27): merged branches pruned, unmerged
+      # past 48h reported. Runs against a throwaway bare remote; no network.
+      - name: Branch hygiene report and merged-only prune
+        run: ./scripts/test-branch-hygiene.sh
       - name: CLI refusal remedies (board doing)
         run: ./scripts/test-board-continuation-hint.sh
       # AMUX-4652: board needs reports a refused blocker link instead of claiming it.
@@ -644,6 +1026,8 @@ jobs:
         run: |
           set -uo pipefail
           node scripts/test-linkify-paths.mjs
+      - name: Browser driver executable entrypoint
+        run: node scripts/test-browser-driver-entrypoint.mjs
 
       # AEAB-18. The freshness hook is a SHELL script outside crates/, so
       # rust.yml's path filter never sees it. It also guards a silent,
@@ -662,7 +1046,7 @@ jobs:
       # Its control (nothing cleared above the floor) and its last-resort case
       # (the shared dir must STILL be reachable) are what stop the fix becoming
       # either a no-op or a reintroduction of the disk-full outage.
-      - name: SessionStart freshness + deployment and watchdog recovery
+      - name: SessionStart freshness + deployment and watchdog recovery (1/3)
         run: |
           set -uo pipefail
           ./scripts/test-session-freshness.sh
@@ -670,13 +1054,49 @@ jobs:
           ./scripts/test-build-disk-clear.sh
           python3 scripts/test-cargo-target-guard.py
           python3 scripts/test-cargo-budget.py
+          bash scripts/test-safe-cargo-sizing.sh
           ./scripts/test-build-activation-authority.sh
+          ./scripts/test-build-restamp.sh || exit 1
           ./scripts/test-build-activation-launcher.sh
+          ./scripts/test-authority-launcher-sync.sh
+          ./scripts/test-build-shell-run-defer.sh
+          python3 scripts/test-claude-rotate.py
+          ./scripts/test-claude-rotate-refresh.sh
+          # Policy unit tests, including opt-in (default off). `|| exit 1`: this
+          # step has no -e, so a middle line's failure would otherwise not count.
+          python3 scripts/tests/test_claude_rotate.py || exit 1
+          ./scripts/test-main-ci-watch.sh
+      - name: SessionStart freshness + deployment and watchdog recovery (2/3)
+        run: |
+          set -uo pipefail
+          ./scripts/test-board-refusal-why.sh
           # A replacement is complete and signed before its one visible rename;
           # persistent listener loss makes the external watchdog reload only the
           # exact configured launch agent.
           ./scripts/test-build-atomic-install.sh
+          # AMUX-6530: a long deploy build logs a heartbeat, and the heartbeat
+          # can neither outlive the build nor abort it under set -e.
+          ./scripts/test-build-heartbeat.sh
+          # A young build lock whose pid is not written yet is held, not broken
+          # (implicit state machines #22); an old one is still broken.
+          ./scripts/test-build-lock-young.sh
+          ./scripts/test-build-repo-hooks-sync.sh
+          # AF-1012: a link failure on unresolved symbols clears the stale
+          # amux_server incremental trees and retries once; a compile error does not.
+          ./scripts/test-build-link-retry.sh
+          # Cloud follows main's tip without the CI wait: an activation that does
+          # not come up healthy is put back and held.
+          ./scripts/test-build-activation-rollback.sh
+          # The rule tree VISION.md roots, and the slop ratchet (2026-10-30).
+          ./scripts/test-rules-tree.sh
+          ./scripts/test-slop-ratchet.sh
+          python3 scripts/check_rules_tree.py
+          # The builder compiles main's tip while its CI runs (2026-10-29).
+          ./scripts/test-rust-prebuild.sh
           python3 ./scripts/test-watchdog-recovery.py
+      - name: SessionStart freshness + deployment and watchdog recovery (3/3)
+        run: |
+          set -uo pipefail
           # AEAB-36: a board write that never reached the server must say so,
           # and must never be confused with one the server refused. Its (c)/(d)
           # controls are the load-bearing half — a CLI that shouted "cannot

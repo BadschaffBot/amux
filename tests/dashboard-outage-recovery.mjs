@@ -23,7 +23,7 @@ function fixture(names = [], shared = {}) {
   const timers = new Map(); const timerDelays = new Map(); let tid = 0;
   const elements = new Map();
   const element = id => {
-    if (!elements.has(id)) elements.set(id, {value: '', textContent: '', innerHTML: '', style: {}, scrollHeight: 0, setAttribute() {}, classList: {add() {}, remove() {}, contains() {return false;}}});
+    if (!elements.has(id)) elements.set(id, {value: '', textContent: '', innerHTML: '', style: {}, scrollHeight: 0, setAttribute() {}, classList: {add() {}, remove() {}, toggle() {}, contains() {return false;}}});
     return elements.get(id);
   };
   const sandbox = { Response, AbortController, AbortSignal, DOMException, crypto: globalThis.crypto,
@@ -34,9 +34,12 @@ function fixture(names = [], shared = {}) {
       removeItem(k) { stored.delete(k); }, key(i) { return [...stored.keys()][i] ?? null; }, get length() { return stored.size; }},
     setTimeout(fn, delay) { timers.set(++tid, fn); timerDelays.set(tid, delay); return tid; }, clearTimeout(id) { timers.delete(id); timerDelays.delete(id); },
     API: '', offlineQueue: [], drafts: [], online: true, _syncFlight: null, _syncRetryTimer: null, _syncBackoffMs: 0, _SYNC_MIN_MS: 2000, _SYNC_MAX_MS: 60000, _OUTBOX_STALLED_MS:600000,
-    _interactionReplay:q => ({id:q.id}), _interactionAcknowledge:async () => {}, _interactionSet() {}, _upqList:async () => [], _uploadSyncPending:false, _syncChecklist:[], _localWriteError: '', window:{isSecureContext:true}, APP_VER:'test', _writeError: '', _outboxActive: new Set(), _bdSaveRequests: new Set(), consecutiveFailures: 0,
+    _interactionReplay:q => ({id:q.id}), _interactionAcknowledge:async () => {}, _interactionSet() {}, _upqList:async () => [], _uploadSyncPending:false, _dictSyncClips:async () => [], _dictPendingBadge:async () => {}, _dictPendingN:0, _dictAttentionN:0, _dictSyncPending:false, _dictPendingRows:[], _dictFlushing:0, _syncChecklist:[], _localWriteError: '', _syncBannerRequested: false, _syncBannerAuto: false, _syncChecklistAt: 0, _syncPillText: '', peekSession: null, _swOfflineNotice: null,
+    // Chat tab (AMUX-5350): no chat open, every worker renders as a terminal.
+    _chat: {name: null}, _chatShowing: () => false, _workerRenderer: () => 'terminal', _workersAsOfNote: () => '',
+    window:{isSecureContext:true}, APP_VER:'test', _writeError: '', _outboxActive: new Set(), _bdSaveRequests: new Set(), consecutiveFailures: 0,
     _OUTBOX_SKIP: /\/api\/client-debug/, _OUTBOX_METHODS: {POST:1,PATCH:1,PUT:1,DELETE:1},
-    _getDeviceName: () => 'test device', _authHeaders: h => h, esc: s => s, escJs: s => s, describeOp: q => q.url,
+    _getDeviceName: () => 'test device', _authHeaders: h => h, _ownerMentionHeaders: (u, b, h) => h, esc: s => s, escJs: s => s, describeOp: q => q.url,
     showToast() {}, amuxTrack() {}, updateConnectionStatus() {}, fetchSessions() {}, fetchBoard() {},
     _loadCmdHistoryFromServer: () => Promise.resolve(), _peekMessagesBadge() {}, _outboxBoardAcknowledged() {},
     _waitForMessageReceipt: () => new Promise(() => {}),
@@ -45,8 +48,8 @@ function fixture(names = [], shared = {}) {
   };
   const ctx = vm.createContext(sandbox);
   // Load production dependencies too: replay must execute, not fail on a stale fixture.
-  for (const name of ['_syncBannerShownAt', '_RECEIPT_TIMEOUT_MSG', '_geoFix', '_GEO_FIX_MAX_AGE_MS']) vm.runInContext(declaration(name), ctx);
-  for (const name of ['_syncBannerBeacon', '_sendContext', '_pendingStop', '_localStorageBytes', '_writeUserStorage', '_outboxDiagnostic', '_outboxAgeMs', '_outboxIsStalled', '_outboxAgeLabel', '_outboxNeedsAttention', '_localWriteNotice', '_localMessageRequest', '_validateMessageAcknowledgement', '_validateBoardAcknowledgement', '_readQueue', '_outboxLock', '_mutateQueue', '_outboxQueueable', '_outboxMessageId', '_outboxUncertainMessage', '_outboxConfirmMessage', '_queueOp', '_boundedMutationFetch', '_syncOneDraft', '_syncBackoffReset', '_scheduleSyncRetry', '_clearSyncTransientToast', '_runSyncBanner', 'runSyncBanner', ...names]) vm.runInContext(code(name), ctx);
+  for (const name of ['_DELIVERY_STEAL_MS', '_STORAGE_STEAL_MS', '_syncBannerShownAt', '_RECEIPT_TIMEOUT_MSG', '_geoFix', '_GEO_FIX_MAX_AGE_MS', '_OUTBOX_DECIDE_AFTER_MS', '_OUTBOX_STALE_SEND_MS', '_SYNC_STALL_MS', '_SYNC_LOCK_STEAL_MS', '_upqResetSinceOk', '_UPQ_DEAD_MS', '_UPQ_REPORT_EVERY_MS', '_upqEpisode', '_syncPhase', '_outboxOwned', '_OUTBOX_SETTLED_KEY']) vm.runInContext(declaration(name), ctx);
+  for (const name of ['_outboxDeliveryLock', '_outboxStorageLock', '_syncSetPhase', '_syncLockRequest', '_upqTimeoutReport', '_upqReadOk', '_upqListBounded', '_syncBannerBeacon', '_sendContext', '_pendingStop', '_localStorageBytes', '_writeUserStorage', '_outboxDiagnostic', '_outboxAgeMs', '_outboxIsStalled', '_outboxAgeLabel', '_outboxNeedsAttention', '_localWriteNotice', '_localMessageRequest', '_validateMessageAcknowledgement', '_validateBoardAcknowledgement', '_readQueue', '_lockRequest', '_outboxLock', '_outboxSettledRead', '_outboxRestoreOwned', '_outboxOwnedMissing', '_mutateQueue', '_outboxViewsRefresh', '_outboxQueueable', '_outboxMessageId', '_outboxMessageProgress', '_outboxUncertainMessage', '_outboxConfirmMessage', '_queueOp', '_boundedMutationFetch', '_syncOneDraft', '_syncBackoffReset', '_scheduleSyncRetry', '_clearSyncTransientToast', '_outboxPermanentRefusal', '_runSyncBanner', 'runSyncBanner', ...names, '_outboxIsMessage', '_outboxNeedsDecision', '_outboxMarkDecision', '_outboxServerAnswered', '_outboxBlockedMessageDecision', '_outboxRearmUnreached', '_outboxSettleDecisions']) vm.runInContext(code(name), ctx);
   return {ctx, stored, timers, timerDelays, element};
 }
 const patch = {method:'PATCH', body:'{"title":"saved","expect_rev":1}'};
@@ -182,14 +185,18 @@ test('connection status follows reads while pending write errors remain visible 
   const connection = element('connection');
   ctx.document.querySelectorAll = () => [connection];
   Object.assign(ctx, {_sessionLoadError:null, _boardReadError:'', _syncReadError:'',
-    _liveSSE:true, _recordConnState() {}, _sessionReadNotice:() => ''});
+    _liveSSE:true, _sseGraceUntil:0, _recordConnState() {}, _sessionReadNotice:() => ''});
   ctx.updateConnectionStatus(); assert.equal(connection.textContent, 'Live');
   ctx._writeError = '500: pool timeout';
   ctx.updateConnectionStatus(); assert.equal(connection.textContent, 'Live');
   assert.equal(ctx._writeError, '500: pool timeout', 'a live connection does not erase the failed write');
   ctx.offlineQueue = [{url:'/api/board/TASK-1',timestamp:Date.now(),error:ctx._writeError}];
   ctx.updateConnectionStatus(); assert.equal(connection.textContent, '1 pending');
-  assert.match(element('offline-ops').innerHTML, /500: pool timeout/, 'the failed operation retains its actionable error');
+  // Failed ops moved from the homepage banner to the status modal (07b42586,
+  // Ethan 2026-09-24). The error stays on the op the modal renders; the
+  // banner stays hidden and empty.
+  assert.equal(ctx.offlineQueue[0].error, '500: pool timeout', 'the failed operation retains its actionable error');
+  assert.equal(element('offline-ops').innerHTML, '');
   ctx._writeError = ''; ctx.offlineQueue = []; ctx._boardReadError = '500';
   ctx.updateConnectionStatus(); assert.equal(connection.textContent, 'Sync error');
   ctx._boardReadError = ''; ctx._syncReadError = 'network_error';
@@ -200,12 +207,78 @@ test('connection status follows reads while pending write errors remain visible 
 
 function sharedStorage() {
   const flights = new Map();
-  return {stored: new Map(), locks: {request(name, work) {
+  // The Web Locks signature: request(name, [options,] callback).
+  return {stored: new Map(), locks: {request(name, options, work) {
+    if (typeof options === 'function') work = options;
     const flight = (flights.get(name) || Promise.resolve()).then(work);
     flights.set(name, flight.catch(() => {}));
     return flight;
   }}};
 }
+
+// Two Mac app windows are separate WebContent processes sharing localStorage
+// through WebKit's storage process. With that process wedged (2026-10-28,
+// outbox_upload_list_timeout after_reset=1 for hours) a write in one window
+// had not reached the other, which then wrote its own copy over it. Each
+// window here gets its own copy of storage; `propagate` is the storage process
+// finally applying one window's write to the other's.
+function laggedWindows() {
+  const locks = sharedStorage().locks;
+  const x = fixture([], {locks, stored: new Map()}), y = fixture([], {locks, stored: new Map()});
+  const propagate = (from, to) => { for (const [k, v] of from.stored) to.stored.set(k, v); to.ctx.offlineQueue = to.ctx._readQueue(); };
+  const beacons = [];
+  for (const w of [x, y]) w.ctx.fetch = async (url, init) => { beacons.push(JSON.parse(init.body)); return new Response('{}'); };
+  return {x, y, propagate, beacons};
+}
+const message = text => ({method:'POST', body:JSON.stringify({text, msg_id:'m-' + text})});
+
+test('a sync pass that changes nothing does not rewrite the queue', async () => {
+  const {x, y, propagate} = laggedWindows();
+  assert.equal(await x.ctx._queueOp('/api/sessions/w/send', message('hello')), true);
+  let writes = 0;
+  const set = y.ctx.localStorage.setItem;
+  y.ctx.localStorage.setItem = (k, v) => { writes++; set(k, v); };
+  await y.ctx._mutateQueue(() => {});   // the first step of every sync pass
+  assert.equal(writes, 0, 'an idle pass in a window that has not seen the message writes nothing');
+  propagate(y, x);
+  assert.equal(JSON.parse(x.stored.get('amux_offline_queue')).length, 1, 'the message is still queued');
+});
+
+test("a window's stale write that drops another window's message is repaired, and the message is delivered", async () => {
+  const {x, y, propagate, beacons} = laggedWindows();
+  assert.equal(await x.ctx._queueOp('/api/sessions/w/send', message('hello')), true);
+  // Window y has not received it, makes a real change from its stale copy, and
+  // that copy reaches window x.
+  assert.equal(await y.ctx._queueOp('/api/board/TASK-1', patch), true);
+  propagate(y, x);
+  assert.deepEqual(x.ctx.offlineQueue.map(q => q.url), ['/api/board/TASK-1'], 'the stale write dropped the message');
+  assert.ok(x.ctx._outboxOwnedMissing() === 1, 'the window that queued it knows it is missing');
+  const posted = [];
+  x.ctx._origFetch = async (url, init) => {
+    posted.push(url.endsWith('/send') ? JSON.parse(init.body).msg_id : url);
+    return new Response(url.endsWith('/send') ? '{"ok":true,"submitted":true}' : '{"id":"TASK-1"}', {status:200});
+  };
+  await x.ctx.runSyncBanner();
+  assert.ok(posted.includes('m-hello'), 'the message is delivered: ' + JSON.stringify(posted));
+  assert.equal(posted.filter(p => p === 'm-hello').length, 1, 'once');
+  assert.equal(JSON.parse(x.stored.get('amux_offline_queue')).length, 0);
+  assert.ok(beacons.some(b => b.verdict === 'outbox_entry_restored' && b.msg_id === 'm-hello' && b.message === 1), JSON.stringify(beacons));
+});
+
+test('an entry another window delivered is not put back', async () => {
+  const shared = sharedStorage();
+  const a = fixture([], shared), b = fixture([], shared);
+  assert.equal(await a.ctx._queueOp('/api/sessions/w/send', message('hello')), true);
+  b.ctx.offlineQueue = b.ctx._readQueue();
+  let sends = 0;
+  b.ctx._origFetch = async () => { sends++; return new Response('{"ok":true,"submitted":true}', {status:200}); };
+  await b.ctx.runSyncBanner();
+  assert.equal(sends, 1);
+  await a.ctx._mutateQueue(() => {});
+  assert.equal(JSON.parse(shared.stored.get('amux_offline_queue')).length, 0, 'the delivered message stays settled');
+  assert.equal(a.ctx._outboxOwnedMissing(), 0);
+  assert.equal(vm.runInContext('_outboxOwned.size', a.ctx), 0, 'the window that queued it lets it go');
+});
 
 test('concurrent tabs append without overwriting another tab and replay each intent once', async () => {
   const shared = sharedStorage();
@@ -385,22 +458,25 @@ test('replay retries a durable message even while connectivity is believed offli
 });
 
 test('a newly queued send stays quiet while a stuck send shows its waiting state', () => {
+  // Waiting state lives in the status badge, never the homepage banner
+  // (07b42586, Ethan 2026-09-24: "it takes up too much real estate").
   const {ctx, element} = fixture(['updateConnectionStatus']);
-  ctx.document.querySelectorAll = () => [];
+  const badge = element('conn-status'); badge.id = 'conn-status';
+  ctx.document.querySelectorAll = () => [badge];
   Object.assign(ctx, {_sessionLoadError:null, _boardReadError:'', _syncReadError:'',
-    _liveSSE:true, _recordConnState() {}, _sessionReadNotice:() => ''});
+    _liveSSE:true, _sseGraceUntil:0, _recordConnState() {}, _sessionReadNotice:() => '', _workersAsOfNote:() => ''});
   const classes = new Set();
   element('offline-banner').classList = {add: x=>classes.add(x), remove:x=>classes.delete(x)};
   ctx.offlineQueue = [{url:'/api/sessions/worker/send',timestamp:Date.now()}];
   ctx.updateConnectionStatus();
-  assert.equal(classes.has('active'), false);
+  assert.equal(badge.textContent, 'Live', 'a fresh send is ordinary delivery, not a waiting state');
   ctx.offlineQueue[0].timestamp -= 600001;
   ctx.updateConnectionStatus();
-  assert.equal(classes.has('active'), true);
-  assert.match(element('offline-banner-title').innerHTML, /1 stalled/);
+  assert.equal(badge.textContent, '1 pending', 'a stuck send shows in the badge');
   ctx.online = false;
   ctx.updateConnectionStatus();
-  assert.match(element('offline-banner-title').innerHTML, /will send on reconnect/);
+  assert.equal(badge.textContent, '1 pending');
+  assert.equal(classes.has('active'), false, 'the homepage banner never opens');
 });
 
 
@@ -479,15 +555,61 @@ test('an unaccepted or wrong-identity receipt never clears the local message',as
   }
 });
 
-test('an attempted local send cannot be cancelled as though it never reached the server',async()=>{
-  const {ctx,stored}=fixture(['_pendingCancel']);ctx._peekMessagesRender=()=>{};
-  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"retain"}'});
+test('an attempted send is removed only after the reader confirms; an unattempted one at once',async()=>{
+  const {ctx,stored}=fixture(['_outboxRemoveMessage']);ctx._peekMessagesRender=()=>{};
+  const asked=[];let answer=false;ctx.showConfirm=async msg=>{asked.push(msg);return answer;};
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"retain","msg_id":"m1"}'});
   await ctx._mutateQueue(rows=>{rows[0].attempted_at=Date.now()});
-  await ctx._pendingCancel(ctx.offlineQueue[0].id);assert.equal(JSON.parse(stored.get('amux_offline_queue')).length,1);
-  await ctx._mutateQueue(rows=>{delete rows[0].attempted_at});
-  await ctx._pendingCancel(ctx.offlineQueue[0].id);assert.equal(ctx.offlineQueue.length,0);
+  await ctx._outboxRemoveMessage(ctx.offlineQueue[0].id);
+  assert.equal(JSON.parse(stored.get('amux_offline_queue')).length,1,'declining the confirmation keeps it');
+  assert.match(asked[0],/may already be with worker/);
+  answer=true;await ctx._outboxRemoveMessage(ctx.offlineQueue[0].id);assert.equal(ctx.offlineQueue.length,0);
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"fresh","msg_id":"m2"}'});
+  asked.length=0;await ctx._outboxRemoveMessage(ctx.offlineQueue[0].id);
+  assert.equal(ctx.offlineQueue.length,0);assert.equal(asked.length,0,'an unattempted message needs no confirmation');
 });
 
+test('a refused message waits for a decision and no longer holds later messages to the same worker',async()=>{
+  const {ctx}=fixture();
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"refused","msg_id":"r1"}'});
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"later","msg_id":"r2"}'});
+  const posts=[];
+  ctx._origFetch=async (_url,init)=>{const id=JSON.parse(init.body).msg_id;posts.push(id);
+    return id==='r1'?new Response('{"error":"nothing was pasted"}',{status:409}):new Response('{"ok":true,"submitted":true}');};
+  await ctx.runSyncBanner(true);await ctx.runSyncBanner(true);
+  const head=ctx.offlineQueue.find(q=>JSON.parse(q.options.body).msg_id==='r1');
+  assert.equal(head.needs_decision,'refused');
+  assert.ok(posts.includes('r2'),'the later message was delivered: '+posts.join(','));
+  assert.equal(posts.filter(id=>id==='r1').length,1,'a refused message is not retried on its own');
+  assert.equal(ctx.offlineQueue.length,1);
+});
+
+test('a message refused in an earlier session (Ethan, 2026-10-03) stops blocking the ones queued after it',async()=>{
+  const {ctx}=fixture();
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"old refused","msg_id":"o1"}'});
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"note","msg_id":"o2"}'});
+  // The shape a phone kept for two days: a refused head, blocked, from a build before these rules.
+  await ctx._mutateQueue(rows=>{Object.assign(rows[0],{attempted_at:Date.now()-3600000,attempts:1,state:'blocked',
+    error:'409: nothing was pasted'});});
+  const posts=[];ctx._origFetch=async (_url,init)=>{posts.push(JSON.parse(init.body).msg_id);return new Response('{"ok":true,"submitted":true}');};
+  await ctx.runSyncBanner(true);
+  assert.deepEqual(posts,['o2'],'only the later note is sent; the refused head waits for the reader');
+  assert.equal(ctx.offlineQueue.length,1);assert.equal(ctx.offlineQueue[0].needs_decision,'refused');
+});
+
+test('an unconfirmed message stops being checked after the bound and Retry resends the same msg_id once',async()=>{
+  const {ctx}=fixture(['_outboxRetryNow']);ctx._peekMessagesRender=()=>{};
+  await ctx._queueOp('/api/sessions/worker/send',{method:'POST',body:'{"text":"unsure","msg_id":"u1"}'});
+  await ctx._mutateQueue(rows=>{Object.assign(rows[0],{attempted_at:Date.now(),delivery_uncertain:true,
+    checking_since:Date.now()-vm.runInContext('_OUTBOX_DECIDE_AFTER_MS',ctx)-1000});});
+  const reqs=[];ctx._origFetch=async (url,init)=>{reqs.push((init?.method||'GET')+' '+url);return new Response('{"ok":true,"submitted":true}');};
+  await ctx.runSyncBanner(true);
+  assert.equal(ctx.offlineQueue[0].needs_decision,'unconfirmed');assert.equal(reqs.length,0,'no further confirmation reads');
+  await ctx._outboxRetryNow(ctx.offlineQueue[0].id);await ctx._syncFlight;
+  const sends=reqs.filter(r=>r.startsWith('POST'));
+  assert.equal(sends.length,1,reqs.join(' | '));
+  assert.equal(ctx.offlineQueue.length,0);
+});
 
 test('new input during a replay starts next tick instead of waiting for outage backoff', async () => {
   const {ctx,timers,timerDelays}=fixture();
@@ -508,16 +630,36 @@ test('new input during a replay starts next tick instead of waiting for outage b
 });
 
 test('post-input terminal polling is lightweight, serial and bounded', async () => {
-  const {ctx,timers,timerDelays}=fixture(['_peekPollInterval','_stopPeekPoll','_schedulePeekPoll','_peekKickFast','_refreshPeekSoon']);
-  let now=1000;const refreshes=[];
+  const {ctx,timers,timerDelays}=fixture(['_peekPollInterval','_stopPeekPoll','_schedulePeekPoll','_peekKickFast','_refreshPeekSoon','_peekPollNow']);
+  let now=1000;const refreshes=[];let requestMs=0;let duringRequest=null;
   Object.assign(ctx,{performance:{now:()=>now},peekSession:'lane',peekTimer:null,_peekUrgentUntil:0,_peekLastChangeMs:0,
-    _peekPollGen:0,_peekPollActive:false,_peekPollSession:null,_peekPrevStatus:'active',_peekFullPending:false,_peekLastFullMs:900,_PEEK_HISTORY_REFRESH_MS:30000,
-    sessions:[{name:'lane',status:'waiting'}],_peekPollBeacon(){},_peekUpdateBranch(){},refreshPeek:async live=>refreshes.push(live)});
-  ctx._refreshPeekSoon();assert.equal(timerDelays.get(ctx.peekTimer),40);
+    _peekPollGen:0,_peekPollActive:true,_peekPollSession:null,_peekPrevStatus:'active',_peekFullPending:false,_peekLastFullMs:900,_peekLastFullAttemptMs:900,_PEEK_HISTORY_REFRESH_MS:30000,
+    _peekPollInFlight:false,_peekPollAgain:false,
+    sessions:[{name:'lane',status:'waiting'}],_peekPollBeacon(){},_peekUpdateBranch(){},
+    refreshPeek:async (live=false)=>{refreshes.push(live);if(!live){ctx._peekLastFullAttemptMs=now;return;}if(duringRequest)duringRequest();now+=requestMs;}});
+  ctx._refreshPeekSoon();assert.equal(timerDelays.get(ctx.peekTimer),0);
   await timers.get(ctx.peekTimer)();assert.deepEqual(refreshes,[true]);
   assert.equal(timerDelays.get(ctx.peekTimer),100);
-  now=3000;await timers.get(ctx.peekTimer)();assert.deepEqual(refreshes,[true,false]);
+  now=3000;await timers.get(ctx.peekTimer)();assert.deepEqual(refreshes,[true,false,true]);
   assert.ok(timerDelays.get(ctx.peekTimer)>100);
+  // AMUX-4802: the cadence is a PERIOD. The idle setting is 500ms since
+  // 6efbc8fc, so a 200ms request waits 300, not 500. The request's duration
+  // used to be added on top.
+  now=20000;requestMs=200;await timers.get(ctx.peekTimer)();
+  assert.equal(timerDelays.get(ctx.peekTimer),300);
+  // A request slower than the period still leaves a gap: serial and bounded.
+  now=40000;requestMs=5000;await timers.get(ctx.peekTimer)();
+  assert.equal(timerDelays.get(ctx.peekTimer),40);
+  // A caller asking for a tick WHILE one is in flight starts no second fetch.
+  // It gets one more tick straight after, so nothing is dropped or reordered.
+  now=60000;requestMs=0;const before=refreshes.length;
+  duringRequest=()=>{assert.equal(ctx._peekPollInFlight,true);ctx._peekPollNow();};
+  await timers.get(ctx.peekTimer)();duringRequest=null;
+  assert.equal(refreshes.length,before+1,'no concurrent fetch was started');
+  assert.equal(timerDelays.get(ctx.peekTimer),40);
+  // Idle, with the loop waiting on its timer, the same call pulls the tick forward.
+  await timers.get(ctx.peekTimer)();assert.ok(timerDelays.get(ctx.peekTimer)>40);
+  ctx._peekPollNow();assert.equal(timerDelays.get(ctx.peekTimer),0);
   ctx.document.hidden=true;ctx._schedulePeekPoll();assert.equal(ctx.peekTimer,null);
 });
 
@@ -537,33 +679,53 @@ test('distinct fast taps fire while synthetic click echoes remain suppressed', (
 });
 
 
-test('offline banner distinguishes blocked work from changes that will retry', () => {
+test('a dropped stream reads Live during the reconnect grace, then Polling', () => {
+  // A server rebuild ends every stream; the pill must not flash a disconnect
+  // while the first reconnect runs (3b8b7d63).
   const {ctx, element} = fixture(['updateConnectionStatus']);
-  ctx.document.querySelectorAll = () => [];
+  const badge = element('conn-status'); badge.id = 'conn-status';
+  ctx.document.querySelectorAll = () => [badge];
+  Object.assign(ctx, {_sessionLoadError:null, _boardReadError:'', _syncReadError:'', _liveSSE:false,
+    _sseGraceUntil:Date.now() + 5000, _recordConnState() {}, _sessionReadNotice:() => '', _workersAsOfNote:() => '', online:true});
+  ctx.offlineQueue = [];
+  ctx.updateConnectionStatus();
+  assert.equal(badge.textContent, 'Live', 'inside the grace a dropped stream still reads Live');
+  ctx._sseGraceUntil = Date.now() - 1;
+  ctx.updateConnectionStatus();
+  assert.equal(badge.textContent, 'Polling', 'after the grace the true state shows');
+  ctx._sseGraceUntil = Date.now() + 5000; ctx.online = false;
+  ctx.updateConnectionStatus();
+  assert.equal(badge.textContent, 'Offline', 'the grace never hides a real offline');
+});
+
+test('offline banner distinguishes blocked work from changes that will retry', () => {
+  // The distinction now lives in the status badge (blocked wins: "N failed")
+  // and the status modal; the homepage banner is always hidden (07b42586).
+  const {ctx, element} = fixture(['updateConnectionStatus']);
+  const badge = element('conn-status'); badge.id = 'conn-status';
+  ctx.document.querySelectorAll = () => [badge];
   Object.assign(ctx, {_sessionLoadError:null, _boardReadError:'', _syncReadError:'',
-    _liveSSE:false, _recordConnState() {}, _sessionReadNotice:() => '', online:false});
+    _liveSSE:false, _sseGraceUntil:0, _recordConnState() {}, _sessionReadNotice:() => '', _workersAsOfNote:() => '', online:false});
   ctx.offlineQueue = [{id:'blocked',state:'blocked',error:'409: revision conflict',url:'/api/board/TASK-1',timestamp:Date.now()}];
   ctx.updateConnectionStatus();
-  let title = element('offline-banner-title').innerHTML;
-  assert.match(title, /Offline/);
-  assert.match(title, /1 failed op/);
-  assert.match(title, /review/);
-  assert.doesNotMatch(title, /will send on reconnect/);
+  assert.equal(badge.textContent, '1 failed');
   ctx.offlineQueue.push({id:'pending',url:'/api/board/TASK-2',timestamp:Date.now()});
   ctx.updateConnectionStatus();
-  title = element('offline-banner-title').innerHTML;
-  assert.match(title, /1 queued, will send on reconnect/);
-  assert.match(title, /1 failed/);
-  assert.doesNotMatch(title, /2 (ops|queued)/);
+  assert.equal(badge.textContent, '1 failed', 'a retryable op must not hide the one that needs review');
   ctx.online = true;
   ctx.updateConnectionStatus();
-  assert.match(element('offline-banner-title').innerHTML, /1 sending, 1 failed/);
+  assert.equal(badge.textContent, '1 failed');
+  ctx.offlineQueue = [{id:'pending',url:'/api/board/TASK-2',timestamp:Date.now()}];
+  ctx.updateConnectionStatus();
+  assert.equal(badge.textContent, 'Polling', 'online: a fresh queued op is ordinary delivery');
+  ctx.online = false;
+  ctx.updateConnectionStatus();
+  assert.equal(badge.textContent, '1 pending', 'offline: queued work reads as pending, not failed');
+  ctx.online = true;
   ctx.offlineQueue = [{id:'stalled',url:'/api/board/TASK-2',timestamp:Date.now()-3*60*60*1000}];
   ctx.updateConnectionStatus();
-  title = element('offline-banner-title').innerHTML;
-  assert.match(title, /1 stalled 3h/);
-  assert.match(title, /review/);
-  assert.doesNotMatch(title, /sending|_clearBlockedOps/);
+  assert.equal(badge.textContent, '1 pending', 'a stalled op keeps the badge in its waiting state');
+  assert.equal(element('offline-ops').innerHTML, '');
 });
 
 test('a stale failed-row dismiss cannot remove work another tab has resumed', async () => {
@@ -612,7 +774,10 @@ test('quiet batches show individual receipts while one ordinary send stays quiet
     for(let i=0;i<count;i++)await ctx._queueOp('/api/board/TASK-'+i,patch);
     ctx._origFetch=async url=>new Response(JSON.stringify({id:url.split('/').pop()}),{status:200});
     await ctx.runSyncBanner(true);
-    assert.equal(shown,count>=2);
+    // The checklist no longer opens on its own for any batch size (Ethan
+    // 2026-09-24: "keep it in the pending/live status at the top"); progress
+    // is the connection pill, and a tap on it opens the list.
+    assert.equal(shown,false);
     assert.equal(ctx.offlineQueue.length,0);
   }
 });
@@ -718,7 +883,7 @@ test('reconnect retries retain completed file checkmarks without uploading those
 
 test('a queue entry removed in another tab cannot earn an acknowledgement checkmark', async () => {
   const {ctx, stored, element} = fixture(); await enqueue(ctx);
-  ctx._outboxLock=async (name, work) => {if(name.startsWith('amux-outbox-delivery:')) stored.set('amux_offline_queue','[]'); return work();};
+  ctx._outboxDeliveryLock=async (name, work) => {if(name.startsWith('amux-outbox-delivery:')) stored.set('amux_offline_queue','[]'); return work();};
   await ctx.runSyncBanner();
   assert.equal(element('sync-title-text').textContent,'0 synced, 1 skipped');
   assert.doesNotMatch(element('sync-items').innerHTML,/sync-item done/);
@@ -778,4 +943,208 @@ test('Stop deduplication preserves a later Stop after Start and separate worker 
   for (const url of ['/api/sessions/a/stop', '/api/sessions/b/stop', '/api/sessions/a/stop', '/api/sessions/a/start', '/api/sessions/a/stop'])
     await ctx._queueOp(url, {method:'POST'});
   assert.deepEqual(Array.from(ctx.offlineQueue, q => q.url), ['/api/sessions/a/stop', '/api/sessions/b/stop', '/api/sessions/a/start', '/api/sessions/a/stop']);
+});
+
+
+test('local settings never probe the gateway-only billing route', async () => {
+  const nodes = new Map(['settings-billing-section','settings-billing-info','settings-billing-sep'].map(id=>[id,{style:{display:''}}]));
+  const calls=[];
+  const ctx=vm.createContext({_cloudEmail:'',document:{getElementById:id=>nodes.get(id)},fetch:async url=>{calls.push(url);return {ok:true,json:async()=>({stripe_configured:false})};}});
+  for(const name of ['_loadCloudPlan','loadBillingSection'])vm.runInContext(code(name),ctx);
+  await ctx._loadCloudPlan();await ctx.loadBillingSection();
+  assert.deepEqual(calls,[]);assert.equal(nodes.get('settings-billing-section').style.display,'none');
+  ctx._cloudEmail='owner@example.test';
+  await ctx._loadCloudPlan();await ctx.loadBillingSection();
+  assert.deepEqual(calls,['/api/stripe/status','/api/stripe/status'],'managed accounts still load their billing capability');
+});
+
+test('identity arriving after settings opened refreshes billing without another click',async()=>{
+  const calls=[];
+  const ctx=vm.createContext({_cloudEmail:'',location:{hostname:'example.test'},document:{getElementById:id=>id==='settings-menu'?{classList:{contains:()=>true}}:null},
+    fetch:async()=>({ok:true,status:200,json:async()=>({is_cloud:true,email:'owner@example.test',has_api_key:true})}),
+    // _initIdentity calls these too (2aa72c6b6 added _cloudOfferInit); a missing
+    // one throws inside its try and the billing refresh this test pins never runs.
+    _applyIdentityToSettings(){},_cloudOfferInit(){},loadTeamSection(){},_loadGatewayOrgs(){},
+    _loadCloudPlan(){calls.push('plan')},loadBillingSection(){calls.push('billing')}});
+  vm.runInContext(code('_initIdentity'),ctx);await ctx._initIdentity();
+  assert.deepEqual(calls,['plan','billing']);assert.equal(ctx._cloudEmail,'owner@example.test');
+});
+
+// A lock stub with Web Locks' steal: a {steal:true} request is granted at once,
+// and the request it took the lock from rejects with an AbortError while that
+// holder's callback keeps running. That rejection is WebKit's "lock was stolen
+// by another request" (Ethan, 2026-10-25).
+function stealingLocks() {
+  const holders = new Map();
+  return {request(name, options, work) {
+    if (typeof options === 'function') { work = options; options = {}; }
+    return new Promise((resolve, reject) => {
+      const grant = () => {
+        const prev = holders.get(name);
+        holders.set(name, {reject});
+        Promise.resolve().then(() => work({name})).then(resolve, reject)
+          .finally(() => { if (holders.get(name)?.reject === reject) holders.delete(name); });
+        return prev;
+      };
+      if (options.steal) {
+        const prev = grant();
+        if (prev) { const e = new Error('Lock was stolen by another request'); e.name = 'AbortError'; prev.reject(e); }
+      } else if (!holders.has(name)) grant();
+      else reject(Object.assign(new Error('busy'), {name: 'TimeoutError'}));
+    });
+  }};
+}
+
+test('a lock stolen from a holder that already ran resolves with its own work, once, and says so', async () => {
+  const locks = stealingLocks();
+  const {ctx} = fixture([], {locks});
+  const beacons = [];
+  ctx.fetch = async (url, init) => { if (String(url).includes('client-debug')) beacons.push(JSON.parse(init.body)); return new Response('{}'); };
+  let release; let runs = 0;
+  const slow = () => { runs++; return new Promise(r => { release = r; }); };
+  const holder = ctx._lockRequest('amux-outbox-delivery:m1', {}, slow);
+  await new Promise(setImmediate);
+  const stealer = ctx._lockRequest('amux-outbox-delivery:m1', {steal: true}, async () => 'stealer-done');
+  assert.equal(await stealer, 'stealer-done');
+  release('holder-done');
+  assert.equal(await holder, 'holder-done', 'the stolen holder resolves with its own result, not "lock was stolen"');
+  assert.equal(runs, 1, 'the holder\'s work is not run a second time');
+  assert.ok(beacons.some(b => b.verdict === 'outbox_lock_stolen_while_held' && b.lock === 'amux-outbox-delivery'), JSON.stringify(beacons));
+  // A request that never got the lock still rejects: only a granted one is resolved.
+  const waiting = ctx._lockRequest('amux-outbox-delivery:m2', {}, () => new Promise(() => {}));
+  await new Promise(setImmediate);
+  await assert.rejects(ctx._lockRequest('amux-outbox-delivery:m2', {}, async () => 1), e => e.name === 'TimeoutError');
+  void waiting;
+});
+
+// Web Locks with a queue, and WebKit's gap between granting a lock and calling
+// its callback: a steal in that gap rejects a request whose work never ran
+// (Ethan, 2026-10-25, "still" after the stolen-while-held fix).
+function queuedStealingLocks() {
+  const held = new Map(), queues = new Map();
+  const next = name => { const q = queues.get(name) || []; if (!held.has(name) && q.length) q.shift()(); };
+  return {request(name, options, work) {
+    if (typeof options === 'function') { work = options; options = {}; }
+    return new Promise((resolve, reject) => {
+      const grant = () => {
+        const me = {reject, ran: false};
+        held.set(name, me);
+        // The callback runs a macrotask after the grant: the gap a steal can land in.
+        setImmediate(() => {
+          if (held.get(name) !== me) return;
+          me.ran = true;
+          Promise.resolve().then(() => work({name})).then(resolve, reject)
+            .finally(() => { if (held.get(name) === me) { held.delete(name); next(name); } });
+        });
+      };
+      if (options.steal) {
+        const prev = held.get(name);
+        if (prev) { held.delete(name); const e = new Error('Lock was stolen by another request'); e.name = 'AbortError'; prev.reject(e); }
+        grant();
+      } else {
+        options.signal?.addEventListener?.('abort', () => reject(Object.assign(new Error('timed out'), {name: 'TimeoutError'})));
+        if (!queues.has(name)) queues.set(name, []);
+        queues.get(name).push(grant); next(name);
+      }
+    });
+  }};
+}
+
+test('a lock stolen before its work started waits its turn and runs once, instead of "lock was stolen"', async () => {
+  const locks = queuedStealingLocks();
+  const {ctx} = fixture([], {locks});
+  const beacons = [];
+  ctx.fetch = async (url, init) => { if (String(url).includes('client-debug')) beacons.push(JSON.parse(init.body)); return new Response('{}'); };
+  const order = [];
+  // Granted, then stolen by another shown window before its callback ran.
+  const first = ctx._lockRequest('amux-outbox-replay', {steal: true}, async () => { order.push('first'); return 'first-done'; });
+  const thief = ctx._lockRequest('amux-outbox-replay', {steal: true}, async () => { order.push('thief'); return 'thief-done'; });
+  assert.equal(await thief, 'thief-done');
+  assert.equal(await first, 'first-done', 'the request whose work never ran waits its turn rather than rejecting');
+  assert.deepEqual(order, ['thief', 'first'], 'each work runs once, the robbed one after the thief');
+  assert.ok(beacons.some(b => b.verdict === 'outbox_lock_stolen_before_run' && b.lock === 'amux-outbox-replay' && b.steal === 1), JSON.stringify(beacons));
+});
+
+test('a message delivery lock stolen before its work started yields: the thief delivers, the message goes once', async () => {
+  // The replay retry above must not reach a message's delivery lock: the thief
+  // is another window delivering that same message, and retrying sent it twice
+  // (outbox-stalled-window red on f47ddbe29: 2 posts of one msg_id).
+  const locks = queuedStealingLocks();
+  const {ctx} = fixture([], {locks});
+  ctx.fetch = async () => new Response('{}');
+  const sends = [];
+  const first = ctx._lockRequest('amux-outbox-delivery:q1', {steal: true}, async () => { sends.push('first'); return 'first-done'; })
+    .then(v => v, e => e);
+  const thief = ctx._lockRequest('amux-outbox-delivery:q1', {steal: true}, async () => { sends.push('thief'); return 'thief-done'; });
+  assert.equal(await thief, 'thief-done');
+  const robbed = await first;
+  assert.equal(robbed && robbed.name, 'AbortError', 'the robbed delivery yields to the window that took it over');
+  await new Promise(r => setImmediate(r));
+  assert.deepEqual(sends, ['thief'], 'the message is delivered once');
+});
+
+// A WORKER DELETE NEVER WAITS IN THE OUTBOX (2026-11-16). Queued, it sat behind
+// a replay that stalled across windows: 8 deletes of two workers from two
+// browsers, none in the request log, and the workers came back.
+function shippedSkipList(ctx) {
+  for (const name of ['_OUTBOX_SKIP', '_OUTBOX_ANSWER_NOW']) vm.runInContext(declaration(name), ctx);
+}
+
+test('the shipped skip list keeps worker deletes out of the outbox and nothing else of a worker', () => {
+  const {ctx} = fixture();
+  shippedSkipList(ctx);
+  const post = {method: 'POST'};
+  assert.equal(ctx._outboxQueueable('/api/sessions/test2/delete', post), false);
+  assert.equal(ctx._outboxQueueable('https://amux.test/api/sessions/a%20b/delete?x=1', post), false);
+  // Other worker actions, and a worker NAMED delete, stay queueable.
+  assert.equal(ctx._outboxQueueable('/api/sessions/test2/stop', post), true);
+  assert.equal(ctx._outboxQueueable('/api/sessions/delete/start', post), true);
+  assert.equal(ctx._outboxQueueable('/api/sessions/delete-me/archive', post), true);
+  assert.equal(ctx._outboxQueueable('/api/board/TASK-1', patch), true);
+});
+
+function apiCallFixture(fetchImpl) {
+  const f = fixture(['apiCall', '_isLocallyQueued']);
+  shippedSkipList(f.ctx);
+  const toasts = []; const calls = [];
+  Object.assign(f.ctx, {
+    showToast: t => toasts.push(t), setOnline() {}, _warnIgnoredFields() {}, console: {...console, error() {}},
+    fetch: async (url, init) => { calls.push(String(url)); return fetchImpl(url, init); },
+  });
+  return {...f, toasts, calls};
+}
+
+test('a delete pressed while this tab believes it is offline goes to the server, not the queue', async () => {
+  const {ctx, calls} = apiCallFixture(async () => new Response('{"ok":true}', {status: 200}));
+  vm.runInContext('online = false', ctx);
+  const r = await ctx.apiCall('/api/sessions/test2/delete', {method: 'POST', headers: {'X-Amux-UI-Token': 't'}});
+  assert.equal(r && r.status, 200, 'the server answered the delete');
+  assert.deepEqual(calls, ['/api/sessions/test2/delete']);
+  assert.equal(ctx._readQueue().length, 0, 'nothing waits in the outbox');
+  // A queueable write under the same belief is still queued, untouched.
+  assert.equal(await ctx.apiCall('/api/board/TASK-1', {...patch}), null);
+  assert.deepEqual(calls, ['/api/sessions/test2/delete'], 'the board edit did not hit the network');
+  assert.equal(ctx._readQueue().length, 1);
+});
+
+test('a delete the server cannot be reached for says so and is not queued', async () => {
+  const {ctx, toasts} = apiCallFixture(async () => { throw new TypeError('Failed to fetch'); });
+  assert.equal(await ctx.apiCall('/api/sessions/test2/delete', {method: 'POST'}), null);
+  assert.equal(ctx._readQueue().length, 0, 'no delete waits to replay later');
+  assert.ok(toasts.some(t => /^Not done: the server could not be reached/.test(t)), JSON.stringify(toasts));
+});
+
+test('worker deletes already queued are dropped at load and the count is reported', async () => {
+  const {ctx} = fixture(['_outboxDropAnswerNow']);
+  shippedSkipList(ctx);
+  const beacons = [];
+  ctx.fetch = async (url, init) => { if (String(url).includes('client-debug')) beacons.push(JSON.parse(init.body)); return new Response('{}'); };
+  // Entries written before the skip list knew about deletes.
+  await ctx._mutateQueue(q => { q.push(
+    {id: 'd1', url: '/api/sessions/test2/delete', options: {method: 'POST'}, timestamp: Date.now()},
+    {id: 'd2', url: '/api/sessions/test/delete', options: {method: 'POST'}, timestamp: Date.now()},
+    {id: 'b1', url: '/api/board/TASK-1', options: {...patch}, timestamp: Date.now()}); });
+  await ctx._outboxDropAnswerNow();
+  assert.deepEqual(ctx._readQueue().map(q => q.id), ['b1']);
+  assert.ok(beacons.some(b => b.verdict === 'answer_now_dropped' && b.dropped === 2 && b.n_considered === 3), JSON.stringify(beacons));
 });

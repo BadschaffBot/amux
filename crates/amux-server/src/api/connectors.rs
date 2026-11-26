@@ -38,19 +38,22 @@
 //! differs. The redirect URI follows [`crate::config::canonical_port`] so it is
 //! correct in the 8824 laptop and the 8822 container without a build flag.
 
+#[path = "declared_oauth.rs"]
+mod declared_oauth;
+
 use super::AppState;
 use crate::config::{amux_home, canonical_port, parse_env_file};
 use crate::integrations::email::{
-    base64url_nopad, connected_accounts_in, html_escape, HttpTransport, ReqwestTransport,
-    DEFAULT_TOKEN_URI,
+    DEFAULT_TOKEN_URI, HttpTransport, ReqwestTransport, base64url_nopad, connected_accounts_in,
+    html_escape,
 };
-use axum::extract::{Path, Query};
+use crate::integrations::oauth_store;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -58,15 +61,18 @@ use std::time::Instant;
 
 /// Broker context: the HTTP transport (mockable in tests, like
 /// [`super::gmail_auth::GmailAuthCtx`]) plus the amux home the token store
-/// lives under. Only the broker endpoints (auth/callback/token/accounts) use
-/// it; list/credentials/test keep reading the process-global home.
+/// lives under. Broker and provider tests share this boundary; credentials
+/// and the dashboard inventory use the process home.
 pub struct ConnectorsCtx {
     pub http: Arc<dyn HttpTransport>,
     pub home: PathBuf,
 }
 
 fn default_ctx() -> Arc<ConnectorsCtx> {
-    Arc::new(ConnectorsCtx { http: Arc::new(ReqwestTransport::new()), home: amux_home() })
+    Arc::new(ConnectorsCtx {
+        http: Arc::new(ReqwestTransport::new()),
+        home: amux_home(),
+    })
 }
 
 /// Auth model for a provider. OAuth needs a client id/secret plus a browser
@@ -76,6 +82,11 @@ fn default_ctx() -> Arc<ConnectorsCtx> {
 enum Auth {
     ApiKey {
         key_env: &'static str,
+    },
+    /// Several keys pasted together, no browser grant (a chat bridge bot:
+    /// a token plus the ids and secrets its webhook needs).
+    ApiKeys {
+        keys: &'static [&'static str],
     },
     OAuth2 {
         client_id_env: &'static str,
@@ -123,7 +134,9 @@ const REGISTRY: &[Provider] = &[
         id: "granola",
         label: "Granola",
         category: "Notes / transcripts",
-        auth: Auth::ApiKey { key_env: "GRANOLA_API_KEY" },
+        auth: Auth::ApiKey {
+            key_env: "GRANOLA_API_KEY",
+        },
         setup_note: "Business or Enterprise plan required to mint a key: Granola desktop -> Settings -> Connectors -> API keys (grn_...). Key-only, no OAuth.",
         docs: "https://public-api.granola.ai",
         test_url: "https://public-api.granola.ai/v1/notes?limit=1",
@@ -188,6 +201,20 @@ const REGISTRY: &[Provider] = &[
         test_url: "https://admin.googleapis.com/admin/directory/v1/users?maxResults=1&customer=my_customer",
     },
     Provider {
+        id: "google-youtube",
+        label: "YouTube",
+        category: "Google",
+        auth: Auth::OAuth2 {
+            client_id_env: "GOOGLE_OAUTH_CLIENT_ID",
+            client_secret_env: "GOOGLE_OAUTH_CLIENT_SECRET",
+            callback_path: "/api/connectors/google/callback",
+            scopes: "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly https://www.googleapis.com/auth/yt-analytics.readonly",
+        },
+        setup_note: "Enable the YouTube Data API v3 and YouTube Analytics API. For a Workspace channel, delegate these scopes to the domain's service account (GOOGLE_SA_KEY_FILE_<DOMAIN>). Uploads stay private until Google's YouTube API audit passes. Posting goes through /api/social.",
+        docs: "https://console.cloud.google.com/apis/library/youtube.googleapis.com",
+        test_url: "https://www.googleapis.com/youtube/v3/channels?part=id&mine=true",
+    },
+    Provider {
         id: "slack",
         label: "Slack",
         category: "Chat",
@@ -197,21 +224,58 @@ const REGISTRY: &[Provider] = &[
             callback_path: "/api/connectors/slack/callback",
             scopes: "channels:read chat:write channels:history",
         },
-        setup_note: "Create a Slack app, add the redirect URI below, and paste its client id + secret.",
+        setup_note: "Create the Slack app with the link below (it fills in the redirect URI and scopes), then paste its client id + secret from the app's Basic Information page.",
         docs: "https://api.slack.com/apps",
         test_url: "https://slack.com/api/auth.test",
+    },
+    // The chat bridge's bots (bridge/adapters.rs): conversations linked to
+    // workers and groups through messages.
+    Provider {
+        id: "whatsapp",
+        label: "WhatsApp",
+        category: "Chat",
+        auth: Auth::ApiKeys {
+            keys: &["WHATSAPP_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_APP_SECRET", "WHATSAPP_VERIFY_TOKEN"],
+        },
+        setup_note: "Create a Meta app with the WhatsApp product (developers.facebook.com). Paste the access token, the phone number id, the app secret, and a verify token you choose. Set the webhook to <public amux URL>/api/bridge/hook/whatsapp with that verify token and subscribe to messages. Then message the number and send /link <worker or group>.",
+        docs: "https://developers.facebook.com/docs/whatsapp/cloud-api/get-started",
+        test_url: "",
+    },
+    Provider {
+        id: "slack-bot",
+        label: "Slack bot",
+        category: "Chat",
+        auth: Auth::ApiKeys {
+            keys: &["SLACK_BOT_TOKEN", "SLACK_SIGNING_SECRET"],
+        },
+        setup_note: "In your Slack app, add the chat:write, im:history and channels:history bot scopes, install it, and paste the bot token and signing secret. Point Event Subscriptions at <public amux URL>/api/bridge/hook/slack (message.im, message.channels). Then /link <worker or group> in a channel or DM.",
+        docs: "https://api.slack.com/apps",
+        test_url: "https://slack.com/api/auth.test",
+    },
+    Provider {
+        id: "discord",
+        label: "Discord",
+        category: "Chat",
+        auth: Auth::ApiKeys {
+            keys: &["DISCORD_BOT_TOKEN", "DISCORD_CHANNELS"],
+        },
+        setup_note: "Create a bot at discord.com/developers, enable the Message Content intent, invite it to your server, and paste its token and the channel ids to watch (comma separated; prefix a DM channel with dm:). amux reads them every few seconds, so no public URL is needed. Then /link <worker or group> in the channel.",
+        docs: "https://discord.com/developers/docs/intro",
+        test_url: "",
     },
     Provider {
         id: "telegram",
         label: "Telegram",
         category: "Chat",
-        auth: Auth::ApiKey { key_env: "TELEGRAM_BOT_TOKEN" },
+        auth: Auth::ApiKey {
+            key_env: "TELEGRAM_BOT_TOKEN",
+        },
         // No OAuth, no server URL to configure — one bot token, and the
         // `runtime_jobs::telegram_poll` long-poll loop (no public endpoint
         // needed, unlike a webhook) picks it up on the next server restart.
         // Chats link themselves to a session by sending `/link <session>` to
         // the bot; `/api/telegram/mappings` is the operator-side view.
-        setup_note: "Message @BotFather on Telegram, /newbot, paste the token it gives you. No webhook/public URL needed — amux polls. After saving, restart the server so the poll loop picks up the token, then send /link <session> to the bot from Telegram.",
+        setup_note: "Message @BotFather on Telegram, /newbot, paste the token it gives you. No webhook/public URL needed — amux polls. After saving, amux discovers the token within five seconds. Send /link <session> to the bot from Telegram.",
         docs: "https://core.telegram.org/bots#how-do-i-create-a-bot",
         test_url: "",
     },
@@ -226,8 +290,37 @@ const REGISTRY: &[Provider] = &[
         },
         // Self-hosted: no fixed docs/console URL, no fixed test_url — the
         // server is wherever MATTERMOST_URL says it is (see mattermost_test_url).
-        setup_note: "Self-hosted Mattermost. Paste the server URL (e.g. https://chat.example.com, no trailing slash), plus a login and password — a personal access token works too as the password.",
+        setup_note: "Self-hosted Mattermost. Paste the server URL (e.g. https://chat.example.com, no trailing slash), plus a login and password. This connector uses the server login endpoint.",
         docs: "",
+        test_url: "",
+    },
+    // Social publishing (api/social_devto.rs). Another account's key is
+    // DEVTO_API_KEY_<ACCOUNT>, declared as a custom connector.
+    Provider {
+        id: "devto",
+        label: "dev.to",
+        category: "Social",
+        auth: Auth::ApiKey {
+            key_env: "DEVTO_API_KEY",
+        },
+        setup_note: "dev.to -> Settings -> Extensions -> DEV Community API Keys: generate a key and paste it. Articles are saved as drafts until AMUX_SOCIAL_PUBLIC=1.",
+        docs: "https://developers.forem.com/api/v1",
+        // Forem reads the key from an api-key header, not a bearer, so the
+        // bearer Test would report a working key as broken.
+        test_url: "",
+    },
+    // Outbound phone calls (api/calls.rs, docs/design/phone-calls.md). The
+    // Twilio and xAI keys are read by the call bridge; amux itself only needs
+    // AMUX_CALL_BRIDGE_URL to place a call.
+    Provider {
+        id: "phone",
+        label: "Phone calls",
+        category: "Voice",
+        auth: Auth::ApiKeys {
+            keys: &["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM", "XAI_API_KEY", "AMUX_CALL_BRIDGE_URL"],
+        },
+        setup_note: "A Twilio account SID, auth token and the number calls come from (E.164, e.g. +15551234567), an xAI API key with realtime voice, and the URL of the call bridge on the amux cloud host. A worker places a call with `amux call <number> --stdin`; numbers outside AMUX_CALL_ALLOWLIST wait for your approval in the Calls tab.",
+        docs: "https://www.twilio.com/docs/voice/media-streams",
         test_url: "",
     },
 ];
@@ -297,20 +390,25 @@ struct CustomProvider {
     test_url: String,
 }
 
+fn load_custom_checked(home: &std::path::Path) -> std::io::Result<Vec<CustomProvider>> {
+    crate::integrations::secure_store::read_json(&custom_store_path(home))
+}
+
 fn load_custom(home: &std::path::Path) -> Vec<CustomProvider> {
-    std::fs::read_to_string(custom_store_path(home))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Vec<CustomProvider>>(&t).ok())
-        .unwrap_or_default()
+    load_custom_checked(home).unwrap_or_else(|e| {
+        tracing::warn!(%e, verdict = "connector_registry_unreadable", "connector registry could not be read; retained on disk");
+        Vec::new()
+    })
 }
 
 fn save_custom(home: &std::path::Path, list: &[CustomProvider]) -> std::io::Result<()> {
-    let path = custom_store_path(home);
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let body = serde_json::to_string_pretty(list).unwrap_or_else(|_| "[]".into());
-    std::fs::write(&path, body)
+    let body = serde_json::to_vec_pretty(list)?;
+    crate::integrations::secure_store::write(&custom_store_path(home), &body)
+}
+
+fn storage_error(error: std::io::Error) -> Response {
+    tracing::warn!(%error, verdict = "connector_storage_refused", "connector update not acknowledged; inspect storage before retrying");
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"ok":false,"error":"connector storage is unreadable or could not be durably committed","acknowledged":false}))).into_response()
 }
 
 /// The owned, source-agnostic view of a connector.
@@ -341,11 +439,16 @@ struct Def {
 impl From<&'static Provider> for Def {
     fn from(p: &'static Provider) -> Def {
         let (kind, authorize_url, token_url, scopes) = match p.auth {
-            Auth::ApiKey { .. } => ("api_key", String::new(), String::new(), String::new()),
-            Auth::OAuth2 { scopes, .. } => ("oauth2", String::new(), String::new(), scopes.to_string()),
-            Auth::LoginPassword { .. } => {
-                ("login_password", String::new(), String::new(), String::new())
+            Auth::ApiKey { .. } | Auth::ApiKeys { .. } => ("api_key", String::new(), String::new(), String::new()),
+            Auth::OAuth2 { scopes, .. } => {
+                ("oauth2", String::new(), String::new(), scopes.to_string())
             }
+            Auth::LoginPassword { .. } => (
+                "login_password",
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
         };
         Def {
             id: p.id.to_string(),
@@ -367,7 +470,10 @@ impl From<&'static Provider> for Def {
 impl From<&CustomProvider> for Def {
     fn from(c: &CustomProvider) -> Def {
         let (kind, env_keys) = if c.kind == "oauth2" {
-            ("oauth2", vec![c.client_id_env.clone(), c.client_secret_env.clone()])
+            (
+                "oauth2",
+                vec![c.client_id_env.clone(), c.client_secret_env.clone()],
+            )
         } else {
             ("api_key", vec![c.key_env.clone()])
         };
@@ -380,7 +486,10 @@ impl From<&CustomProvider> for Def {
                 c.category.clone()
             },
             kind,
-            env_keys: env_keys.into_iter().filter(|k| !k.trim().is_empty()).collect(),
+            env_keys: env_keys
+                .into_iter()
+                .filter(|k| !k.trim().is_empty())
+                .collect(),
             authorize_url: c.authorize_url.clone(),
             token_url: c.token_url.clone(),
             scopes: c.scopes.clone(),
@@ -420,14 +529,17 @@ pub fn env_keys_for(home: &std::path::Path, id: &str) -> Option<Vec<String>> {
 fn valid_connector_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
-        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
 /// An env var name Ethan may declare. Same reasoning: reject, do not rewrite.
 fn valid_env_name(k: &str) -> bool {
     !k.is_empty()
         && k.len() <= 128
-        && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && k.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
         && !k.chars().next().is_some_and(|c| c.is_ascii_digit())
 }
 
@@ -436,6 +548,7 @@ fn valid_env_name(k: &str) -> bool {
 fn env_keys(p: &Provider) -> Vec<&'static str> {
     match p.auth {
         Auth::ApiKey { key_env } => vec![key_env],
+        Auth::ApiKeys { keys } => keys.to_vec(),
         Auth::OAuth2 {
             client_id_env,
             client_secret_env,
@@ -451,8 +564,28 @@ fn env_keys(p: &Provider) -> Vec<&'static str> {
 
 /// This server's origin for redirect URIs, canonical-port so it is right in
 /// both the laptop (8824) and the container (8822) with no build flag.
+/// `AMUX_OAUTH_ORIGIN` wins (a cloud server is reached at its domain, so a
+/// localhost redirect reaches nothing there).
 fn origin() -> String {
-    format!("https://localhost:{}", canonical_port())
+    super::gmail_auth::oauth_origin().unwrap_or_else(|| format!("https://localhost:{}", canonical_port()))
+}
+
+/// Slack's create-from-manifest link for the `slack` connector, so setting it
+/// up is one click and a workspace pick: the redirect URI and the bot scopes
+/// both connectors need arrive filled in, where the owner used to copy them
+/// across by hand. Slack shows the manifest for review before it creates
+/// anything.
+fn slack_create_app_url(redirect_uri: &str) -> String {
+    let manifest = json!({
+        "display_information": {"name": "amux", "description": "amux workers in Slack"},
+        "features": {"bot_user": {"display_name": "amux", "always_online": true}},
+        "oauth_config": {
+            "redirect_urls": [redirect_uri],
+            "scopes": {"bot": ["channels:read", "chat:write", "channels:history", "im:history"]},
+        },
+        "settings": {"org_deploy_enabled": false, "socket_mode_enabled": false, "token_rotation_enabled": false},
+    });
+    format!("https://api.slack.com/apps?new_app=1&manifest_json={}", urlencode(&manifest.to_string()))
 }
 
 /// The redirect URI every google-family grant uses: the GMAIL one, on purpose
@@ -650,17 +783,28 @@ fn family_of(p: &Provider) -> &'static str {
 /// excluded from the default union (its scopes need a Workspace super-admin
 /// and fail on consumer accounts like a personal gmail); a grant STARTED from
 /// google-admin adds them.
+/// Rows a Google grant includes when it was started from ANOTHER row. Admin
+/// needs a super-admin, and YouTube adds upload scopes nobody connecting Gmail
+/// meant to grant; each joins a grant only when the grant starts from it.
+fn in_default_google_grant(id: &str) -> bool {
+    !matches!(id, "google-admin" | "google-youtube")
+}
+
 fn google_union_scopes(requesting: &Provider) -> String {
     let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for p in REGISTRY.iter().filter(|p| p.category == "Google") {
-        if p.id == "google-admin" && requesting.id != "google-admin" {
+        if p.id != requesting.id && !in_default_google_grant(p.id) {
             continue;
         }
         if let Auth::OAuth2 { scopes, .. } = p.auth {
             set.extend(scopes.split_whitespace().map(String::from));
         }
     }
-    set.extend(super::gmail_auth::GMAIL_SCOPES.iter().map(|s| s.to_string()));
+    set.extend(
+        super::gmail_auth::GMAIL_SCOPES
+            .iter()
+            .map(|s| s.to_string()),
+    );
     set.into_iter().collect::<Vec<_>>().join(" ")
 }
 
@@ -702,9 +846,10 @@ fn scope_capability(scope: &str) -> (String, bool) {
         "https://www.googleapis.com/auth/gmail.send" => {
             ("Gmail — send mail AS this account".into(), true)
         }
-        "https://www.googleapis.com/auth/gmail.settings.basic" => {
-            ("Gmail — change settings such as filters, forwarding and signatures".into(), true)
-        }
+        "https://www.googleapis.com/auth/gmail.settings.basic" => (
+            "Gmail — change settings such as filters, forwarding and signatures".into(),
+            true,
+        ),
         "https://www.googleapis.com/auth/calendar" => (
             "Google Calendar — read, create, edit and DELETE events".into(),
             true,
@@ -713,7 +858,10 @@ fn scope_capability(scope: &str) -> (String, bool) {
             ("Read this account's email address".into(), false)
         }
         s if s.ends_with(".readonly") => (format!("Read-only: {s}"), false),
-        s => (format!("{s} (amux has no plain-words description for this scope yet)"), false),
+        s => (
+            format!("{s} (amux has no plain-words description for this scope yet)"),
+            false,
+        ),
     }
 }
 
@@ -771,54 +919,61 @@ fn pending_save(
     verifier: Option<&str>,
 ) -> std::io::Result<()> {
     let p = pending_path(home);
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut d: Map<String, Value> = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    let _lease = crate::integrations::secure_store::lock(&p)?;
+    let mut d: Map<String, Value> = crate::integrations::secure_store::read_json(&p)?;
     let now = now_ts();
     d.retain(|_, v| now - v.get("ts").and_then(Value::as_f64).unwrap_or(0.0) < PENDING_TTL_S);
     d.insert(
         state.to_string(),
         json!({ "family": family, "account": account, "verifier": verifier, "ts": now }),
     );
-    std::fs::write(&p, Value::Object(d).to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::integrations::secure_store::write(&p, Value::Object(d).to_string().as_bytes())
 }
 
 /// SINGLE-USE take (removed even when expired); `(family, account, verifier)`
 /// while fresh.
 fn pending_take(home: &std::path::Path, state: &str) -> Option<(String, String, Option<String>)> {
     let p = pending_path(home);
-    let mut d: Map<String, Value> = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
-    let e = d.remove(state)?;
-    let _ = std::fs::write(&p, Value::Object(d).to_string());
+    let take = || -> std::io::Result<Option<Value>> {
+        let _lease = crate::integrations::secure_store::lock(&p)?;
+        let mut d: Map<String, Value> = crate::integrations::secure_store::read_json(&p)?;
+        let Some(e) = d.remove(state) else {
+            return Ok(None);
+        };
+        crate::integrations::secure_store::write(&p, Value::Object(d).to_string().as_bytes())?;
+        Ok(Some(e))
+    };
+    let e = match take() {
+        Ok(e) => e?,
+        Err(error) => {
+            tracing::warn!(%error, verdict = "connector_pending_consume_failed", "OAuth state not consumed; no exchange attempted");
+            return None;
+        }
+    };
     if now_ts() - e.get("ts").and_then(Value::as_f64).unwrap_or(0.0) > PENDING_TTL_S {
         return None;
     }
     Some((
         e.get("family").and_then(Value::as_str)?.to_string(),
-        e.get("account").and_then(Value::as_str).unwrap_or("").to_string(),
+        e.get("account")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         e.get("verifier").and_then(Value::as_str).map(String::from),
     ))
 }
 
 fn token_urlsafe(nbytes: usize) -> String {
     let mut bytes = vec![0u8; nbytes];
-    OsRng.fill_bytes(&mut bytes);
+    getrandom::fill(&mut bytes).expect("OS random source");
     base64url_nopad(&bytes)
 }
 
 /// Family token store path: `~/.amux/connectors/<family>/<account>.json`.
 fn store_path(home: &std::path::Path, family: &str, account: &str) -> PathBuf {
-    home.join("connectors").join(family).join(format!("{account}.json"))
+    home.join("connectors")
+        .join(family)
+        .join(format!("{account}.json"))
 }
 
 /// Accounts with a stored grant for a family (file stems of the store dir).
@@ -828,7 +983,9 @@ fn store_accounts(home: &std::path::Path, family: &str) -> Vec<String> {
             rd.flatten()
                 .filter_map(|e| {
                     let p = e.path();
-                    if p.extension().is_some_and(|x| x == "json") {
+                    if p.extension().is_some_and(|x| x == "json")
+                        && !declared_oauth::is_disconnected(&p)
+                    {
                         p.file_stem().map(|s| s.to_string_lossy().into_owned())
                     } else {
                         None
@@ -842,16 +999,7 @@ fn store_accounts(home: &std::path::Path, family: &str) -> Vec<String> {
 }
 
 fn write_store_file(path: &std::path::Path, body: &Value) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, body.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::integrations::secure_store::write(path, body.to_string().as_bytes())
 }
 
 /// `POST {base}/api/v4/users/login` — Mattermost's login endpoint. Goes
@@ -880,14 +1028,39 @@ async fn mattermost_login(
         )
         .await?;
     if !(200..300).contains(&status) {
-        let detail = body.get("message").and_then(Value::as_str).unwrap_or("login failed");
+        let detail = body
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("login failed");
         return Err(format!("HTTP {status}: {detail}"));
     }
     let Some(token) = token else {
-        return Err("login succeeded but no Token header in the response — unexpected Mattermost API shape".to_string());
+        return Err(
+            "login succeeded but no Token header in the response — unexpected Mattermost API shape"
+                .to_string(),
+        );
     };
-    let user_id = body.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+    let user_id = body
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     Ok((token, user_id))
+}
+
+/// Where a Google row's credential comes from. A stored sign-in answers a mint
+/// before the service account (connector_token), so it is named first: on
+/// 2026-11-08 the row read "service account" while hello@amux.io's grant did
+/// the work and the service account's delegation was failing.
+fn google_cred_source(home: &std::path::Path, category: &str) -> Option<Value> {
+    if category != "Google" {
+        return None;
+    }
+    let grants = store_accounts(home, "google");
+    if !grants.is_empty() {
+        return Some(json!(format!("Google sign-in ({})", grants.join(", "))));
+    }
+    super::google_sa::sa_config_in(home).map(|_| json!("service account (domain-wide delegation)"))
 }
 
 /// GET /api/connectors — the registry with per-provider status. `?worker=` is
@@ -895,6 +1068,9 @@ async fn mattermost_login(
 /// global (credential presence + token); per-scope enablement is the scope
 /// read.
 async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
+    if let Err(e) = load_custom_checked(&amux_home()) {
+        return storage_error(e);
+    }
     let file_env = parse_env_file(&amux_home().join("server.env"));
     let items: Vec<Value> = REGISTRY
         .iter()
@@ -915,8 +1091,8 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
             // Where the credential came from, so the tab can say "reusing the
             // existing Google client" rather than looking un-configured (AMUX-3341).
             let in_server_env = keys.iter().all(|k| env_val(&file_env, k).is_some());
-            let cred_source = if p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some() {
-                json!("service account (domain-wide delegation)")
+            let cred_source = if let Some(google) = google_cred_source(&ctx.home, p.category) {
+                google
             } else if !all_creds_set {
                 Value::Null
             } else if in_server_env {
@@ -925,7 +1101,7 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
                 json!("gmail-oauth-client.json (reused)")
             };
             let (kind, oauth) = match p.auth {
-                Auth::ApiKey { .. } => ("apikey", Value::Null),
+                Auth::ApiKey { .. } | Auth::ApiKeys { .. } => ("apikey", Value::Null),
                 Auth::OAuth2 {
                     callback_path,
                     scopes,
@@ -933,7 +1109,15 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
                 } => (
                     "oauth2",
                     json!({
-                        "redirect_uri": format!("{}{}", origin(), callback_path),
+                        // The URI the grant actually sends: Google reuses the
+                        // gmail one (google_redirect_uri), so showing the
+                        // connectors path told the owner to register a URI no
+                        // request ever used (sandbox, 2026-10-28).
+                        "redirect_uri": if p.category == "Google" {
+                            google_redirect_uri()
+                        } else {
+                            format!("{}{}", origin(), callback_path)
+                        },
                         "scopes": scopes,
                     }),
                 ),
@@ -977,6 +1161,8 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
             } else {
                 Value::Null
             };
+            let last_test = last_tests(&amux_home()).get(p.id).cloned();
+            let (status, test_detail) = status_after_test(status, last_test.as_ref());
             json!({
                 "id": p.id,
                 "label": p.label,
@@ -985,6 +1171,7 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
                 "oauth": oauth,
                 "env_keys": key_status,
                 "status": status,
+                "last_test": last_test,
                 "cred_source": cred_source,
                 // usable = a SESSION can obtain a working credential from amux
                 // right now (POST token_endpoint). Distinct from "connected",
@@ -997,10 +1184,15 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
                 "detail": if sa_key_gone {
                     json!("Service-account key file is configured but missing on disk — re-paste the key or fix GOOGLE_SA_KEY_FILE in server.env")
                 } else {
-                    Value::Null
+                    test_detail.map(Value::String).unwrap_or(Value::Null)
                 },
                 "setup_note": p.setup_note,
                 "docs": p.docs,
+                "create_app": if p.id == "slack" {
+                    json!(slack_create_app_url(&format!("{}/api/connectors/slack/callback", origin())))
+                } else {
+                    Value::Null
+                },
             })
         })
         .collect();
@@ -1027,7 +1219,9 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
             })
             .collect();
         let all_set = !key_status.is_empty()
-            && key_status.iter().all(|k| k["set"].as_bool().unwrap_or(false));
+            && key_status
+                .iter()
+                .all(|k| k["set"].as_bool().unwrap_or(false));
         let is_oauth = d.kind == "oauth2";
         let has_grant = !store_accounts(&home, &d.id).is_empty();
         let status = if !all_set {
@@ -1042,6 +1236,9 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
         // builtin ladder applies, rather than calling a pasted client id
         // "connected" and handing a caller nothing (AMUX-3362).
         let usable = all_set && (!is_oauth || has_grant);
+        let last_test = last_tests(&home).get(&d.id).cloned();
+        let (status, detail) = status_after_test(status, last_test.as_ref());
+        let usable = usable && status == "connected";
         items.push(json!({
             "id": d.id,
             "label": d.label,
@@ -1049,7 +1246,7 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
             "auth": if is_oauth { "oauth2" } else { "apikey" },
             "oauth": if is_oauth {
                 json!({
-                    "redirect_uri": format!("{}/api/connectors/{}/callback", origin(), d.id),
+                    "redirect_uri": declared_oauth::redirect_uri(&home, &d.id).ok(),
                     "scopes": d.scopes,
                     "authorize_url": d.authorize_url,
                     "token_url": d.token_url,
@@ -1061,12 +1258,14 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
             "status": status,
             "cred_source": if all_set { json!("server.env") } else { Value::Null },
             "usable": usable,
-            "token_endpoint": if usable {
+            "token_endpoint": if usable && is_oauth {
                 json!(format!("/api/connectors/{}/token", d.id))
             } else {
                 Value::Null
             },
-            "detail": Value::Null,
+            "detail": detail,
+            "last_test": last_test,
+            "accounts": store_accounts(&home, &d.id),
             "setup_note": d.setup_note,
             "docs": d.docs,
             // The ONLY field a builtin does not carry. The tab offers Delete on
@@ -1102,17 +1301,29 @@ async fn list(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
 async fn create_connector(Json(body): Json<Value>) -> Response {
     let home = amux_home();
     let get = |k: &str| -> String {
-        body.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string()
+        body.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     };
     let id = get("id").to_ascii_lowercase();
     let label = get("label");
     let kind = {
         let k = get("kind");
-        if k.is_empty() { "api_key".to_string() } else { k }
+        if k.is_empty() {
+            "api_key".to_string()
+        } else {
+            k
+        }
     };
 
     let bad = |msg: String, how: &str| -> Response {
-        (StatusCode::BAD_REQUEST, Json(json!({"error": msg, "how": how}))).into_response()
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": msg, "how": how})),
+        )
+            .into_response()
     };
     if !valid_connector_id(&id) {
         return bad(
@@ -1121,10 +1332,16 @@ async fn create_connector(Json(body): Json<Value>) -> Response {
         );
     }
     if label.is_empty() {
-        return bad("label is required".into(), "the human-readable name shown in the Connectors tab");
+        return bad(
+            "label is required".into(),
+            "the human-readable name shown in the Connectors tab",
+        );
     }
     if kind != "api_key" && kind != "oauth2" {
-        return bad(format!("unknown kind '{kind}'"), "kind must be \"api_key\" or \"oauth2\"");
+        return bad(
+            format!("unknown kind '{kind}'"),
+            "kind must be \"api_key\" or \"oauth2\"",
+        );
     }
     // A builtin wins: shadowing one from the tab would make the same id mean two
     // things depending on which loop rendered it.
@@ -1138,7 +1355,14 @@ async fn create_connector(Json(body): Json<Value>) -> Response {
         )
             .into_response();
     }
-    let mut list = load_custom(&home);
+    let _lease = match crate::integrations::secure_store::lock(&custom_store_path(&home)) {
+        Ok(lease) => lease,
+        Err(e) => return storage_error(e),
+    };
+    let mut list = match load_custom_checked(&home) {
+        Ok(list) => list,
+        Err(e) => return storage_error(e),
+    };
     if list.iter().any(|c| c.id == id) {
         return (
             StatusCode::CONFLICT,
@@ -1160,7 +1384,11 @@ async fn create_connector(Json(body): Json<Value>) -> Response {
         client_secret_env: get("client_secret_env").to_ascii_uppercase(),
         authorize_url: get("authorize_url"),
         token_url: get("token_url"),
-        scopes: get("scopes"),
+        scopes: get("scopes")
+            .replace(',', " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
         setup_note: get("setup_note"),
         docs: get("docs"),
         test_url: get("test_url"),
@@ -1181,6 +1409,36 @@ async fn create_connector(Json(body): Json<Value>) -> Response {
                 format!("invalid env var name '{k}'"),
                 "A-Z, 0-9 and '_' only, not starting with a digit — this name is what the credential paste is restricted to, so it is validated before the connector is stored",
             );
+        }
+    }
+    if kind == "oauth2" {
+        for endpoint in [&c.authorize_url, &c.token_url] {
+            let valid = reqwest::Url::parse(endpoint).ok().is_some_and(|u| {
+                let loopback = matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+                (u.scheme() == "https" || (u.scheme() == "http" && loopback))
+                    && u.host_str().is_some()
+                    && u.username().is_empty()
+                    && u.password().is_none()
+                    && u.fragment().is_none()
+                    && !u.query_pairs().any(|(k, _)| {
+                        matches!(
+                            k.as_ref(),
+                            "state"
+                                | "client_id"
+                                | "redirect_uri"
+                                | "response_type"
+                                | "scope"
+                                | "code_challenge"
+                                | "code_challenge_method"
+                        )
+                    })
+            });
+            if !valid {
+                return bad(
+                    "invalid OAuth endpoint".into(),
+                    "use HTTPS (HTTP only for loopback), without credentials, fragments or reserved OAuth query parameters",
+                );
+            }
         }
     }
     if kind == "oauth2" && (c.authorize_url.is_empty() || c.token_url.is_empty()) {
@@ -1233,13 +1491,23 @@ async fn delete_connector(Path(id): Path<String>) -> Response {
         )
             .into_response();
     }
-    let mut list = load_custom(&home);
+    let _lease = match crate::integrations::secure_store::lock(&custom_store_path(&home)) {
+        Ok(lease) => lease,
+        Err(e) => return storage_error(e),
+    };
+    let mut list = match load_custom_checked(&home) {
+        Ok(list) => list,
+        Err(e) => return storage_error(e),
+    };
     let before = list.len();
     let removed: Vec<String> = list
         .iter()
         .filter(|c| c.id == id)
         .flat_map(|c| Def::from(c).env_keys)
         .collect();
+    if let Err(error) = declared_oauth::forget_grants(&home, &id).await {
+        return storage_error(error);
+    }
     list.retain(|c| c.id != id);
     if list.len() == before {
         return (
@@ -1276,11 +1544,19 @@ async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Res
     // unchanged and is the security property: a paste for one connector can only
     // write the env keys THAT connector declares, whichever source declared it.
     let Some(d) = def_of(&amux_home(), &id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown connector '{id}'")}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown connector '{id}'")})),
+        )
+            .into_response();
     };
     let allowed: Vec<&str> = d.env_keys.iter().map(String::as_str).collect();
     let Some(obj) = body.as_object() else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "body must be a JSON object of {ENV_NAME: value}"}))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "body must be a JSON object of {ENV_NAME: value}"})),
+        )
+            .into_response();
     };
     let home = amux_home();
     let mut written: Vec<String> = Vec::new();
@@ -1295,20 +1571,8 @@ async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Res
             rejected.push(k.clone());
             continue;
         }
-        if let Err(e) = super::settings::set_server_env_key(&home, k, val) {
-            tracing::warn!("connector_credentials: write failed for {} key {}: {}", id, k, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("write failed for {k}")}))).into_response();
-        }
         written.push(k.clone());
     }
-    // Redacted audit — names of keys written, NEVER the values (two-fixes rule:
-    // grep `connector_credentials` to see who set what, without leaking it).
-    tracing::info!(
-        "connector_credentials: {} wrote {:?} to server.env (rejected {:?})",
-        id,
-        written,
-        rejected
-    );
     if written.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -1322,18 +1586,23 @@ async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Res
         )
             .into_response();
     }
-    // server.env is read at startup (setdefault); a fresh paste needs the value
-    // in the PROCESS env to take effect without a restart. Mirror it in-process
-    // so a just-pasted key works immediately for this run (settings.rs does the
-    // same for ANTHROPIC_API_KEY).
-    let file_env = parse_env_file(&home.join("server.env"));
-    for k in &written {
-        if let Some(v) = file_env.get(k) {
-            // SAFETY: single-threaded config mutation at request time, same
-            // pattern settings.rs uses; value came from our own atomic write.
-            std::env::set_var(k, v);
-        }
+    let updates: Vec<(&str, &str)> = written
+        .iter()
+        .map(|k| (k.as_str(), obj[k].as_str().unwrap_or("").trim()))
+        .collect();
+    if let Err(e) = super::settings::set_server_env_keys(&home, &updates) {
+        return storage_error(e);
     }
+    // Redacted audit — names of keys written, NEVER the values (two-fixes rule:
+    // grep `connector_credentials` to see who set what, without leaking it).
+    tracing::info!(
+        "connector_credentials: {} wrote {:?} to server.env (rejected {:?})",
+        id,
+        written,
+        rejected
+    );
+    // Consumers resolve credentials file-first; changing process-global env
+    // from a multithreaded request handler is unsafe and unnecessary.
     // REPUBLISH THE PREFLIGHT, because this is the event that makes it stale
     // (AF-372).
     //
@@ -1382,18 +1651,46 @@ async fn begin_auth(
     Path(id): Path<String>,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
+    if def_of(&ctx.home, &id).is_some_and(|d| !d.builtin) {
+        let _lease = match declared_oauth::registry_lease(&ctx.home).await {
+            Ok(lease) => lease,
+            Err(error) => return storage_error(error),
+        };
+        let Some(d) = def_of(&ctx.home, &id).filter(|d| !d.builtin) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"connector was deleted"})),
+            )
+                .into_response();
+        };
+        return declared_oauth::begin(&ctx, &d, q.get("account").map(String::as_str)).await;
+    }
     let p = if id == "google" {
         REGISTRY.iter().find(|p| p.category == "Google")
     } else {
         provider(&id)
     };
     let Some(p) = p else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown connector '{id}'")}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown connector '{id}'")})),
+        )
+            .into_response();
     };
-    let account = q.get("account").map(|s| s.trim().to_string()).unwrap_or_default();
+    let account = q
+        .get("account")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if !account.is_empty() && !oauth_store::valid_account(&account) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid connector account"})),
+        )
+            .into_response();
+    }
     let file_env = parse_env_file(&ctx.home.join("server.env"));
     match p.auth {
-        Auth::ApiKey { .. } => Json(json!({
+        Auth::ApiKey { .. } | Auth::ApiKeys { .. } => Json(json!({
             "ok": true,
             "auth": "apikey",
             "note": "key-only connector: paste the API key, no browser grant needed",
@@ -1426,7 +1723,18 @@ async fn begin_auth(
                     .into_response();
             };
             let base_url = base_url.trim_end_matches('/').to_string();
-            let account = if account.is_empty() { username.clone() } else { account };
+            let account = if account.is_empty() {
+                username.clone()
+            } else {
+                account
+            };
+            if !oauth_store::valid_account(&account) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":"invalid connector account"})),
+                )
+                    .into_response();
+            }
             match mattermost_login(&ctx.http, &base_url, &username, &password).await {
                 Ok((token, user_id)) => {
                     let store = json!({
@@ -1436,14 +1744,19 @@ async fn begin_auth(
                         "login": username,
                         "logged_in_at": now_ts(),
                     });
-                    if let Err(e) = write_store_file(&store_path(&ctx.home, p.id, &account), &store) {
+                    if let Err(e) = write_store_file(&store_path(&ctx.home, p.id, &account), &store)
+                    {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(json!({"ok": false, "error": format!("login succeeded but could not write token store: {e}")})),
                         )
                             .into_response();
                     }
-                    tracing::info!("connector_auth: mattermost login stored for account={} base_url={}", account, base_url);
+                    tracing::info!(
+                        "connector_auth: mattermost login stored for account={} base_url={}",
+                        account,
+                        base_url
+                    );
                     Json(json!({
                         "ok": true,
                         "auth": "login_password",
@@ -1453,7 +1766,11 @@ async fn begin_auth(
                     .into_response()
                 }
                 Err(e) => {
-                    tracing::warn!("connector_auth: mattermost login failed for account={}: {}", account, e);
+                    tracing::warn!(
+                        "connector_auth: mattermost login failed for account={}: {}",
+                        account,
+                        e
+                    );
                     (
                         StatusCode::UNAUTHORIZED,
                         Json(json!({"ok": false, "error": format!("login failed: {e}")})),
@@ -1547,8 +1864,10 @@ async fn begin_auth(
             let registered: Value = if p.category == "Google" {
                 match ctx.http.get(&url, None).await {
                     Ok((_, body)) => {
-                        let text =
-                            body.as_str().map(str::to_string).unwrap_or_else(|| body.to_string());
+                        let text = body
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| body.to_string());
                         json!(!text.contains("redirect_uri_mismatch"))
                     }
                     // Probe unreachable: unknown beats a guess in either direction.
@@ -1673,12 +1992,27 @@ async fn callback(
     Path(url_family): Path<String>,
     Query(p): Query<CallbackParams>,
 ) -> Response {
+    let _registry_lease = if def_of(&ctx.home, &url_family).is_some_and(|d| !d.builtin) {
+        match declared_oauth::registry_lease(&ctx.home).await {
+            Ok(lease) => Some(lease),
+            Err(error) => return storage_error(error),
+        }
+    } else {
+        None
+    };
     let code = p.code.unwrap_or_default().trim().to_string();
     let state = p.state.unwrap_or_default().trim().to_string();
     let error = p.error.unwrap_or_default().trim().to_string();
     let file_env = parse_env_file(&ctx.home.join("server.env"));
     if !error.is_empty() {
-        tracing::warn!("connector_oauth_callback: {} answered error={}", url_family, error);
+        if !state.is_empty() {
+            let _ = pending_take(&ctx.home, &state);
+        }
+        tracing::warn!(
+            "connector_oauth_callback: {} answered error={}",
+            url_family,
+            error
+        );
         if error.contains("redirect_uri_mismatch") && url_family == "google" {
             let cid = resolve_cred_in(&ctx.home, &file_env, "Google", "GOOGLE_OAUTH_CLIENT_ID")
                 .unwrap_or_default();
@@ -1697,10 +2031,17 @@ async fn callback(
         }
         return cb_page(
             StatusCode::BAD_REQUEST,
-            format!("<h2>Auth failed: {}</h2><p>Close this tab.</p>", html_escape(&error)),
+            format!(
+                "<h2>Auth failed: {}</h2><p>Close this tab.</p>",
+                html_escape(&error)
+            ),
         );
     }
-    let entry = if state.is_empty() { None } else { pending_take(&ctx.home, &state) };
+    let entry = if state.is_empty() {
+        None
+    } else {
+        pending_take(&ctx.home, &state)
+    };
     let Some((family, hint_account, verifier)) = entry.filter(|_| !code.is_empty()) else {
         return cb_page(
             StatusCode::BAD_REQUEST,
@@ -1717,6 +2058,15 @@ async fn callback(
                 html_escape(&family),
                 html_escape(&url_family)
             ),
+        );
+    }
+    if let Some(d) = def_of(&ctx.home, &family).filter(|d| !d.builtin) {
+        return declared_oauth::complete(&ctx, &d, code, hint_account, verifier).await;
+    }
+    if family != "google" && family != "slack" {
+        return cb_page(
+            StatusCode::BAD_REQUEST,
+            "<h2>Connector was deleted. Start a new connection.</h2>".into(),
         );
     }
     complete_exchange(&ctx, family, code, hint_account, verifier).await
@@ -1748,8 +2098,17 @@ pub(crate) async fn delegate_gmail_callback(
             ),
         ));
     }
-    let ctx = ConnectorsCtx { http, home: home.to_path_buf() };
+    let ctx = ConnectorsCtx {
+        http,
+        home: home.to_path_buf(),
+    };
     Some(complete_exchange(&ctx, family, code.to_string(), hint_account, verifier).await)
+}
+
+/// The Gmail callback also receives connector-family states. A provider error
+/// must consume that state before rendering its cancellation page.
+pub(crate) fn cancel_delegated_gmail_state(home: &std::path::Path, state: &str) {
+    let _ = pending_take(home, state);
 }
 
 /// The code→token exchange + store write shared by BOTH entry points: the
@@ -1775,7 +2134,9 @@ async fn complete_exchange(
     ) else {
         return cb_page(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("<h2>Token exchange failed</h2><pre>client credentials for {family} are no longer set</pre>"),
+            format!(
+                "<h2>Token exchange failed</h2><pre>client credentials for {family} are no longer set</pre>"
+            ),
         );
     };
     // Must match the auth request byte-for-byte: google grants were issued
@@ -1805,11 +2166,17 @@ async fn complete_exchange(
         Err(e) => {
             return cb_page(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("<h2>Token exchange failed</h2><pre>{}</pre>", html_escape(&e)),
-            )
+                format!(
+                    "<h2>Token exchange failed</h2><pre>{}</pre>",
+                    html_escape(&e)
+                ),
+            );
         }
     };
-    let access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
+    let access = body
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     // Slack answers HTTP 200 with {"ok": false} on failure — status alone lies.
     let slack_not_ok = family != "google" && body.get("ok").is_some_and(|v| v == false);
     if status >= 400 || access.is_empty() || slack_not_ok {
@@ -1831,7 +2198,14 @@ async fn complete_exchange(
     // browser profile than the login_hint cannot mis-file the token. Slack:
     // the workspace name. Fall back to the hint from pending.
     let account = if family == "google" {
-        match ctx.http.get("https://www.googleapis.com/oauth2/v2/userinfo", Some(access)).await {
+        match ctx
+            .http
+            .get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                Some(access),
+            )
+            .await
+        {
             Ok((st, v)) if st < 400 => v
                 .get("email")
                 .and_then(Value::as_str)
@@ -1846,9 +2220,40 @@ async fn complete_exchange(
             .and_then(Value::as_str)
             .map(str::to_string)
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| if hint_account.is_empty() { "workspace".into() } else { hint_account.clone() })
+            .unwrap_or_else(|| {
+                if hint_account.is_empty() {
+                    "workspace".into()
+                } else {
+                    hint_account.clone()
+                }
+            })
     };
-    let granted_scopes = body.get("scope").and_then(Value::as_str).unwrap_or("").to_string();
+    let path = match oauth_store::family_path(&ctx.home, &family, &account) {
+        Ok(path) => path,
+        Err(_) => {
+            return cb_page(
+                StatusCode::BAD_REQUEST,
+                "<h2>Invalid connector account</h2>".into(),
+            );
+        }
+    };
+    let _lease = match oauth_store::lock(&ctx.home, &family, &account).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            return cb_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "<h2>Grant storage unavailable</h2><pre>{}</pre>",
+                    html_escape(&error.to_string())
+                ),
+            );
+        }
+    };
+    let granted_scopes = body
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let expires_at = body
         .get("expires_in")
         .and_then(Value::as_f64)
@@ -1863,10 +2268,13 @@ async fn complete_exchange(
         "scopes": granted_scopes,
         "expires_at": expires_at,
     });
-    if let Err(e) = write_store_file(&store_path(&ctx.home, &family, &account), &store) {
+    if let Err(e) = write_store_file(&path, &store) {
         return cb_page(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("<h2>Token exchange failed</h2><pre>{}</pre>", html_escape(&e.to_string())),
+            format!(
+                "<h2>Token exchange failed</h2><pre>{}</pre>",
+                html_escape(&e.to_string())
+            ),
         );
     }
     // Gmail mirror: when the grant covers Gmail, write the legacy token file
@@ -1884,9 +2292,19 @@ async fn complete_exchange(
         });
         let dir = ctx.home.join("gmail-tokens");
         mirrored = std::fs::create_dir_all(&dir)
-            .and_then(|_| std::fs::write(dir.join(format!("{account}.json")), legacy.to_string()))
+            .and_then(|_| {
+                crate::integrations::secure_store::write(
+                    &dir.join(format!("{account}.json")),
+                    legacy.to_string().as_bytes(),
+                )
+            })
             .is_ok();
     }
+    supersede_tests_after_grant(&ctx.home, &family, &account);
+    // The accounts rollup caches for ROLLUP_TTL_S. Without this the Google
+    // card read "Connections (0)" for five minutes after hello@amux.io's grant
+    // (2026-11-08); gmail_auth and declared_oauth already drop it on a grant.
+    invalidate_rollup(&ctx.home);
     tracing::info!(
         "connector_oauth_callback: {} grant stored for {} (gmail_mirror={}, scopes=[{}])",
         family,
@@ -1899,7 +2317,11 @@ async fn complete_exchange(
         format!(
             "<h2>✓ {} connected</h2><p>The grant is stored once and shared by every worker{}. You can close this tab.</p>",
             html_escape(&account),
-            if mirrored { " (email API included)" } else { "" }
+            if mirrored {
+                " (email API included)"
+            } else {
+                ""
+            }
         ),
     )
 }
@@ -1911,7 +2333,142 @@ async fn complete_exchange(
 /// (broker) lands, since there is no stored access token to present yet. The
 /// bearer value is NEVER logged — only the provider id, HTTP status and latency
 /// (grep `connector_test`).
+/// The last live test per connector, so the list can stop saying "connected"
+/// for a connector whose own test fails (connector e2e, 2026-10-08: Gmail,
+/// Calendar and Admin listed connected+usable while their test answered
+/// unauthorized_client on the service-account delegation).
+fn last_tests_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("connector-tests.json")
+}
+
+pub(crate) fn last_tests(home: &std::path::Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(last_tests_path(home))
+        .ok()
+        .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+pub(crate) fn record_test(home: &std::path::Path, id: &str, result: &Value) {
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let status = result.get("status").and_then(Value::as_str).unwrap_or("");
+    let detail = result.get("detail").and_then(Value::as_str).unwrap_or("");
+    let path = last_tests_path(home);
+    let committed = (|| -> std::io::Result<()> {
+        let _lease = crate::integrations::secure_store::lock(&path)?;
+        let mut all: Map<String, Value> = crate::integrations::secure_store::read_json(&path)?;
+        all.insert(id.to_string(), json!({"ok":ok,"status":status,"detail":detail,"at":now_ts()}));
+        crate::integrations::secure_store::write(&path, Value::Object(all).to_string().as_bytes())
+    })();
+    if committed.is_err() {
+        tracing::warn!(connector=id,verdict="connector_test_record_not_durable", "live test history was not committed; existing receipt retained");
+    }
+    // The same line the list draws: an untested or needs_credentials answer
+    // tried nothing. Upkeep records dev.to's "untested" every pass, and this
+    // WARN called each one a failed live test (deploy check of 559eede40).
+    if test_failed(result) {
+        tracing::warn!(
+            connector = id,
+            status,
+            detail,
+            measured = true,
+            n_considered = 1,
+            verdict = "connector_test_failed",
+            "a connector's live test failed; the list now reports it"
+        );
+    }
+}
+
+/// A new grant is a new credential, so a failed live test recorded before it
+/// no longer describes the connector. On 2026-11-08 Ethan connected hello@amux.io
+/// and Gmail still read "error" from an Oct 31 service-account test until someone
+/// re-ran the test by hand. Drop those receipts for every row the grant covers;
+/// the list then shows the computed status until the next live test.
+pub(crate) fn supersede_tests_after_grant(home: &std::path::Path, family: &str, account: &str) {
+    let ids: Vec<&str> = REGISTRY
+        .iter()
+        .filter(|p| family_of(p) == family)
+        .map(|p| p.id)
+        .chain(std::iter::once(family))
+        .collect();
+    let path = last_tests_path(home);
+    let mut cleared: Vec<String> = Vec::new();
+    let committed = (|| -> std::io::Result<()> {
+        let _lease = crate::integrations::secure_store::lock(&path)?;
+        let mut all: Map<String, Value> = crate::integrations::secure_store::read_json(&path)?;
+        all.retain(|id, t| {
+            let stale = ids.contains(&id.as_str()) && test_failed(t);
+            if stale {
+                cleared.push(id.clone());
+            }
+            !stale
+        });
+        if cleared.is_empty() {
+            return Ok(());
+        }
+        crate::integrations::secure_store::write(&path, Value::Object(all).to_string().as_bytes())
+    })();
+    tracing::info!(
+        family,
+        account,
+        cleared = ?cleared,
+        durable = committed.is_ok(),
+        measured = true,
+        n_considered = ids.len(),
+        verdict = "connector_status_refreshed_after_grant",
+        "a new grant superseded failed live tests recorded before it"
+    );
+}
+
+/// Whether a recorded test result is a failure the list reports. A "needs_*"
+/// answer is not a failed test (nothing was tried), and neither is
+/// "untested": a connector with no test endpoint (dev.to, which reads its key
+/// from a header the bearer test cannot send) tried nothing.
+pub(crate) fn test_failed(t: &Value) -> bool {
+    let ok = t.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let st = t.get("status").and_then(Value::as_str).unwrap_or("");
+    !ok && !st.starts_with("needs_credentials") && st != "untested"
+}
+
+/// What the list should say given the computed status and the last test: a
+/// connector whose last real test failed (test_failed) reads "error" with that
+/// test's own words.
+pub(crate) fn status_after_test(computed: &str, last: Option<&Value>) -> (String, Option<String>) {
+    let Some(t) = last else {
+        return (computed.to_string(), None);
+    };
+    if computed == "connected" && test_failed(t) {
+        let detail = t
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return (
+            "error".to_string(),
+            Some(format!("last live test failed: {detail}")),
+        );
+    }
+    (computed.to_string(), None)
+}
+
 async fn test_connection(
+    Extension(ctx): Extension<Arc<ConnectorsCtx>>,
+    Path(id): Path<String>,
+) -> Response {
+    let resp = test_connection_inner(Extension(ctx.clone()), Path(id.clone())).await;
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
+        return (parts.status, "test response unreadable").into_response();
+    };
+    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+        if v.get("ok").is_some() {
+            record_test(&ctx.home, &id, &v);
+        }
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+async fn test_connection_inner(
     Extension(ctx): Extension<Arc<ConnectorsCtx>>,
     Path(id): Path<String>,
 ) -> Response {
@@ -1921,10 +2478,16 @@ async fn test_connection(
     // GET the declared test_url with the declared key as a bearer. When no
     // test_url was given, say the test did not RUN rather than return a
     // pass/fail neither of us measured (ethos rule 4).
-    if let Some(d) = def_of(&amux_home(), &id).filter(|d| !d.builtin) {
-        let file_env = parse_env_file(&amux_home().join("server.env"));
-        let missing: Vec<&String> =
-            d.env_keys.iter().filter(|k| env_val(&file_env, k).is_none()).collect();
+    if let Some(d) = def_of(&ctx.home, &id).filter(|d| !d.builtin) {
+        if d.kind == "oauth2" {
+            return declared_oauth::test(&ctx, &d).await;
+        }
+        let file_env = parse_env_file(&ctx.home.join("server.env"));
+        let missing: Vec<&String> = d
+            .env_keys
+            .iter()
+            .filter(|k| env_val(&file_env, k).is_none())
+            .collect();
         if !missing.is_empty() {
             return Json(json!({
                 "ok": false,
@@ -1944,186 +2507,255 @@ async fn test_connection(
             }))
             .into_response();
         }
-        let key = d.env_keys.first().and_then(|k| env_val(&file_env, k)).unwrap_or_default();
-        let res = ReqwestTransport::new().get(&d.test_url, Some(&key)).await;
-        return match res {
-            Ok((code, _)) if (200..300).contains(&code) => Json(json!({
-                "ok": true, "status": "connected", "measured": true, "http": code,
-            }))
-            .into_response(),
-            Ok((code, body)) => Json(json!({
-                "ok": false,
-                "status": "error",
-                "measured": true,
-                "http": code,
-                "detail": format!("{} answered {code}", d.test_url),
-                "body": body,
-            }))
-            .into_response(),
-            Err(e) => Json(json!({
-                "ok": false, "status": "error", "measured": true,
-                "detail": format!("{}: {e}", d.test_url),
-            }))
-            .into_response(),
-        };
+        let key = d
+            .env_keys
+            .first()
+            .and_then(|k| env_val(&file_env, k))
+            .unwrap_or_default();
+        return Json(provider_canary(&ctx, &d.id, &d.test_url, &key).await).into_response();
     }
     let Some(p) = provider(&id) else {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown connector '{id}'")}))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":"unknown connector"})),
+        )
+            .into_response();
     };
-    let file_env = parse_env_file(&amux_home().join("server.env"));
-    let mut url = p.test_url.to_string();
-    let bearer = match p.auth {
-        Auth::ApiKey { key_env } => match env_val(&file_env, key_env) {
-            Some(k) => k,
-            None => {
-                return Json(json!({
-                    "ok": false,
-                    "status": "needs_credentials",
-                    "detail": format!("set {key_env} first — nothing to test yet"),
-                }))
-                .into_response()
-            }
-        },
-        // Self-hosted: test_url is static-empty in the registry (there is no
-        // fixed host), built here from the stored grant's own base_url — the
-        // one that was ACTUALLY reached at login time, not merely whatever
-        // MATTERMOST_URL currently says, in case it changed since.
-        Auth::LoginPassword { .. } => {
-            let home = amux_home();
-            let Some(account) = store_accounts(&home, p.id).into_iter().next() else {
-                return Json(json!({
-                    "ok": false,
-                    "status": "needs_auth",
-                    "detail": "not connected yet — POST /api/connectors/mattermost/auth first",
-                }))
-                .into_response();
-            };
-            let store: Value = std::fs::read_to_string(store_path(&home, p.id, &account))
-                .ok()
-                .and_then(|r| serde_json::from_str(&r).ok())
-                .unwrap_or(json!({}));
-            let (Some(token), Some(base_url)) = (
-                store.get("token").and_then(Value::as_str),
-                store.get("base_url").and_then(Value::as_str),
-            ) else {
-                return Json(json!({
-                    "ok": false,
-                    "status": "error",
-                    "detail": format!("stored grant for {account} is malformed — reconnect"),
-                }))
-                .into_response();
-            };
-            url = format!("{base_url}/api/v4/users/me");
-            token.to_string()
+    let file_env = parse_env_file(&ctx.home.join("server.env"));
+    if let Auth::OAuth2 { scopes, .. } = p.auth {
+        let family = family_of(p);
+        let mut accounts = store_accounts(&ctx.home, family);
+        if accounts.is_empty() && id == "google-gmail" {
+            accounts = connected_accounts_in(&ctx.home);
         }
-        Auth::OAuth2 { scopes, .. } => {
-            // Mixpeek Google connectors mint an impersonated token via the
-            // service-account domain-wide delegation (AMUX-3347) — no per-user
-            // browser grant. If no SA is configured, fall back to the honest
-            // "connect first" until the OAuth broker (AMUX-3192) lands.
-            if p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some() {
-                match super::google_sa::mint_token(scopes).await {
-                    Ok(tok) => tok,
-                    Err(e) => {
-                        tracing::warn!("connector_test: {} SA delegation failed: {}", id, e);
-                        return Json(json!({
-                            "ok": false,
-                            "status": "needs_auth",
-                            "detail": format!("service-account delegation failed: {e}. If this is 'unauthorized_client', a Workspace super-admin must authorize this connector's scope for the SA in Admin console -> Security -> API controls -> Domain-wide delegation."),
-                        }))
-                        .into_response();
+        if !accounts.is_empty() {
+            let mut checks = Vec::new();
+            for account in accounts {
+                let response = mint_from_user_grant(&ctx, p.id, family, &account, scopes).await;
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap_or_default();
+                let minted: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let missing = missing_scopes(scopes, minted["scope"].as_str());
+                let mut check = if status.is_success() && !missing.is_empty() {
+                    // A shared Google grant that never consented this connector's
+                    // scopes is not connected FOR this connector: calling the
+                    // provider only produces a 403 that reads as broken (google-admin
+                    // failed for every saved account, two of them gmail.com, 2026-10-14).
+                    json!({"ok":false,"status":"needs_auth","measured":true,
+                        "detail":format!("this account's grant does not include {}; connect it for this connector", missing.join(" "))})
+                } else if status.is_success() {
+                    match minted["access_token"].as_str() {
+                        Some(token) => provider_canary(&ctx, p.id, p.test_url, token).await,
+                        None => {
+                            json!({"ok":false,"status":"error","measured":false,"detail":"grant mint returned no bearer"})
+                        }
                     }
+                } else {
+                    // Never return the mint response: it can contain a bearer.
+                    json!({"ok":false,"status":minted["status"],"measured":false,"http_status":status.as_u16(),"reconnect":minted["reconnect"]})
+                };
+                check["account"] = json!(account);
+                checks.push(check);
+            }
+            let unscoped = checks.iter().filter(|c| c["status"] == "needs_auth").count();
+            if unscoped == checks.len() {
+                // No saved account carries this connector's scopes: report it as not
+                // set up, unless a domain-wide service account can test it below.
+                tracing::info!(connector=%id, accounts=unscoped, measured=true, n_considered=unscoped,
+                    verdict="connector_accounts_lack_scope", "no saved account granted this connector's scopes");
+                if !(p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some()) {
+                    return Json(json!({"ok":false,"status":"needs_auth","measured":true,"accounts":checks,
+                        "detail":format!("no saved account granted this connector's scopes; connect first — POST /api/connectors/{}/auth", p.id)})).into_response();
                 }
             } else {
-                return Json(json!({
-                    "ok": false,
-                    "status": "needs_auth",
-                    "detail": "Connect first — configure a service account (GOOGLE_SA_KEY_FILE) or wait for the OAuth token exchange (AMUX-3192).",
-                }))
-                .into_response();
+                let scoped: Vec<&Value> = checks.iter().filter(|c| c["status"] != "needs_auth").collect();
+                let ok = scoped.iter().all(|c| c["ok"] == true);
+                return Json(json!({"ok":ok,"status":if ok {"connected"} else {"error"},"measured":scoped.iter().all(|c| c["measured"] == true),"accounts":checks,"detail":if ok {"all saved accounts passed the live provider test"} else {"one or more saved accounts failed; inspect accounts"}})).into_response();
             }
         }
-    };
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return Json(json!({"ok": false, "status": "error", "detail": format!("client build failed: {e}")}))
-                .into_response()
-        }
-    };
-    // Telegram's Bot API puts the token IN THE URL PATH (`/bot<token>/getMe`),
-    // not an Authorization header — the one connector here where `bearer`
-    // isn't a header value, so it can't share the generic GET below (an empty
-    // `test_url` there would hit `client.get("")`, a malformed-URL error that
-    // reads as "could not reach the provider" — true of the request, false of
-    // the actual cause).
-    if id == "telegram" {
-        let started = std::time::Instant::now();
-        let resp = client.get(format!("https://api.telegram.org/bot{bearer}/getMe")).send().await;
-        let ms = started.elapsed().as_millis();
-        return match resp {
-            Ok(r) => {
-                let code = r.status().as_u16();
-                let body: Value = r.json().await.unwrap_or_default();
-                let ok = body.get("ok").and_then(Value::as_bool) == Some(true);
-                tracing::info!("connector_test: telegram -> {code} ({ok}) in {ms}ms");
-                Json(json!({
-                    "ok": ok,
-                    "status": if ok { "connected" } else { "error" },
-                    "http_status": code,
-                    "elapsed_ms": ms,
-                    "detail": if ok {
-                        format!("live: bot @{} in {ms}ms", body.get("result").and_then(|r| r.get("username")).and_then(Value::as_str).unwrap_or("?"))
-                    } else {
-                        format!("Telegram rejected the token: {body}")
-                    },
-                }))
-                .into_response()
-            }
-            Err(e) => Json(json!({"ok": false, "status": "error", "detail": format!("could not reach Telegram: {e}")}))
-                .into_response(),
-        };
-    }
-    let started = std::time::Instant::now();
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {bearer}"))
-        .send()
-        .await;
-    let ms = started.elapsed().as_millis();
-    match resp {
-        Ok(r) => {
-            let code = r.status().as_u16();
-            let ok = r.status().is_success();
-            tracing::info!("connector_test: {id} -> {code} ({ok}) in {ms}ms");
-            Json(json!({
-                "ok": ok,
-                "status": if ok { "connected" } else { "error" },
-                "http_status": code,
-                "elapsed_ms": ms,
-                "detail": if ok {
-                    format!("live: HTTP {code} in {ms}ms")
-                } else {
-                    format!("provider returned HTTP {code} — the key may be invalid or lack scope")
-                },
-            }))
-            .into_response()
-        }
-        Err(e) => {
-            let msg = if e.is_timeout() {
-                "timed out after 10s".to_string()
-            } else if e.is_connect() {
-                "could not reach the provider".to_string()
-            } else {
-                format!("request failed: {e}")
+        if p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some() {
+            return match super::google_sa::mint_token(scopes).await {
+                Ok(token) => {
+                    Json(provider_canary(&ctx, p.id, p.test_url, &token).await).into_response()
+                }
+                Err(e) => {
+                    tracing::warn!(connector=%id, verdict="connector_delegation_failed", error=%e,"service-account delegation failed");
+                    Json(json!({"ok":false,"status":if delegation_refusal(&e) {"needs_auth"} else {"error"},"measured":false,"detail":"service-account delegation failed; inspect delegation configuration and server logs"})).into_response()
+                }
             };
-            tracing::warn!("connector_test: {id} failed ({msg}) in {ms}ms");
-            Json(json!({"ok": false, "status": "error", "detail": msg, "elapsed_ms": ms})).into_response()
+        }
+        return Json(json!({"ok":false,"status":"needs_auth","measured":false,"detail":format!("connect first — POST /api/connectors/{}/auth",p.id)})).into_response();
+    }
+    if let Auth::LoginPassword { .. } = p.auth {
+        let accounts = store_accounts(&ctx.home, p.id);
+        if accounts.is_empty() {
+            return Json(json!({"ok":false,"status":"needs_auth","measured":false,"detail":"connect first — POST /api/connectors/mattermost/auth"})).into_response();
+        }
+        let mut checks = Vec::new();
+        for account in accounts {
+            let grant = crate::integrations::secure_store::read_json::<Value>(&store_path(
+                &ctx.home, p.id, &account,
+            ))
+            .unwrap_or_default();
+            let mut check = match (grant["token"].as_str(), grant["base_url"].as_str()) {
+                (Some(token), Some(base)) => {
+                    provider_canary(&ctx, p.id, &format!("{base}/api/v4/users/me"), token).await
+                }
+                _ => {
+                    json!({"ok":false,"status":"error","measured":false,"detail":"malformed grant; reconnect"})
+                }
+            };
+            check["account"] = json!(account);
+            checks.push(check);
+        }
+        let ok = checks.iter().all(|c| c["ok"] == true);
+        return Json(json!({"ok":ok,"status":if ok {"connected"} else {"error"},"measured":checks.iter().all(|c|c["measured"]==true),"accounts":checks})).into_response();
+    }
+    let key_env = match p.auth {
+        Auth::ApiKey { key_env } => key_env,
+        Auth::ApiKeys { keys } => keys[0],
+        _ => unreachable!(),
+    };
+    let Some(key) = env_val(&file_env, key_env) else {
+        return Json(json!({"ok":false,"status":"needs_credentials","measured":false}))
+            .into_response();
+    };
+    if p.test_url.is_empty() && id != "telegram" {
+        return Json(json!({"ok": false, "status": "untested", "measured": false,
+            "why_unmeasured": "this connector has no test endpoint; message the bot and check GET /api/bridge"})).into_response();
+    }
+    let url = if id == "telegram" {
+        format!("https://api.telegram.org/bot{key}/getMe")
+    } else {
+        p.test_url.into()
+    };
+    Json(provider_canary(&ctx, p.id, &url, &key).await).into_response()
+}
+
+/// The connector scopes a grant did not include. `granted` is the scope string
+/// the mint reports for the stored grant; when the grant never recorded its
+/// scopes there is nothing to compare, and nothing is reported missing.
+fn missing_scopes<'a>(wanted: &'a str, granted: Option<&str>) -> Vec<&'a str> {
+    let Some(granted) = granted.filter(|g| !g.trim().is_empty()) else { return vec![] };
+    // Google separates granted scopes with spaces, Slack with commas.
+    let have: Vec<&str> = granted.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
+    // A full scope covers its `.readonly` form: a grant of admin.directory.user
+    // can read users, and Google reports only the scope that was granted.
+    let covered = |w: &str| have.contains(&w) || w.strip_suffix(".readonly").is_some_and(|full| have.contains(&full));
+    wanted.split_whitespace().filter(|w| !covered(w)).collect()
+}
+
+/// Provider success includes application-level errors (Slack/Telegram can return HTTP 200).
+/// Keep response bodies and request URLs out of results/logs: either may echo credentials.
+async fn provider_canary(ctx: &ConnectorsCtx, id: &str, url: &str, token: &str) -> Value {
+    let started = Instant::now();
+    match ctx
+        .http
+        .get(url, if id == "telegram" { None } else { Some(token) })
+        .await
+    {
+        Ok((code, body)) => {
+            let ok = (200..300).contains(&code)
+                && (!matches!(id, "slack" | "telegram") || body["ok"] == true);
+            if !ok {
+                tracing::warn!(connector=%id,http_status=code,verdict="connector_provider_test_failed","provider rejected connector canary");
+            }
+            json!({"ok":ok,"status":if ok {"connected"} else {"error"},"measured":true,"http_status":code,"elapsed_ms":started.elapsed().as_millis(),"detail":if ok {"live provider call passed"} else {"provider rejected the credential or scope; reconnect"}})
+        }
+        Err(_) => {
+            tracing::warn!(connector=%id,verdict="connector_provider_unreachable","connector canary transport failed");
+            json!({"ok":false,"status":"error","measured":false,"detail":"provider unreachable; inspect network configuration"})
         }
     }
+}
+
+/// Which account (if any) `lane` may mint a token for, on connector
+/// `connector_id`, through the generic OAuth broker (APM-2).
+///
+/// Mirrors `email::gmail_scope_check` (AMUX-3103), generalized to every
+/// provider and built on the `connectors` scope capability
+/// ([`super::scope::effective_connectors`]) rather than a per-provider env
+/// var, since one route here serves every family.
+///
+/// ABSENT MEANS UNRESTRICTED — same reasoning as `gmail_scope_check`: a
+/// worker/group/global layer that never mentions this connector at all
+/// keeps today's behavior, so shipping this cannot silently break a lane
+/// nobody scoped. A layer that DOES mention the connector is the explicit
+/// switch: `enabled: false` (or absent) refuses outright, and a scoped
+/// `account` pins which account — a worker scoped to one account cannot
+/// mint a DIFFERENT account's live bearer by asking for it explicitly,
+/// which is exactly the gap this closes: before this check, `enabled` and
+/// `account` were UI-only, and every worker could mint every connected
+/// account's token regardless of what the scope tab showed.
+pub(crate) fn connector_entitlement_check(
+    conn: Option<&rusqlite::Connection>,
+    home: &std::path::Path,
+    lane: &str,
+    connector_id: &str,
+    requested_account: Option<&str>,
+) -> Result<Option<String>, Value> {
+    let effective = super::scope::effective_connectors(conn, home, lane).map_err(|reason| {
+        tracing::warn!(worker = %lane, connector = %connector_id, error = %reason,
+            verdict = "connector_scope_unreadable", measured = true, n_considered = 1,
+            "connector access refused because saved scope could not be verified");
+        json!({"error": reason, "blocked": "connector_scope_unreadable",
+            "connector": connector_id,
+            "how": "Repair the saved Connectors scope; access was not granted."})
+    })?;
+    connector_entitlement_decision(&effective, lane, connector_id, requested_account)
+}
+
+/// The pure decision half of [`connector_entitlement_check`], split out so
+/// the policy logic (fail-open-if-unscoped, fail-closed-if-disabled,
+/// account-pinning) is testable against a hand-built map without a DB or a
+/// worker env file fixture — the merge itself is exercised where it lives,
+/// in `scope::effective_connectors_merges_global_group_worker_by_key`.
+fn connector_entitlement_decision(
+    effective: &Map<String, Value>,
+    lane: &str,
+    connector_id: &str,
+    requested_account: Option<&str>,
+) -> Result<Option<String>, Value> {
+    let Some(cfg) = effective.get(connector_id) else {
+        return Ok(None); // never scoped anywhere for this lane: unrestricted
+    };
+    let enabled = cfg.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    if !enabled {
+        return Err(json!({
+            "error": format!(
+                "worker '{lane}' is not entitled to connector '{connector_id}'"
+            ),
+            "blocked": "connector_scope",
+            "connector": connector_id,
+            "worker": lane,
+            "how_to_change": format!(
+                "PUT /api/scope capability=connectors to enable '{connector_id}' \
+                 for this worker/group/global"
+            ),
+        }));
+    }
+    let scoped_account = cfg
+        .get("account")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let (Some(req), Some(allowed)) = (requested_account, scoped_account.as_deref()) {
+        if !req.eq_ignore_ascii_case(allowed) {
+            return Err(json!({
+                "error": format!(
+                    "worker '{lane}' is scoped to '{connector_id}' account \
+                     '{allowed}', not '{req}'"
+                ),
+                "blocked": "connector_scope",
+                "connector": connector_id,
+                "worker": lane,
+                "requested": req,
+                "allowed": allowed,
+            }));
+        }
+    }
+    Ok(scoped_account)
 }
 
 /// POST /api/connectors/{id}/token — hand the caller a ready-to-use bearer for a
@@ -2161,24 +2793,108 @@ pub(crate) fn delegation_refusal(err: &str) -> bool {
 /// Google's own error (e.g. `unauthorized_client`), which names the Admin-console
 /// fix — the same honest-error path `test_connection` uses.
 async fn mint_connector_token(
+    State(state): State<AppState>,
     Extension(ctx): Extension<Arc<ConnectorsCtx>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let Some(p) = provider(&id) else {
+    // WHO IS THIS FOR (governance PR 4): resolved from what the server
+    // verified, never from whether a worker header is present. See
+    // `connector_scope.rs`; every mint below leaves a receipt.
+    let principal = super::connector_scope::resolve(&ctx.home, &headers);
+    let gate = super::connector_scope::gate(&principal);
+    let scopes = q.get("scopes").cloned();
+    if gate == super::connector_scope::Gate::Refuse {
+        let account = q.get("account").cloned();
+        super::connector_scope::record(&state, &id, &principal, &gate, account, scopes, 403).await;
+        return super::connector_scope::refusal(&id, &principal);
+    }
+    let (resp, account) = mint_for(&state, &ctx, &id, principal.lane(), &headers, q).await;
+    super::connector_scope::record(&state, &id, &principal, &gate, account, scopes, resp.status().as_u16()).await;
+    resp
+}
+
+/// The mint itself, for a principal already resolved. `lane` is the worker
+/// whose connector scope limits the bearer, or `None` for a verified human.
+/// Returns the account the mint was pinned to, for the receipt.
+async fn mint_for(
+    state: &AppState,
+    ctx: &Arc<ConnectorsCtx>,
+    id: &str,
+    lane: Option<&str>,
+    headers: &HeaderMap,
+    mut q: std::collections::HashMap<String, String>,
+) -> (Response, Option<String>) {
+    let resp = mint_for_inner(state, ctx, id, lane, headers, &mut q).await;
+    (resp, q.get("account").cloned())
+}
+
+async fn mint_for_inner(
+    state: &AppState,
+    ctx: &Arc<ConnectorsCtx>,
+    id: &str,
+    lane: Option<&str>,
+    headers: &HeaderMap,
+    q: &mut std::collections::HashMap<String, String>,
+) -> Response {
+    let id = id.to_string();
+    let declared = def_of(&ctx.home, &id).filter(|d| !d.builtin);
+    if provider(&id).is_none() && declared.is_none() {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("unknown connector '{id}'")})),
         )
             .into_response();
-    };
+    }
+    // ENTITLEMENT (APM-2): a live bearer is the actual secret — mint it only
+    // for a worker the `connectors` scope actually names. `lane` comes from
+    // the resolved principal: a worker (proven or merely named, since the
+    // name only narrows) is held to its scope; a verified human is not.
+    if let Some(lane) = lane {
+        let req_account = q
+            .get("account")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let conn = state.store.read().ok();
+        match connector_entitlement_check(
+            conn.as_deref(),
+            &ctx.home,
+            lane,
+            &id,
+            req_account.as_deref(),
+        ) {
+            Ok(Some(account)) => {
+                q.insert("account".into(), account);
+            }
+            Ok(None) => {}
+            Err(denial) => {
+                tracing::warn!(
+                    worker = %lane, connector = %id,
+                    "[connectors] token mint refused: not entitled (APM-2)"
+                );
+                let resource = match req_account.as_deref() {
+                    Some(a) => format!("connector {id} account {a}"),
+                    None => format!("connector {id}"),
+                };
+                super::capabilities::existing_refusal(&ctx.home, lane, "connectors", &resource, &id);
+                return (StatusCode::FORBIDDEN, Json(denial)).into_response();
+            }
+        }
+    }
+    if let Some(d) = declared {
+        return declared_oauth::mint(ctx, &d, q.get("account").map(String::as_str)).await;
+    }
+    let p = provider(&id).expect("builtin was checked");
     // LoginPassword's mint has nothing in common with the Google-SA-impersonation
     // machinery the rest of this function is built around (no scopes, no
     // impersonation subject) — resolved and returned here directly rather than
     // falling through to it.
     if let Auth::LoginPassword { .. } = p.auth {
-        let req_account = q.get("account").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let req_account = q
+            .get("account")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let stored = store_accounts(&ctx.home, p.id);
         let account = match req_account {
             Some(a) if stored.contains(&a) => a,
@@ -2210,7 +2926,7 @@ async fn mint_connector_token(
                 }
             },
         };
-        let store: Value = std::fs::read_to_string(store_path(&ctx.home, p.id, &account))
+        let store: Value = crate::integrations::secure_store::read_string(store_path(&ctx.home, p.id, &account))
             .ok()
             .and_then(|r| serde_json::from_str(&r).ok())
             .unwrap_or(json!({}));
@@ -2225,7 +2941,7 @@ async fn mint_connector_token(
     }
     let default_scopes = match p.auth {
         Auth::OAuth2 { scopes, .. } => scopes,
-        Auth::ApiKey { .. } => {
+        Auth::ApiKey { .. } | Auth::ApiKeys { .. } => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
@@ -2245,7 +2961,20 @@ async fn mint_connector_token(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default_scopes.to_string());
     let family = family_of(p);
-    let req_account = q.get("account").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let req_account = q
+        .get("account")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if req_account
+        .as_deref()
+        .is_some_and(|account| !oauth_store::valid_account(account))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid connector account"})),
+        )
+            .into_response();
+    }
     let stored = store_accounts(&ctx.home, family);
     // Route the mint. An explicit `?account=` that has a stored USER grant wins
     // (the SA cannot impersonate outside its Workspace domain — a personal
@@ -2257,8 +2986,13 @@ async fn mint_connector_token(
         // covered calendar/drive, so minting them for another provider would
         // hand out a token that cannot do what the caller asked (the
         // "connected but useless" lie the list() endpoint already refuses).
-        Some(a) if p.id == "google-gmail"
-            && ctx.home.join("gmail-tokens").join(format!("{a}.json")).exists() =>
+        Some(a)
+            if p.id == "google-gmail"
+                && ctx
+                    .home
+                    .join("gmail-tokens")
+                    .join(format!("{a}.json"))
+                    .exists() =>
         {
             Some(a.clone())
         }
@@ -2283,6 +3017,32 @@ async fn mint_connector_token(
         }
         None => None,
     };
+    // A STORED GRANT ANSWERS ONLY FOR THE SCOPES IT HOLDS (amux-gtm, 2026-11-02).
+    // hello@amux.io's mailbox grant won every google-youtube mint, so the scopes
+    // delegated to the service account were never asked for and every YouTube
+    // read was a 403. When the grant lacks a requested scope and the service
+    // account can mint them all, the service account answers. If it cannot, the
+    // grant still does, and the log says what is missing.
+    let user_account = match user_account {
+        Some(a) if p.category == "Google" && super::google_sa::sa_usable_in(&ctx.home) => {
+            let missing = oauth_store::family_path(&ctx.home, family, &a)
+                .ok()
+                .and_then(|path| crate::integrations::secure_store::read_string(path).ok())
+                .map(|grant| grant_missing_scopes(&grant, &scope))
+                .unwrap_or_default();
+            if missing.is_empty() {
+                Some(a)
+            } else {
+                let minted = super::google_sa::mint_token_as(&scope, &a).await;
+                tracing::warn!(connector = %p.id, account = %a, missing = ?missing, sa_minted = minted.is_ok(),
+                    sa_error = minted.as_ref().err().map(String::as_str).unwrap_or(""),
+                    measured = true, n_considered = 1, verdict = "connector_grant_lacks_scope",
+                    "connector_token: the stored grant lacks requested scopes");
+                if minted.is_ok() { None } else { Some(a) }
+            }
+        }
+        other => other,
+    };
     if user_account.is_none()
         && !(p.category == "Google" && super::google_sa::sa_config_in(&ctx.home).is_some())
     {
@@ -2295,7 +3055,11 @@ async fn mint_connector_token(
                 // Legacy gmail-tokens can still serve google-gmail mints (and
                 // only gmail — see the routing note above).
                 let gm = connected_accounts_in(&ctx.home);
-                if gm.len() == 1 { Some(gm[0].clone()) } else { None }
+                if gm.len() == 1 {
+                    Some(gm[0].clone())
+                } else {
+                    None
+                }
             }
             _ => None,
         };
@@ -2316,12 +3080,12 @@ async fn mint_connector_token(
             )
                 .into_response();
         };
-        return mint_from_user_grant(&ctx, p, family, &acct, &scope).await;
+        return mint_from_user_grant(ctx, p.id, family, &acct, &scope).await;
     }
     if let Some(acct) = user_account {
-        return mint_from_user_grant(&ctx, p, family, &acct, &scope).await;
+        return mint_from_user_grant(ctx, p.id, family, &acct, &scope).await;
     }
-    let Some(subject) = impersonation_subject(&headers, &ctx.home) else {
+    let Some(subject) = impersonation_subject(headers, &ctx.home) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "status": "error", "detail": "no impersonation subject (GOOGLE_SA_SUBJECT unset and no X-Amux-User-Email)"})),
@@ -2382,23 +3146,92 @@ async fn mint_connector_token(
     }
 }
 
+/// Accounts holding a Google family grant, with whether that grant carries
+/// the Calendar scope. The grant files the Connectors page writes are the
+/// one source of truth; `/api/gcal` keeps no account table of its own.
+pub(crate) fn google_calendar_accounts(home: &std::path::Path) -> Vec<(String, bool)> {
+    store_accounts(home, "google")
+        .into_iter()
+        .map(|account| {
+            let granted = crate::integrations::secure_store::read_string(store_path(home, "google", &account))
+                .ok()
+                .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+                .and_then(|v| v.get("scopes").and_then(Value::as_str).map(|s| s.contains("auth/calendar")))
+                .unwrap_or(false);
+            (account, granted)
+        })
+        .collect()
+}
+
+/// A Calendar bearer for one account, minted through the same user-grant
+/// path workers use: stored-token reuse, refresh, the legacy gmail-tokens
+/// fallback and the `invalid_grant` WARN all apply. `Err` carries the
+/// mint's own JSON body (status, detail, the reconnect action).
+pub(crate) async fn google_calendar_token(account: &str) -> Result<String, Value> {
+    let ctx = default_ctx();
+    let Some(p) = provider("google-calendar") else {
+        return Err(json!({"status": "error", "detail": "google-calendar connector is not registered"}));
+    };
+    let scope = match &p.auth {
+        Auth::OAuth2 { scopes, .. } => *scopes,
+        _ => "https://www.googleapis.com/auth/calendar",
+    };
+    let resp = mint_from_user_grant(&ctx, p.id, family_of(p), account, scope).await;
+    let ok = resp.status().is_success();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .map_err(|e| json!({"status": "error", "detail": e.to_string()}))?;
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}));
+    match body.get("access_token").and_then(Value::as_str) {
+        Some(token) if ok && !token.is_empty() => Ok(token.to_string()),
+        _ => Err(body),
+    }
+}
+
 /// Mint a bearer from a stored USER grant, refreshing through the broker when
 /// stale — the path that makes "authorize once per account" real for workers.
 /// Response shape matches the SA mint. `invalid_grant` names the ONE reconnect
 /// action instead of a bare 502, and WARNs so a log sweep sees the rot.
 async fn mint_from_user_grant(
     ctx: &ConnectorsCtx,
-    p: &Provider,
+    id: &str,
     family: &str,
     account: &str,
     scope: &str,
 ) -> Response {
-    let fam_path = store_path(&ctx.home, family, account);
-    let legacy_path = ctx.home.join("gmail-tokens").join(format!("{account}.json"));
-    let (path, legacy) = if fam_path.exists() {
-        (fam_path, false)
+    mint_with_lifetime(ctx, id, family, account, scope, 60.0).await
+}
+
+async fn mint_with_lifetime(
+    ctx: &ConnectorsCtx,
+    id: &str,
+    family: &str,
+    account: &str,
+    scope: &str,
+    minimum_lifetime: f64,
+) -> Response {
+    let fam_path = match oauth_store::family_path(&ctx.home, family, account) {
+        Ok(path) => path,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok":false,"error":"invalid connector account"})),
+            )
+                .into_response();
+        }
+    };
+    let _lease = match oauth_store::lock(&ctx.home, family, account).await {
+        Ok(lease) => lease,
+        Err(error) => return storage_error(error),
+    };
+    let legacy_path = ctx
+        .home
+        .join("gmail-tokens")
+        .join(format!("{account}.json"));
+    let path = if fam_path.exists() {
+        fam_path
     } else if family == "google" && legacy_path.exists() {
-        (legacy_path, true)
+        legacy_path
     } else {
         return (
             StatusCode::NOT_FOUND,
@@ -2411,34 +3244,48 @@ async fn mint_from_user_grant(
         )
             .into_response();
     };
-    let Some(tf) = std::fs::read_to_string(&path).ok().and_then(|r| serde_json::from_str::<Value>(&r).ok())
-    else {
+    let raw = match crate::integrations::secure_store::read_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if crate::integrations::at_rest::is_locked(&e) => {
+            // Sealed at rest and the key is not available: the grant is fine,
+            // so this must not read as "reconnect the account" (gov PR 18).
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"ok": false, "status": "locked", "detail": e.to_string(),
+                    "fix": "make the at-rest key available (GET /api/security/at-rest)"})),
+            )
+                .into_response();
+        }
+        Err(_) => String::new(),
+    };
+    let Some(tf) = serde_json::from_str::<Value>(&raw).ok() else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"ok": false, "status": "error", "detail": format!("grant file for {account} is unreadable")})),
         )
             .into_response();
     };
-    let s = |k: &str| tf.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    // Fresh stored token (60s safety margin): serve it without a round trip.
-    // Legacy gmail files carry no expires_at, so they always refresh — which
-    // is also what keeps their stored `token` field usable for email.rs.
-    let expires_at = tf.get("expires_at").and_then(Value::as_f64);
-    if let Some(exp) = expires_at {
-        let left = exp - now_ts();
-        if left > 60.0 && !s("token").is_empty() {
-            return Json(json!({
-                "ok": true,
-                "access_token": s("token"),
-                "token_type": "Bearer",
-                "expires_in": left as u64,
-                "scope": tf.get("scopes").and_then(Value::as_str).unwrap_or(scope),
-                "subject": account,
-                "source": "user-grant (stored)",
-                "usage": "Authorization: Bearer <access_token>",
-            }))
+    if tf["disconnected"] == true {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"ok":false,"status":"needs_auth","detail":"account was disconnected"})),
+        )
             .into_response();
-        }
+    }
+    let s = |k: &str| tf.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    // Slack's ordinary bot grants do not expire when rotation is disabled.
+    // Unknown Google expiry still requires a refresh; it is not evidence of a
+    // nonexpiring token. Rotating Slack grants always carry an expiry.
+    let expires_at = tf.get("expires_at").and_then(Value::as_f64);
+    let remaining = expires_at.map(|exp| exp - now_ts());
+    let nonexpiring = family != "google" && expires_at.is_none() && s("refresh_token").is_empty();
+    if !s("token").is_empty() && (remaining.is_some_and(|left| left > minimum_lifetime) || nonexpiring) {
+        return Json(json!({
+            "ok":true,"access_token":s("token"),"token_type":"Bearer",
+            "expires_in":remaining.map(|left| left as u64),
+            "scope":tf.get("scopes").and_then(Value::as_str).unwrap_or(scope),
+            "subject":account,"identity_unverified":tf["identity_unverified"],"source":"user-grant (stored)","usage":"Authorization: Bearer <access_token>",
+        })).into_response();
     }
     let refresh = s("refresh_token");
     if refresh.is_empty() {
@@ -2455,7 +3302,11 @@ async fn mint_from_user_grant(
     }
     let token_uri = {
         let t = s("token_uri");
-        if t.is_empty() { DEFAULT_TOKEN_URI.to_string() } else { t }
+        if t.is_empty() {
+            DEFAULT_TOKEN_URI.to_string()
+        } else {
+            t
+        }
     };
     let form = vec![
         ("grant_type".to_string(), "refresh_token".to_string()),
@@ -2464,6 +3315,24 @@ async fn mint_from_user_grant(
         ("client_secret".to_string(), s("client_secret")),
     ];
     match ctx.http.post_form(&token_uri, &form).await {
+        Ok((_, body)) if matches!(body.get("error").and_then(Value::as_str), Some("invalid_grant" | "invalid_refresh_token" | "token_revoked" | "token_expired" | "invalid_auth")) => {
+            tracing::warn!(
+                connector=id, family, account,
+                provider_error=body["error"].as_str().unwrap_or("revoked"),
+                verdict="connector_grant_revoked",
+                "provider rejected the saved refresh credential; re-approval required"
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "status": "needs_reauth",
+                    "detail": format!("the grant for {account} was revoked or expired. One re-approval repairs every worker."),
+                    "reconnect": format!("POST /api/connectors/{family}/auth?account={account} → open authorize_url, approve"),
+                })),
+            )
+                .into_response()
+        }
         Ok((st, body)) if st < 400 => {
             let access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
             if access.is_empty() {
@@ -2474,26 +3343,16 @@ async fn mint_from_user_grant(
                     .into_response();
             }
             let expires_in = body.get("expires_in").and_then(Value::as_f64).unwrap_or(3599.0);
-            // Persist so the NEXT mint (any worker) skips the round trip; the
-            // legacy gmail shape keeps its exact five fields.
-            let updated = if legacy {
-                json!({
-                    "token": access,
-                    "refresh_token": refresh,
-                    "token_uri": token_uri,
-                    "client_id": s("client_id"),
-                    "client_secret": s("client_secret"),
-                })
-            } else {
-                let mut m = tf.as_object().cloned().unwrap_or_default();
-                m.insert("token".into(), json!(access));
-                m.insert("expires_at".into(), json!(now_ts() + expires_in));
-                Value::Object(m)
+            let updated = match oauth_store::refreshed(&tf, &body, true) {
+                Ok(updated) => updated,
+                Err(error) => return (StatusCode::BAD_GATEWAY, Json(json!({"ok":false,"error":error.to_string()}))).into_response(),
             };
-            let _ = write_store_file(&path, &updated);
+            if let Err(error) = oauth_store::persist_refresh(&ctx.home, family, account, &path, &tf, updated) {
+                return storage_error(error);
+            }
             tracing::info!(
                 "connector_token: {} minted from user grant for {} (family {family}) expires_in={}",
-                p.id,
+                id,
                 account,
                 expires_in as u64
             );
@@ -2505,34 +3364,19 @@ async fn mint_from_user_grant(
                 "scope": tf.get("scopes").and_then(Value::as_str).unwrap_or(scope),
                 "subject": account,
                 "source": "user-grant (refreshed)",
+                "identity_unverified": tf["identity_unverified"],
                 "usage": "Authorization: Bearer <access_token>",
             }))
             .into_response()
         }
-        Ok((_, body)) if body.to_string().contains("invalid_grant") => {
-            tracing::warn!(
-                "connector_token: {} user grant for {account} is REVOKED (invalid_grant) — needs one re-approval",
-                p.id
-            );
-            (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "ok": false,
-                    "status": "needs_reauth",
-                    "detail": format!("the grant for {account} was revoked or expired (invalid_grant). One re-approval repairs every worker."),
-                    "reconnect": format!("POST /api/connectors/{family}/auth?account={account} → open authorize_url, approve"),
-                })),
-            )
-                .into_response()
-        }
-        Ok((st, body)) => (
+        Ok((st, _)) => (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"ok": false, "status": "error", "detail": format!("token refresh failed: HTTP {st}: {body}")})),
+            Json(json!({"ok": false, "status": "error", "detail": format!("token refresh failed: HTTP {st}; saved credentials retained")})),
         )
             .into_response(),
-        Err(e) => (
+        Err(_) => (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"ok": false, "status": "error", "detail": format!("token refresh failed: {e}")})),
+            Json(json!({"ok": false, "status": "error", "detail": "token refresh transport failed; saved credentials retained"})),
         )
             .into_response(),
     }
@@ -2550,32 +3394,113 @@ static ROLLUP_CACHE: Mutex<std::collections::BTreeMap<PathBuf, (Instant, Value)>
     Mutex::new(std::collections::BTreeMap::new());
 const ROLLUP_TTL_S: u64 = 300;
 
+/// Bumped by every invalidation. A rollup records it before probing and only
+/// caches its result if no invalidation landed meanwhile: a rollup started
+/// before an account connected used to finish after the callback's
+/// invalidation and cache the stale list for the full TTL (the flaky
+/// `declared_oauth_connector_lifecycle_survives_sigkill`, 1 account of 2).
+static ROLLUP_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Is `id` one of the builtin Google connectors (they share one grant)?
+pub(super) fn is_google_connector(id: &str) -> bool {
+    provider(id).is_some_and(|p| family_of(p) == "google")
+}
+
+/// Disconnect a Google account: revoke its token at Google, then delete the
+/// grant and its Gmail copy. Before this, the Connections tab's Disconnect
+/// answered every Google account with "use the provider's existing disconnect
+/// flow for builtins", and no such flow existed (sandbox, 2026-10-30: a
+/// mailbox connected by mistake could not be removed from the dashboard).
+/// The files are deleted even when Google's revoke fails, so amux stops using
+/// the grant either way; `provider_revoked` says which happened. Logs
+/// verdict=google_grant_disconnected.
+pub(super) async fn disconnect_google(ctx: &ConnectorsCtx, account: &str) -> Response {
+    if !crate::integrations::oauth_store::valid_account(account) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid account"}))).into_response();
+    }
+    let grant = ctx.home.join("connectors").join("google").join(format!("{account}.json"));
+    let mirror = ctx.home.join("gmail-tokens").join(format!("{account}.json"));
+    let token = [&grant, &mirror].iter().find_map(|p| {
+        let v: Value = serde_json::from_str(&crate::integrations::secure_store::read_string(p).ok()?).ok()?;
+        ["refresh_token", "token", "access_token"].iter()
+            .find_map(|k| v[*k].as_str().filter(|t| !t.is_empty()).map(str::to_string))
+    });
+    let held = grant.exists() || mirror.exists();
+    if !held {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("no Google grant for {account}")}))).into_response();
+    }
+    let revoked = match &token {
+        Some(t) => matches!(ctx.http.post_form("https://oauth2.googleapis.com/revoke", &[("token".to_string(), t.clone())]).await,
+            Ok((s, _)) if s < 300 || s == 400),
+        None => false,
+    };
+    let removed: Vec<&str> = [("grant", &grant), ("gmail", &mirror)].iter()
+        .filter(|(_, p)| std::fs::remove_file(p).is_ok()).map(|(k, _)| *k).collect();
+    invalidate_rollup(&ctx.home);
+    tracing::info!(account, provider_revoked = revoked, removed = ?removed, measured = true, n_considered = 1,
+        verdict = "google_grant_disconnected", "a Google account was disconnected; amux no longer holds its grant");
+    Json(json!({"ok": true, "account": account, "disconnected": true, "provider_revoked": revoked, "removed": removed})).into_response()
+}
+
+/// Which grant generation is current. Bumped by every grant change (connect,
+/// reconnect, disconnect, a refresh that rotated a token), so a cache of
+/// grant health from an older generation is stale whatever its age.
+pub(crate) fn grant_epoch() -> u64 {
+    ROLLUP_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Drop the cached rollup for `home` and stop any rollup already in flight
+/// from caching what it computed before this change. Also voids every cached
+/// Gmail health verdict, which carries the epoch it was read in.
+pub(crate) fn invalidate_rollup(home: &std::path::Path) {
+    ROLLUP_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    ROLLUP_CACHE.lock().expect("rollup cache").remove(home);
+}
+
 /// Canary targets: the cheapest real call per Google service, gated on the
 /// grant actually covering it (a gmail-only grant must read `not_granted` for
 /// calendar, never red — the inverse of the "connected but useless" lie).
 /// A refreshable token proves only the TOKEN leg; these prove the API serves.
 const CANARY_TARGETS: &[(&str, &str, &str)] = &[
-    ("gmail", "https://gmail.googleapis.com/gmail/v1/users/me/profile", "auth/gmail."),
+    (
+        "gmail",
+        "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+        "auth/gmail.",
+    ),
     (
         "calendar",
         "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=1",
         "auth/calendar",
     ),
-    ("drive", "https://www.googleapis.com/drive/v3/about?fields=user", "auth/drive"),
+    (
+        "drive",
+        "https://www.googleapis.com/drive/v3/about?fields=user",
+        "auth/drive",
+    ),
 ];
 
 /// Build the per-account rollup: every account amux holds any credential for,
 /// which families cover it, each one's LIVE health, and — when broken — the
 /// ONE reconnect action. This is the view Ethan's "do it once per account"
 /// resolves through: each row is one approval at most.
-pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::path::Path, bypass_cache: bool) -> Value {
+pub(crate) async fn accounts_rollup(
+    http: &Arc<dyn HttpTransport>,
+    home: &std::path::Path,
+    bypass_cache: bool,
+) -> Value {
     if !bypass_cache {
-        if let Some((at, v)) = ROLLUP_CACHE.lock().expect("rollup cache").get(home).cloned() {
+        if let Some((at, v)) = ROLLUP_CACHE
+            .lock()
+            .expect("rollup cache")
+            .get(home)
+            .cloned()
+        {
             if at.elapsed().as_secs() < ROLLUP_TTL_S {
                 return v;
             }
         }
     }
+    let gen_at_start = ROLLUP_GEN.load(std::sync::atomic::Ordering::SeqCst);
     let mut rows: std::collections::BTreeMap<String, Map<String, Value>> = Default::default();
     // Per-account canary legs (AMUX-3430): the CONTINUES-working proof, one
     // cheap real API call per granted service on every cache refresh.
@@ -2587,7 +3512,9 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
     // canary leg for these accounts (mirrored below, never pinged twice).
     for a in &legacy_gmail {
         let health = super::gmail_auth::health_for(http.clone(), home, a).await;
-        rows.entry(a.clone()).or_default().insert("gmail".into(), json!(health));
+        rows.entry(a.clone())
+            .or_default()
+            .insert("gmail".into(), json!(health));
         canaries.entry(a.clone()).or_default().insert(
             "gmail".into(),
             json!({"status": health, "via": "gmail_probe", "checked_at": now_ts()}),
@@ -2598,35 +3525,57 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
     for family in ["google", "slack", "mattermost"] {
         for a in store_accounts(home, family) {
             let path = store_path(home, family, &a);
-            let tf: Value = std::fs::read_to_string(&path)
+            let read = crate::integrations::secure_store::read_string(&path);
+            let locked = read.as_ref().is_err_and(crate::integrations::at_rest::is_locked);
+            let tf: Value = read
                 .ok()
                 .and_then(|r| serde_json::from_str(&r).ok())
                 .unwrap_or(json!({}));
-            let health = if family != "google" {
+            let health = if locked {
+                "locked".to_string()
+            } else if family == "slack" {
+                let ctx = ConnectorsCtx { home: home.into(), http: http.clone() };
+                let response = mint_from_user_grant(&ctx, "slack", "slack", &a, "").await;
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.ok();
+                let body: Value = body.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+                if status.is_success() { "ok" } else if body["status"] == "needs_reauth" { "needs_reauth" } else { "not_connected" }.to_string()
+            } else if family != "google" {
                 // Slack bot tokens do not expire; Mattermost session tokens
                 // can be revoked server-side with no local signal — for both,
                 // presence says nothing about whether the token still works.
                 // The canary below is the live check.
                 "ok".to_string()
-            } else if tf.get("expires_at").and_then(Value::as_f64).is_some_and(|e| e - now_ts() > 60.0) {
+            } else if tf
+                .get("expires_at")
+                .and_then(Value::as_f64)
+                .is_some_and(|e| e - now_ts() > 60.0)
+            {
                 "ok".to_string()
             } else {
-                probe_google_refresh(http, &path, &tf).await
+                probe_google_refresh(http, home, &a, &path, &tf).await
             };
-            rows.entry(a.clone()).or_default().insert(family.into(), json!(health));
+            rows.entry(a.clone())
+                .or_default()
+                .insert(family.into(), json!(health));
             let legs = canaries.entry(a.clone()).or_default();
             if family == "google" {
                 canary_google_legs(http, &path, &health, legacy_gmail.contains(&a), legs).await;
             } else if family == "slack" && health == "ok" {
-                let token = tf.get("token").and_then(Value::as_str).unwrap_or("");
+                let committed: Value = crate::integrations::secure_store::read_json(&path).unwrap_or_default();
+                let token = committed.get("token").and_then(Value::as_str).unwrap_or("");
                 legs.insert("slack".into(), canary_slack_leg(http, token).await);
             } else if family == "mattermost" && health == "ok" {
                 let token = tf.get("token").and_then(Value::as_str).unwrap_or("");
                 let base_url = tf.get("base_url").and_then(Value::as_str).unwrap_or("");
-                legs.insert("mattermost".into(), canary_mattermost_leg(http, base_url, token).await);
+                legs.insert(
+                    "mattermost".into(),
+                    canary_mattermost_leg(http, base_url, token).await,
+                );
             }
         }
     }
+    declared_oauth::rollup(http, home, &mut rows, &mut canaries).await;
     let mut accounts: Vec<Value> = Vec::new();
     let mut needs_reauth: Vec<Value> = Vec::new();
     for (account, families) in rows {
@@ -2640,20 +3589,56 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
         } else if broken.first().map(String::as_str) == Some("slack") {
             Some("slack")
         } else {
-            None
+            broken.iter().find(|id| def_of(home, id).is_some_and(|d| !d.builtin && d.kind == "oauth2")).map(String::as_str)
         };
         let reconnect = reconnect_family.map(|f| {
-            format!("POST /api/connectors/{f}/auth?account={account} → open authorize_url, approve once")
+            format!(
+                "POST /api/connectors/{f}/auth?account={account} → open authorize_url, approve once"
+            )
         });
         if let Some(rc) = &reconnect {
-            needs_reauth.push(json!({"account": account, "broken": broken, "reconnect": rc}));
+            // The age travels with the finding, so a reader sees the clock
+            // without going to the log (AMUX-5019).
+            let last_ok = ["google", "slack", "mattermost"]
+                .iter()
+                .map(|f| store_path(home, f, &account))
+                .find_map(|p| grant_last_ok_age_days(&p));
+            needs_reauth.push(json!({
+                "account": account,
+                "broken": broken,
+                "reconnect": rc,
+                "last_ok_age_days": last_ok,
+                "measured": last_ok.is_some(),
+            }));
+        }
+        // A Gmail-only grant (the legacy /api/gmail/auth flow) reads healthy
+        // while calendar, drive and docs were never granted, so every
+        // calendar call for that account fails with nothing on this page to
+        // say why. Name the gap and the one grant that closes it.
+        let missing: Vec<&str> =
+            if families.contains_key("gmail") && !families.contains_key("google") {
+                vec!["google"]
+            } else {
+                Vec::new()
+            };
+        let connect = (!missing.is_empty()).then(|| {
+            format!("POST /api/connectors/google/auth?account={account} → open authorize_url, approve once (adds calendar, drive, docs)")
+        });
+        if !missing.is_empty() {
+            tracing::warn!(
+                account = %account,
+                verdict = "connector_grant_partial",
+                "account has a Gmail grant but no Google grant: calendar, drive and docs are not authorized"
+            );
         }
         accounts.push(json!({
             "account": account,
             "families": families,
             "canary": canaries.get(&account).cloned().map(Value::Object),
-            "needs_reauth": reconnect.is_some(),
+            "needs_reauth": !broken.is_empty(),
             "reconnect": reconnect,
+            "missing": missing,
+            "connect": connect,
         }));
     }
     // Persist the canary map with a timestamp: last-checked must survive the
@@ -2663,21 +3648,24 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
         "checked_at": now_ts(),
         "accounts": canaries.iter().map(|(k, v)| (k.clone(), Value::Object(v.clone()))).collect::<Map<_, _>>(),
     });
-    let _ = std::fs::create_dir_all(home.join("connectors")).and_then(|_| {
-        std::fs::write(
-            home.join("connectors").join("canary.json"),
-            serde_json::to_string_pretty(&canary_file).unwrap_or_default(),
-        )
-    });
+    let _ = crate::integrations::secure_store::write(
+        &home.join("connectors/canary.json"),
+        canary_file.to_string().as_bytes(),
+    );
     let out = json!({
         "accounts": accounts,
         "needs_reauth": needs_reauth,
         "note": "One row per account; one approval repairs every family listed as needs_reauth (a Google grant covers gmail + calendar + drive/docs at once and every worker shares it). canary = one real API call per granted service on every refresh (~5min): ok / api_error / not_granted / unreachable, with checked_at.",
     });
-    ROLLUP_CACHE
-        .lock()
-        .expect("rollup cache")
-        .insert(home.to_path_buf(), (Instant::now(), out.clone()));
+    {
+        let mut cache = ROLLUP_CACHE.lock().expect("rollup cache");
+        if ROLLUP_GEN.load(std::sync::atomic::Ordering::SeqCst) == gen_at_start {
+            cache.insert(home.to_path_buf(), (Instant::now(), out.clone()));
+        } else {
+            tracing::info!(verdict = "connector_rollup_not_cached_stale", measured = true, n_considered = 1,
+                "connector rollup computed across a credential change; served once, not cached");
+        }
+    }
     out
 }
 
@@ -2685,7 +3673,58 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
 /// refresh so the next reader skips the round trip. Same discriminator as the
 /// gmail probe: `invalid_grant` → needs_reauth, anything else unusable →
 /// not_connected.
-async fn probe_google_refresh(http: &Arc<dyn HttpTransport>, path: &std::path::Path, tf: &Value) -> String {
+/// Days since this grant last refreshed successfully (AMUX-5019).
+///
+/// Read from the store file's mtime, because a successful refresh REWRITES the
+/// file with the new access token and a failed one does not. So the mtime is
+/// the last moment the grant demonstrably worked, and it needs no new column.
+///
+/// This number is the whole point: "needs_reauth" on its own has been true for
+/// these accounts repeatedly and says nothing about the clock they die on.
+/// Measured 2026-09-23 across one OAuth client, five accounts:
+///   ethan@mixpeek.com, info@mixpeek.com   refresh OK
+///   beefinethan@gmail.com, hello@amux.io,
+///   esteininger21@gmail.com               invalid_grant,
+///                                         "Token has been expired or revoked."
+/// The two that survive are in the same Google Workspace as the Cloud project
+/// that owns the client (mixpeek-inference-463103). That is the documented
+/// exemption from the 7-day refresh-token expiry an app in TESTING gives every
+/// other user. With this age recorded, the next occurrence says so itself.
+fn grant_last_ok_age_days(path: &std::path::Path) -> Option<f64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let secs = std::time::SystemTime::now()
+        .duration_since(modified)
+        .ok()?
+        .as_secs_f64();
+    Some(secs / 86_400.0)
+}
+
+async fn probe_google_refresh(
+    http: &Arc<dyn HttpTransport>,
+    home: &std::path::Path,
+    account: &str,
+    path: &std::path::Path,
+    _snapshot: &Value,
+) -> String {
+    let _lease = match oauth_store::lock(home, "google", account).await {
+        Ok(lease) => lease,
+        Err(_) => return "storage_error".into(),
+    };
+    let tf: Value = match crate::integrations::secure_store::read_json::<Value>(path) {
+        Ok(tf) if tf.is_object() => tf,
+        _ => return "storage_error".into(),
+    };
+    if tf
+        .get("expires_at")
+        .and_then(Value::as_f64)
+        .is_some_and(|exp| exp - now_ts() > 60.0)
+        && tf
+            .get("token")
+            .and_then(Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+    {
+        return "ok".into();
+    }
     let s = |k: &str| tf.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let refresh = s("refresh_token");
     if refresh.is_empty() {
@@ -2693,7 +3732,11 @@ async fn probe_google_refresh(http: &Arc<dyn HttpTransport>, path: &std::path::P
     }
     let token_uri = {
         let t = s("token_uri");
-        if t.is_empty() { DEFAULT_TOKEN_URI.to_string() } else { t }
+        if t.is_empty() {
+            DEFAULT_TOKEN_URI.to_string()
+        } else {
+            t
+        }
     };
     let form = vec![
         ("grant_type".to_string(), "refresh_token".to_string()),
@@ -2703,18 +3746,43 @@ async fn probe_google_refresh(http: &Arc<dyn HttpTransport>, path: &std::path::P
     ];
     match http.post_form(&token_uri, &form).await {
         Ok((st, body)) if st < 400 => {
-            let access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
+            let access = body
+                .get("access_token")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if access.is_empty() {
                 return "not_connected".into();
             }
-            let expires_in = body.get("expires_in").and_then(Value::as_f64).unwrap_or(3599.0);
-            let mut m = tf.as_object().cloned().unwrap_or_default();
-            m.insert("token".into(), json!(access));
-            m.insert("expires_at".into(), json!(now_ts() + expires_in));
-            let _ = write_store_file(path, &Value::Object(m));
+            let updated = match oauth_store::refreshed(&tf, &body, true) {
+                Ok(updated) => updated,
+                Err(_) => return "not_connected".into(),
+            };
+            if oauth_store::persist_refresh(home, "google", account, path, &tf, updated).is_err() {
+                return "storage_error".into();
+            }
             "ok".into()
         }
-        Ok((_, body)) if body.to_string().contains("invalid_grant") => "needs_reauth".into(),
+        Ok((_, body)) if body.to_string().contains("invalid_grant") => {
+            // THE PROVIDER'S OWN WORDS, PLUS THE CLOCK. "needs_reauth" alone
+            // has been true for these accounts repeatedly and cannot show that
+            // they die on a schedule (AMUX-5019).
+            let desc = body
+                .get("error_description")
+                .and_then(Value::as_str)
+                .unwrap_or("no description")
+                .to_string();
+            let age = grant_last_ok_age_days(path);
+            tracing::warn!(
+                account = %path.file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
+                provider_error = %desc,
+                last_ok_age_days = age.unwrap_or(-1.0),
+                measured = age.is_some(),
+                n_considered = 1,
+                verdict = "connector_grant_expired",
+                "a stored Google grant no longer refreshes; the age is how long it lasted"
+            );
+            "needs_reauth".into()
+        }
         _ => "not_connected".into(),
     }
 }
@@ -2736,11 +3804,14 @@ async fn canary_google_legs(
     if health != "ok" {
         // No usable token: every covered leg inherits the grant's state so
         // the canary never claims silence where the grant itself is broken.
-        legs.insert("grant".into(), json!({"status": health, "checked_at": now_ts()}));
+        legs.insert(
+            "grant".into(),
+            json!({"status": health, "checked_at": now_ts()}),
+        );
         return;
     }
     // Re-read: probe_google_refresh may have just rotated the token in place.
-    let tf: Value = std::fs::read_to_string(store)
+    let tf: Value = crate::integrations::secure_store::read_string(store)
         .ok()
         .and_then(|r| serde_json::from_str(&r).ok())
         .unwrap_or(json!({}));
@@ -2771,7 +3842,10 @@ async fn canary_google_legs(
 /// Slack canary: auth.test is the cheapest authenticated call and answers
 /// `{"ok":false}` with HTTP 200 on a dead token, so the body is the verdict.
 async fn canary_slack_leg(http: &Arc<dyn HttpTransport>, token: &str) -> Value {
-    match http.get("https://slack.com/api/auth.test", Some(token)).await {
+    match http
+        .get("https://slack.com/api/auth.test", Some(token))
+        .await
+    {
         Ok((st, body)) if st < 400 && body.get("ok").is_some_and(|v| v == true) => {
             json!({"status": "ok", "checked_at": now_ts()})
         }
@@ -2788,8 +3862,15 @@ async fn canary_slack_leg(http: &Arc<dyn HttpTransport>, token: &str) -> Value {
 /// Mattermost canary: `GET /api/v4/users/me` is the cheapest authenticated
 /// call — a dead session token answers 401, distinct from the store simply
 /// existing (a session that has since expired or been revoked server-side).
-async fn canary_mattermost_leg(http: &Arc<dyn HttpTransport>, base_url: &str, token: &str) -> Value {
-    match http.get(&format!("{base_url}/api/v4/users/me"), Some(token)).await {
+async fn canary_mattermost_leg(
+    http: &Arc<dyn HttpTransport>,
+    base_url: &str,
+    token: &str,
+) -> Value {
+    match http
+        .get(&format!("{base_url}/api/v4/users/me"), Some(token))
+        .await
+    {
         Ok((st, _)) if st < 400 => json!({"status": "ok", "checked_at": now_ts()}),
         Ok((st, body)) => json!({
             "status": "api_error",
@@ -2805,19 +3886,116 @@ async fn accounts_view(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Respons
     Json(accounts_rollup(&ctx.http, &ctx.home, false).await).into_response()
 }
 
+#[path = "connector_maintenance.rs"]
+mod maintenance;
+
+/// Server maintenance and isolated HTTP/process tests share this exact pass.
+pub async fn maintenance_pass(ctx: &ConnectorsCtx) -> Value {
+    maintenance::pass(ctx).await
+}
+
 pub fn routes() -> Router<AppState> {
     routes_with(default_ctx())
+}
+
+/// A bearer for builtin connector `id`, resolved exactly as
+/// `POST /api/connectors/{id}/token?account=` resolves it (the account's stored
+/// grant, else the domain-wide service account), for server-side callers that
+/// spend the token and never return it (`api/social.rs`). The principal is
+/// whoever `headers` proves, resolved exactly as for the HTTP route
+/// (`connector_scope::resolve`): the original request's verified owner, member
+/// or worker token, or, for a job running inside the server, the job's
+/// `org::policy_headers("job:<name>")` mark plus the worker it acts for. Empty
+/// headers prove nobody and count as anonymous. The error is the mint's JSON
+/// with any bearer removed.
+/// The requested scopes a stored grant (its JSON text) does not hold. A grant
+/// that names no scopes cannot be judged, so nothing reads as missing.
+fn grant_missing_scopes(grant: &str, requested: &str) -> Vec<String> {
+    let parsed: Value = serde_json::from_str(grant).unwrap_or_default();
+    let Some(held) = parsed["scopes"].as_str().filter(|h| !h.trim().is_empty()) else {
+        return Vec::new();
+    };
+    let held: std::collections::HashSet<&str> = held.split_whitespace().collect();
+    requested.split_whitespace().filter(|s| !held.contains(s)).map(str::to_string).collect()
+}
+
+#[cfg(test)]
+mod grant_scope_tests {
+    use super::grant_missing_scopes as m;
+    #[test]
+    fn a_mailbox_grant_does_not_answer_for_youtube() {
+        let grant = r#"{"scopes":"openid https://x/gmail.send https://x/drive"}"#;
+        assert_eq!(m(grant, "https://x/youtube.readonly https://x/drive"), vec!["https://x/youtube.readonly"]);
+        assert!(m(grant, "https://x/drive openid").is_empty(), "a grant holding every scope still answers");
+        assert!(m(r#"{"token":"t"}"#, "https://x/drive").is_empty(), "no recorded scopes cannot be judged");
+        assert!(m("not json", "https://x/drive").is_empty());
+    }
+}
+
+pub(crate) async fn bearer_for(
+    state: AppState,
+    headers: HeaderMap,
+    id: &str,
+    account: &str,
+) -> Result<String, Value> {
+    bearer_for_scopes(state, headers, id, account, None).await
+}
+
+/// `bearer_for`, asking only for `scopes` (space-separated) instead of all the
+/// connector's scopes. One scope the domain has not delegated fails a service
+/// account's whole request, so a caller that only reads should say so.
+pub(crate) async fn bearer_for_scopes(
+    state: AppState,
+    headers: HeaderMap,
+    id: &str,
+    account: &str,
+    scopes: Option<&str>,
+) -> Result<String, Value> {
+    let mut q = std::collections::HashMap::from([("account".to_string(), account.to_string())]);
+    if let Some(scopes) = scopes {
+        q.insert("scopes".to_string(), scopes.to_string());
+    }
+    let resp = mint_connector_token(
+        State(state),
+        Extension(default_ctx()),
+        Path(id.to_string()),
+        headers,
+        Query(q),
+    )
+    .await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let mut v: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+    match v["access_token"].as_str() {
+        Some(t) if status.is_success() => Ok(t.to_string()),
+        _ => {
+            if let Some(o) = v.as_object_mut() {
+                o.remove("access_token");
+            }
+            Err(json!({"http_status": status.as_u16(), "mint": v}))
+        }
+    }
 }
 
 pub fn routes_with(ctx: Arc<ConnectorsCtx>) -> Router<AppState> {
     Router::new()
         .route("/api/connectors", get(list).post(create_connector))
-        .route("/api/connectors/{id}", axum::routing::delete(delete_connector))
+        .route(
+            "/api/connectors/{id}",
+            axum::routing::delete(delete_connector),
+        )
         .route("/api/connectors/accounts", get(accounts_view))
+        .route("/api/connectors/maintenance", get(maintenance::view))
         .route("/api/connectors/{id}/credentials", post(set_credentials))
         .route("/api/connectors/{id}/auth", post(begin_auth))
         .route("/api/connectors/{id}/test", post(test_connection))
         .route("/api/connectors/{id}/token", post(mint_connector_token))
+        .route(
+            "/api/connectors/{id}/accounts/{account}",
+            axum::routing::delete(declared_oauth::disconnect),
+        )
         .layer(Extension(ctx))
 }
 
@@ -2869,7 +4047,10 @@ mod declared_connector_tests {
         assert_eq!(d.env_keys, vec!["ACME_API_KEY".to_string()]);
         assert_eq!(d.kind, "api_key");
         assert!(!d.builtin, "a declared row must not claim to be builtin");
-        assert_eq!(d.category, "Custom", "an empty category gets a default, not an empty column");
+        assert_eq!(
+            d.category, "Custom",
+            "an empty category gets a default, not an empty column"
+        );
     }
 
     /// THE SEAM IS ONE SEAM. A builtin and a declared row must both resolve
@@ -2898,8 +4079,14 @@ mod declared_connector_tests {
         )
         .unwrap();
         let all = defs(h.path());
-        assert!(all.iter().any(|d| d.id == "granola" && d.builtin), "builtins must be present");
-        assert!(all.iter().any(|d| d.id == "acme" && !d.builtin), "declared rows must be present");
+        assert!(
+            all.iter().any(|d| d.id == "granola" && d.builtin),
+            "builtins must be present"
+        );
+        assert!(
+            all.iter().any(|d| d.id == "acme" && !d.builtin),
+            "declared rows must be present"
+        );
         // And a builtin still resolves with the SAME call the declared one uses.
         assert!(def_of(h.path(), "granola").is_some_and(|d| d.builtin));
     }
@@ -2919,7 +4106,10 @@ mod declared_connector_tests {
         assert!(valid_env_name("ACME_API_KEY"));
         assert!(!valid_env_name("acme_api_key"), "lowercase");
         assert!(!valid_env_name("1ACME"), "leading digit");
-        assert!(!valid_env_name("ACME-KEY"), "hyphen is not legal in an env name");
+        assert!(
+            !valid_env_name("ACME-KEY"),
+            "hyphen is not legal in an env name"
+        );
         assert!(!valid_env_name(""), "empty");
     }
 
@@ -2955,7 +4145,13 @@ mod declared_connector_tests {
         };
         let d = Def::from(&oauth);
         assert_eq!(d.kind, "oauth2");
-        assert_eq!(d.env_keys, vec!["VEND_CLIENT_ID".to_string(), "VEND_CLIENT_SECRET".to_string()]);
+        assert_eq!(
+            d.env_keys,
+            vec![
+                "VEND_CLIENT_ID".to_string(),
+                "VEND_CLIENT_SECRET".to_string()
+            ]
+        );
         assert_eq!(d.authorize_url, "https://vend.example/authorize");
     }
 
@@ -2994,9 +4190,19 @@ mod declared_connector_tests {
         // fields. A new field carrying a VALUE would have to be added here
         // deliberately, which is the review moment.
         const NAME_ONLY_FIELDS: &[&str] = &[
-            "id", "label", "category", "kind", "key_env", "client_id_env",
-            "client_secret_env", "authorize_url", "token_url", "scopes",
-            "setup_note", "docs", "test_url",
+            "id",
+            "label",
+            "category",
+            "kind",
+            "key_env",
+            "client_id_env",
+            "client_secret_env",
+            "authorize_url",
+            "token_url",
+            "scopes",
+            "setup_note",
+            "docs",
+            "test_url",
         ];
         let rows: Vec<serde_json::Map<String, Value>> = serde_json::from_str(&raw).unwrap();
         for row in &rows {
@@ -3026,6 +4232,95 @@ mod declared_connector_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Connector e2e, 2026-10-08: Gmail listed "connected" while its own test
+    /// failed. A failed real test turns the status into "error" with its words;
+    /// a passing test, or a "needs_*" answer that tried nothing, does not.
+    #[test]
+    fn a_failed_live_test_overrides_connected() {
+        let failed = json!({"ok": false, "status": "needs_auth", "detail": "unauthorized_client"});
+        let (st, detail) = status_after_test("connected", Some(&failed));
+        assert_eq!(st, "error");
+        assert!(detail.unwrap().contains("unauthorized_client"));
+        assert_eq!(
+            status_after_test(
+                "connected",
+                Some(&json!({"ok": true, "status": "connected"}))
+            )
+            .0,
+            "connected"
+        );
+        assert_eq!(status_after_test("connected", None).0, "connected");
+        assert_eq!(
+            status_after_test(
+                "connected",
+                Some(&json!({"ok": false, "status": "needs_credentials"}))
+            )
+            .0,
+            "connected",
+            "a test that could not run is not a failed test"
+        );
+        // SCHED-646, 2026-10-29: dev.to has a key and no test endpoint, and its
+        // "untested" answer listed it as "last live test failed: " (empty).
+        assert_eq!(
+            status_after_test(
+                "connected",
+                Some(&json!({"ok": false, "status": "untested", "measured": false}))
+            ),
+            ("connected".to_string(), None),
+            "a connector with no test endpoint tried nothing, so nothing failed"
+        );
+        assert_eq!(
+            status_after_test("needs_auth", Some(&failed)).0,
+            "needs_auth",
+            "a worse computed status stands"
+        );
+        let home = tempfile::tempdir().unwrap();
+        record_test(home.path(), "google-gmail", &failed);
+        assert_eq!(last_tests(home.path())["google-gmail"]["ok"], false);
+    }
+
+    #[test]
+    fn a_google_rows_source_names_the_sign_in_over_the_service_account() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("server.env"),
+            "GOOGLE_SA_KEY_FILE=/tmp/k.json\nGOOGLE_SA_SUBJECT=hello@amux.io\n").unwrap();
+        assert_eq!(google_cred_source(home.path(), "Google"),
+            Some(json!("service account (domain-wide delegation)")));
+        let dir = home.path().join("connectors").join("google");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("hello@amux.io.json"), "{}").unwrap();
+        assert_eq!(google_cred_source(home.path(), "Google"),
+            Some(json!("Google sign-in (hello@amux.io)")),
+            "the grant answers mints first, so the row names it");
+        assert_eq!(google_cred_source(home.path(), "Chat"), None);
+    }
+
+    /// 2026-11-08: hello@amux.io was connected and working, and Gmail still
+    /// listed "error" from a service-account test recorded a week before the
+    /// grant. A grant drops failed receipts for the family it covers, and only
+    /// those: another family's failure and a passing receipt stay.
+    #[test]
+    fn a_new_grant_supersedes_failed_tests_recorded_before_it() {
+        let home = tempfile::tempdir().unwrap();
+        let failed = json!({"ok": false, "status": "needs_auth",
+            "detail": "service-account delegation failed"});
+        record_test(home.path(), "google-gmail", &failed);
+        record_test(home.path(), "google-calendar", &failed);
+        record_test(home.path(), "google-drive", &json!({"ok": true, "status": "connected"}));
+        record_test(home.path(), "slack", &failed);
+        supersede_tests_after_grant(home.path(), "google", "hello@amux.io");
+        let after = last_tests(home.path());
+        assert!(!after.contains_key("google-gmail"), "gmail's stale failure must go: {after:?}");
+        assert!(!after.contains_key("google-calendar"), "the grant covers the whole family");
+        assert_eq!(after["google-drive"]["ok"], true, "a passing receipt is kept");
+        assert_eq!(after["slack"]["ok"], false, "another family's failure is not this grant's to clear");
+        assert_eq!(
+            status_after_test("connected", after.get("google-gmail")),
+            ("connected".to_string(), None),
+            "the list now shows the computed status"
+        );
+    }
+
     /// AMUX-3738: a delegation REFUSAL is 403 + needs_auth, a real fault stays
     /// 502.
     ///
@@ -3052,7 +4347,10 @@ mod tests {
             "access_denied: ",
             "invalid_scope: bad scope",
         ] {
-            assert!(delegation_refusal(e), "Google refusing us is not amux failing: {e}");
+            assert!(
+                delegation_refusal(e),
+                "Google refusing us is not amux failing: {e}"
+            );
         }
 
         // CONTROLS: every OTHER mint_token failure is a genuine fault and must
@@ -3086,6 +4384,80 @@ mod tests {
 
     use super::*;
 
+    /// APM-2: a lane never mentioned in ANY layer must stay unrestricted —
+    /// shipping this check cannot retroactively lock out every worker that
+    /// was minting tokens before entitlement existed at all.
+    #[test]
+    fn entitlement_is_unrestricted_when_the_connector_is_never_scoped() {
+        let effective = Map::new();
+        assert_eq!(
+            connector_entitlement_decision(&effective, "w1", "gmail", None),
+            Ok(None)
+        );
+    }
+
+    /// A layer that names the connector but never sets `enabled: true` is
+    /// the explicit off switch — fail closed, not fail open, once someone
+    /// has said anything about this connector for this lane.
+    #[test]
+    fn entitlement_fails_closed_when_disabled_or_unset() {
+        let effective: Map<String, Value> = json!({"gmail": {"account": "ethan@mixpeek.com"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let denial = connector_entitlement_decision(&effective, "w1", "gmail", None)
+            .expect_err("no `enabled: true` must deny");
+        assert_eq!(denial["blocked"], "connector_scope");
+        assert_eq!(denial["connector"], "gmail");
+    }
+
+    /// A worker scoped to one account cannot mint a DIFFERENT account's
+    /// token by asking for it explicitly — the actual gap this closes.
+    #[test]
+    fn entitlement_pins_the_scoped_account() {
+        let effective: Map<String, Value> = json!({
+            "gmail": {"enabled": true, "account": "ethan@mixpeek.com"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            connector_entitlement_decision(&effective, "w1", "gmail", None),
+            Ok(Some("ethan@mixpeek.com".to_string())),
+            "no explicit request: the scoped account is handed back as the default"
+        );
+        assert_eq!(
+            connector_entitlement_decision(&effective, "w1", "gmail", Some("ethan@mixpeek.com")),
+            Ok(Some("ethan@mixpeek.com".to_string())),
+            "matching request: allowed"
+        );
+        let denial = connector_entitlement_decision(
+            &effective,
+            "w1",
+            "gmail",
+            Some("someone-else@mixpeek.com"),
+        )
+        .expect_err("a DIFFERENT explicit account must be denied");
+        assert_eq!(denial["blocked"], "connector_scope");
+        assert_eq!(denial["requested"], "someone-else@mixpeek.com");
+        assert_eq!(denial["allowed"], "ethan@mixpeek.com");
+    }
+
+    /// Entitled but with no `account` field pinned (e.g. a bot-scoped Slack
+    /// connector) means any account name in the request passes through —
+    /// there is nothing to pin against, so this must not falsely deny.
+    #[test]
+    fn entitlement_with_no_pinned_account_allows_any_requested_account() {
+        let effective: Map<String, Value> = json!({"slack": {"enabled": true}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            connector_entitlement_decision(&effective, "w1", "slack", Some("T999")),
+            Ok(None)
+        );
+    }
+
     #[test]
     fn registry_ids_are_unique_and_have_env_keys() {
         let mut seen = std::collections::HashSet::new();
@@ -3100,17 +4472,30 @@ mod tests {
         // No hardcoded host (self-hosted, unlike Slack/Google) and 3 fields,
         // not 1 (ApiKey) or 2 (OAuth2) — base_url is not optional, since
         // without it there is nowhere to send the login POST.
-        let mm = REGISTRY.iter().find(|p| p.id == "mattermost").expect("mattermost not registered");
-        assert!(mm.test_url.is_empty(), "test_url should be built from the stored grant, not a fixed host");
+        let mm = REGISTRY
+            .iter()
+            .find(|p| p.id == "mattermost")
+            .expect("mattermost not registered");
+        assert!(
+            mm.test_url.is_empty(),
+            "test_url should be built from the stored grant, not a fixed host"
+        );
         match mm.auth {
-            Auth::LoginPassword { username_env, password_env, base_url_env } => {
+            Auth::LoginPassword {
+                username_env,
+                password_env,
+                base_url_env,
+            } => {
                 assert_eq!(base_url_env, "MATTERMOST_URL");
                 assert_eq!(username_env, "MATTERMOST_LOGIN");
                 assert_eq!(password_env, "MATTERMOST_PASSWORD");
             }
             _ => panic!("mattermost should be Auth::LoginPassword"),
         }
-        assert_eq!(env_keys(mm), vec!["MATTERMOST_URL", "MATTERMOST_LOGIN", "MATTERMOST_PASSWORD"]);
+        assert_eq!(
+            env_keys(mm),
+            vec!["MATTERMOST_URL", "MATTERMOST_LOGIN", "MATTERMOST_PASSWORD"]
+        );
     }
 
     #[test]
@@ -3121,8 +4506,17 @@ mod tests {
         for p in REGISTRY {
             if let Auth::OAuth2 { callback_path, .. } = p.auth {
                 let uri = format!("{}{}", origin(), callback_path);
-                assert!(uri.contains(&want), "{} redirect {} lost canonical port", p.id, uri);
-                assert!(!uri.contains(":8822") || want == ":8822", "{} pins retired 8822", p.id);
+                assert!(
+                    uri.contains(&want),
+                    "{} redirect {} lost canonical port",
+                    p.id,
+                    uri
+                );
+                assert!(
+                    !uri.contains(":8822") || want == ":8822",
+                    "{} pins retired 8822",
+                    p.id
+                );
             }
         }
     }
@@ -3176,8 +4570,17 @@ mod tests {
         let google: Vec<_> = REGISTRY.iter().filter(|p| p.category == "Google").collect();
         assert!(google.len() >= 4);
         for p in &google {
-            if let Auth::OAuth2 { client_id_env, callback_path, .. } = p.auth {
-                assert_eq!(client_id_env, "GOOGLE_OAUTH_CLIENT_ID", "{} uses a different client", p.id);
+            if let Auth::OAuth2 {
+                client_id_env,
+                callback_path,
+                ..
+            } = p.auth
+            {
+                assert_eq!(
+                    client_id_env, "GOOGLE_OAUTH_CLIENT_ID",
+                    "{} uses a different client",
+                    p.id
+                );
                 assert_eq!(callback_path, "/api/connectors/google/callback");
             }
         }
@@ -3210,7 +4613,10 @@ mod tests {
             Arc::new(Self {
                 calls: Mutex::new(Vec::new()),
                 script: Mutex::new(
-                    script.into_iter().map(|(m, u, s, v)| (m.into(), u.into(), s, v)).collect(),
+                    script
+                        .into_iter()
+                        .map(|(m, u, s, v)| (m.into(), u.into(), s, v))
+                        .collect(),
                 ),
                 headers: Mutex::new(Vec::new()),
             })
@@ -3238,8 +4644,9 @@ mod tests {
                 body.cloned(),
             ));
             let mut script = self.script.lock().unwrap();
-            if let Some(pos) =
-                script.iter().position(|(m, sub, _, _)| m == method && url.contains(sub.as_str()))
+            if let Some(pos) = script
+                .iter()
+                .position(|(m, sub, _, _)| m == method && url.contains(sub.as_str()))
             {
                 let (_, _, status, v) = script.remove(pos);
                 return Ok((status, v));
@@ -3269,7 +4676,11 @@ mod tests {
             url: &str,
             form: &[(String, String)],
         ) -> Result<(u16, Value), String> {
-            let v = Value::Object(form.iter().map(|(k, val)| (k.clone(), json!(val))).collect());
+            let v = Value::Object(
+                form.iter()
+                    .map(|(k, val)| (k.clone(), json!(val)))
+                    .collect(),
+            );
             self.answer("FORM", url, None, Some(&v))
         }
         async fn post_json_with_header(
@@ -3307,7 +4718,10 @@ mod tests {
     }
 
     fn app_with(http: Arc<MockHttp>, home: &std::path::Path) -> (axum::Router, tempfile::TempDir) {
-        let ctx = Arc::new(ConnectorsCtx { http, home: home.to_path_buf() });
+        let ctx = Arc::new(ConnectorsCtx {
+            http,
+            home: home.to_path_buf(),
+        });
         let dir = tempfile::tempdir().unwrap();
         let store = crate::db::Store::open(&dir.path().join("c.db")).unwrap();
         let state = AppState {
@@ -3315,7 +4729,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let router = Router::new()
             .merge(routes_with(ctx.clone()))
@@ -3325,20 +4739,30 @@ mod tests {
     }
 
     async fn send(app: &axum::Router, method: &str, path: &str) -> (StatusCode, String) {
-        let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .unwrap();
         let res = app.clone().oneshot(req).await.unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
     async fn send_json(app: &axum::Router, method: &str, path: &str) -> (StatusCode, Value) {
         let (st, body) = send(app, method, path).await;
-        (st, serde_json::from_str(&body).unwrap_or(Value::String(body)))
+        (
+            st,
+            serde_json::from_str(&body).unwrap_or(Value::String(body)),
+        )
     }
 
     fn qparam<'a>(url: &'a str, key: &str) -> Option<&'a str> {
-        url.split(['?', '&']).find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+        url.split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
     }
 
     #[tokio::test]
@@ -3368,15 +4792,26 @@ mod tests {
         // Family alias, account required.
         let (st, v) = send_json(&app, "POST", "/api/connectors/google/auth").await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-        let (st, v) =
-            send_json(&app, "POST", "/api/connectors/google/auth?account=hello%40amux.io").await;
+        let (st, v) = send_json(
+            &app,
+            "POST",
+            "/api/connectors/google/auth?account=hello%40amux.io",
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "{v}");
         let url = v["authorize_url"].as_str().unwrap();
 
         // ONE grant covers the family: gmail + calendar + drive/docs scopes in
         // one consent — this is the "authorize once per account" property.
         let scope = qparam(url, "scope").unwrap();
-        for want in ["gmail.send", "gmail.modify", "auth%2Fcalendar", "auth%2Fdrive", "auth%2Fdocuments", "userinfo.email"] {
+        for want in [
+            "gmail.send",
+            "gmail.modify",
+            "auth%2Fcalendar",
+            "auth%2Fdrive",
+            "auth%2Fdocuments",
+            "userinfo.email",
+        ] {
             assert!(scope.contains(want), "union scope missing {want}: {scope}");
         }
         // Admin scopes stay out of the default union (they fail on consumer
@@ -3390,7 +4825,10 @@ mod tests {
         // is the regression that dead-ended the first live Reconnect at
         // Google's own `Error 400: redirect_uri_mismatch` wall (AMUX-3427).
         assert!(
-            v["redirect_uri"].as_str().unwrap().ends_with("/api/gmail/callback"),
+            v["redirect_uri"]
+                .as_str()
+                .unwrap()
+                .ends_with("/api/gmail/callback"),
             "google grant must reuse the registered gmail redirect URI: {}",
             v["redirect_uri"]
         );
@@ -3399,14 +4837,17 @@ mod tests {
         // a wall amux cannot observe.
         assert_eq!(v["redirect_uri_registered"], json!(false));
         assert!(
-            v["fix_if_unregistered"].as_str().unwrap().contains("console.cloud.google.com"),
+            v["fix_if_unregistered"]
+                .as_str()
+                .unwrap()
+                .contains("console.cloud.google.com"),
             "{v}"
         );
 
         // Pending state persisted (family + verifier), challenge derived S256.
         let state = qparam(url, "state").unwrap();
         let pending: Value = serde_json::from_str(
-            &std::fs::read_to_string(home.path().join("connectors").join("pending.json")).unwrap(),
+            &crate::integrations::secure_store::read_string(home.path().join("connectors").join("pending.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(pending[state]["family"], json!("google"));
@@ -3416,9 +4857,12 @@ mod tests {
         assert_eq!(qparam(url, "code_challenge"), Some(want_challenge.as_str()));
 
         // A provider id (not the alias) starts the SAME family-wide grant.
-        let (st, v2) =
-            send_json(&app, "POST", "/api/connectors/google-drive/auth?account=hello%40amux.io")
-                .await;
+        let (st, v2) = send_json(
+            &app,
+            "POST",
+            "/api/connectors/google-drive/auth?account=hello%40amux.io",
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v2["family"], json!("google"));
         // Second probe rendered the consent page: registered, no fix needed.
@@ -3443,9 +4887,20 @@ mod tests {
         ]);
         let (app, _d) = app_with(http.clone(), home.path());
 
-        let (_, v) =
-            send_json(&app, "POST", "/api/connectors/google/auth?account=hint%40other.io").await;
-        let state = qparam(v["authorize_url"].as_str().unwrap(), "state").unwrap().to_string();
+        let (_, v) = send_json(
+            &app,
+            "POST",
+            "/api/connectors/google/auth?account=hint%40other.io",
+        )
+        .await;
+        let state = qparam(v["authorize_url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
+        // A rollup cached before the grant (no accounts) must not outlive it.
+        ROLLUP_CACHE.lock().unwrap().insert(
+            home.path().to_path_buf(),
+            (Instant::now(), json!({"accounts": []})),
+        );
         let (st, page) = send(
             &app,
             "GET",
@@ -3455,21 +4910,38 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{page}");
         assert!(page.contains("connected"), "{page}");
         assert!(page.contains("email API included"), "{page}");
+        assert!(
+            !ROLLUP_CACHE.lock().unwrap().contains_key(home.path()),
+            "the grant must drop the pre-grant accounts rollup, or the card reads Connections (0) for the TTL"
+        );
 
         // The exchange carried the PKCE verifier and the SAME redirect URI the
         // auth request was issued with — the registered gmail one (AMUX-3427).
         // (calls() also records the begin_auth registration probe, so select
         // the token exchange by method rather than position.)
-        let form =
-            http.calls().into_iter().find(|c| c.0 == "FORM").expect("token exchange").3.unwrap();
+        let form = http
+            .calls()
+            .into_iter()
+            .find(|c| c.0 == "FORM")
+            .expect("token exchange")
+            .3
+            .unwrap();
         assert_eq!(form["grant_type"], json!("authorization_code"));
-        assert!(form["redirect_uri"].as_str().unwrap().ends_with("/api/gmail/callback"));
+        assert!(
+            form["redirect_uri"]
+                .as_str()
+                .unwrap()
+                .ends_with("/api/gmail/callback")
+        );
         assert!(form["code_verifier"].as_str().is_some());
 
         // Family store: one file per ACCOUNT (named by userinfo, not the hint).
         let fam: Value = serde_json::from_str(
-            &std::fs::read_to_string(
-                home.path().join("connectors").join("google").join(format!("{ACCT}.json")),
+            &crate::integrations::secure_store::read_string(
+                home.path()
+                    .join("connectors")
+                    .join("google")
+                    .join(format!("{ACCT}.json")),
             )
             .unwrap(),
         )
@@ -3477,13 +4949,24 @@ mod tests {
         assert_eq!(fam["token"], json!("PLACEHOLDER_AT"));
         assert_eq!(fam["refresh_token"], json!("PLACEHOLDER_RT"));
         assert!(fam["expires_at"].as_f64().unwrap() > now_ts());
-        assert!(!home.path().join("connectors").join("google").join("hint@other.io.json").exists());
+        assert!(
+            !home
+                .path()
+                .join("connectors")
+                .join("google")
+                .join("hint@other.io.json")
+                .exists()
+        );
 
         // Gmail mirror: EXACT legacy shape (integrations/email.rs reads this),
         // so the one approval repaired the email subsystem too.
         let legacy: Value = serde_json::from_str(
-            &std::fs::read_to_string(home.path().join("gmail-tokens").join(format!("{ACCT}.json")))
-                .unwrap(),
+            &crate::integrations::secure_store::read_string(
+                home.path()
+                    .join("gmail-tokens")
+                    .join(format!("{ACCT}.json")),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -3527,9 +5010,15 @@ mod tests {
             ("GET", "oauth2/v2/userinfo", 200, json!({ "email": ACCT })),
         ]);
         let (app, _d) = app_with(http.clone(), home.path());
-        let (_, v) =
-            send_json(&app, "POST", "/api/connectors/google/auth?account=hint%40other.io").await;
-        let state = qparam(v["authorize_url"].as_str().unwrap(), "state").unwrap().to_string();
+        let (_, v) = send_json(
+            &app,
+            "POST",
+            "/api/connectors/google/auth?account=hint%40other.io",
+        )
+        .await;
+        let state = qparam(v["authorize_url"].as_str().unwrap(), "state")
+            .unwrap()
+            .to_string();
 
         // Google redirects to the GMAIL callback, not the connectors one.
         let gctx = Arc::new(crate::api::gmail_auth::GmailAuthCtx::new(
@@ -3543,24 +5032,107 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let gapp = Router::new()
             .merge(crate::api::gmail_auth::callback_routes_with(gctx))
             .with_state(gstate);
-        let (st, page) =
-            send(&gapp, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        let (st, page) = send(
+            &gapp,
+            "GET",
+            &format!("/api/gmail/callback?code=authcode123&state={state}"),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "{page}");
         assert!(page.contains("connected"), "{page}");
 
         // The delegated exchange wrote the family store AND the gmail mirror.
-        assert!(home
-            .path()
-            .join("connectors")
-            .join("google")
-            .join(format!("{ACCT}.json"))
-            .exists());
-        assert!(home.path().join("gmail-tokens").join(format!("{ACCT}.json")).exists());
+        assert!(
+            home.path()
+                .join("connectors")
+                .join("google")
+                .join(format!("{ACCT}.json"))
+                .exists()
+        );
+        assert!(
+            home.path()
+                .join("gmail-tokens")
+                .join(format!("{ACCT}.json"))
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnecting_a_google_account_revokes_it_and_removes_both_copies() {
+        // Sandbox, 2026-10-30: a mailbox connected by mistake could not be
+        // removed; Disconnect answered every builtin "use the provider's flow".
+        let home = tempfile::tempdir().unwrap();
+        let fam_dir = home.path().join("connectors").join("google");
+        let mirror_dir = home.path().join("gmail-tokens");
+        std::fs::create_dir_all(&fam_dir).unwrap();
+        std::fs::create_dir_all(&mirror_dir).unwrap();
+        let grant = json!({"token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT", "scopes": "https://www.googleapis.com/auth/gmail.modify"});
+        std::fs::write(fam_dir.join("info@x.io.json"), grant.to_string()).unwrap();
+        std::fs::write(mirror_dir.join("info@x.io.json"), grant.to_string()).unwrap();
+        std::fs::write(fam_dir.join(format!("{ACCT}.json")), grant.to_string()).unwrap();
+        let http = MockHttp::new(vec![("FORM", "/revoke", 200, json!({}))]);
+        let (app, _d) = app_with(http.clone(), home.path());
+        let (st, v) = send_json(&app, "DELETE", "/api/connectors/google-gmail/accounts/info%40x.io").await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["provider_revoked"], json!(true), "{v}");
+        assert!(!fam_dir.join("info@x.io.json").exists() && !mirror_dir.join("info@x.io.json").exists(), "both copies removed");
+        assert!(fam_dir.join(format!("{ACCT}.json")).exists(), "another account is untouched");
+        let revoke = http.calls().into_iter().find(|c| c.1.contains("/revoke")).expect("revoked at Google");
+        assert_eq!(revoke.3.unwrap()["token"], json!("PLACEHOLDER_RT"), "the refresh token is the one revoked");
+        // Gone now, and an unknown account is a 404, not a fake success.
+        let (st, _) = send_json(&app, "DELETE", "/api/connectors/google-gmail/accounts/info%40x.io").await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// Governance PR 4: who a mint is for comes from proof, not from whether a
+    /// worker header is present. A headerless call used to be taken for the
+    /// dashboard and handed an unscoped bearer.
+    #[tokio::test]
+    async fn a_mint_is_scoped_by_proof_and_every_mint_leaves_a_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        let fam_dir = home.path().join("connectors").join("google");
+        std::fs::create_dir_all(&fam_dir).unwrap();
+        std::fs::write(
+            fam_dir.join(format!("{ACCT}.json")),
+            json!({"token": "PLACEHOLDER_FRESH", "scopes": "https://www.googleapis.com/auth/drive",
+                   "expires_at": now_ts() + 3000.0}).to_string(),
+        )
+        .unwrap();
+        let (app, d) = app_with(MockHttp::new(vec![]), home.path());
+        let _mode = super::super::connector_scope::test_override::set(
+            super::super::connector_scope::Mode::Enforce, true);
+        let path = "/api/connectors/google-drive/token?account=hello%40amux.io";
+
+        let (st, v) = send_json(&app, "POST", path).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "a headerless mint proves nobody: {v}");
+        assert_eq!(v["code"], "connector_token_refused", "{v}");
+        assert!(v.get("access_token").is_none(), "{v}");
+
+        let req = Request::builder().method("POST").uri(path)
+            .header(super::super::human_proof::OWNER_PROOF_HEADER, "1")
+            .body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "the verified owner still mints");
+
+        let conn = rusqlite::Connection::open(d.path().join("c.db")).unwrap();
+        let rows: Vec<(String, String, String)> = conn
+            .prepare("SELECT actor,effect,rationale FROM _amux_policy_receipts
+                      WHERE action='connector_token_mint' ORDER BY created_at")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both mints leave a receipt: {rows:?}");
+        assert_eq!((rows[0].0.as_str(), rows[0].1.as_str()), ("anonymous", "deny"), "{rows:?}");
+        assert_eq!((rows[1].0.as_str(), rows[1].1.as_str()), ("owner-token", "allow"), "{rows:?}");
+        assert!(rows[1].2.contains("hello@amux.io"), "the receipt names the account: {rows:?}");
+        assert!(!rows.iter().any(|r| r.2.contains("PLACEHOLDER_FRESH")), "a receipt never holds a bearer");
     }
 
     #[tokio::test]
@@ -3592,7 +5164,10 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["access_token"], json!("PLACEHOLDER_FRESH"));
         assert_eq!(v["subject"], json!(ACCT));
-        assert!(http.calls().is_empty(), "fresh grant must not hit the provider");
+        assert!(
+            http.calls().is_empty(),
+            "fresh grant must not hit the provider"
+        );
 
         // Stale token: refreshed through the broker and PERSISTED, so the next
         // worker's mint is free.
@@ -3624,7 +5199,7 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["access_token"], json!("PLACEHOLDER_NEW"));
         let persisted: Value = serde_json::from_str(
-            &std::fs::read_to_string(fam_dir.join(format!("{ACCT}.json"))).unwrap(),
+            &crate::integrations::secure_store::read_string(fam_dir.join(format!("{ACCT}.json"))).unwrap(),
         )
         .unwrap();
         assert_eq!(persisted["token"], json!("PLACEHOLDER_NEW"));
@@ -3663,7 +5238,10 @@ mod tests {
         assert_eq!(st, StatusCode::CONFLICT, "{v}");
         assert_eq!(v["status"], json!("needs_reauth"));
         assert!(
-            v["reconnect"].as_str().unwrap().contains("/api/connectors/google/auth?account=hello@amux.io"),
+            v["reconnect"]
+                .as_str()
+                .unwrap()
+                .contains("/api/connectors/google/auth?account=hello@amux.io"),
             "{v}"
         );
     }
@@ -3694,9 +5272,19 @@ mod tests {
                 &format!("/api/connectors/{provider}/token?account=hello%40amux.io"),
             )
             .await;
-            assert_ne!(st, StatusCode::OK, "{provider} must not mint from a gmail-only grant: {v}");
+            assert_ne!(
+                st,
+                StatusCode::OK,
+                "{provider} must not mint from a gmail-only grant: {v}"
+            );
             assert_eq!(v["status"], json!("needs_auth"), "{v}");
-            assert!(v["connect"].as_str().unwrap().contains("/api/connectors/google/auth"), "{v}");
+            assert!(
+                v["connect"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/api/connectors/google/auth"),
+                "{v}"
+            );
         }
         // gmail itself still mints from the legacy file (refresh path).
         let http2 = MockHttp::new(vec![(
@@ -3714,6 +5302,78 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["access_token"], json!("PLACEHOLDER_NEW"));
+    }
+
+    /// A grant that cannot refresh reaches the owner (2026-11-08: two Gmail
+    /// grants were dead for three weeks and only a board card said so): once
+    /// with a one-tap reconnect link, again after a day while it stays broken,
+    /// never on a stale report about an account that works, and again at once
+    /// when a healed account breaks a second time.
+    #[tokio::test]
+    async fn a_grant_that_cannot_refresh_alerts_the_owner_with_a_reconnect_link() {
+        use crate::api::alerts::AlertChannels;
+        type Sent = Arc<Mutex<Vec<(String, String, String)>>>;
+        struct Mail(Sent);
+        #[async_trait::async_trait]
+        impl AlertChannels for Mail {
+            async fn push(&self, _: &AppState, _: &str, _: &str) -> Result<(), String> { Err("mock".into()) }
+            async fn sms(&self, _: &str, _: &str) -> (bool, String) { panic!("a reauth alert never pages SMS") }
+            async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String) {
+                self.0.lock().unwrap().push((to.into(), subject.into(), body.into()));
+                (true, "mock".into())
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("server.env"),
+            "AMUX_OWNER_EMAIL=owner@x.io\nAMUX_PUBLIC_URL=https://mac.example.ts.net:8824\n").unwrap();
+        let gm = home.path().join("gmail-tokens");
+        std::fs::create_dir_all(&gm).unwrap();
+        std::fs::write(gm.join("broken@x.io.json"), json!({ "token": "PLACEHOLDER_DEAD", "refresh_token": "PLACEHOLDER_RT",
+            "token_uri": "https://oauth2.googleapis.com/token", "client_id": "CID", "client_secret": "CSEC" }).to_string()).unwrap();
+        let dead = || vec![("GET", "/profile", 401, json!({ "error": "unauthorized" })),
+            ("FORM", "oauth2.googleapis.com/token", 400, json!({ "error": "invalid_grant" }))];
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: Arc::new(crate::db::Store::open(&dir.path().join("c.db")).unwrap()),
+            started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let mail = Arc::new(Mutex::new(Vec::new()));
+        let channels = Mail(mail.clone());
+        let report = json!({"needs_reauth": [{"account": "broken@x.io",
+            "reconnect": "POST /api/connectors/google/auth?account=broken@x.io → open authorize_url, approve once"}]});
+        let run = |script: Vec<(&'static str, &'static str, u16, Value)>, now: f64| {
+            let ctx = ConnectorsCtx { home: home.path().to_path_buf(), http: MockHttp::new(script) };
+            let (state, channels, report) = (&state, &channels, &report);
+            async move { crate::runtime_jobs::connector_maintenance::reauth_alerts(channels, state, &ctx, report, now).await }
+        };
+        let t0 = now_ts();
+        let sent = |m: &Sent| m.lock().unwrap().len();
+
+        let out = run(dead(), t0).await;
+        assert_eq!(sent(&mail), 1, "{out}");
+        let (to, subject, body) = mail.lock().unwrap()[0].clone();
+        assert_eq!(to, "owner@x.io");
+        assert!(subject.contains("broken@x.io"), "{subject}");
+        assert!(body.contains("https://mac.example.ts.net:8824/#reconnect=google:broken@x.io"), "{body}");
+
+        // Within a day: not again.
+        run(dead(), t0 + 3600.0).await;
+        assert_eq!(sent(&mail), 1);
+        // A day later, still broken: a reminder that says how long.
+        run(dead(), t0 + 90_000.0).await;
+        assert_eq!(sent(&mail), 2);
+        assert!(mail.lock().unwrap()[1].2.contains("broken for 25 hours"), "{:?}", mail.lock().unwrap()[1]);
+
+        // The report still names it, but the account works now (a cached
+        // verdict from before a reconnect): no alert, and the record clears.
+        let out = run(vec![("GET", "/profile", 200, json!({ "emailAddress": "broken@x.io" }))], t0 + 90_100.0).await;
+        assert_eq!(sent(&mail), 2, "{out}");
+        assert_eq!(out["healed"], json!(["broken@x.io"]), "{out}");
+        // Broken again: told at once, not a day later.
+        run(dead(), t0 + 90_200.0).await;
+        assert_eq!(sent(&mail), 3);
+        assert!(!mail.lock().unwrap()[2].2.contains("broken for"), "a new break is not a reminder");
     }
 
     #[tokio::test]
@@ -3744,23 +5404,45 @@ mod tests {
         .unwrap();
         let http: Arc<dyn HttpTransport> = MockHttp::new(vec![
             ("GET", "/profile", 401, json!({ "error": "unauthorized" })),
-            ("FORM", "oauth2.googleapis.com/token", 400, json!({ "error": "invalid_grant" })),
+            (
+                "FORM",
+                "oauth2.googleapis.com/token",
+                400,
+                json!({ "error": "invalid_grant" }),
+            ),
         ]);
         let v = accounts_rollup(&http, home.path(), true).await;
         let accounts = v["accounts"].as_array().unwrap();
         assert_eq!(accounts.len(), 2, "{v}");
-        let broken =
-            accounts.iter().find(|a| a["account"] == json!("broken@x.io")).expect("broken row");
+        let broken = accounts
+            .iter()
+            .find(|a| a["account"] == json!("broken@x.io"))
+            .expect("broken row");
         assert_eq!(broken["families"]["gmail"], json!("needs_reauth"), "{v}");
-        assert!(broken["reconnect"]
-            .as_str()
-            .unwrap()
-            .contains("/api/connectors/google/auth?account=broken@x.io"));
-        let healthy =
-            accounts.iter().find(|a| a["account"] == json!("healthy@x.io")).expect("healthy row");
+        assert!(
+            broken["reconnect"]
+                .as_str()
+                .unwrap()
+                .contains("/api/connectors/google/auth?account=broken@x.io")
+        );
+        let healthy = accounts
+            .iter()
+            .find(|a| a["account"] == json!("healthy@x.io"))
+            .expect("healthy row");
         assert_eq!(healthy["families"]["google"], json!("ok"));
         assert_eq!(healthy["needs_reauth"], json!(false));
         assert_eq!(v["needs_reauth"].as_array().unwrap().len(), 1);
+        // A gmail-only grant never covered calendar/drive/docs: the row must
+        // say so and carry the one grant that closes it.
+        assert_eq!(broken["missing"], json!(["google"]), "{v}");
+        assert!(
+            broken["connect"]
+                .as_str()
+                .unwrap()
+                .contains("/api/connectors/google/auth?account=broken@x.io")
+        );
+        assert_eq!(healthy["missing"], json!([]), "{v}");
+        assert_eq!(healthy["connect"], Value::Null, "{v}");
     }
 
     #[tokio::test]
@@ -3783,8 +5465,18 @@ mod tests {
         )
         .unwrap();
         let http: Arc<dyn HttpTransport> = MockHttp::new(vec![
-            ("GET", "gmail/v1/users/me/profile", 200, json!({ "emailAddress": ACCT })),
-            ("GET", "calendar/v3/users/me/calendarList", 500, json!({ "error": "backendError" })),
+            (
+                "GET",
+                "gmail/v1/users/me/profile",
+                200,
+                json!({ "emailAddress": ACCT }),
+            ),
+            (
+                "GET",
+                "calendar/v3/users/me/calendarList",
+                500,
+                json!({ "error": "backendError" }),
+            ),
         ]);
         let v = accounts_rollup(&http, home.path(), true).await;
         let row = v["accounts"]
@@ -3795,19 +5487,30 @@ mod tests {
             .expect("account row")
             .clone();
         assert_eq!(row["canary"]["gmail"]["status"], json!("ok"), "{v}");
-        assert_eq!(row["canary"]["calendar"]["status"], json!("api_error"), "{v}");
+        assert_eq!(
+            row["canary"]["calendar"]["status"],
+            json!("api_error"),
+            "{v}"
+        );
         assert_eq!(row["canary"]["calendar"]["http"], json!(500), "{v}");
-        assert_eq!(row["canary"]["drive"]["status"], json!("not_granted"), "{v}");
+        assert_eq!(
+            row["canary"]["drive"]["status"],
+            json!("not_granted"),
+            "{v}"
+        );
         assert!(row["canary"]["gmail"]["checked_at"].as_f64().unwrap() > 0.0);
         // The grant itself stays green — an API-side failure is a DIFFERENT
         // state from token rot and must not trigger the reconnect flow.
         assert_eq!(row["needs_reauth"], json!(false), "{v}");
         // Last-checked survives restarts: the canary map is persisted.
         let persisted: Value = serde_json::from_str(
-            &std::fs::read_to_string(home.path().join("connectors").join("canary.json")).unwrap(),
+            &crate::integrations::secure_store::read_string(home.path().join("connectors").join("canary.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(persisted["accounts"][ACCT]["calendar"]["status"], json!("api_error"));
+        assert_eq!(
+            persisted["accounts"][ACCT]["calendar"]["status"],
+            json!("api_error")
+        );
         assert!(persisted["checked_at"].as_f64().unwrap() > 0.0);
     }
 
@@ -3834,10 +5537,19 @@ mod tests {
             200,
             json!({ "id": "USER123", "username": "alice" }),
         )]);
-        http.with_header("chat.example.com/api/v4/users/login", "Token", "PLACEHOLDER_SESSION_TOKEN");
+        http.with_header(
+            "chat.example.com/api/v4/users/login",
+            "Token",
+            "PLACEHOLDER_SESSION_TOKEN",
+        );
         let (app, _d) = app_with(http.clone(), home.path());
 
-        let (st, v) = send_json(&app, "POST", "/api/connectors/mattermost/auth?account=alice").await;
+        let (st, v) = send_json(
+            &app,
+            "POST",
+            "/api/connectors/mattermost/auth?account=alice",
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["ok"], json!(true), "{v}");
         assert_eq!(v["account"], json!("alice"), "{v}");
@@ -3847,10 +5559,13 @@ mod tests {
         let calls = http.calls();
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert!(calls[0].1.contains("/api/v4/users/login"), "{calls:?}");
-        assert_eq!(calls[0].3, Some(json!({ "login_id": "alice", "password": "PLACEHOLDER_PW" })));
+        assert_eq!(
+            calls[0].3,
+            Some(json!({ "login_id": "alice", "password": "PLACEHOLDER_PW" }))
+        );
 
         let stored: Value = serde_json::from_str(
-            &std::fs::read_to_string(store_path(home.path(), "mattermost", "alice")).unwrap(),
+            &crate::integrations::secure_store::read_string(store_path(home.path(), "mattermost", "alice")).unwrap(),
         )
         .unwrap();
         assert_eq!(stored["token"], json!("PLACEHOLDER_SESSION_TOKEN"));
@@ -3879,11 +5594,19 @@ mod tests {
         )]);
         let (app, _d) = app_with(http, home.path());
 
-        let (st, v) = send_json(&app, "POST", "/api/connectors/mattermost/auth?account=alice").await;
+        let (st, v) = send_json(
+            &app,
+            "POST",
+            "/api/connectors/mattermost/auth?account=alice",
+        )
+        .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
         assert_eq!(v["ok"], json!(false), "{v}");
         assert!(
-            v["error"].as_str().unwrap().contains("Invalid or expired session"),
+            v["error"]
+                .as_str()
+                .unwrap()
+                .contains("Invalid or expired session"),
             "{v}"
         );
         assert!(
@@ -3898,7 +5621,10 @@ mod tests {
     /// shared Sheet while they watched.
     #[test]
     fn a_gmail_grant_discloses_that_it_also_hands_over_full_drive() {
-        let gmail = REGISTRY.iter().find(|p| p.id == "google-gmail").expect("google-gmail provider");
+        let gmail = REGISTRY
+            .iter()
+            .find(|p| p.id == "google-gmail")
+            .expect("google-gmail provider");
         let scope = google_union_scopes(gmail);
         assert!(
             scope.contains("https://www.googleapis.com/auth/drive"),
@@ -3907,7 +5633,9 @@ mod tests {
         let d = describe_grant(&scope);
         let destructive = d["destructive"].as_array().expect("destructive list");
         assert!(
-            destructive.iter().any(|x| x.as_str().unwrap_or("").contains("PERMANENTLY DELETE")),
+            destructive
+                .iter()
+                .any(|x| x.as_str().unwrap_or("").contains("PERMANENTLY DELETE")),
             "a grant carrying full Drive does not disclose deletion: {d:#}"
         );
         assert!(
@@ -3925,11 +5653,17 @@ mod tests {
         let d = describe_grant("https://www.googleapis.com/auth/drive.file");
         assert_eq!(d["destructive"].as_array().map(Vec::len), Some(0), "{d:#}");
         assert!(
-            d["summary"].as_str().unwrap_or("").contains("no destructive action"),
+            d["summary"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no destructive action"),
             "{d:#}"
         );
         assert!(
-            d["permits"][0].as_str().unwrap_or("").contains("cannot see or delete anything else"),
+            d["permits"][0]
+                .as_str()
+                .unwrap_or("")
+                .contains("cannot see or delete anything else"),
             "{d:#}"
         );
     }
@@ -3943,7 +5677,10 @@ mod tests {
         assert_eq!(d["scope_count"], 1);
         assert_eq!(d["permits"].as_array().map(Vec::len), Some(1), "{d:#}");
         assert!(
-            d["permits"][0].as_str().unwrap_or("").contains("something-new"),
+            d["permits"][0]
+                .as_str()
+                .unwrap_or("")
+                .contains("something-new"),
             "the unknown scope vanished from the disclosure: {d:#}"
         );
     }
@@ -3952,7 +5689,10 @@ mod tests {
     /// denominator rather than a filtered list.
     #[test]
     fn every_scope_produces_exactly_one_line() {
-        let gmail = REGISTRY.iter().find(|p| p.id == "google-gmail").expect("google-gmail provider");
+        let gmail = REGISTRY
+            .iter()
+            .find(|p| p.id == "google-gmail")
+            .expect("google-gmail provider");
         let scope = google_union_scopes(gmail);
         let n = scope.split_whitespace().count();
         let d = describe_grant(&scope);
@@ -3981,7 +5721,10 @@ mod tests {
             vec!["SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET"],
             "an empty server.env must name both slack keys: {gaps:?}"
         );
-        assert!(connector_count() >= gaps.len(), "the share needs a denominator");
+        assert!(
+            connector_count() >= gaps.len(),
+            "the share needs a denominator"
+        );
 
         // HALF-CONFIGURED IS STILL A GAP.
         std::fs::write(home.path().join("server.env"), "SLACK_CLIENT_ID=abc\n").unwrap();
@@ -3991,7 +5734,11 @@ mod tests {
             .find(|(id, _)| *id == "slack")
             .map(|(_, m)| m.clone())
             .unwrap_or_default();
-        assert_eq!(slack, vec!["SLACK_CLIENT_SECRET"], "the set key drops out, the unset one stays");
+        assert_eq!(
+            slack,
+            vec!["SLACK_CLIENT_SECRET"],
+            "the set key drops out, the unset one stays"
+        );
 
         // AND BOTH SET CLEARS IT, or the check could be reporting a constant.
         std::fs::write(
@@ -4000,9 +5747,477 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !credential_gaps_in(home.path()).iter().any(|(id, _)| *id == "slack"),
+            !credential_gaps_in(home.path())
+                .iter()
+                .any(|(id, _)| *id == "slack"),
             "slack is fully configured and must disappear from the gaps"
         );
     }
+}
 
+#[cfg(test)]
+mod connector_storage_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn connector_storage_corrupt_registry_is_retained_on_create() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::api::settings::test_env::set_home(home.path());
+        std::fs::create_dir_all(home.path().join("connectors")).unwrap();
+        let path = custom_store_path(home.path());
+        std::fs::write(&path, "{broken registry").unwrap();
+        let response = create_connector(Json(
+            json!({"id":"fixture", "label":"Fixture", "key_env":"FIXTURE_KEY"}),
+        ))
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(crate::integrations::secure_store::read_string(path).unwrap(), "{broken registry");
+    }
+
+    #[test]
+    fn connector_storage_pending_saves_preserve_concurrent_grants() {
+        let home = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let home = home.path();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    pending_save(
+                        home,
+                        &format!("state-{i}"),
+                        "google",
+                        "fixture@example.com",
+                        Some("verifier"),
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        for i in 0..16 {
+            assert!(
+                pending_take(home.path(), &format!("state-{i}")).is_some(),
+                "lost pending state {i}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connector_storage_pending_take_refuses_an_uncommitted_consumption() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        pending_save(
+            home.path(),
+            "state",
+            "google",
+            "fixture@example.com",
+            Some("verifier"),
+        )
+        .unwrap();
+        let path = pending_path(home.path());
+        let dir = path.parent().unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let taken = pending_take(home.path(), "state");
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            taken.is_none(),
+            "must not exchange a state whose removal failed"
+        );
+        assert!(
+            pending_take(home.path(), "state").is_some(),
+            "failed consume must remain recoverable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod connector_maintenance_regressions {
+    #[test]
+    fn missing_scopes_names_what_a_grant_lacks_and_trusts_unrecorded_grants() {
+        let admin = "https://www.googleapis.com/auth/admin.directory.user.readonly https://www.googleapis.com/auth/admin.directory.group.readonly";
+        let gmail_only = "openid https://www.googleapis.com/auth/gmail.modify";
+        assert_eq!(super::missing_scopes(admin, Some(gmail_only)).len(), 2);
+        assert!(super::missing_scopes(admin, Some(&format!("{gmail_only} {admin}"))).is_empty());
+        assert!(super::missing_scopes(admin, None).is_empty(), "no recorded scopes: nothing to compare");
+        assert!(super::missing_scopes(admin, Some("  ")).is_empty());
+        let full = "https://www.googleapis.com/auth/admin.directory.user https://www.googleapis.com/auth/admin.directory.group";
+        assert!(super::missing_scopes(admin, Some(full)).is_empty(), "a full scope covers its readonly form");
+        assert!(super::missing_scopes("channels:read chat:write", Some("chat:write,channels:read")).is_empty(), "Slack's comma list");
+        assert_eq!(super::missing_scopes("https://www.googleapis.com/auth/drive", Some("https://www.googleapis.com/auth/drive.readonly")).len(), 1, "readonly does not cover full");
+    }
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RefreshHttp {
+        calls: AtomicUsize,
+        hold_first: bool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    impl RefreshHttp {
+        fn new(hold_first: bool) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicUsize::new(0),
+                hold_first,
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl HttpTransport for RefreshHttp {
+        async fn get(&self, _: &str, _: Option<&str>) -> Result<(u16, Value), String> {
+            Ok((200, json!({"ok":true,"emailAddress":"fixture@example.com"})))
+        }
+        async fn post_json(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &Value,
+        ) -> Result<(u16, Value), String> {
+            Err("unexpected JSON call".into())
+        }
+        async fn post_form(
+            &self,
+            _: &str,
+            form: &[(String, String)],
+        ) -> Result<(u16, Value), String> {
+            assert_eq!(
+                form.iter().find(|(k, _)| k == "refresh_token").unwrap().1,
+                "old-refresh"
+            );
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 && self.hold_first {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok((
+                200,
+                json!({"access_token":"new-access", "refresh_token":"rotated-refresh", "expires_in":3600}),
+            ))
+        }
+    }
+    fn seed(home: &std::path::Path) -> PathBuf {
+        let path = store_path(home, "google", "fixture@example.com");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, json!({"token":"old-access", "refresh_token":"old-refresh", "expires_at":0, "token_uri":"https://fixture.invalid/token", "client_id":"fixture-client", "client_secret":"fixture-secret", "scopes":"https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/gmail.modify", "identity_unverified":true}).to_string()).unwrap();
+        path
+    }
+    fn ctx(home: &std::path::Path, http: Arc<RefreshHttp>) -> ConnectorsCtx {
+        ConnectorsCtx {
+            home: home.into(),
+            http,
+        }
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_rollup_refreshes_rotating_slack() {
+        let home = tempfile::tempdir().unwrap();
+        let path = store_path(home.path(), "slack", "Fixture Workspace");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, json!({"token":"old-access","refresh_token":"old-refresh","expires_at":0,"token_uri":"https://fixture.invalid/token","client_id":"fixture-client","client_secret":"fixture-secret"}).to_string()).unwrap();
+        let http = RefreshHttp::new(false);
+        let transport: Arc<dyn HttpTransport> = http.clone();
+        let result = accounts_rollup(&transport, home.path(), true).await;
+        assert_eq!(http.calls.load(Ordering::SeqCst), 1, "idle Slack health must refresh its rotating grant, not canary an expired bearer");
+        assert_eq!(result["accounts"][0]["canary"]["slack"]["status"], "ok");
+        let stored: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(path).unwrap()).unwrap();
+        assert_eq!(stored["refresh_token"], "rotated-refresh");
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_idle_grants_refresh_early_and_preserve_owner_configuration() {
+        for family in ["google", "slack", "fixture-oauth"] {
+            let home = tempfile::tempdir().unwrap();
+            let mut grant = json!({"token":"old-access","refresh_token":"old-refresh","expires_at":now_ts()+300.0,"token_uri":"https://fixture.invalid/token","client_id":"fixture-client","client_secret":"fixture-secret","identity_unverified":true,"owner_metadata":{"tenant":"Beth","pinned":true}});
+            let path = store_path(home.path(), family, "fixture@example.com");
+            write_store_file(&path, &grant).unwrap();
+            let registry = if family == "fixture-oauth" {json!([{"id":family,"label":"Owner fixture","kind":"oauth2","test_url":"https://fixture.invalid/canary"}])} else {json!([])};
+            write_store_file(&custom_store_path(home.path()), &registry).unwrap();
+            std::fs::write(home.path().join("server.env"), "OWNER_UNRELATED=stable\n").unwrap();
+            let registry_before = crate::integrations::secure_store::read_bytes(custom_store_path(home.path())).unwrap();
+            let http = RefreshHttp::new(false);
+            let result = maintenance_pass(&ctx(home.path(), http.clone())).await;
+            assert_eq!(http.calls.load(Ordering::SeqCst), 1, "upkeep must refresh idle {family} before expiry");
+            assert_eq!(result["durable"], true);
+            let stored: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(&path).unwrap()).unwrap();
+            assert_eq!(stored["refresh_token"], "rotated-refresh");
+            assert_eq!(stored["owner_metadata"], grant["owner_metadata"]);
+            assert_eq!(crate::integrations::secure_store::read_bytes(custom_store_path(home.path())).unwrap(), registry_before);
+            assert_eq!(crate::integrations::secure_store::read_string(home.path().join("server.env")).unwrap(), "OWNER_UNRELATED=stable\n");
+            assert!(!result.to_string().contains("rotated-refresh"));
+            assert!(!result.to_string().contains("new-access"));
+            maintenance_pass(&ctx(home.path(), http.clone())).await;
+            assert_eq!(http.calls.load(Ordering::SeqCst), 1, "second pass must reuse committed grant");
+            grant["disconnected"] = json!(true);
+            write_store_file(&path, &grant).unwrap();
+            maintenance_pass(&ctx(home.path(), http.clone())).await;
+            assert_eq!(http.calls.load(Ordering::SeqCst), 1, "disconnect must never be resurrected by upkeep");
+            assert_eq!(crate::integrations::secure_store::read_string(&path).unwrap(), grant.to_string());
+        }
+    }
+
+    #[test]
+    fn the_failure_warn_and_the_list_agree_on_what_failed() {
+        // record_test's WARN and status_after_test read one predicate.
+        assert!(!test_failed(&json!({"ok":false,"status":"untested"})), "untested tried nothing");
+        assert!(!test_failed(&json!({"ok":false,"status":"needs_credentials"})));
+        assert!(!test_failed(&json!({"ok":true,"status":"connected"})));
+        assert!(test_failed(&json!({"ok":false,"status":"error","detail":"provider rejected"})));
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_does_not_probe_a_key_with_no_test_endpoint() {
+        // dev.to has a key and no test_url. Upkeep used to GET the empty URL and
+        // record the transport error, so the list showed it as an error.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("server.env"), "DEVTO_API_KEY=fixture-devto-key\n").unwrap();
+        // What an older pass stored on the live server (2026-10-29 14:03).
+        record_test(home.path(), "devto", &json!({"ok":false,"status":"error","detail":"provider unreachable; inspect network configuration"}));
+        let report = maintenance_pass(&ctx(home.path(), RefreshHttp::new(false))).await;
+        let devto = report["api_keys"].as_array().unwrap().iter().find(|k| k["connector"] == "devto").cloned();
+        assert_eq!(devto.as_ref().map(|k| k["status"].clone()), Some(json!("untested")), "{report}");
+        let recorded = last_tests(home.path()).get("devto").cloned();
+        assert_eq!(recorded.as_ref().map(|t| t["status"].clone()), Some(json!("untested")), "{recorded:?}");
+        assert_eq!(status_after_test("connected", recorded.as_ref()).0, "connected", "untested must not list it as an error");
+        assert_eq!(report["failures"], 0);
+        assert!(!report.to_string().contains("fixture-devto-key"));
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_corrupt_registry_is_retained_and_reported() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("connectors")).unwrap();
+        std::fs::write(custom_store_path(home.path()), "broken-json").unwrap();
+        let http = RefreshHttp::new(false);
+        let report = maintenance_pass(&ctx(home.path(), http)).await;
+        assert_eq!(report["grants"][0]["status"], "registry_unreadable");
+        assert_eq!(crate::integrations::secure_store::read_string(custom_store_path(home.path())).unwrap(), "broken-json");
+        assert_eq!(report["failures"], 1);
+    }
+
+    #[test]
+    fn connector_maintenance_last_test_receipts_do_not_lose_parallel_updates() {
+        let home = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let home = home.path();
+                scope.spawn(move || record_test(home, &format!("fixture-{index}"), &json!({"ok":true,"status":"connected"})));
+            }
+        });
+        assert_eq!(last_tests(home.path()).len(), 16);
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(last_tests_path(home.path())).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        std::fs::write(last_tests_path(home.path()), "corrupt-receipt").unwrap();
+        record_test(home.path(), "new", &json!({"ok":true}));
+        assert_eq!(crate::integrations::secure_store::read_string(last_tests_path(home.path())).unwrap(), "corrupt-receipt");
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_legacy_unknown_expiry_refresh_is_bounded() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("gmail-tokens/fixture@example.com.json");
+        write_store_file(&path, &json!({"token":"old-access","refresh_token":"old-refresh","client_id":"fixture-client","client_secret":"fixture-secret","token_uri":"https://fixture.invalid/token"})).unwrap();
+        std::fs::File::open(&path).unwrap().set_modified(std::time::SystemTime::now()-std::time::Duration::from_secs(172_800)).unwrap();
+        let http = RefreshHttp::new(false);
+        let ctx = ctx(home.path(), http.clone());
+        assert_eq!(maintenance::maintain(&ctx,"google","fixture@example.com").await["status"], "ok");
+        let saved:Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(&path).unwrap()).unwrap();
+        assert!(saved["expires_at"].as_f64().unwrap()>now_ts()+3000.0);
+        assert_eq!(maintenance::maintain(&ctx,"google","fixture@example.com").await["status"], "not_due");
+        assert_eq!(http.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct RejectedRefresh { status: u16, code: &'static str }
+    #[async_trait::async_trait]
+    impl HttpTransport for RejectedRefresh {
+        async fn get(&self,_:&str,_:Option<&str>)->Result<(u16,Value),String>{Err("unreachable fixture".into())}
+        async fn post_json(&self,_:&str,_:Option<&str>,_:&Value)->Result<(u16,Value),String>{Err("unexpected JSON".into())}
+        async fn post_form(&self,_:&str,_:&[(String,String)])->Result<(u16,Value),String>{Ok((self.status,json!({"ok":false,"error":self.code})))}
+    }
+    #[tokio::test]
+    async fn connector_maintenance_provider_revocation_never_replaces_saved_state() {
+        for (status,code) in [(200,"invalid_grant"),(400,"invalid_grant"),(200,"invalid_refresh_token"),(200,"token_revoked")] {
+            let home = tempfile::tempdir().unwrap();
+            let path = seed(home.path());
+            let before = crate::integrations::secure_store::read_bytes(&path).unwrap();
+            let ctx = ConnectorsCtx { home:home.path().into(),http:Arc::new(RejectedRefresh{status,code}) };
+            let response = mint_with_lifetime(&ctx,"fixture","google","fixture@example.com","",600.0).await;
+            assert_eq!(response.status(),StatusCode::CONFLICT,"provider {status}/{code} must name reauth");
+            let body:Value=serde_json::from_slice(&axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap()).unwrap();
+            assert_eq!(body["status"], "needs_reauth");
+            assert_eq!(crate::integrations::secure_store::read_bytes(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_slack_nonexpiring_token_is_usable() {
+        let home = tempfile::tempdir().unwrap();
+        let path = store_path(home.path(), "slack", "Fixture Workspace");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            json!({"token":"fixture-slack-token", "expires_at":null}).to_string(),
+        )
+        .unwrap();
+        let http = RefreshHttp::new(false);
+        let response = mint_from_user_grant(
+            &ctx(home.path(), http.clone()),
+            "slack",
+            "slack",
+            "Fixture Workspace",
+            "",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(http.calls.load(Ordering::SeqCst), 0);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["access_token"], "fixture-slack-token");
+        assert_eq!(value["expires_in"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_mint_persists_rotated_refresh_and_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(home.path());
+        let http = RefreshHttp::new(false);
+        let response = mint_from_user_grant(
+            &ctx(home.path(), http),
+            "google-drive",
+            "google",
+            "fixture@example.com",
+            "drive",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stored: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(path).unwrap()).unwrap();
+        assert_eq!(stored["refresh_token"], "rotated-refresh");
+        assert_eq!(stored["identity_unverified"], true);
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_health_refresh_persists_rotation() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(home.path());
+        let http: Arc<dyn HttpTransport> = RefreshHttp::new(false);
+        let tf = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(&path).unwrap()).unwrap();
+        assert_eq!(
+            probe_google_refresh(&http, home.path(), "fixture@example.com", &path, &tf).await,
+            "ok"
+        );
+        let stored: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(path).unwrap()).unwrap();
+        assert_eq!(stored["refresh_token"], "rotated-refresh");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connector_maintenance_failed_persistence_is_not_success() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(home.path());
+        let http = RefreshHttp::new(false);
+        drop(crate::integrations::secure_store::lock(&path).unwrap());
+        let dir = path.parent().unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let response = mint_from_user_grant(
+            &ctx(home.path(), http.clone()),
+            "google-drive",
+            "google",
+            "fixture@example.com",
+            "drive",
+        )
+        .await;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            http.calls.load(Ordering::SeqCst),
+            1,
+            "the failure must be the commit after a successful refresh"
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let stored: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(path).unwrap()).unwrap();
+        assert_eq!(stored["refresh_token"], "old-refresh");
+    }
+
+    #[tokio::test]
+    async fn connector_maintenance_two_workers_do_not_reuse_a_rotating_grant() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(home.path());
+        let http = RefreshHttp::new(true);
+        let first_ctx = ctx(home.path(), http.clone());
+        let first = tokio::spawn(async move {
+            mint_from_user_grant(
+                &first_ctx,
+                "google-drive",
+                "google",
+                "fixture@example.com",
+                "drive",
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), http.entered.notified())
+            .await
+            .expect("first worker must reach refresh");
+        let second_ctx = ctx(home.path(), http.clone());
+        let second = tokio::spawn(async move {
+            mint_from_user_grant(
+                &second_ctx,
+                "google-drive",
+                "google",
+                "fixture@example.com",
+                "drive",
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        http.release.notify_one();
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(second.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            http.calls.load(Ordering::SeqCst),
+            1,
+            "the second worker must re-read the committed fresh grant"
+        );
+        let stored: Value = serde_json::from_slice(&crate::integrations::secure_store::read_bytes(path).unwrap()).unwrap();
+        assert_eq!(stored["refresh_token"], "rotated-refresh");
+    }
+}
+
+#[cfg(test)]
+mod slack_create_app_tests {
+    #[test]
+    fn the_manifest_link_carries_the_redirect_and_the_bot_scopes() {
+        let redirect = "https://localhost:8824/api/connectors/slack/callback";
+        let link = super::slack_create_app_url(redirect);
+        let (base, query) = link.split_once("&manifest_json=").expect("manifest param");
+        assert_eq!(base, "https://api.slack.com/apps?new_app=1");
+        let bytes = query.as_bytes();
+        let mut raw = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                raw.push(u8::from_str_radix(&query[i + 1..i + 3], 16).expect("hex escape"));
+                i += 3;
+            } else {
+                raw.push(bytes[i]);
+                i += 1;
+            }
+        }
+        let decoded = String::from_utf8(raw).expect("utf-8");
+        let manifest: serde_json::Value = serde_json::from_str(&decoded).expect("manifest is JSON");
+        assert_eq!(manifest["oauth_config"]["redirect_urls"][0], redirect);
+        let bot = manifest["oauth_config"]["scopes"]["bot"].as_array().unwrap();
+        for scope in ["channels:read", "chat:write", "channels:history", "im:history"] {
+            assert!(bot.iter().any(|s| s == scope), "{scope} missing from {bot:?}");
+        }
+    }
 }

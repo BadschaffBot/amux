@@ -56,6 +56,8 @@ COPY amux ./amux
 # so the next scripts/ include_str! does not re-break it; build-stage only (the
 # content is baked into the binary, the runtime stage needs none of it).
 COPY scripts scripts
+# Project execution embeds the harness contract at compile time.
+COPY docs docs
 # frustrations.md is a BUILD INPUT for the same reason, third recurrence of the
 # class after `amux` and `scripts/` (AMUX-3633). The ledger checks added in
 # 14573a02 include_str! the file to parse the REAL ledger rather than a fixture,
@@ -76,6 +78,13 @@ COPY frustrations.md frustrations.md
 # looks for) without adding this line, so the guard went red on origin/main.
 # Fourth recurrence of the class the comment above already numbers three.
 COPY frustrations-archive.md frustrations-archive.md
+# The worker boundary registry: api/boundaries.rs embeds it with include_str!
+# so a box without the installed copy still has the rule text.
+COPY boundaries.toml boundaries.toml
+# The browser methods registry: api/browser_routing.rs embeds it with include_str!.
+COPY browser-methods.toml browser-methods.toml
+# The skills amux ships: api/skills.rs embeds skills/amux-contribute.md with include_str!.
+COPY skills skills
 
 # --release is REQUIRED, not a preference. `rust-embed` is built without the
 # `debug-embed` feature, so a DEBUG binary reads the dashboard from
@@ -86,6 +95,8 @@ COPY frustrations-archive.md frustrations-archive.md
 # The cache mounts make an incremental rebuild cheap, and they are also why the
 # binaries are copied to /out INSIDE this RUN: a cache mount is not part of the
 # layer, so anything left in /src/target vanishes when the step ends.
+# No .git in this context, so CI names the commit (build.rs reads it) and /health reports it.
+ARG AMUX_SOURCE_COMMIT=
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release -p amux-server -p amux-cli \
@@ -115,6 +126,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # be a silent capability regression for every customer.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git tmux procps ripgrep ffmpeg \
+      imagemagick libheif-examples \
       python3 python3-pip python3-venv \
       openssh-client less jq unzip \
       chromium fonts-liberation xdg-utils \

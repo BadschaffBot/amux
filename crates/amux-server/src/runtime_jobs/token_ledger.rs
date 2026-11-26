@@ -77,7 +77,9 @@ pub(crate) fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
     let Ok(user) = serde_json::from_str::<serde_json::Value>(&text) else {
         return table;
     };
-    let Some(obj) = user.as_object() else { return table };
+    let Some(obj) = user.as_object() else {
+        return table;
+    };
     for (k, v) in obj {
         let Some(arr) = v.as_array() else { continue };
         if arr.len() != 4 {
@@ -189,13 +191,19 @@ pub(crate) struct LedgerFileBatch {
 pub(crate) fn read_cursors(store: &SharedStore) -> anyhow::Result<HashMap<String, u64>> {
     let conn = store.read()?;
     let mut stmt = conn.prepare("SELECT conversation, offset FROM ledger_cursor")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+    })?;
     Ok(rows.flatten().collect())
 }
 
 /// Warn about rows that took the default price because no table entry names
 /// their model. Duplicated in codex and gemini before this was extracted.
-pub(crate) fn warn_unpriced(provider: &str, table: &[(String, [f64; 4])], batches: &[LedgerFileBatch]) {
+pub(crate) fn warn_unpriced(
+    provider: &str,
+    table: &[(String, [f64; 4])],
+    batches: &[LedgerFileBatch],
+) {
     let models: std::collections::BTreeSet<String> = batches
         .iter()
         .flat_map(|b| b.rows.iter())
@@ -329,19 +337,98 @@ pub static LEDGER_DUPLICATE_MESSAGES: std::sync::atomic::AtomicU64 =
 /// preceding line (py:18133) — deliberately not a set, because two genuinely
 /// distinct turns can carry identical counts and a set would silently drop the
 /// second.
-fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[(String, [f64; 4])]) -> (u64, Vec<Turn>) {
+/// One transcript's parse result awaiting the write: conversation, new offset,
+/// mtime, billed turns and skill events.
+type PendingFile = (String, u64, i64, Vec<Turn>, Vec<SkillUse>);
+
+/// A skill invocation seen in a transcript (AMUX-5340): the model's Skill tool
+/// call, or a slash command the user typed. Feeds "most used" on the Skills page.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SkillUse {
+    pub uuid: String,
+    pub skill: String,
+    pub source: &'static str,
+    pub session: String,
+    pub ts: i64,
+}
+
+/// The skills one transcript record invoked. Only TYPED text counts for slash
+/// commands: a tool result that quotes `<command-name>` (a file read, a grep)
+/// is not an invocation.
+pub(crate) fn skill_uses_in(e: &serde_json::Value, owner: &str, fallback_ts: i64) -> Vec<SkillUse> {
+    let Some(uuid) = e["uuid"].as_str().filter(|u| !u.is_empty()) else { return vec![] };
+    let ts = e["timestamp"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.timestamp())
+        .unwrap_or(fallback_ts);
+    let norm = |s: &str| s.trim().trim_start_matches('/').to_ascii_lowercase();
+    let mut out: Vec<SkillUse> = Vec::new();
+    let mut push = |skill: String, source: &'static str| {
+        if !skill.is_empty() && skill.len() <= 120 && !out.iter().any(|u| u.skill == skill) {
+            out.push(SkillUse { uuid: uuid.to_string(), skill, source, session: owner.to_string(), ts });
+        }
+    };
+    let content = &e["message"]["content"];
+    let mut typed = String::new();
+    match content {
+        serde_json::Value::String(t) => typed.push_str(t),
+        serde_json::Value::Array(parts) => {
+            for c in parts {
+                if c["type"] == "tool_use" && c["name"] == "Skill" {
+                    if let Some(sk) = c["input"]["skill"].as_str() {
+                        push(norm(sk), "model");
+                    }
+                } else if c["type"] == "text" {
+                    typed.push_str(c["text"].as_str().unwrap_or(""));
+                    typed.push('\n');
+                }
+            }
+        }
+        _ => {}
+    }
+    if e["type"] == "user" && typed.contains("<command-name>") {
+        static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = RE.get_or_init(|| regex::Regex::new(r"<command-name>\s*(/[^<\s]+)\s*</command-name>").expect("command-name regex"));
+        for c in re.captures_iter(&typed) {
+            push(norm(&c[1]), "user");
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+fn parse_from(
+    path: &Path,
+    offset: u64,
+    fallback_ts: i64,
+    owner: &str,
+    table: &[(String, [f64; 4])],
+) -> (u64, Vec<Turn>) {
+    let (off, turns, _) = parse_from_with_skills(path, offset, fallback_ts, owner, table);
+    (off, turns)
+}
+
+fn parse_from_with_skills(
+    path: &Path,
+    offset: u64,
+    fallback_ts: i64,
+    owner: &str,
+    table: &[(String, [f64; 4])],
+) -> (u64, Vec<Turn>, Vec<SkillUse>) {
     let conversation = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     let Ok(mut f) = std::fs::File::open(path) else {
-        return (offset, vec![]);
+        return (offset, vec![], vec![]);
     };
     if offset > 0 && f.seek(SeekFrom::Start(offset)).is_err() {
-        return (offset, vec![]);
+        return (offset, vec![], vec![]);
     }
     let mut new_off = offset;
     let mut out = Vec::new();
+    let mut skills: Vec<SkillUse> = Vec::new();
     let mut prev_sig: Option<(i64, i64, i64)> = None;
     // AMUX-4580: responses already billed in this pass, by message id.
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -358,6 +445,8 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
         let Ok(e) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             continue;
         };
+        // Before the usage check: a typed command carries no usage block.
+        skills.extend(skill_uses_in(&e, owner, fallback_ts));
         let msg = &e["message"];
         let u = &msg["usage"];
         if !u.is_object() {
@@ -382,7 +471,10 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
         // response several times. The id cannot merge two real turns: they have
         // different ids even when their counts match. Lines without an id keep
         // the adjacent-signature rule, which is still right for them.
-        let message_id = msg["id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        let message_id = msg["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         if let Some(id) = message_id.as_deref() {
             if !seen_ids.insert(id.to_string()) {
                 LEDGER_DUPLICATE_MESSAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -411,10 +503,93 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
             tokens,
             cost: turn_cost_usd(table, &model, tokens),
             message_id,
-            request_id: e["requestId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+            request_id: e["requestId"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
         });
     }
-    (new_off, out)
+    (new_off, out, skills)
+}
+
+const SKILL_BACKFILL_PREF: &str = "skill_usage_backfill_v1";
+/// Transcripts older than this are not backfilled: "most used" is about now.
+const SKILL_BACKFILL_DAYS: u64 = 90;
+
+/// One-time (AMUX-5340): skill events in transcript bytes the incremental
+/// indexer passed before it learned to read them. Only lines that mention a
+/// Skill call or a typed command are parsed, so the 15G tree reads in minutes.
+/// Marked done in prefs; safe to repeat anyway (INSERT OR IGNORE by uuid).
+pub async fn backfill_skill_usage(store: &SharedStore, projects: &Path) -> anyhow::Result<Option<usize>> {
+    let done = store
+        .read_async(|conn| {
+            Ok(conn
+                .query_row("SELECT 1 FROM prefs WHERE key=?1", [SKILL_BACKFILL_PREF], |_| Ok(()))
+                .is_ok())
+        })
+        .await?;
+    if done {
+        return Ok(None);
+    }
+    let projects = projects.to_path_buf();
+    let (files, uses) = tokio::task::spawn_blocking(move || scan_skill_uses(&projects)).await?;
+    let n = uses.len();
+    store
+        .write_async(move |conn| {
+            let mut st = conn.prepare(
+                "INSERT OR IGNORE INTO skill_usage (record_uuid, skill, source, session, ts) VALUES (?1,?2,?3,?4,?5)",
+            )?;
+            for u in &uses {
+                st.execute(rusqlite::params![u.uuid, u.skill, u.source, u.session, u.ts])?;
+            }
+            conn.execute(
+                "INSERT INTO prefs (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![SKILL_BACKFILL_PREF, format!("{} events from {} files", n, files)],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await?;
+    tracing::info!(verdict = "skill_usage_backfilled", measured = true, n_considered = files, events = n,
+        "skill usage: one-time backfill from existing transcripts");
+    Ok(Some(n))
+}
+
+/// (files read, skill events) under `projects`, including subagent transcripts.
+fn scan_skill_uses(projects: &Path) -> (usize, Vec<SkillUse>) {
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(SKILL_BACKFILL_DAYS * 86_400);
+    let mut files: Vec<PathBuf> = Vec::new();
+    for proj in std::fs::read_dir(projects).into_iter().flatten().flatten() {
+        for f in std::fs::read_dir(proj.path()).into_iter().flatten().flatten() {
+            let p = f.path();
+            if p.is_dir() {
+                for sf in std::fs::read_dir(p.join("subagents")).into_iter().flatten().flatten() {
+                    files.push(sf.path());
+                }
+            } else {
+                files.push(p);
+            }
+        }
+    }
+    files.retain(|p| {
+        p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            && p.metadata().and_then(|m| m.modified()).is_ok_and(|t| t >= cutoff)
+    });
+    let mut out = Vec::new();
+    for p in &files {
+        let Ok(f) = std::fs::File::open(p) else { continue };
+        let mtime = p.metadata().ok().and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64).unwrap_or(0);
+        for line in BufReader::new(f).split(b'\n').flatten() {
+            let hit = line.windows(7).any(|w| w == b"\"Skill\"") || line.windows(13).any(|w| w == b"command-name>");
+            if !hit {
+                continue;
+            }
+            if let Ok(e) = serde_json::from_slice::<serde_json::Value>(&line) {
+                out.extend(skill_uses_in(&e, "", mtime));
+            }
+        }
+    }
+    (files.len(), out)
 }
 
 fn claude_projects_dir() -> PathBuf {
@@ -429,13 +604,9 @@ fn claude_projects_dir() -> PathBuf {
 /// One indexing pass. Returns rows inserted. Cheap on a fully-indexed tree —
 /// a stat per file and nothing else.
 pub async fn index_once(store: &SharedStore, home: &Path) -> anyhow::Result<usize> {
-    index_once_at(
-        store,
-        home,
-        &claude_projects_dir(),
-        &crate::api::session_verbs::conversation_claims(),
-    )
-    .await
+    let claims =
+        tokio::task::spawn_blocking(crate::api::session_verbs::conversation_claims).await?;
+    index_once_at(store, home, &claude_projects_dir(), &claims).await
 }
 
 /// The pass, with the projects root injected. Split out so tests drive a temp
@@ -450,14 +621,98 @@ pub async fn index_once_at(
     if !projects.is_dir() {
         return Ok(0);
     }
-    let projects = projects.to_path_buf();
+    // On a blocking thread: the walk stats every transcript on the box (18,993
+    // files across 8,262 project dirs, measured 2026-11-01), and on the runtime
+    // it held a thread for up to 47.7s at a time (AF-1142).
+    let (pending, skipped_for_cap, cap) = {
+        let store = store.clone();
+        let home = home.to_path_buf();
+        let projects = projects.to_path_buf();
+        let claims = claims.clone();
+        tokio::task::spawn_blocking(move || scan_pending(&store, &home, &projects, &claims))
+            .await??
+    };
+    if skipped_for_cap > 0 {
+        tracing::info!(
+            indexed = pending.len(),
+            deferred = skipped_for_cap,
+            cap,
+            "token-ledger: capped this pass; the rest are picked up next tick"
+        );
+    }
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let expected: usize = pending.iter().map(|(_, _, _, t, _)| t.len()).sum();
+
+    let inserted = store
+        .write_async(move |conn| {
+            let mut n = 0usize;
+            {
+                let mut ins = conn.prepare(
+                    // A response already billed by an EARLIER pass (the cursor
+                    // resumed mid-message, or a repeat landed after a flush)
+                    // updates its row to the larger output instead of adding one.
+                    "INSERT INTO token_ledger
+                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd,
+                        message_id, request_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                     ON CONFLICT(conversation, message_id) WHERE message_id IS NOT NULL
+                     DO UPDATE SET output = MAX(output, excluded.output),
+                                   cost_usd = MAX(cost_usd, excluded.cost_usd)",
+                )?;
+                let mut cur = conn.prepare(
+                    "INSERT INTO ledger_cursor (conversation, offset, mtime) VALUES (?1,?2,?3)
+                     ON CONFLICT(conversation) DO UPDATE SET offset=?2, mtime=?3",
+                )?;
+                let mut sk = conn.prepare(
+                    "INSERT OR IGNORE INTO skill_usage (record_uuid, skill, source, session, ts) VALUES (?1,?2,?3,?4,?5)",
+                )?;
+                for (conv, off, mtime, turns, skill_uses) in &pending {
+                    for u in skill_uses {
+                        sk.execute(rusqlite::params![u.uuid, u.skill, u.source, u.session, u.ts])?;
+                    }
+                    for t in turns {
+                        ins.execute(rusqlite::params![
+                            t.ts, t.session, t.conversation, t.model,
+                            t.tokens[0], t.tokens[1], t.tokens[2], t.tokens[3], t.cost,
+                            t.message_id, t.request_id
+                        ])?;
+                        n += 1;
+                    }
+                    cur.execute(rusqlite::params![conv, *off as i64, mtime])?;
+                }
+            }
+            debug_assert_eq!(n, expected, "insert count must match what was parsed");
+            Ok(WriteOutcome { applied: n > 0, events: vec![] })
+        })
+        .await
+        .map(|_| expected)?;
+
+    if inserted > 0 {
+        attribute_tasks(store).await?;
+    }
+    Ok(inserted)
+}
+
+/// Everything before the commit: the cursors, the walk and the parse. Blocking
+/// by nature, so `index_once_at` runs it on the blocking pool.
+fn scan_pending(
+    store: &SharedStore,
+    home: &Path,
+    projects: &Path,
+    claims: &BTreeMap<String, String>,
+) -> anyhow::Result<(Vec<PendingFile>, usize, usize)> {
     let table = prices(home);
 
     let cursors: HashMap<String, (u64, i64)> = {
         let conn = store.read()?;
         let mut stmt = conn.prepare("SELECT conversation, offset, mtime FROM ledger_cursor")?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)?)))
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)?),
+            ))
         })?;
         rows.flatten().collect()
     };
@@ -476,20 +731,22 @@ pub async fn index_once_at(
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(200);
     let mut skipped_for_cap = 0usize;
-    let mut pending: Vec<(String, u64, i64, Vec<Turn>)> = Vec::new();
+    let mut pending: Vec<PendingFile> = Vec::new();
     // Owner titles are read from a conversation's FIRST line; subagent files
     // all share one parent, so cache per parent rather than re-opening it once
     // per delegated transcript.
     let mut owner_cache: HashMap<PathBuf, String> = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(&projects) else {
-        return Ok(0);
+    let Ok(entries) = std::fs::read_dir(projects) else {
+        return Ok((pending, skipped_for_cap, cap));
     };
     for proj in entries.flatten() {
         let p = proj.path();
         if !p.is_dir() {
             continue;
         }
-        let Ok(files) = std::fs::read_dir(&p) else { continue };
+        let Ok(files) = std::fs::read_dir(&p) else {
+            continue;
+        };
         for f in files.flatten() {
             let path = f.path();
             // Two shapes under a project dir:
@@ -524,7 +781,10 @@ pub async fn index_once_at(
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                let conv = jf.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let conv = jf
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 let (off, cmt) = cursors.get(&conv).copied().unwrap_or((0, 0));
                 // Both halves matter. Size alone misses an in-place rewrite;
                 // mtime alone re-reads an untouched file after any `touch`.
@@ -546,64 +806,12 @@ pub async fn index_once_at(
                         .or_insert_with(|| jsonl_owner_title(pp, claims))
                         .clone(),
                 };
-                let (new_off, turns) = parse_from(&jf, start, mtime, &owner, &table);
-                pending.push((conv, new_off, mtime, turns));
+                let (new_off, turns, skill_uses) = parse_from_with_skills(&jf, start, mtime, &owner, &table);
+                pending.push((conv, new_off, mtime, turns, skill_uses));
             }
         }
     }
-    if skipped_for_cap > 0 {
-        tracing::info!(
-            indexed = pending.len(), deferred = skipped_for_cap, cap,
-            "token-ledger: capped this pass; the rest are picked up next tick"
-        );
-    }
-    if pending.is_empty() {
-        return Ok(0);
-    }
-    let expected: usize = pending.iter().map(|(_, _, _, t)| t.len()).sum();
-
-    let inserted = store
-        .write_async(move |conn| {
-            let mut n = 0usize;
-            {
-                let mut ins = conn.prepare(
-                    // A response already billed by an EARLIER pass (the cursor
-                    // resumed mid-message, or a repeat landed after a flush)
-                    // updates its row to the larger output instead of adding one.
-                    "INSERT INTO token_ledger
-                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd,
-                        message_id, request_id)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-                     ON CONFLICT(conversation, message_id) WHERE message_id IS NOT NULL
-                     DO UPDATE SET output = MAX(output, excluded.output),
-                                   cost_usd = MAX(cost_usd, excluded.cost_usd)",
-                )?;
-                let mut cur = conn.prepare(
-                    "INSERT INTO ledger_cursor (conversation, offset, mtime) VALUES (?1,?2,?3)
-                     ON CONFLICT(conversation) DO UPDATE SET offset=?2, mtime=?3",
-                )?;
-                for (conv, off, mtime, turns) in &pending {
-                    for t in turns {
-                        ins.execute(rusqlite::params![
-                            t.ts, t.session, t.conversation, t.model,
-                            t.tokens[0], t.tokens[1], t.tokens[2], t.tokens[3], t.cost,
-                            t.message_id, t.request_id
-                        ])?;
-                        n += 1;
-                    }
-                    cur.execute(rusqlite::params![conv, *off as i64, mtime])?;
-                }
-            }
-            debug_assert_eq!(n, expected, "insert count must match what was parsed");
-            Ok(WriteOutcome { applied: n > 0, events: vec![] })
-        })
-        .await
-        .map(|_| expected)?;
-
-    if inserted > 0 {
-        attribute_tasks(store).await?;
-    }
-    Ok(inserted)
+    Ok((pending, skipped_for_cap, cap))
 }
 
 /// A claim window may not run longer than this, however it ended.
@@ -712,7 +920,12 @@ fn claim_windows(
             .filter(|(s, _, _)| s == session)
             .map(|(_, _, t)| *t)
             .unwrap_or(now);
-        wins.push((card, session.clone(), *ts, next.min(ts + MAX_CLAIM_WINDOW_S)));
+        wins.push((
+            card,
+            session.clone(),
+            *ts,
+            next.min(ts + MAX_CLAIM_WINDOW_S),
+        ));
     }
     // Oldest first, so the earliest claim covering a turn wins it; the UPDATE
     // only touches rows still unattributed.
@@ -728,6 +941,18 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
     // are still unattributed, so nothing is overwritten by arriving late.
     let (wins, bounds) = store
         .read_async(move |conn| {
+            // Separate MIN and MAX let SQLite seek from each end of the
+            // (task, ts) index instead of scanning every unattributed row.
+            // A blank session cannot match any claim window.
+            let bounds: (Option<i64>, Option<i64>) = conn.query_row(
+                "SELECT (SELECT MIN(ts) FROM token_ledger WHERE task='' AND session<>''), \
+                        (SELECT MAX(ts) FROM token_ledger WHERE task='' AND session<>'')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let (Some(lo), Some(hi)) = bounds else {
+                return Ok((Vec::new(), None));
+            };
             let mut attempts: Vec<(String, String, i64, i64)> = Vec::new();
             // The live source. `min(a, b)` is SQLite's two-argument scalar min.
             if let Ok(mut stmt) = conn.prepare(
@@ -761,20 +986,7 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
                 })?;
                 rows.flatten().collect()
             };
-            // The ts range that still has anything to attribute. A window
-            // outside it cannot match a row, so issuing its UPDATE is a
-            // guaranteed no-op — and in the steady state that is nearly all of
-            // them, because this job re-derives the whole of history every
-            // cycle and history was attributed on the first one.
-            let bounds: Option<(i64, i64)> = conn
-                .query_row(
-                    "SELECT MIN(ts), MAX(ts) FROM token_ledger WHERE task=''",
-                    [],
-                    |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
-                )
-                .ok()
-                .and_then(|(lo, hi)| Some((lo?, hi?)));
-            Ok((claim_windows(attempts, claims, now), bounds))
+            Ok((claim_windows(attempts, claims, now), Some((lo, hi))))
         })
         .await?;
 
@@ -825,7 +1037,10 @@ pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
                     }
                 }
                 counter.store(n, std::sync::atomic::Ordering::Relaxed);
-                Ok(WriteOutcome { applied: n > 0, events: vec![] })
+                Ok(WriteOutcome {
+                    applied: n > 0,
+                    events: vec![],
+                })
             })
             .await?;
         let n = consumed.load(std::sync::atomic::Ordering::Relaxed);
@@ -860,41 +1075,50 @@ pub fn spawn(state: crate::api::AppState) -> Option<super::PeriodicTask> {
         return None;
     }
     let home = crate::api::settings::amux_home();
-    Some(super::spawn_periodic(super::registry::ids::TOKEN_LEDGER, secs, move || {
-        let store = state.store.clone();
-        let home = home.clone();
-        async move {
-            match index_once(&store, &home).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(rows = n, "token-ledger indexed"),
-                // LOUD. The whole reason this job exists is that a silent gap
-                // between writer and readers served a confident zero for
-                // 36 hours; a failing indexer must not reproduce that quietly.
-                Err(e) => tracing::warn!(error = %e, "token-ledger index failed"),
-            }
-            // AMUX-4583: codex lanes spend through a different file tree, and
-            // their turns were in no ledger at all. Same tick, same table,
-            // counted separately so "0 codex rows" is readable as a state.
-            match super::codex_ledger::index_once(&store, &home).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(rows = n, provider = "codex", "token-ledger indexed"),
-                Err(e) => tracing::warn!(error = %e, provider = "codex", "token-ledger index failed"),
-            }
-            // AMUX-4679, the same shape a third time. The gemini ADAPTER
-            // declares it reports no usage, which is true of the provider
-            // interface and says nothing about the CLI, which writes per-turn
-            // counts to ~/.gemini/tmp/<project>/chats. Counted separately for
-            // the reason codex is: "0 gemini rows" has to be readable as a
-            // state rather than as an absent provider.
-            match super::gemini_ledger::index_once(&store, &home).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(rows = n, provider = "gemini", "token-ledger indexed"),
-                Err(e) => {
-                    tracing::warn!(error = %e, provider = "gemini", "token-ledger index failed")
+    Some(super::spawn_periodic(
+        super::registry::ids::TOKEN_LEDGER,
+        secs,
+        move || {
+            let store = state.store.clone();
+            let home = home.clone();
+            async move {
+                if let Err(e) = backfill_skill_usage(&store, &claude_projects_dir()).await {
+                    tracing::warn!(error = %e, verdict = "skill_usage_backfill_failed", "skill usage backfill failed; retried next tick");
+                }
+                match index_once(&store, &home).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(rows = n, "token-ledger indexed"),
+                    // LOUD. The whole reason this job exists is that a silent gap
+                    // between writer and readers served a confident zero for
+                    // 36 hours; a failing indexer must not reproduce that quietly.
+                    Err(e) => tracing::warn!(error = %e, "token-ledger index failed"),
+                }
+                // AMUX-4583: codex lanes spend through a different file tree, and
+                // their turns were in no ledger at all. Same tick, same table,
+                // counted separately so "0 codex rows" is readable as a state.
+                match super::codex_ledger::index_once(&store, &home).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(rows = n, provider = "codex", "token-ledger indexed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, provider = "codex", "token-ledger index failed")
+                    }
+                }
+                // AMUX-4679, the same shape a third time. The gemini ADAPTER
+                // declares it reports no usage, which is true of the provider
+                // interface and says nothing about the CLI, which writes per-turn
+                // counts to ~/.gemini/tmp/<project>/chats. Counted separately for
+                // the reason codex is: "0 gemini rows" has to be readable as a
+                // state rather than as an absent provider.
+                match super::gemini_ledger::index_once(&store, &home).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(rows = n, provider = "gemini", "token-ledger indexed"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, provider = "gemini", "token-ledger index failed")
+                    }
                 }
             }
-        }
-    }))
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -902,7 +1126,10 @@ mod tests {
     use super::*;
 
     fn table() -> Vec<(String, [f64; 4])> {
-        MODEL_PRICES_DEFAULT.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        MODEL_PRICES_DEFAULT
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect()
     }
 
     // ---- claim windows (AMUX-4750) --------------------------------------
@@ -937,10 +1164,35 @@ mod tests {
                 .find(|(s, _, _)| s == session)
                 .map(|(_, _, t)| *t)
                 .unwrap_or(now);
-            wins.push((card, session.clone(), *ts, next.min(ts + MAX_CLAIM_WINDOW_S)));
+            wins.push((
+                card,
+                session.clone(),
+                *ts,
+                next.min(ts + MAX_CLAIM_WINDOW_S),
+            ));
         }
         wins.sort_by_key(|(_, _, from, _)| *from);
         wins
+    }
+
+    /// AF-1142: the walk stats every transcript on the box, so the async
+    /// half of a pass must hand all of it to the blocking pool. A filesystem or
+    /// store call that comes back here holds a runtime thread for seconds.
+    #[test]
+    fn a_pass_never_walks_the_disk_on_a_runtime_thread() {
+        for (src, pass, scan) in [
+            (include_str!("token_ledger.rs"), "pub async fn index_once_at(", "fn scan_pending("),
+            (include_str!("codex_ledger.rs"), "pub async fn index_once_at(", "fn scan_rollouts("),
+            (include_str!("gemini_ledger.rs"), "pub(crate) async fn index_once_at(", "fn scan_chats("),
+        ] {
+            let start = src.find(pass).expect("the async pass");
+            let end = start + src[start..].find(scan).expect("its blocking scan");
+            let body = &src[start..end];
+            assert!(body.contains("spawn_blocking"), "{pass} left the blocking pool");
+            for banned in ["std::fs::", "store.read()", "read_cursors(", "metadata()"] {
+                assert!(!body.contains(banned), "{banned} is back on the runtime in {pass}");
+            }
+        }
     }
 
     #[test]
@@ -972,7 +1224,10 @@ mod tests {
     fn the_window_is_capped_even_when_the_lane_never_claims_again() {
         let now = 10 * MAX_CLAIM_WINDOW_S;
         let got = claim_windows(Vec::new(), vec![claim("alpha", "A-1", 0)], now);
-        assert_eq!(got, vec![("A-1".into(), "alpha".into(), 0, MAX_CLAIM_WINDOW_S)]);
+        assert_eq!(
+            got,
+            vec![("A-1".into(), "alpha".into(), 0, MAX_CLAIM_WINDOW_S)]
+        );
     }
 
     #[test]
@@ -997,7 +1252,14 @@ mod tests {
         // one, runs of several, adjacent lanes whose names sort next to each
         // other, and a gap wider than the cap.
         let mut claims: Vec<(String, String, i64)> = Vec::new();
-        for (lane, count) in [("a", 1), ("aa", 5), ("ab", 2), ("b", 7), ("c", 1), ("cc", 3)] {
+        for (lane, count) in [
+            ("a", 1),
+            ("aa", 5),
+            ("ab", 2),
+            ("b", 7),
+            ("c", 1),
+            ("cc", 3),
+        ] {
             for k in 0..count {
                 claims.push(claim(lane, &format!("{lane}-{k}"), 100 + (k as i64) * 250));
             }
@@ -1046,7 +1308,10 @@ mod tests {
     #[test]
     fn a_rate_is_applied_only_where_one_is_known() {
         let t = table();
-        assert_eq!(price_for_model(&t, "claude-opus-5"), Some([15.0, 1.50, 18.75, 75.0]));
+        assert_eq!(
+            price_for_model(&t, "claude-opus-5"),
+            Some([15.0, 1.50, 18.75, 75.0])
+        );
         assert_eq!(
             price_for_model(&t, "claude-haiku-4-5-20251001"),
             Some([0.80, 0.08, 1.00, 4.0])
@@ -1059,16 +1324,27 @@ mod tests {
         assert_eq!(price_for_model(&t, "claude-nova-1"), Some(PRICE_DEFAULT));
         assert!(model_is_priced(&t, "claude-nova-1"));
         for fam in ["opus", "sonnet", "haiku", "fable"] {
-            assert!(!"claude-nova-1".contains(fam), "fixture must not match {fam}");
+            assert!(
+                !"claude-nova-1".contains(fam),
+                "fixture must not match {fam}"
+            );
         }
 
         // DIFFERENT VENDOR, no rate: UNMETERED. Not Sonnet's price, which is
         // the live defect, and the cost is 0 because the column is NOT NULL —
         // `model_is_priced` is what says this zero is "withheld", not "free".
         for m in ["gpt-5.5", "gpt-6-astra", "gemini-3.5-flash", "gpt-5-codex"] {
-            assert_eq!(price_for_model(&t, m), None, "{m} must not take a Claude rate");
+            assert_eq!(
+                price_for_model(&t, m),
+                None,
+                "{m} must not take a Claude rate"
+            );
             assert!(!model_is_priced(&t, m), "{m} must read as unmetered");
-            assert_eq!(turn_cost_usd(&t, m, [1_000_000, 0, 0, 1_000_000]), 0.0, "{m}");
+            assert_eq!(
+                turn_cost_usd(&t, m, [1_000_000, 0, 0, 1_000_000]),
+                0.0,
+                "{m}"
+            );
         }
 
         // LOCAL: a known rate that happens to be zero. $0 is a FACT here, so it
@@ -1076,7 +1352,11 @@ mod tests {
         for m in ["qwen3.8:27b", "qwen3-coder:30b-65k", "llama3.3:70b"] {
             assert_eq!(price_for_model(&t, m), Some([0.0; 4]), "{m}");
             assert!(model_is_priced(&t, m), "{m} is free, not unknown");
-            assert_eq!(turn_cost_usd(&t, m, [9_000_000, 0, 0, 9_000_000]), 0.0, "{m}");
+            assert_eq!(
+                turn_cost_usd(&t, m, [9_000_000, 0, 0, 9_000_000]),
+                0.0,
+                "{m}"
+            );
         }
 
         // 1M output tokens on opus = $75 exactly.
@@ -1092,8 +1372,14 @@ mod tests {
         )
         .unwrap();
         let t = prices(dir.path());
-        assert_eq!(price_for_model(&t, "claude-opus-5"), Some([1.0, 2.0, 3.0, 4.0]));
-        assert_eq!(price_for_model(&t, "newmodel-x"), Some([9.0, 9.0, 9.0, 9.0]));
+        assert_eq!(
+            price_for_model(&t, "claude-opus-5"),
+            Some([1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            price_for_model(&t, "newmodel-x"),
+            Some([9.0, 9.0, 9.0, 9.0])
+        );
         // A malformed row is ignored, not fatal, and must not shadow anything.
         assert_eq!(price_for_model(&t, "sonnet"), Some([3.0, 0.30, 3.75, 15.0]));
     }
@@ -1108,10 +1394,16 @@ mod tests {
         assert_eq!(price_for_model(&t, "gpt-5.5"), None);
         assert!(!model_is_priced(&t, "gpt-5.5"));
 
-        std::fs::write(dir.path().join("prices.json"), r#"{"gpt-5.5": [1.25, 0.125, 1.5, 10.0]}"#)
-            .unwrap();
+        std::fs::write(
+            dir.path().join("prices.json"),
+            r#"{"gpt-5.5": [1.25, 0.125, 1.5, 10.0]}"#,
+        )
+        .unwrap();
         let t = prices(dir.path());
-        assert_eq!(price_for_model(&t, "gpt-5.5"), Some([1.25, 0.125, 1.5, 10.0]));
+        assert_eq!(
+            price_for_model(&t, "gpt-5.5"),
+            Some([1.25, 0.125, 1.5, 10.0])
+        );
         assert!(model_is_priced(&t, "gpt-5.5"));
         // 1M in + 1M out at those rates.
         assert!((turn_cost_usd(&t, "gpt-5.5", [1_000_000, 0, 0, 1_000_000]) - 11.25).abs() < 1e-9);
@@ -1120,10 +1412,16 @@ mod tests {
 
         // An explicit `_default` is the owner saying "price the unknowns like
         // this", which is theirs to decide and still honoured.
-        std::fs::write(dir.path().join("prices.json"), r#"{"_default": [2.0, 2.0, 2.0, 2.0]}"#)
-            .unwrap();
+        std::fs::write(
+            dir.path().join("prices.json"),
+            r#"{"_default": [2.0, 2.0, 2.0, 2.0]}"#,
+        )
+        .unwrap();
         let t = prices(dir.path());
-        assert_eq!(price_for_model(&t, "gpt-6-astra"), Some([2.0, 2.0, 2.0, 2.0]));
+        assert_eq!(
+            price_for_model(&t, "gpt-6-astra"),
+            Some([2.0, 2.0, 2.0, 2.0])
+        );
     }
 
     fn line(model: &str, ts: &str, inp: i64, cr: i64, cw: i64, out: i64) -> String {
@@ -1132,7 +1430,15 @@ mod tests {
         )
     }
 
-    fn line_with_id(model: &str, ts: &str, id: &str, inp: i64, cr: i64, cw: i64, out: i64) -> String {
+    fn line_with_id(
+        model: &str,
+        ts: &str,
+        id: &str,
+        inp: i64,
+        cr: i64,
+        cw: i64,
+        out: i64,
+    ) -> String {
         format!(
             r#"{{"timestamp":"{ts}","requestId":"req_{id}","message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{inp},"cache_read_input_tokens":{cr},"cache_creation_input_tokens":{cw},"output_tokens":{out}}}}}}}"#
         )
@@ -1155,9 +1461,15 @@ mod tests {
             + "\n";
         std::fs::write(&path, &body).unwrap();
         let (_, turns) = parse_from(&path, 0, 1_786_000_000, "lane", &table());
-        let ids: Vec<_> = turns.iter().map(|t| t.message_id.clone().unwrap()).collect();
-        assert_eq!(ids, vec!["msg_A".to_string(), "msg_B".to_string()],
-            "msg_A billed once despite non-adjacent repeats; msg_B kept though its counts match");
+        let ids: Vec<_> = turns
+            .iter()
+            .map(|t| t.message_id.clone().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["msg_A".to_string(), "msg_B".to_string()],
+            "msg_A billed once despite non-adjacent repeats; msg_B kept though its counts match"
+        );
         assert_eq!(turns[0].request_id.as_deref(), Some("req_msg_A"));
     }
 
@@ -1184,7 +1496,10 @@ mod tests {
 
         let (off, turns) = parse_from(&jf, 0, 0, "alpha", &table());
         assert_eq!(turns.len(), 3, "2 distinct + 1 repeat-after-gap");
-        assert_eq!(turns.iter().map(|t| t.tokens[0]).collect::<Vec<_>>(), vec![100, 5, 100]);
+        assert_eq!(
+            turns.iter().map(|t| t.tokens[0]).collect::<Vec<_>>(),
+            vec![100, 5, 100]
+        );
         assert_eq!(off, body.len() as u64, "cursor must land exactly at EOF");
         assert_eq!(turns[0].conversation, "conv1");
         assert!(turns[0].cost > 0.0);
@@ -1204,7 +1519,11 @@ mod tests {
         let second = line("sonnet", "2026-08-11T10:05:00Z", 20, 0, 0, 4) + "\n";
         std::fs::write(&jf, first.clone() + &second).unwrap();
         let (off2, turns2) = parse_from(&jf, off, 0, "", &table());
-        assert_eq!(turns2.len(), 1, "the already-indexed line must not be re-billed");
+        assert_eq!(
+            turns2.len(),
+            1,
+            "the already-indexed line must not be re-billed"
+        );
         assert_eq!(turns2[0].tokens[0], 20);
         assert_eq!(off2, (first.len() + second.len()) as u64);
     }
@@ -1228,7 +1547,7 @@ mod tests {
     fn store() -> SharedStore {
         let dir = tempfile::tempdir().unwrap();
         let st = crate::db::Store::open(&dir.path().join("ledger-test.db")).unwrap();
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         std::sync::Arc::new(st)
     }
 
@@ -1290,9 +1609,11 @@ mod tests {
         let task_of = |conv: &str| -> String {
             st.read()
                 .unwrap()
-                .query_row("SELECT task FROM token_ledger WHERE conversation=?1", [conv], |r| {
-                    r.get::<_, String>(0)
-                })
+                .query_row(
+                    "SELECT task FROM token_ledger WHERE conversation=?1",
+                    [conv],
+                    |r| r.get::<_, String>(0),
+                )
                 .unwrap()
         };
         assert_eq!(
@@ -1331,6 +1652,7 @@ mod tests {
                  cache_write, output, cost_usd, task) VALUES \
                  (?1,'lane-a','conv-a','m',10,0,0,1,0.5,''), \
                  (?1,'lane-b','conv-b','m',10,0,0,1,0.5,''), \
+                 (?1,'','conv-blank','m',10,0,0,1,0.5,''), \
                  (?2,'lane-a','conv-old','m',10,0,0,1,0.5,'')",
                 [now - 300, now - 40 * 3600],
             )?;
@@ -1343,18 +1665,29 @@ mod tests {
         let task_of = |conv: &str| -> String {
             st.read()
                 .unwrap()
-                .query_row("SELECT task FROM token_ledger WHERE conversation=?1", [conv], |r| {
-                    r.get::<_, String>(0)
-                })
+                .query_row(
+                    "SELECT task FROM token_ledger WHERE conversation=?1",
+                    [conv],
+                    |r| r.get::<_, String>(0),
+                )
                 .unwrap()
         };
-        assert_eq!(task_of("conv-a"), "AMUX-9001", "a running attempt attributes its lane's turn");
-        assert_eq!(task_of("conv-b"), "AMUX-9002", "a task.claimed event still attributes historical turns");
+        assert_eq!(
+            task_of("conv-a"),
+            "AMUX-9001",
+            "a running attempt attributes its lane's turn"
+        );
+        assert_eq!(
+            task_of("conv-b"),
+            "AMUX-9002",
+            "a task.claimed event still attributes historical turns"
+        );
         assert_eq!(
             task_of("conv-old"),
             "",
             "a turn 40h BEFORE the claim is outside the window and must stay unattributed"
         );
+        assert_eq!(task_of("conv-blank"), "", "blank sessions stay unattributed");
     }
 
     async fn ledger(store: &SharedStore) -> Vec<(String, String, i64)> {
@@ -1390,15 +1723,21 @@ mod tests {
         // Parent conversation: carries the owning session.
         std::fs::write(
             proj.join(format!("{conv}.jsonl")),
-            format!("{}\n{}\n", r#"{"customTitle":"gtm-videos"}"#,
-                    line("claude-opus-5", "2026-08-11T10:00:00Z", 11, 0, 0, 1)),
+            format!(
+                "{}\n{}\n",
+                r#"{"customTitle":"gtm-videos"}"#,
+                line("claude-opus-5", "2026-08-11T10:00:00Z", 11, 0, 0, 1)
+            ),
         )
         .unwrap();
         // Delegated transcript: NO owner of its own.
         std::fs::write(
             proj.join(conv).join("subagents").join("agent-abc123.jsonl"),
-            format!("{}\n{}\n", r#"{"type":"user"}"#,
-                    line("claude-opus-5", "2026-08-11T10:01:00Z", 22, 0, 0, 2)),
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"user"}"#,
+                line("claude-opus-5", "2026-08-11T10:01:00Z", 22, 0, 0, 2)
+            ),
         )
         .unwrap();
 
@@ -1407,12 +1746,16 @@ mod tests {
         // is testing under instead of inheriting whatever is on the machine.
         // Empty = no meta claim, so the owner resolves from the title record.
         let claims = BTreeMap::new();
-        let n = index_once_at(&st, home.path(), projects.path(), &claims).await.unwrap();
+        let n = index_once_at(&st, home.path(), projects.path(), &claims)
+            .await
+            .unwrap();
         assert_eq!(n, 2, "one parent turn + one delegated turn");
 
         let rows = ledger(&st).await;
-        let by_conv: std::collections::HashMap<_, _> =
-            rows.iter().map(|(s, c, i)| (c.clone(), (s.clone(), *i))).collect();
+        let by_conv: std::collections::HashMap<_, _> = rows
+            .iter()
+            .map(|(s, c, i)| (c.clone(), (s.clone(), *i)))
+            .collect();
         assert_eq!(by_conv[conv], ("gtm-videos".into(), 11));
         assert_eq!(
             by_conv["agent-abc123"],
@@ -1435,9 +1778,14 @@ mod tests {
         let proj = projects.path().join("-proj");
         std::fs::create_dir_all(proj.join("dead-uuid").join("subagents")).unwrap();
         std::fs::write(
-            proj.join("dead-uuid").join("subagents").join("agent-zzz.jsonl"),
-            format!("{}\n{}\n", r#"{"type":"user"}"#,
-                    line("sonnet", "2026-08-11T10:00:00Z", 5, 0, 0, 1)),
+            proj.join("dead-uuid")
+                .join("subagents")
+                .join("agent-zzz.jsonl"),
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"user"}"#,
+                line("sonnet", "2026-08-11T10:00:00Z", 5, 0, 0, 1)
+            ),
         )
         .unwrap();
 
@@ -1445,8 +1793,16 @@ mod tests {
         // No claim for this conversation: the owner must come from the
         // transcript, which is what this cell is about.
         let claims = BTreeMap::new();
-        assert_eq!(index_once_at(&st, home.path(), projects.path(), &claims).await.unwrap(), 1);
-        assert_eq!(ledger(&st).await, vec![(String::new(), "agent-zzz".into(), 5)]);
+        assert_eq!(
+            index_once_at(&st, home.path(), projects.path(), &claims)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            ledger(&st).await,
+            vec![(String::new(), "agent-zzz".into(), 5)]
+        );
     }
 
     /// THE CLAIMS MAP MUST REACH THE INDEXER (AF-209).
@@ -1472,15 +1828,23 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(
             proj.join(format!("{conv}.jsonl")),
-            format!("{}\n{}\n", r#"{"customTitle":"gtm-videos"}"#,
-                    line("sonnet", "2026-08-11T10:00:00Z", 7, 0, 0, 1)),
+            format!(
+                "{}\n{}\n",
+                r#"{"customTitle":"gtm-videos"}"#,
+                line("sonnet", "2026-08-11T10:00:00Z", 7, 0, 0, 1)
+            ),
         )
         .unwrap();
 
         let st = store();
         let mut claims = BTreeMap::new();
         claims.insert(conv.to_string(), "claiming-lane".to_string());
-        assert_eq!(index_once_at(&st, home.path(), projects.path(), &claims).await.unwrap(), 1);
+        assert_eq!(
+            index_once_at(&st, home.path(), projects.path(), &claims)
+                .await
+                .unwrap(),
+            1
+        );
         assert_eq!(
             ledger(&st).await,
             vec![("claiming-lane".to_string(), conv.to_string(), 7)],
@@ -1499,14 +1863,20 @@ mod tests {
         std::fs::create_dir_all(proj.join("u1").join("subagents")).unwrap();
         std::fs::write(
             proj.join("u1.jsonl"),
-            format!("{}\n{}\n", r#"{"customTitle":"amux"}"#,
-                    line("sonnet", "2026-08-11T10:00:00Z", 9, 0, 0, 1)),
+            format!(
+                "{}\n{}\n",
+                r#"{"customTitle":"amux"}"#,
+                line("sonnet", "2026-08-11T10:00:00Z", 9, 0, 0, 1)
+            ),
         )
         .unwrap();
         std::fs::write(
             proj.join("u1").join("subagents").join("agent-q.jsonl"),
-            format!("{}\n{}\n", r#"{"type":"user"}"#,
-                    line("sonnet", "2026-08-11T10:01:00Z", 3, 0, 0, 1)),
+            format!(
+                "{}\n{}\n",
+                r#"{"type":"user"}"#,
+                line("sonnet", "2026-08-11T10:01:00Z", 3, 0, 0, 1)
+            ),
         )
         .unwrap();
 
@@ -1514,9 +1884,16 @@ mod tests {
         // No claim for this conversation: the owner must come from the
         // transcript, which is what this cell is about.
         let claims = BTreeMap::new();
-        assert_eq!(index_once_at(&st, home.path(), projects.path(), &claims).await.unwrap(), 2);
         assert_eq!(
-            index_once_at(&st, home.path(), projects.path(), &claims).await.unwrap(),
+            index_once_at(&st, home.path(), projects.path(), &claims)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            index_once_at(&st, home.path(), projects.path(), &claims)
+                .await
+                .unwrap(),
             0,
             "an unchanged tree must be a no-op"
         );
@@ -1532,8 +1909,11 @@ mod tests {
     fn owner_comes_from_the_last_title_record_and_is_empty_for_ad_hoc_conversations() {
         let dir = tempfile::tempdir().unwrap();
         let named = dir.path().join("a.jsonl");
-        std::fs::write(&named, "{\"customTitle\":\"amux-rust\"}\n{\"customTitle\":\"amux\"}\n")
-            .unwrap();
+        std::fs::write(
+            &named,
+            "{\"customTitle\":\"amux-rust\"}\n{\"customTitle\":\"amux\"}\n",
+        )
+        .unwrap();
         assert_eq!(jsonl_owner_title(&named, &BTreeMap::new()), "amux");
 
         let anon = dir.path().join("b.jsonl");
@@ -1542,5 +1922,50 @@ mod tests {
 
         let missing = dir.path().join("nope.jsonl");
         assert_eq!(jsonl_owner_title(&missing, &BTreeMap::new()), "");
+    }
+}
+
+#[cfg(test)]
+mod skill_usage_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn skill_calls_and_typed_commands_count_and_quoted_tags_do_not() {
+        // The model invoking a skill (live shape, 2026-09-29).
+        let e = json!({"type":"assistant","uuid":"u1","timestamp":"2026-09-29T12:00:00Z","message":{"content":[
+            {"type":"text","text":"Loading it."},
+            {"type":"tool_use","name":"Skill","input":{"skill":"Chrome-CDP"}}]}});
+        let u = skill_uses_in(&e, "lane", 0);
+        assert_eq!((u.len(), u[0].skill.as_str(), u[0].source), (1, "chrome-cdp", "model"));
+        // A typed slash command.
+        let e = json!({"type":"user","uuid":"u2","message":{"content":"<command-name>/goal</command-name>\n<command-args>ship it</command-args>"}});
+        let u = skill_uses_in(&e, "lane", 5);
+        assert_eq!((u[0].skill.as_str(), u[0].source, u[0].ts), ("goal", "user", 5));
+        // A tool result that QUOTES the tag (a file read) is not an invocation.
+        let e = json!({"type":"user","uuid":"u3","message":{"content":[
+            {"type":"tool_result","content":"grep hit: <command-name>/compact</command-name>"}]}});
+        assert!(skill_uses_in(&e, "lane", 0).is_empty());
+        // No uuid, no event (it could not be deduplicated).
+        let e = json!({"type":"user","message":{"content":"<command-name>/goal</command-name>"}});
+        assert!(skill_uses_in(&e, "lane", 0).is_empty());
+    }
+
+    #[test]
+    fn the_backfill_scan_reads_subagent_transcripts_and_only_matching_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-Users-x-proj");
+        std::fs::create_dir_all(proj.join("conv1").join("subagents")).unwrap();
+        std::fs::write(proj.join("conv1.jsonl"), concat!(
+            r#"{"type":"user","uuid":"a","message":{"content":"<command-name>/standup</command-name>"}}"#, "\n",
+            r#"{"type":"assistant","uuid":"b","message":{"content":[{"type":"text","text":"nothing here"}]}}"#, "\n",
+        )).unwrap();
+        std::fs::write(proj.join("conv1").join("subagents").join("s.jsonl"),
+            r#"{"type":"assistant","uuid":"c","message":{"content":[{"type":"tool_use","name":"Skill","input":{"skill":"slop"}}]}}"#).unwrap();
+        let (files, uses) = scan_skill_uses(dir.path());
+        assert_eq!(files, 2);
+        let mut names: Vec<_> = uses.iter().map(|u| u.skill.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["slop", "standup"]);
     }
 }

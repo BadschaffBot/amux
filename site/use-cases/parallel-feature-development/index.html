@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -20,7 +20,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
-  <script src="/site.js"></script>
 
   <script type="application/ld+json">
   {
@@ -123,7 +122,7 @@
         "name": "What happens if one agent crashes mid-feature?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "amux's self-healing watchdog automatically restarts crashed sessions and replays the last message. The agent resumes from its previous context without losing progress. You see a notification in the dashboard when a restart happens, and the feature card stays claimed on the board so no other agent picks it up."
+          "text": "The amux server does not restart a crashed agent process today; an optional macOS script (scripts/tmux-watchdog.sh, not installed by default) restarts crashed Claude Code workers. The feature card stays claimed on the board so no other agent picks it up, and stall detection flags the stopped work so you can restart the session from the dashboard."
         }
       },
       {
@@ -137,18 +136,39 @@
     ]
   }
   </script>
+  <link rel="stylesheet" href="/nav.css?v=20261108">
+  <script src="/site.js?v=20261108"></script>
 </head>
 <body>
   <header class="site-header">
     <a class="logo" href="/">amux</a>
-    <nav>
-      <a href="/docs/" class="hide-mobile">docs</a>
-      <a href="/guides/" class="hide-mobile">guides</a>
-      <a href="/compare/" class="hide-mobile">compare</a>
+    <nav aria-label="Main">
+      <details class="nav-drop" data-cta-loc="nav-solutions">
+        <summary><span class="nd-label">solutions</span><span class="nd-sr">Menu</span><svg class="nd-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg><svg class="nd-burger" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg></summary>
+        <div class="nav-drop-menu">
+          <div class="nd-head">Solutions by industry</div>
+          <a href="/solutions/accounting-firms/" data-cta-loc="nav-solutions-accounting-firms">Accounting firms</a>
+          <a href="/solutions/skilled-nursing-facilities/" data-cta-loc="nav-solutions-skilled-nursing-facilities">Skilled nursing facilities</a>
+          <a href="/solutions/healthcare-recruiting/" data-cta-loc="nav-solutions-healthcare-recruiting">Healthcare recruiting</a>
+          <a href="/solutions/dental-practices/" data-cta-loc="nav-solutions-dental-practices">Dental practices</a>
+          <a href="/solutions/merchant-cash-advance/" data-cta-loc="nav-solutions-merchant-cash-advance">Merchant cash advance</a>
+          <a href="/solutions/" class="nd-all" data-cta-loc="nav-solutions-all">All solutions &rarr;</a>
+          <div class="nd-more" data-cta-loc="nav-menu"><a href="/demos/">demos</a><a href="/docs/">docs</a><a href="/pricing/">pricing</a></div>
+        </div>
+      </details>
       <a href="/demos/" class="hide-mobile">demos</a>
-      <a href="/blog/" class="hide-mobile">blog</a>
-      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
-      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/pricing/" class="hide-mobile">pricing</a>
+      <div class="theme-pick">
+        <button type="button" class="theme-btn" aria-haspopup="menu" aria-expanded="false" aria-label="Theme" title="Theme"><svg class="ti ti-system" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><svg class="ti ti-light" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg><svg class="ti ti-dark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg></button>
+        <div class="theme-menu" role="menu" hidden>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="system"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>System</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="light"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>Light</button>
+          <button type="button" role="menuitemradio" aria-checked="false" data-theme-set="dark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>Dark</button>
+        </div>
+      </div>
+      <a href="/#get" class="nav-cta nav-cta-primary">Get started</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta nav-gh" aria-label="Star amux on GitHub"><span class="gh-label">GitHub</span> <span class="gh-stars" id="gh-stars">★</span></a>
     </nav>
   </header>
 
@@ -160,7 +180,7 @@
 
     <p>Run one AI coding agent per feature branch simultaneously. amux coordinates each session on a shared kanban board, prevents git conflicts, and lets you monitor every agent from a single dashboard or your phone. A four-person sprint's worth of features — auth, search, payments, onboarding — runs in parallel and finishes together instead of one after another.</p>
 
-    <p>amux works with <a href="/compare/amux-vs-codex/">Claude Code</a>, <a href="/guides/claude-code-vs-codex-vs-gemini-cli/">Codex CLI, and Gemini CLI</a> in the same fleet. Each agent claims tasks atomically — no two agents pick the same feature card. If one crashes overnight, the <a href="/guides/self-healing-ai-agents/">self-healing watchdog</a> restarts it and replays the last message so work continues unattended.</p>
+    <p>amux works with <a href="/compare/amux-vs-codex/">Claude Code</a>, <a href="/guides/claude-code-vs-codex-vs-gemini-cli/">Codex CLI, and Gemini CLI</a> in the same fleet. Each agent claims tasks atomically — no two agents pick the same feature card. If one hits a usage limit overnight, amux holds delivery and resumes it at the provider's reset (see <a href=\"/guides/self-healing-ai-agents/\">recovery and restarts</a>); if one stalls, stall detection alerts you.</p>
 
     <p style="font-size:0.85rem;color:var(--fg-dim)">Last updated: August 2026</p>
 
@@ -186,9 +206,9 @@
           <td style="padding:0.6rem 0.8rem">Prevented by isolated branches + amux shared-checkout guard</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border-faint)">
-          <td style="padding:0.6rem 0.8rem">Crash recovery</td>
+          <td style="padding:0.6rem 0.8rem">Recovery</td>
           <td style="padding:0.6rem 0.8rem">Manual restart</td>
-          <td style="padding:0.6rem 0.8rem">Auto-restart with context replay</td>
+          <td style="padding:0.6rem 0.8rem">Resumes after usage limits; workers return after a macOS reboot; stall alerts</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border-faint)">
           <td style="padding:0.6rem 0.8rem">Monitoring</td>
@@ -240,7 +260,7 @@ curl -sk -X PATCH -d '{"blocked_on":"CARD-AUTH-ID"}' $AMUX_URL/api/board/CARD-PA
     <p>All registered sessions launch simultaneously. amux staggers startup by one second per agent to avoid a cold-boot memory spike. Each agent reads from the board, claims a task, creates a branch, and starts coding.</p>
 
     <h3>Step 4: Monitor from the dashboard or your iPhone</h3>
-    <p>Open <code>https://localhost:8824</code> or the <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435">iOS app</a>. Each agent's status, current card, branch, and most recent output appear in real time. If an agent goes quiet for too long, the self-healing watchdog flags it in the dashboard — and restarts it if it has crashed.</p>
+    <p>Open <code>https://localhost:8824</code> or the <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435">iOS app</a>. Each agent's status, current card, branch, and most recent output appear in real time. If an agent goes quiet for too long, stall detection flags it in the dashboard and alerts you.</p>
 
     <p>You can approve pull requests, send new instructions to a specific agent, or reassign a card — all from your phone, without touching a laptop.</p>
 
@@ -279,14 +299,14 @@ amux register onboard --model gemini-2-5-pro --dir ~/Dev/app</code></pre>
 
     <p>Set agents loose before you sleep. amux keeps them running unattended:</p>
     <ul>
-      <li>Context compaction fires automatically before any session hits its context limit — no stalled agents at 3am.</li>
-      <li>Crashed sessions restart themselves and replay the last prompt.</li>
+      <li>Claude Code compacts its own context, at a threshold you set in amux.</li>
+      <li>Agents that hit a usage limit resume at the provider's reset, and stalled work raises an alert.</li>
       <li>The board prevents any agent from picking up a task that was already completed by another.</li>
     </ul>
     <p>Wake up to a queue of pull requests, one per feature, ready to review. See <a href="/use-cases/ai-coding-while-you-sleep/">AI coding while you sleep</a> for the full overnight workflow.</p>
 
     <h2>What amux is</h2>
-    <p>amux is an open-source control plane for running an AI engineering team from a single dashboard or your phone. It launches, monitors, and self-heals dozens of parallel Claude Code, Codex, or Gemini CLI sessions, with built-in kanban, notes, CRM, email, browser automation, and a scheduler. Self-healing, single Rust binary, zero external dependencies, MIT licensed.</p>
+    <p>amux is a self-hosted control plane for running an AI engineering team from a single dashboard or your phone. It launches and monitors dozens of parallel Claude Code, Codex, or Gemini CLI sessions, with built-in kanban, notes, CRM, email, browser automation, and a scheduler. Usage-limit resume, single Rust binary, zero external dependencies, MIT + Commons Clause.</p>
 
     <div class="cta-box">
       <h3>Run your first parallel sprint</h3>
@@ -312,51 +332,24 @@ amux start-all
     </ul>
   </main>
 
-  <footer class="sub-footer">
-    <div class="footer-inner">
-      <div class="footer-top">
-        <div class="footer-brand-col">
-          <a href="/" class="footer-logo">amux</a>
-          <p>Open-source control plane for AI agents.</p>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Resources</div>
-          <ul>
-            <li><a href="/guides/">Guides</a></li>
-            <li><a href="/blog/">Blog</a></li>
-            <li><a href="/demos/">Demos</a></li>
-            <li><a href="/glossary/">Glossary</a></li>
-            <li><a href="/faq/">FAQ</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">Compare</div>
-          <ul>
-            <li><a href="/compare/amux-vs-cursor/">vs Cursor</a></li>
-            <li><a href="/compare/amux-vs-devin/">vs Devin</a></li>
-            <li><a href="/compare/amux-vs-cline/">vs Cline</a></li>
-            <li><a href="/compare/">All comparisons</a></li>
-          </ul>
-        </div>
-        <div class="footer-col">
-          <div class="footer-col-label">More</div>
-          <ul>
-            <li><a href="/use-cases/">Use Cases</a></li>
-            <li><a href="/solutions/">Solutions</a></li>
-            <li><a href="/for/">For your stack</a></li>
-            <li><a href="/changelog/">Changelog</a></li>
-          </ul>
-        </div>
-      </div>
-      <div class="footer-bottom">
-        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
-        <div class="footer-bottom-links">
-          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
-          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
-        </div>
-      </div>
+  <footer class="site-foot">
+  <div class="site-foot-inner">
+    <div class="site-foot-brand">
+      <a href="/" class="site-foot-logo">amux</a>
+      <p>The agent control plane. Run, watch and govern parallel coding agents from one place.</p>
     </div>
-  </footer>
+    <nav class="site-foot-cols" aria-label="Footer">
+      <div><b>Product</b><a href="/features/">Features</a><a href="/pricing/">Pricing</a><a href="/changelog/">Changelog</a><a href="/security/">Security</a><a href="/own-your-data/">Your data</a></div>
+      <div><b>Learn</b><a href="/docs/">Docs</a><a href="/guides/">Guides</a><a href="/walkthrough/">Walkthrough</a><a href="/demos/">Demos</a><a href="/blog/">Blog</a><a href="/faq/">FAQ</a></div>
+      <div><b>Compare</b><a href="/compare/amux-vs-cursor/">vs Cursor</a><a href="/compare/amux-vs-devin/">vs Devin</a><a href="/compare/amux-vs-cline/">vs Cline</a><a href="/compare/">All comparisons</a></div>
+      <div><b>More</b><a href="/use-cases/">Use cases</a><a href="/solutions/">Solutions</a><a href="/for/">For your stack</a><a href="/glossary/">Glossary</a></div>
+    </nav>
+  </div>
+  <div class="site-foot-bottom">
+    <span>&copy; 2026 <a href="https://mixpeek.com">Mixpeek</a> &middot; MIT + Commons Clause</span>
+    <span class="site-foot-links"><a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a><a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS app</a><a href="/privacy/">Privacy</a></span>
+  </div>
+</footer>
 
   <script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
 </body>

@@ -118,17 +118,24 @@ pub(crate) fn apfs_snapshot_note(n: usize) -> String {
     )
 }
 
-
 /// Bound both child lifetime and stdout consumption. A child can exit while a
 /// descendant still holds its stdout open, so wait_with_output after try_wait
 /// is not a deadline. Nonblocking reads also prevent a full pipe deadlock.
-pub(crate) fn bounded_output(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<u8>> {
+pub(crate) fn bounded_output(
+    program: &str,
+    args: &[&str],
+    budget: std::time::Duration,
+) -> Option<Vec<u8>> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::process::{Command, Stdio};
     let deadline = std::time::Instant::now() + budget;
-    let mut child = Command::new(program).args(args).stdout(Stdio::piped())
-        .stderr(Stdio::null()).spawn().ok()?;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
     let result = (|| {
         let mut stdout = child.stdout.take()?;
         let fd = stdout.as_raw_fd();
@@ -155,19 +162,28 @@ pub(crate) fn bounded_output(program: &str, args: &[&str], budget: std::time::Du
                         progressed = true;
                         output.extend_from_slice(&buf[..n]);
                         if output.len() > 1024 * 1024 {
-                            tracing::warn!(program, "storage_probe_output_limit: measurement unknown");
+                            tracing::warn!(
+                                program,
+                                "storage_probe_output_limit: measurement unknown"
+                            );
                             return None;
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => return None,
                 }
             }
-            if status.is_none() { status = child.try_wait().ok()?; }
+            if status.is_none() {
+                status = child.try_wait().ok()?;
+            }
             if let Some(status) = status {
-                if !status.success() { return None; }
-                if eof { return Some(output); }
+                if !status.success() {
+                    return None;
+                }
+                if eof {
+                    return Some(output);
+                }
             }
             if !progressed {
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -205,22 +221,34 @@ pub(crate) fn parse_local_snapshots(stdout: &[u8]) -> Option<Vec<String>> {
     Some(snapshots)
 }
 
-
 pub(crate) const SNAPSHOT_UNMEASURED: &str = "Local snapshot retention is unmeasured: the probe did not return a successful recognized listing (unsupported platform/output, command failure, or timeout). Do not infer that snapshots are absent or that deleting them is necessary.";
 
 pub(crate) fn local_snapshots() -> Option<Vec<String>> {
-    probe_local_snapshots("/usr/bin/tmutil", &["listlocalsnapshots", "/"], std::time::Duration::from_secs(5))
+    probe_local_snapshots(
+        "/usr/bin/tmutil",
+        &["listlocalsnapshots", "/"],
+        std::time::Duration::from_secs(5),
+    )
 }
 
-fn probe_local_snapshots(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<String>> {
-    let snapshots = bounded_output(program, args, budget)
-        .and_then(|stdout| parse_local_snapshots(&stdout));
+fn probe_local_snapshots(
+    program: &str,
+    args: &[&str],
+    budget: std::time::Duration,
+) -> Option<Vec<String>> {
+    let snapshots =
+        bounded_output(program, args, budget).and_then(|stdout| parse_local_snapshots(&stdout));
     let measured = snapshots.is_some();
     let n_considered = snapshots.as_ref().map_or(0, Vec::len);
     if measured {
         tracing::info!(measured, n_considered, "storage_snapshot_probe");
     } else {
-        tracing::warn!(measured, n_considered, why_unmeasured = SNAPSHOT_UNMEASURED, "storage_snapshot_probe");
+        tracing::warn!(
+            measured,
+            n_considered,
+            why_unmeasured = SNAPSHOT_UNMEASURED,
+            "storage_snapshot_probe"
+        );
     }
     snapshots
 }
@@ -288,6 +316,17 @@ pub const SPECS: &[SweepSpec] = &[
         unit: TsUnit::Secs,
         env: "AMUX_SESSION_EVENTS_RETAIN_DAYS",
         default_days: 90.0,
+    },
+    // The session.* status rows of the same table, kept 30 days (Ethan's yes on
+    // AMUX-6067/AMUX-6016, 2026-10-16). session.native_status alone was 354K rows
+    // and 2.7GB, ~7.7KB/row; message.* and task.* rows keep the 90 days above.
+    // Listed AFTER the 90-day spec: the chat.message test finds the first one.
+    SweepSpec {
+        table: "session_events",
+        ts_col: "ts",
+        unit: TsUnit::Secs,
+        env: "AMUX_SESSION_STATUS_EVENTS_RETAIN_DAYS",
+        default_days: 30.0,
     },
     // ~1.8 KB per sample at a 300 s default interval: ~520 KB/day, ~15 MB at
     // 30 days. Kept longer than the interaction log because a row is small and
@@ -375,12 +414,26 @@ pub const SPECS: &[SweepSpec] = &[
         env: "AMUX_STEERING_HISTORY_RETAIN_DAYS",
         default_days: 30.0,
     },
+    // _amux_invariant_result is not listed: invariants/store.rs already trims
+    // it to 7 days (1 hour for passing rows) on every monitor pass.
+    // ~1.2M rows, 187MB. Policy receipt records. 30d is enough for audit.
+    // `created_at` is ISO-8601 TEXT like `_amux_state_events.at`.
+    SweepSpec {
+        table: "_amux_policy_receipts",
+        ts_col: "created_at",
+        unit: TsUnit::IsoText,
+        env: "AMUX_POLICY_RECEIPTS_RETAIN_DAYS",
+        default_days: 30.0,
+    },
 ];
 
 /// `<ENV>`: process env wins, then `server.env`, then the spec default — the
 /// same precedence `AMUX_REQLOG_RETAIN_DAYS` and every other knob uses.
 pub fn retain_days(spec: &SweepSpec) -> f64 {
-    if let Some(d) = std::env::var(spec.env).ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+    if let Some(d) = std::env::var(spec.env)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+    {
         return d;
     }
     crate::config::parse_env_file(&amux_home().join("server.env"))
@@ -392,7 +445,10 @@ pub fn retain_days(spec: &SweepSpec) -> f64 {
 pub use crate::config::amux_home;
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
 }
 
 fn unix_now() -> f64 {
@@ -407,10 +463,16 @@ fn unix_now() -> f64 {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SweepResult {
     Disabled,
-    Deleted { rows: usize, kept: i64 },
+    Deleted {
+        rows: usize,
+        kept: i64,
+    },
     /// The cutoff would have emptied a non-empty table — almost certainly a
     /// unit mismatch. Nothing was deleted.
-    Refused { total: i64, cutoff: String },
+    Refused {
+        total: i64,
+        cutoff: String,
+    },
     Error(String),
 }
 
@@ -452,7 +514,18 @@ fn iso_utc(secs: i64) -> String {
 /// returns None: the ISO column is compared lexicographically and cannot land
 /// 1000x off, so the mismatch this guard exists to catch cannot occur there.
 fn retention_eligible(spec: &SweepSpec) -> &'static str {
-    if spec.table == "cmd_history" { "capture_pending=0" } else { "1=1" }
+    if spec.env == "AMUX_SESSION_STATUS_EVENTS_RETAIN_DAYS" {
+        "COALESCE(type,'') LIKE 'session.%'"
+    } else if spec.table == "cmd_history" {
+        "capture_pending=0"
+    } else if spec.table == "session_events" {
+        // Chat history is the conversation itself, kept like a coding
+        // transcript, not telemetry (AMUX-5350: "it maintains chat history
+        // which should have the full logs/backups/restore/saving to db").
+        "COALESCE(type,'') <> 'chat.message'"
+    } else {
+        "1=1"
+    }
 }
 
 fn oldest_secs(conn: &Connection, spec: &SweepSpec) -> Option<f64> {
@@ -461,47 +534,73 @@ fn oldest_secs(conn: &Connection, spec: &SweepSpec) -> Option<f64> {
         TsUnit::Secs | TsUnit::Millis => {
             let raw: f64 = conn
                 .query_row(
-                    &format!("SELECT MIN({}) FROM {} WHERE {}", spec.ts_col, spec.table, retention_eligible(spec)),
+                    &format!(
+                        "SELECT MIN({}) FROM {} WHERE {}",
+                        spec.ts_col,
+                        spec.table,
+                        retention_eligible(spec)
+                    ),
                     [],
                     |r| r.get(0),
                 )
                 .ok()?;
-            Some(if spec.unit == TsUnit::Millis { raw / 1000.0 } else { raw })
+            Some(if spec.unit == TsUnit::Millis {
+                raw / 1000.0
+            } else {
+                raw
+            })
         }
     }
 }
 
-/// Sweep one table. Counts what would remain BEFORE deleting anything, and
-/// refuses rather than empty a table — see the module docs.
+/// Sweep one table: [`sweep_guarded_delete`] then [`sweep_report`] on the same
+/// connection. Asks what would remain BEFORE deleting anything, and refuses
+/// rather than empty a table — see the module docs. [`storage_tick`] runs the
+/// two halves on the writer and on a read connection respectively.
 pub fn sweep_one(conn: &Connection, spec: &SweepSpec, now_secs: f64) -> SweepResult {
+    let result = sweep_guarded_delete(conn, spec, now_secs);
+    sweep_report(conn, spec, now_secs, result)
+}
+
+/// The half of [`sweep_one`] that runs on the single writer: the guard and one
+/// bounded DELETE, and nothing that grows with the table (AF-1075).
+///
+/// It used to open with SELECT COUNT(*) FROM <table> and also count every row
+/// at or after the cutoff. On _amux_policy_receipts (1.8M rows, in a 15.8 GB
+/// database) each count is 0.1 s with a warm cache and 5 s with a cold one,
+/// and inside the writer on a busy Mac it held every other write for up to
+/// 43 s, every tick, mostly to delete nothing. The guard needs only whether
+/// ANY row survives, which is one index seek; the whole-table count runs only
+/// on the rare refuse path. A `Deleted` from here carries `kept: -1`;
+/// [`sweep_report`] fills it in.
+pub fn sweep_guarded_delete(conn: &Connection, spec: &SweepSpec, now_secs: f64) -> SweepResult {
     let days = retain_days(spec);
     if days <= 0.0 {
         return SweepResult::Disabled;
     }
     let cutoff = cutoff_for(spec.unit, now_secs, days);
 
-    let total: i64 = match conn.query_row(&format!("SELECT COUNT(*) FROM {}", spec.table), [], |r| {
-        r.get(0)
-    }) {
-        Ok(v) => v,
-        Err(e) => return SweepResult::Error(format!("count {}: {e}", spec.table)),
-    };
-    if total == 0 {
-        return SweepResult::Deleted { rows: 0, kept: 0 };
-    }
-
     // THE GUARD. Ask what survives, not what dies: an unbounded match and a
     // correct match are indistinguishable from the deleted rows alone.
-    let kept: i64 = match conn.query_row(
-        &format!("SELECT COUNT(*) FROM {} WHERE {} >= ?1", spec.table, spec.ts_col),
+    let survives: bool = match conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE {} >= ?1)", spec.table, spec.ts_col),
         rusqlite::params![&cutoff],
         |r| r.get(0),
     ) {
         Ok(v) => v,
         Err(e) => return SweepResult::Error(format!("guard {}: {e}", spec.table)),
     };
-    if kept == 0 {
-        tracing::error!(
+    if !survives {
+        let total: i64 =
+            match conn.query_row(&format!("SELECT COUNT(*) FROM {}", spec.table), [], |r| r.get(0)) {
+                Ok(v) => v,
+                Err(e) => return SweepResult::Error(format!("count {}: {e}", spec.table)),
+            };
+        if total == 0 {
+            return SweepResult::Deleted { rows: 0, kept: 0 };
+        }
+        tracing::warn!(
+            verdict = "storage_retention_empty_hold",
             table = spec.table,
             column = spec.ts_col,
             unit = ?spec.unit,
@@ -509,69 +608,127 @@ pub fn sweep_one(conn: &Connection, spec: &SweepSpec, now_secs: f64) -> SweepRes
             total,
             knob = spec.env,
             "storage retention REFUSED: cutoff would delete every row — this is a \
-             timestamp-unit mismatch, not an old table. Nothing deleted."
+             possible timestamp-unit mismatch or entirely aged table. Nothing deleted."
         );
         return SweepResult::Refused { total, cutoff };
     }
 
     match conn.execute(
-        &format!("DELETE FROM {} WHERE {} < ?1 AND {}", spec.table, spec.ts_col, retention_eligible(spec)),
+        &format!(
+            "DELETE FROM {} WHERE rowid IN (SELECT rowid FROM {} WHERE {} < ?1 AND {} LIMIT {})",
+            spec.table,
+            spec.table,
+            spec.ts_col,
+            retention_eligible(spec),
+            SWEEP_BATCH
+        ),
         rusqlite::params![&cutoff],
     ) {
-        Ok(rows) => {
-            // Include protected unfinished message consequences in the actual
-            // survivor count without weakening the timestamp-unit guard above.
-            let kept = total - rows as i64;
-            if rows > 0 {
-                tracing::info!(
-                    table = spec.table,
-                    deleted = rows,
-                    kept,
-                    retain_days = days,
-                    knob = spec.env,
-                    "storage retention sweep"
-                );
-            } else if let Some(oldest_secs) = oldest_secs(conn, spec) {
-                // GUARD 2. Deleting nothing is safe, so this warns instead of
-                // refusing — but a table holding rows the sweep should have
-                // reached is a table whose bound is not working.
-                //
-                // TWO tells, and the first one is not the obvious one. A
-                // MILLISECOND column read as seconds does not look OLD, it
-                // looks like it is dated ~55,000 years in the FUTURE, so an
-                // "older than retention" test alone never fires on the exact
-                // mismatch this guard exists to catch. That is not a
-                // hypothetical: the first version of this check tested only
-                // `age > retention` and the unit test walked straight through
-                // it.
-                let age_days = (now_secs - oldest_secs) / 86_400.0;
-                let reason = if age_days < 0.0 {
-                    "the oldest row is dated in the FUTURE, which a real timestamp cannot be — \
-                     this column is almost certainly milliseconds being read as seconds"
-                } else if age_days > days * 1.5 {
-                    "the table holds rows older than its own retention window, so the cutoff is \
-                     not landing where it should"
-                } else {
-                    ""
-                };
-                if !reason.is_empty() {
-                    tracing::warn!(
-                        table = spec.table,
-                        column = spec.ts_col,
-                        unit = ?spec.unit,
-                        oldest_row_age_days = age_days,
-                        retain_days = days,
-                        knob = spec.env,
-                        reason,
-                        "storage retention deleted NOTHING and should have — this knob is not \
-                         bounding this table"
-                    );
-                }
-            }
-            SweepResult::Deleted { rows, kept }
-        }
+        Ok(rows) => SweepResult::Deleted { rows, kept: -1 },
         Err(e) => SweepResult::Error(format!("delete {}: {e}", spec.table)),
     }
+}
+
+/// The read-only half of [`sweep_one`]: counts what survived (protected rows
+/// included), logs the sweep, and runs the deleted-nothing diagnostic. Both
+/// counts can walk many rows (session_events' oldest chat messages are kept
+/// forever), so [`storage_tick`] runs this on a read connection.
+pub fn sweep_report(conn: &Connection, spec: &SweepSpec, now_secs: f64, result: SweepResult) -> SweepResult {
+    let SweepResult::Deleted { rows, kept } = result else { return result };
+    if kept >= 0 {
+        return result;
+    }
+    let days = retain_days(spec);
+    let kept: i64 =
+        match conn.query_row(&format!("SELECT COUNT(*) FROM {}", spec.table), [], |r| r.get(0)) {
+            Ok(v) => v,
+            Err(e) => return SweepResult::Error(format!("count {}: {e}", spec.table)),
+        };
+        if rows > 0 {
+            tracing::info!(
+                table = spec.table,
+                deleted = rows,
+                batch_limit = SWEEP_BATCH,
+                batch_saturated = rows == SWEEP_BATCH,
+                kept,
+                retain_days = days,
+                knob = spec.env,
+                "storage retention sweep"
+            );
+        } else if let Some(oldest_secs) = oldest_secs(conn, spec) {
+            // GUARD 2. Deleting nothing is safe, so this warns instead of
+            // refusing — but a table holding rows the sweep should have
+            // reached is a table whose bound is not working.
+            //
+            // TWO tells, and the first one is not the obvious one. A
+            // MILLISECOND column read as seconds does not look OLD, it
+            // looks like it is dated ~55,000 years in the FUTURE, so an
+            // "older than retention" test alone never fires on the exact
+            // mismatch this guard exists to catch. That is not a
+            // hypothetical: the first version of this check tested only
+            // `age > retention` and the unit test walked straight through
+            // it.
+            let age_days = (now_secs - oldest_secs) / 86_400.0;
+            let reason = if age_days < 0.0 {
+                "the oldest row is dated in the FUTURE, which a real timestamp cannot be — \
+                 this column is almost certainly milliseconds being read as seconds"
+            } else if age_days > days * 1.5 {
+                "the table holds rows older than its own retention window, so the cutoff is \
+                 not landing where it should"
+            } else {
+                ""
+            };
+            if !reason.is_empty() {
+                tracing::warn!(
+                    table = spec.table,
+                    column = spec.ts_col,
+                    unit = ?spec.unit,
+                    oldest_row_age_days = age_days,
+                    retain_days = days,
+                    knob = spec.env,
+                    reason,
+                    "storage retention deleted NOTHING and should have — this knob is not \
+                     bounding this table"
+                );
+            }
+        }
+    SweepResult::Deleted { rows, kept }
+}
+
+/// One more batch for a table whose `sweep_one` already passed the guard this
+/// tick and came back saturated. Same cutoff and predicate; the guard's two
+/// full-table COUNTs are not repeated, because deleting rows older than the
+/// cutoff cannot change how many rows are at or after it. Those counts were
+/// most of each batch's 150-480ms (2026-10-16 log), and repeating them per
+/// batch would spend the catch-up budget counting.
+pub fn sweep_batch(conn: &Connection, spec: &SweepSpec, now_secs: f64) -> rusqlite::Result<usize> {
+    let cutoff = cutoff_for(spec.unit, now_secs, retain_days(spec));
+    conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE rowid IN (SELECT rowid FROM {} WHERE {} < ?1 AND {} LIMIT {})",
+            spec.table,
+            spec.table,
+            spec.ts_col,
+            retention_eligible(spec),
+            SWEEP_BATCH
+        ),
+        rusqlite::params![&cutoff],
+    )
+}
+
+/// Rows per DELETE. Each batch is one write on the shared writer.
+pub const SWEEP_BATCH: usize = 256;
+
+/// `AMUX_STORAGE_CATCHUP_MS` (default 20000, 0 = one batch per tick as before):
+/// how long one tick may keep deleting a table whose batch came back full.
+///
+/// One 256-row batch an hour removed ~6K rows a day while `_amux_state_events`
+/// added ~30K, so its 14-day bound never held: 137K rows past it on 2026-10-16,
+/// logged as `batch_saturated=true` every hour with nothing acting on it.
+/// Batches stay 256 rows and each is its own write, so worker commands still
+/// interleave between them.
+fn catchup_budget_ms() -> u64 {
+    env_u64("AMUX_STORAGE_CATCHUP_MS", 20_000)
 }
 
 // ---------------------------------------------------------------------------
@@ -618,7 +775,12 @@ pub fn rotate_server_log(logs_dir: &Path) -> Option<u64> {
         return None;
     }
     // Truncate in place — do NOT rename; the tracing appender holds this fd.
-    if std::fs::OpenOptions::new().write(true).truncate(true).open(&log).is_err() {
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&log)
+        .is_err()
+    {
         return None;
     }
     tracing::info!(
@@ -651,7 +813,10 @@ pub fn rotate_server_log(logs_dir: &Path) -> Option<u64> {
 /// is the honest "this was never a unit of work", so holding its attachment
 /// forever would make the protection a leak that never frees anything. That
 /// asymmetry is what the control cell pins.
-pub fn card_referenced_uploads(conn: &Connection, uploads: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
+pub fn card_referenced_uploads(
+    conn: &Connection,
+    uploads: &Path,
+) -> anyhow::Result<std::collections::HashSet<String>> {
     let texts = super::log_retention::reference_texts(conn, "/uploads/")?;
     let mut out = std::collections::HashSet::new();
     let md = match std::fs::symlink_metadata(uploads) {
@@ -659,12 +824,18 @@ pub fn card_referenced_uploads(conn: &Connection, uploads: &Path) -> anyhow::Res
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(error) => return Err(error.into()),
     };
-    anyhow::ensure!(md.is_dir() && !md.file_type().is_symlink(), "upload retention root must be a real directory");
+    anyhow::ensure!(
+        md.is_dir() && !md.file_type().is_symlink(),
+        "upload retention root must be a real directory"
+    );
     // Match actual names rather than parsing prose: upload names may contain
     // spaces and Unicode, and a URL may percent-escape them. A prefix match is
     // deliberately conservative (extra retention is safer than lost evidence).
     for entry in std::fs::read_dir(uploads)? {
-        let name = entry?.file_name().into_string().map_err(|_| anyhow::anyhow!("upload filename is not UTF-8"))?;
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("upload filename is not UTF-8"))?;
         let needle = format!("/uploads/{name}");
         if texts.iter().any(|text| text.contains(&needle)) {
             out.insert(name);
@@ -685,7 +856,9 @@ pub fn prune_dir_by_age_keeping(
         return (0, 0, 0);
     }
     let now = std::time::SystemTime::now();
-    let Ok(rd) = std::fs::read_dir(dir) else { return (0, 0, 0) };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return (0, 0, 0);
+    };
     let (mut n, mut bytes, mut kept) = (0usize, 0u64, 0usize);
     for e in rd.flatten() {
         let Ok(md) = e.metadata() else { continue };
@@ -764,7 +937,9 @@ fn dir_size_fast(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in entries.flatten() {
             let Ok(md) = e.metadata() else { continue };
             if md.is_dir() {
@@ -795,7 +970,9 @@ pub fn prune_rotated_logs(logs_dir: &Path) -> (usize, u64) {
     }
     let max_age = days * 86_400;
     let now = std::time::SystemTime::now();
-    let Ok(rd) = std::fs::read_dir(logs_dir) else { return (0, 0) };
+    let Ok(rd) = std::fs::read_dir(logs_dir) else {
+        return (0, 0);
+    };
     let (mut n, mut bytes) = (0usize, 0u64);
     for e in rd.flatten() {
         let Ok(md) = e.metadata() else { continue };
@@ -857,7 +1034,9 @@ pub fn prune_stale_build_targets(home: &Path) -> (usize, u64) {
     let max_age = days * 86_400;
     let canonical = home.join("rust-build-target");
     let now = std::time::SystemTime::now();
-    let Ok(rd) = std::fs::read_dir(home) else { return (0, 0) };
+    let Ok(rd) = std::fs::read_dir(home) else {
+        return (0, 0);
+    };
     let (mut n, mut bytes) = (0usize, 0u64);
     for e in rd.flatten() {
         let Ok(md) = e.metadata() else { continue };
@@ -912,7 +1091,9 @@ pub fn prune_temp_browser_dirs(home: &Path) -> (usize, u64) {
     let max_age = days * 86_400;
     let pw_dir = home.join("playwright-auth");
     let now = std::time::SystemTime::now();
-    let Ok(rd) = std::fs::read_dir(&pw_dir) else { return (0, 0) };
+    let Ok(rd) = std::fs::read_dir(&pw_dir) else {
+        return (0, 0);
+    };
     let (mut n, mut bytes) = (0usize, 0u64);
     for e in rd.flatten() {
         let Ok(md) = e.metadata() else { continue };
@@ -927,7 +1108,10 @@ pub fn prune_temp_browser_dirs(home: &Path) -> (usize, u64) {
         }
         // Temp dirs contain a timestamp suffix like `bb-1784387451210`
         let has_timestamp = name.contains('-')
-            && name.rsplit('-').next().is_some_and(|s| s.len() >= 10 && s.chars().all(|c| c.is_ascii_digit()));
+            && name
+                .rsplit('-')
+                .next()
+                .is_some_and(|s| s.len() >= 10 && s.chars().all(|c| c.is_ascii_digit()));
         if !has_timestamp {
             continue;
         }
@@ -976,7 +1160,9 @@ pub fn rotate_session_logs(logs_dir: &Path) -> (usize, u64) {
         return (0, 0);
     }
     let max_bytes = max_mb * 1024 * 1024;
-    let Ok(rd) = std::fs::read_dir(logs_dir) else { return (0, 0) };
+    let Ok(rd) = std::fs::read_dir(logs_dir) else {
+        return (0, 0);
+    };
     let (mut n, mut bytes) = (0usize, 0u64);
     for e in rd.flatten() {
         let Ok(md) = e.metadata() else { continue };
@@ -1022,20 +1208,11 @@ pub fn rotate_session_logs(logs_dir: &Path) -> (usize, u64) {
 // Periodic VACUUM
 // ---------------------------------------------------------------------------
 
-/// VACUUM at most once per day, when the storage sweep actually deleted rows.
-/// Returns true if a VACUUM ran.
-///
-/// SQLite DELETE frees pages internally but does not shrink the file. Without
-/// VACUUM, the DB file on disk grows monotonically even while the retention
-/// sweep dutifully removes aged rows. Measured 2026-09-09: 2.8 GB on disk,
-/// ~2.1 GB of live data, 82 free pages (essentially zero reclaimable space
-/// because the freelist is continuously reused for new writes). The gap
-/// between the two numbers is what VACUUM recovers.
-///
-/// Full VACUUM rewrites the entire file, so it is expensive. Once per day is a
-/// compromise: frequent enough that a single day's deletions are reclaimed
-/// before the next day's writes fill the freed pages, infrequent enough that
-/// the ~3 GB rewrite cost is negligible.
+// Full VACUUM rewrites every live page and monopolizes the writer. Retention
+// already leaves freed pages reusable by ordinary SQLite writes; large live
+// databases must not be rewritten merely because an age threshold elapsed.
+const AUTO_VACUUM_MAX_DB_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Truncate the WAL on EVERY tick, independent of VACUUM (AMUX-4811).
 ///
 /// The only `wal_checkpoint(TRUNCATE)` used to live inside `maybe_vacuum`,
@@ -1061,23 +1238,9 @@ async fn checkpoint_wal(store: &crate::db::SharedStore, home: &Path) -> (Option<
     let size = |p: &Path| std::fs::metadata(p).ok().map(|m| m.len());
     let before = size(&wal);
     let t0 = std::time::Instant::now();
-    // `read_async`, NOT `write_async`, and that is the whole fix.
-    //
-    // Every write_async closure runs inside an Immediate transaction
-    // (db/mod.rs:612), and SQLite refuses a checkpoint inside one. The first
-    // version of this function used write_async and the log said so on the
-    // very first tick: `wal_checkpoint(TRUNCATE) failed error=database table
-    // is locked`. read_async hands out a POOLED connection that is not in a
-    // transaction, and those are opened read-write
-    // (SqliteConnectionManager::file with no read-only flag), so the pragma
-    // can actually do its work. The "read-only" in that pool's docstring is a
-    // convention about intent, not an enforced flag.
-    let res = store
-        .read_async(move |conn| {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-            Ok(())
-        })
-        .await;
+    // Fixed maintenance goes through the sole writer without its usual
+    // transaction. Read-pool connections are intentionally query-only.
+    let res = store.maintenance_async(crate::db::Maintenance::Checkpoint).await;
     let after = size(&wal);
     match res {
         Ok(_) => {
@@ -1088,14 +1251,16 @@ async fn checkpoint_wal(store: &crate::db::SharedStore, home: &Path) -> (Option<
             if let (Some(b), Some(a)) = (before, after) {
                 if a > 8 * 1024 * 1024 && a > b / 2 {
                     tracing::warn!(
-                        before_bytes = b, after_bytes = a,
+                        before_bytes = b,
+                        after_bytes = a,
                         took_ms = t0.elapsed().as_millis() as u64,
                         "storage sweep: wal_checkpoint(TRUNCATE) did not shrink the WAL — a \
                          long-lived reader is holding the checkpoint off (AMUX-4811)"
                     );
                 } else {
                     tracing::info!(
-                        before_bytes = b, after_bytes = a,
+                        before_bytes = b,
+                        after_bytes = a,
                         took_ms = t0.elapsed().as_millis() as u64,
                         "storage sweep: WAL checkpointed"
                     );
@@ -1108,6 +1273,24 @@ async fn checkpoint_wal(store: &crate::db::SharedStore, home: &Path) -> (Option<
 }
 
 async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
+    maybe_vacuum_bounded(store, home, env_u64("AMUX_VACUUM_MAX_DB_BYTES", AUTO_VACUUM_MAX_DB_BYTES)).await
+}
+
+async fn maybe_vacuum_bounded(store: &crate::db::SharedStore, home: &Path, max_bytes: u64) -> bool {
+    let db_bytes = match std::fs::metadata(home.join("amux.db")) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            tracing::warn!(%error, measured=false, n_considered=1,
+                verdict="storage_vacuum_size_unavailable", "automatic vacuum deferred; database size is unknown");
+            return false;
+        }
+    };
+    if db_bytes > max_bytes {
+        tracing::info!(db_bytes, max_bytes, measured=true, n_considered=1,
+            verdict="storage_vacuum_size_deferred",
+            "automatic full rewrite deferred to preserve live writes; freed pages remain reusable");
+        return false;
+    }
     let marker = home.join(".last-vacuum");
     let min_interval = env_u64("AMUX_VACUUM_INTERVAL_SECS", 86_400);
     if min_interval == 0 {
@@ -1125,20 +1308,7 @@ async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
         }
     }
     let t0 = std::time::Instant::now();
-    // Same correction as checkpoint_wal above (AMUX-4811): VACUUM, like a
-    // checkpoint, cannot run inside a transaction, and write_async wraps every
-    // closure in an Immediate one (db/mod.rs:612). This path has therefore been
-    // failing for as long as it has existed. Nobody saw it because the marker
-    // below was written whether or not the work succeeded, so the next attempt
-    // was suppressed for another 24 hours and the log line said "VACUUM
-    // completed" only on a branch that never ran.
-    let res = store
-        .read_async(move |conn| {
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
-            conn.execute_batch("VACUUM;")?;
-            Ok(())
-        })
-        .await;
+    let res = store.maintenance_async(crate::db::Maintenance::Vacuum).await;
     // ONLY on success. Writing it unconditionally turned a failure into a
     // 24-hour silence, which is how a 4.16 GB database ended up carrying a
     // 143 MB WAL with nothing in the log to explain it.
@@ -1163,13 +1333,25 @@ async fn maybe_vacuum(store: &crate::db::SharedStore, home: &Path) -> bool {
 
 /// Free bytes on the volume holding `path`.
 pub fn disk_free_bytes(path: &Path) -> Option<u64> {
-    let df = ["/bin/df", "/usr/bin/df"].iter().find(|c| Path::new(c).is_file())?;
-    let out = std::process::Command::new(df).arg("-Pk").arg(path).output().ok()?;
+    let df = ["/bin/df", "/usr/bin/df"]
+        .iter()
+        .find(|c| Path::new(c).is_file())?;
+    let out = std::process::Command::new(df)
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let avail_kb: u64 = text.lines().last()?.split_whitespace().nth(3)?.parse().ok()?;
+    let avail_kb: u64 = text
+        .lines()
+        .last()?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
     Some(avail_kb * 1024)
 }
 
@@ -1192,6 +1374,10 @@ pub struct StorageReport {
     pub kept_card_referenced: usize,
     pub upload_refs_error: Option<String>,
     pub memory_entries_removed: usize,
+    /// Expired scratchpad items MOVED to scratchpad-expired/ (still on disk, so
+    /// not counted in `files_removed` / `bytes_freed`).
+    pub scratchpad_moved: usize,
+    pub scratchpad_moved_bytes: u64,
     pub run_logs: super::log_retention::Report,
     pub diagnostic_dirs: Vec<(String, super::log_retention::Report)>,
     pub dirs_removed: usize,
@@ -1228,42 +1414,112 @@ pub const AGE_PRUNED_DIRS: &[(&str, &str, u64)] = &[
     ("media-cache", "AMUX_MEDIA_CACHE_RETAIN_DAYS", 30),
     ("uploads", "AMUX_UPLOADS_RETAIN_DAYS", 7),
     ("spin-dumps", "AMUX_SPIN_DUMPS_RETAIN_DAYS", 14),
-    ("browser-screenshots", "AMUX_BROWSER_SCREENSHOTS_RETAIN_DAYS", 14),
-    ("email-attachments", "AMUX_EMAIL_ATTACHMENTS_RETAIN_DAYS", 30),
+    (
+        "browser-screenshots",
+        "AMUX_BROWSER_SCREENSHOTS_RETAIN_DAYS",
+        14,
+    ),
+    (
+        "email-attachments",
+        "AMUX_EMAIL_ATTACHMENTS_RETAIN_DAYS",
+        30,
+    ),
     ("transcripts", "AMUX_TRANSCRIPTS_RETAIN_DAYS", 30),
 ];
+
+/// Keep deleting a saturated table, one batch per write, until a batch comes
+/// back short or the budget is spent. Logs one line either way:
+/// `storage_retention_caught_up` or `storage_retention_backlog` (still behind
+/// after the budget, so the next tick resumes; the table has no cursor).
+async fn catch_up(state: &AppState, spec: &'static SweepSpec, now: f64) {
+    let budget = catchup_budget_ms();
+    if budget == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let (mut batches, mut rows, mut last) = (0u32, 0usize, SWEEP_BATCH);
+    while last == SWEEP_BATCH && (started.elapsed().as_millis() as u64) < budget {
+        let sink: std::sync::Arc<std::sync::Mutex<Option<rusqlite::Result<usize>>>> = Default::default();
+        let sink2 = sink.clone();
+        let r = state.store.write_async(move |conn| {
+            if let Ok(mut out) = sink2.lock() { *out = Some(sweep_batch(conn, spec, now)); }
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        }).await;
+        let got = sink.lock().ok().and_then(|mut v| v.take());
+        match (r, got) {
+            (Ok(_), Some(Ok(n))) => { last = n; rows += n; batches += 1; }
+            (r, got) => {
+                let error = match (r, got) {
+                    (Err(e), _) => e.to_string(),
+                    (_, Some(Err(e))) => e.to_string(),
+                    _ => "no receipt".to_string(),
+                };
+                tracing::warn!(verdict = "storage_retention_catchup_error", table = spec.table,
+                    knob = spec.env, batches, rows, %error, "retention catch-up stopped on an error");
+                return;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let behind = last == SWEEP_BATCH;
+    if behind {
+        tracing::warn!(verdict = "storage_retention_backlog", table = spec.table, knob = spec.env,
+            batches, rows, elapsed_ms, budget_ms = budget, measured = true, n_considered = rows,
+            "retention still behind after this tick's catch-up budget; the next tick resumes");
+    } else {
+        tracing::info!(verdict = "storage_retention_caught_up", table = spec.table, knob = spec.env,
+            batches, rows, elapsed_ms, measured = true, n_considered = rows,
+            "retention caught up: the last batch came back short");
+    }
+}
 
 pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     let t0 = std::time::Instant::now();
     let now = unix_now();
-    let mut rep = StorageReport { at: now, ..Default::default() };
+    let mut rep = StorageReport {
+        at: now,
+        ..Default::default()
+    };
 
-    // DB retention runs on the writer thread — one transaction, and
-    // `applied: false` so retention never bumps `_amux_rev`. A delete of aged
-    // rows is not a state change any client needs to delta-sync (the
-    // request-log sweep established this; without it, every sweep would look
-    // like a fleet-wide mutation and trigger a sync storm).
-    // Results travel back on an Arc the closure captures: `write` must return a
-    // `WriteOutcome`, so there is no other channel for them, and a module-level
-    // static would let two ticks (or a test) overwrite each other's results.
-    let sink: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
-    let sink2 = sink.clone();
-    let res = state
-        .store
-        .write_async(move |conn| {
-            let mut out = Vec::new();
-            for spec in SPECS {
-                out.push((spec.table.to_string(), format!("{:?}", sweep_one(conn, spec, now))));
+    // Yield the sole writer between tables. Each sweep remains atomic and
+    // revision-free, but worker commands can interleave with maintenance.
+    for spec in SPECS {
+        let sink: std::sync::Arc<std::sync::Mutex<Option<SweepResult>>> = Default::default();
+        let sink2 = sink.clone();
+        let result = state.store.write_async(move |conn| {
+            let started = std::time::Instant::now();
+            let result = sweep_guarded_delete(conn, spec, now);
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if elapsed_ms >= 100 {
+                tracing::warn!(verdict="storage_retention_slow", table=spec.table,
+                    elapsed_ms, measured=true, n_considered=1, result=?result,
+                    "retention occupied the shared writer");
             }
-            if let Ok(mut s) = sink2.lock() {
-                *s = out;
+            if let Ok(mut output) = sink2.lock() { *output = Some(result); }
+            Ok(crate::db::WriteOutcome { applied:false, events:vec![] })
+        }).await;
+        // What survived, the sweep's log line and its diagnostic, on a read
+        // connection: they count rows, and the writer must not (AF-1075).
+        let written = sink.lock().ok().and_then(|v| v.clone());
+        let reported = match written.clone() {
+            Some(w) => state.store.read_async(move |conn| Ok(sweep_report(conn, spec, now, w))).await.ok(),
+            None => None,
+        };
+        let outcome = match result {
+            Err(error) => format!("Error({error})"),
+            Ok(_) => reported.or(written.clone())
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_else(|| "Error(retention receipt unavailable)".into()),
+        };
+        let first_rows = written;
+        if let Some(SweepResult::Deleted { rows, .. }) = first_rows {
+            if rows == SWEEP_BATCH {
+                catch_up(state, spec, now).await;
             }
-            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
-        })
-        .await;
-    match res {
-        Err(e) => rep.tables.push(("<write>".into(), format!("Error({e})"))),
-        Ok(_) => rep.tables = sink.lock().map(|s| s.clone()).unwrap_or_default(),
+        }
+        rep.tables.push((spec.table.to_string(), outcome));
+        tokio::task::yield_now().await;
     }
 
     let logs = home.join("logs");
@@ -1289,8 +1545,13 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     // directories retain their existing age policy.
     let store = state.store.clone();
     let uploads = home.join("uploads");
-    let keep = tokio::task::spawn_blocking(move || store.read().and_then(|conn| card_referenced_uploads(&conn, &uploads)))
-        .await.unwrap_or_else(|error| Err(error.into()));
+    let keep = tokio::task::spawn_blocking(move || {
+        store
+            .read()
+            .and_then(|conn| card_referenced_uploads(&conn, &uploads))
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.into()));
     if let Err(error) = &keep {
         rep.upload_refs_error = Some(error.to_string());
         tracing::warn!(%error, "upload retention deferred: references unavailable");
@@ -1302,9 +1563,10 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
         let keeping = if *name == "uploads" {
             let Ok(keep) = &keep else { continue };
             keep
-        } else { &empty };
-        let (n, b, k) =
-            prune_dir_by_age_keeping(&home.join(name), days * 86_400, env_key, keeping);
+        } else {
+            &empty
+        };
+        let (n, b, k) = prune_dir_by_age_keeping(&home.join(name), days * 86_400, env_key, keeping);
         files += n;
         bytes += b;
         kept += k;
@@ -1314,8 +1576,17 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     rep.kept_card_referenced = kept;
 
     let log_refs = super::log_retention::references(state, "/logs/").await;
-    rep.run_logs = super::log_retention::sweep(home, "logs", env_u64("AMUX_RUN_LOG_RETAIN_DAYS", 30), log_refs).await;
+    rep.run_logs = super::log_retention::sweep(
+        home,
+        "logs",
+        env_u64("AMUX_RUN_LOG_RETAIN_DAYS", 30),
+        log_refs,
+    )
+    .await;
     rep.memory_entries_removed = crate::api::session_verbs::sweep_transcript_evidence();
+    // Scratchpad expiry (Ethan, 2026-10-09: "everything should expire after 1
+    // week, configurable in the scratchpad tab"). It moves, so it frees nothing.
+    (rep.scratchpad_moved, rep.scratchpad_moved_bytes) = crate::api::scratchpad::sweep(home);
 
     // Directory-level pruning (evidence captures, etc.).
     let (mut dirs, mut dir_bytes) = (0usize, 0u64);
@@ -1353,7 +1624,9 @@ pub async fn storage_tick(state: &AppState, home: &Path) -> StorageReport {
     // return to the OS. Only run when something was actually deleted, and at
     // most once per day. Full VACUUM is expensive and stays gated; the WAL
     // checkpoint it used to carry now runs above on its own schedule.
-    let total_deleted: usize = rep.tables.iter()
+    let total_deleted: usize = rep
+        .tables
+        .iter()
         .filter(|(_, v)| v.contains("Deleted { rows:") && !v.contains("rows: 0"))
         .count();
     if total_deleted > 0 {
@@ -1389,6 +1662,7 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
                 || r.vacuumed
                 || r.rotated_logs_removed > 0
                 || r.memory_entries_removed > 0
+                || r.scratchpad_moved > 0
                 || r.run_logs.removed > 0;
             if any_work {
                 tracing::info!(
@@ -1404,6 +1678,8 @@ pub fn spawn(state: AppState) -> Option<super::PeriodicTask> {
                     rotated_logs_removed = r.rotated_logs_removed,
                     rotated_logs_freed = r.rotated_logs_freed,
                     memory_entries_removed = r.memory_entries_removed,
+                    scratchpad_moved = r.scratchpad_moved,
+                    scratchpad_moved_bytes = r.scratchpad_moved_bytes,
                     run_log_dirs_removed = r.run_logs.removed,
                     run_log_bytes_freed = r.run_logs.bytes_freed,
                     "storage sweep tick"
@@ -1434,6 +1710,7 @@ pub async fn debug_storage() -> axum::Json<Value> {
         "rotated_log_retain_days": env_u64("AMUX_ROTATED_LOG_RETAIN_DAYS", 3),
         "run_log_retain_days": env_u64("AMUX_RUN_LOG_RETAIN_DAYS", 30),
         "sweep_secs": env_u64("AMUX_STORAGE_SWEEP_SECS", STORAGE_TICK_SECS),
+        "vacuum_max_db_bytes": env_u64("AMUX_VACUUM_MAX_DB_BYTES", AUTO_VACUUM_MAX_DB_BYTES),
         "dir_pruning": AGE_PRUNED_SUBDIRS.iter().map(|(name, env, default)| json!({
             "dir": name, "env": env, "retain_days": env_u64(env, *default),
         })).collect::<Vec<_>>(),
@@ -1445,6 +1722,7 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "kept_card_referenced": r.kept_card_referenced,
             "upload_references": {"measured": r.upload_refs_error.is_none(), "why_unmeasured": r.upload_refs_error},
             "memory_entries_removed": r.memory_entries_removed,
+            "scratchpad_moved": r.scratchpad_moved, "scratchpad_moved_bytes": r.scratchpad_moved_bytes,
             "run_logs": r.run_logs,
             "diagnostic_dirs": r.diagnostic_dirs,
             "dirs_removed": r.dirs_removed, "dir_bytes_freed": r.dir_bytes_freed,
@@ -1481,7 +1759,12 @@ mod tests {
                 .args(["--exact", "runtime_jobs::storage::tests::failed_snapshot_probe_logs_unknown_and_positive_control_logs_measured", "--nocapture"])
                 .env("AMUX_TEST_SNAPSHOT_LOG_CHILD", "1")
                 .output().unwrap();
-            assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
             return;
         }
@@ -1493,22 +1776,35 @@ mod tests {
                 self.0.lock().unwrap().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         for (script, measured) in [("exit 0", false), ("echo 'Snapshots for disk /:'", true)] {
             let bytes = Arc::new(Mutex::new(Vec::new()));
             let writer = Writer(bytes.clone());
-            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
-                .with_writer(move || writer.clone()).finish();
-            let result = tracing::subscriber::with_default(subscriber, ||
-                super::probe_local_snapshots("/bin/sh", &["-c", script], std::time::Duration::from_secs(1)));
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let result = tracing::subscriber::with_default(subscriber, || {
+                super::probe_local_snapshots(
+                    "/bin/sh",
+                    &["-c", script],
+                    std::time::Duration::from_secs(1),
+                )
+            });
             assert_eq!(result.is_some(), measured);
             let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
             assert!(logs.contains("storage_snapshot_probe"), "{logs}");
             assert!(logs.contains(&format!("measured={measured}")), "{logs}");
             assert!(logs.contains("n_considered=0"), "{logs}");
             if !measured {
-                assert!(logs.contains("WARN") && logs.contains("why_unmeasured="), "{logs}");
+                assert!(
+                    logs.contains("WARN") && logs.contains("why_unmeasured="),
+                    "{logs}"
+                );
             }
         }
     }
@@ -1516,20 +1812,51 @@ mod tests {
     #[test]
     fn native_snapshot_probe_preserves_zero_unknown_and_positive() {
         let budget = std::time::Duration::from_secs(2);
-        assert_eq!(super::probe_local_snapshots("/bin/echo", &["Snapshots for disk /:"], budget), Some(vec![]));
-        assert_eq!(super::probe_local_snapshots("/bin/echo", &["Snapshots for disk /:\ncom.apple.TimeMachine.example.local"], budget), Some(vec!["com.apple.TimeMachine.example.local".into()]));
-        for script in ["exit 0", "echo 'Snapshots for disk /:'; exit 1", "echo diagnostic"] {
-            assert_eq!(super::probe_local_snapshots("/bin/sh", &["-c", script], budget), None, "{script}");
+        assert_eq!(
+            super::probe_local_snapshots("/bin/echo", &["Snapshots for disk /:"], budget),
+            Some(vec![])
+        );
+        assert_eq!(
+            super::probe_local_snapshots(
+                "/bin/echo",
+                &["Snapshots for disk /:\ncom.apple.TimeMachine.example.local"],
+                budget
+            ),
+            Some(vec!["com.apple.TimeMachine.example.local".into()])
+        );
+        for script in [
+            "exit 0",
+            "echo 'Snapshots for disk /:'; exit 1",
+            "echo diagnostic",
+        ] {
+            assert_eq!(
+                super::probe_local_snapshots("/bin/sh", &["-c", script], budget),
+                None,
+                "{script}"
+            );
         }
-        assert_eq!(super::probe_local_snapshots("/no/such/amux-probe", &[], budget), None);
+        assert_eq!(
+            super::probe_local_snapshots("/no/such/amux-probe", &[], budget),
+            None
+        );
     }
 
     #[test]
     fn snapshot_probe_bounds_running_child_and_inherited_stdout() {
         for script in ["exec /bin/sleep 5", "/bin/sleep 1 & exit 0"] {
             let start = std::time::Instant::now();
-            assert_eq!(super::probe_local_snapshots("/bin/sh", &["-c", script], std::time::Duration::from_millis(150)), None);
-            assert!(start.elapsed() < std::time::Duration::from_millis(900), "probe outlived its own deadline: {script}");
+            assert_eq!(
+                super::probe_local_snapshots(
+                    "/bin/sh",
+                    &["-c", script],
+                    std::time::Duration::from_millis(150)
+                ),
+                None
+            );
+            assert!(
+                start.elapsed() < std::time::Duration::from_millis(900),
+                "probe outlived its own deadline: {script}"
+            );
         }
     }
 
@@ -1538,9 +1865,14 @@ mod tests {
         let budget = std::time::Duration::from_secs(5);
         // Finite deterministic byte streams. Without the ceiling the second
         // command succeeds with 2 MiB, rather than hitting a separate timeout.
-        let bytes = super::bounded_output("/bin/dd", &["if=/dev/zero", "bs=65536", "count=2"], budget).unwrap();
+        let bytes =
+            super::bounded_output("/bin/dd", &["if=/dev/zero", "bs=65536", "count=2"], budget)
+                .unwrap();
         assert_eq!(bytes.len(), 131072);
-        assert_eq!(super::bounded_output("/bin/dd", &["if=/dev/zero", "bs=65536", "count=32"], budget), None);
+        assert_eq!(
+            super::bounded_output("/bin/dd", &["if=/dev/zero", "bs=65536", "count=32"], budget),
+            None
+        );
     }
 
     use super::*;
@@ -1563,7 +1895,11 @@ mod tests {
     fn board(rows: &[(&str, &str, i64)]) -> Connection {
         let c = crate::db::migrate::test_memdb();
         for (id, desc, archived) in rows {
-            let status = if id.starts_with("DISC") { "discarded" } else { "todo" };
+            let status = if id.starts_with("DISC") {
+                "discarded"
+            } else {
+                "todo"
+            };
             c.execute(
                 // `created` is NOT NULL in the real schema. The hand-rolled
                 // fixture this replaced did not have that column at all, which
@@ -1599,13 +1935,25 @@ mod tests {
         aged_file(dir.path(), "orphan.png", 10 * 86_400);
         let conn = board(&[("AMUX-1", "see /Users/ethan/.amux/uploads/referenced.png", 0)]);
         let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
-        assert!(keep.contains("referenced.png"), "keep-set must find the reference: {keep:?}");
+        assert!(
+            keep.contains("referenced.png"),
+            "keep-set must find the reference: {keep:?}"
+        );
 
-        let (removed, _, kept) =
-            prune_dir_by_age_keeping(dir.path(), 7 * 86_400, "TEST", &keep);
-        assert!(dir.path().join("referenced.png").exists(), "a live card's attachment survives");
-        assert!(!dir.path().join("orphan.png").exists(), "an unreferenced aged file is reaped");
-        assert_eq!((removed, kept), (1, 1), "and both outcomes are COUNTED, not just done");
+        let (removed, _, kept) = prune_dir_by_age_keeping(dir.path(), 7 * 86_400, "TEST", &keep);
+        assert!(
+            dir.path().join("referenced.png").exists(),
+            "a live card's attachment survives"
+        );
+        assert!(
+            !dir.path().join("orphan.png").exists(),
+            "an unreferenced aged file is reaped"
+        );
+        assert_eq!(
+            (removed, kept),
+            (1, 1),
+            "and both outcomes are COUNTED, not just done"
+        );
     }
 
     /// CONTROL, and the one that keeps this from becoming a leak: `discarded`
@@ -1615,16 +1963,27 @@ mod tests {
     #[test]
     fn a_discarded_or_archived_card_does_not_pin_its_upload() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["discarded.png", "archived.png", "live.png"] { aged_file(dir.path(), name, 0); }
+        for name in ["discarded.png", "archived.png", "live.png"] {
+            aged_file(dir.path(), name, 0);
+        }
         let conn = board(&[
             ("DISC-1", "/Users/ethan/.amux/uploads/discarded.png", 0),
             ("AMUX-2", "/Users/ethan/.amux/uploads/archived.png", 1),
             ("AMUX-3", "/Users/ethan/.amux/uploads/live.png", 0),
         ]);
         let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
-        assert!(keep.contains("live.png"), "positive control: a live card still pins");
-        assert!(!keep.contains("discarded.png"), "a discarded card must not pin its upload");
-        assert!(!keep.contains("archived.png"), "an archived card must not pin its upload");
+        assert!(
+            keep.contains("live.png"),
+            "positive control: a live card still pins"
+        );
+        assert!(
+            !keep.contains("discarded.png"),
+            "a discarded card must not pin its upload"
+        );
+        assert!(
+            !keep.contains("archived.png"),
+            "an archived card must not pin its upload"
+        );
     }
 
     /// The reference is matched by FILENAME, so it has to survive the forms a
@@ -1634,9 +1993,15 @@ mod tests {
     #[test]
     fn the_reference_is_found_in_every_form_a_card_carries_it() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["at-form.png", "url-form.png", "md-form.png"] { aged_file(dir.path(), name, 0); }
+        for name in ["at-form.png", "url-form.png", "md-form.png"] {
+            aged_file(dir.path(), name, 0);
+        }
         let conn = board(&[
-            ("A", "make it automatic @/Users/ethan/.amux/uploads/at-form.png", 0),
+            (
+                "A",
+                "make it automatic @/Users/ethan/.amux/uploads/at-form.png",
+                0,
+            ),
             ("B", "screenshot: /api/uploads/url-form.png", 0),
             ("C", "![shot](/api/uploads/md-form.png) and text after", 0),
         ]);
@@ -1652,23 +2017,36 @@ mod tests {
     #[test]
     fn upload_retention_references_include_artifacts_saved_messages_and_pending_steering() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["artifact.png", "saved.png", "pending.png"] { aged_file(dir.path(), name, 0); }
+        for name in ["artifact.png", "saved.png", "pending.png"] {
+            aged_file(dir.path(), name, 0);
+        }
         let conn = board(&[]);
         conn.execute_batch("INSERT INTO _amux_task_artifacts(id,task_id,kind,ref_value,created_at,updated_at) VALUES('a','t','file','/uploads/artifact.png',0,0);
             INSERT INTO saved_messages(label,text,created) VALUES('saved','/uploads/saved.png',0);
             INSERT INTO steering_queue(session,text,queued_at) VALUES('worker','/uploads/pending.png',0);").unwrap();
         let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
-        for file in ["artifact.png", "saved.png", "pending.png"] { assert!(keep.contains(file), "{file}"); }
+        for file in ["artifact.png", "saved.png", "pending.png"] {
+            assert!(keep.contains(file), "{file}");
+        }
         conn.execute_batch("DROP TABLE saved_messages").unwrap();
-        assert!(card_referenced_uploads(&conn, dir.path()).is_err(), "partial reference data is not a safe keep-set");
+        assert!(
+            card_referenced_uploads(&conn, dir.path()).is_err(),
+            "partial reference data is not a safe keep-set"
+        );
     }
 
     #[test]
     fn upload_retention_protects_spaces_unicode_and_percent_encoded_file_urls() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["naïve café.txt", "report final.pdf", "unused final.pdf"] { aged_file(dir.path(), name, 40 * 86_400); }
+        for name in ["naïve café.txt", "report final.pdf", "unused final.pdf"] {
+            aged_file(dir.path(), name, 40 * 86_400);
+        }
         let conn = board(&[
-            ("A", "Review file:///tmp/uploads/na%C3%AFve%20caf%C3%A9.txt and then reply", 0),
+            (
+                "A",
+                "Review file:///tmp/uploads/na%C3%AFve%20caf%C3%A9.txt and then reply",
+                0,
+            ),
             ("B", "See /uploads/report final.pdf for evidence", 0),
         ]);
         let keep = card_referenced_uploads(&conn, dir.path()).unwrap();
@@ -1682,19 +2060,38 @@ mod tests {
     #[tokio::test]
     async fn upload_retention_defers_deletion_when_reference_probe_fails() {
         let home = tempfile::tempdir().unwrap();
-        let store = std::sync::Arc::new(crate::db::Store::open(&home.path().join("test.db")).unwrap());
-        store.write_async(|conn| {
-            conn.execute_batch("DROP TABLE saved_messages")?;
-            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
-        }).await.unwrap();
-        let state = AppState { store, started: std::time::Instant::now(), build_hash: "test".into(), auth_token: None,
-            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let store =
+            std::sync::Arc::new(crate::db::Store::open(&home.path().join("test.db")).unwrap());
+        store
+            .write_async(|conn| {
+                conn.execute_batch("DROP TABLE saved_messages")?;
+                Ok(crate::db::WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                })
+            })
+            .await
+            .unwrap();
+        let state = AppState {
+            store,
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
         let uploads = home.path().join("uploads");
         std::fs::create_dir(&uploads).unwrap();
         aged_file(&uploads, "saved.png", 40 * 86_400);
         let report = storage_tick(&state, home.path()).await;
-        assert!(uploads.join("saved.png").exists(), "probe failure must never mean no references");
-        assert!(report.upload_refs_error.as_deref().unwrap().contains("saved_messages"));
+        assert!(
+            uploads.join("saved.png").exists(),
+            "probe failure must never mean no references"
+        );
+        assert!(report
+            .upload_refs_error
+            .as_deref()
+            .unwrap()
+            .contains("saved_messages"));
         assert_eq!(report.files_removed, 0);
     }
 
@@ -1707,7 +2104,10 @@ mod tests {
         // refactor ever makes them equal, every ms table empties on tick one.
         let s: f64 = secs.parse().unwrap();
         let m: f64 = ms.parse().unwrap();
-        assert!((m / s - 1000.0).abs() < 1.0, "millis cutoff must be 1000x the seconds cutoff");
+        assert!(
+            (m / s - 1000.0).abs() < 1.0,
+            "millis cutoff must be 1000x the seconds cutoff"
+        );
         assert!(cutoff_for(TsUnit::IsoText, now, 1.0).starts_with("2026-08-"));
     }
 
@@ -1725,8 +2125,8 @@ mod tests {
     /// looks ancient and the sweep would empty the table.
     #[test]
     fn age_retention_keeps_pending_capture_but_prunes_completed_history() {
-        let dir=tempfile::tempdir().unwrap();
-        let store=crate::db::Store::open(&dir.path().join("retention.db")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("retention.db")).unwrap();
         store.write(|conn| {
             let now=unix_now();
             conn.execute("INSERT INTO cmd_history(id,text,type,session,ts,capture_pending) VALUES (1,'unfinished task','user','fixture',1,1),(2,'old completed','user','fixture',2,0),(3,'recent','user','fixture',?1,0)",[(now*1000.0) as i64])?;
@@ -1739,9 +2139,45 @@ mod tests {
     }
 
     #[test]
+    fn retention_batches_preserve_protected_rows_and_resume_remaining_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("batch.db");
+        let now = unix_now();
+        let spec = SweepSpec { table:"cmd_history", ts_col:"ts", unit:TsUnit::Millis,
+            env:"AMUX_TEST_CAPTURE_RETAIN_DAYS_UNUSED", default_days:90.0 };
+        {
+            let store = crate::db::Store::open(&path).unwrap();
+            store.write(move |c| {
+                for id in 1..=600 {
+                    c.execute("INSERT INTO cmd_history(id,text,type,session,ts,capture_pending) VALUES(?1,'aged','user','fixture',1,0)",[id])?;
+                }
+                c.execute("INSERT INTO cmd_history(id,text,type,session,ts,capture_pending) VALUES(601,'pending','user','fixture',1,1),(602,'recent','user','fixture',?1,0)",[(now*1000.0) as i64])?;
+                Ok(crate::db::WriteOutcome {applied:true,events:vec![]})
+            }).unwrap();
+            store.write(move |c| {
+                assert_eq!(sweep_one(c, &spec, now), SweepResult::Deleted {rows:256, kept:346});
+                Ok(crate::db::WriteOutcome {applied:false,events:vec![]})
+            }).unwrap();
+        }
+        // Reopening the same store is sufficient: unfinished batches have no
+        // volatile cursor and protected pending capture remains ineligible.
+        let store = crate::db::Store::open(&path).unwrap();
+        let rev = store.current_rev().unwrap();
+        store.write(move |c| {
+            assert_eq!(sweep_one(c,&spec,now), SweepResult::Deleted {rows:256,kept:90});
+            assert_eq!(sweep_one(c,&spec,now), SweepResult::Deleted {rows:88,kept:2});
+            assert_eq!(sweep_one(c,&spec,now), SweepResult::Deleted {rows:0,kept:2});
+            assert_eq!(c.query_row("SELECT capture_pending FROM cmd_history WHERE id=601",[],|r|r.get::<_,i64>(0))?,1);
+            Ok(crate::db::WriteOutcome {applied:false,events:vec![]})
+        }).unwrap();
+        assert_eq!(store.current_rev().unwrap(),rev);
+    }
+
+    #[test]
     fn a_cutoff_that_would_empty_the_table_is_refused() {
         let c = mem();
-        c.execute_batch("CREATE TABLE session_events (id INTEGER PRIMARY KEY, ts REAL)").unwrap();
+        c.execute_batch("CREATE TABLE session_events (id INTEGER PRIMARY KEY, ts REAL, type TEXT)")
+            .unwrap();
         let now = unix_now();
         for i in 0..10 {
             c.execute(
@@ -1758,16 +2194,26 @@ mod tests {
             default_days: 1.0,
         };
         let r = sweep_one(&c, &wrong, now);
-        assert!(matches!(r, SweepResult::Refused { total: 10, .. }), "got {r:?}");
-        let left: i64 =
-            c.query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0)).unwrap();
+        assert!(
+            matches!(r, SweepResult::Refused { total: 10, .. }),
+            "got {r:?}"
+        );
+        let left: i64 = c
+            .query_row("SELECT COUNT(*) FROM session_events", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(left, 10, "a refusal must not delete a single row");
 
         // Correctly declared, the same data keeps everything (rows are minutes
         // old, retention is a day) — which proves the refusal above came from
         // the unit and not from the data.
-        let right = SweepSpec { unit: TsUnit::Secs, ..wrong };
-        assert!(matches!(sweep_one(&c, &right, now), SweepResult::Deleted { rows: 0, kept: 10 }));
+        let right = SweepSpec {
+            unit: TsUnit::Secs,
+            ..wrong
+        };
+        assert!(matches!(
+            sweep_one(&c, &right, now),
+            SweepResult::Deleted { rows: 0, kept: 10 }
+        ));
     }
 
     /// The OTHER direction, which is silent: a MILLISECOND table mis-declared
@@ -1799,22 +2245,69 @@ mod tests {
         // Safe, so not a refusal — but nothing is deleted despite every row
         // being 200-400 days old. Guard 2 logs the warning; the observable
         // contract is that data is untouched.
-        assert_eq!(sweep_one(&c, &wrong, now), SweepResult::Deleted { rows: 0, kept: 3 });
+        assert_eq!(
+            sweep_one(&c, &wrong, now),
+            SweepResult::Deleted { rows: 0, kept: 3 }
+        );
         // The tell guard 2 keys on, and it is NOT "very old": read as seconds,
         // a millisecond timestamp is dated tens of thousands of years in the
         // FUTURE, so the age is negative.
-        let age_days = oldest_secs(&c, &wrong).map(|s| (now - s) / 86_400.0).unwrap();
-        assert!(age_days < 0.0, "ms-as-secs must read as a future date, got {age_days} days");
+        let age_days = oldest_secs(&c, &wrong)
+            .map(|s| (now - s) / 86_400.0)
+            .unwrap();
+        assert!(
+            age_days < 0.0,
+            "ms-as-secs must read as a future date, got {age_days} days"
+        );
 
         // Declared correctly, the same rows sweep as intended.
-        let right = SweepSpec { unit: TsUnit::Millis, ..wrong };
-        assert_eq!(sweep_one(&c, &right, now), SweepResult::Deleted { rows: 2, kept: 1 });
+        let right = SweepSpec {
+            unit: TsUnit::Millis,
+            ..wrong
+        };
+        assert_eq!(
+            sweep_one(&c, &right, now),
+            SweepResult::Deleted { rows: 2, kept: 1 }
+        );
+    }
+
+    /// AF-1075: the writer half counts nothing. It reports kept as -1, and the
+    /// read half fills in what survived, protected rows included, so the
+    /// whole-table count no longer holds the single writer.
+    #[test]
+    fn the_writer_half_leaves_counting_to_the_read_half() {
+        let c = mem();
+        c.execute_batch("CREATE TABLE session_events (id INTEGER PRIMARY KEY, ts REAL, type TEXT)")
+            .unwrap();
+        let now = unix_now();
+        for (d, ty) in [(200.0, "x"), (150.0, "chat.message"), (5.0, "x"), (1.0, "x")] {
+            c.execute(
+                "INSERT INTO session_events (ts, type) VALUES (?1, ?2)",
+                rusqlite::params![now - d * 86_400.0, ty],
+            )
+            .unwrap();
+        }
+        let spec = SweepSpec {
+            table: "session_events",
+            ts_col: "ts",
+            unit: TsUnit::Secs,
+            env: "AMUX_TEST_UNSET_SESSION_EVENTS_SPLIT",
+            default_days: 90.0,
+        };
+        let written = sweep_guarded_delete(&c, &spec, now);
+        assert_eq!(written, SweepResult::Deleted { rows: 1, kept: -1 }, "the writer half does not count");
+        assert_eq!(
+            sweep_report(&c, &spec, now, written),
+            SweepResult::Deleted { rows: 1, kept: 3 },
+            "the read half counts the survivors, the protected 150-day chat row included"
+        );
     }
 
     #[test]
     fn old_rows_go_and_new_rows_stay() {
         let c = mem();
-        c.execute_batch("CREATE TABLE session_events (id INTEGER PRIMARY KEY, ts REAL)").unwrap();
+        c.execute_batch("CREATE TABLE session_events (id INTEGER PRIMARY KEY, ts REAL, type TEXT)")
+            .unwrap();
         let now = unix_now();
         for d in [200.0, 150.0, 100.0, 5.0, 1.0] {
             c.execute(
@@ -1865,15 +2358,21 @@ mod tests {
             env: "AMUX_TEST_DORMANT",
             default_days: 90.0,
         };
-        assert!(matches!(sweep_one(&c, &spec, now), SweepResult::Refused { total: 3, .. }));
-        let left: i64 = c.query_row("SELECT COUNT(*) FROM schedule_runs", [], |r| r.get(0)).unwrap();
+        assert!(matches!(
+            sweep_one(&c, &spec, now),
+            SweepResult::Refused { total: 3, .. }
+        ));
+        let left: i64 = c
+            .query_row("SELECT COUNT(*) FROM schedule_runs", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(left, 3, "refusing is safe: it never deletes");
     }
 
     #[test]
     fn disabling_a_table_with_zero_days_sweeps_nothing() {
         let c = mem();
-        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, ts REAL)").unwrap();
+        c.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, ts REAL)")
+            .unwrap();
         std::env::set_var("AMUX_TEST_DISABLED_KNOB", "0");
         let spec = SweepSpec {
             table: "t",
@@ -1900,8 +2399,17 @@ mod tests {
 
         let rolled = rotate_server_log(logs).expect("should rotate");
         assert_eq!(rolled, 2 * 1024 * 1024);
-        assert_eq!(std::fs::metadata(logs.join("server-rs.log.1")).unwrap().len(), 2 * 1024 * 1024);
-        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0, "must truncate in place");
+        assert_eq!(
+            std::fs::metadata(logs.join("server-rs.log.1"))
+                .unwrap()
+                .len(),
+            2 * 1024 * 1024
+        );
+        assert_eq!(
+            std::fs::metadata(&log).unwrap().len(),
+            0,
+            "must truncate in place"
+        );
 
         // The held fd must still write to the SAME path — this is what a
         // rename would have broken, silently and permanently.
@@ -1935,17 +2443,26 @@ mod tests {
         // a real cutoff and backdated mtimes instead.
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
         for f in ["session-a.log.1", "server-rs.log.1", "session-b.log"] {
-            let h = std::fs::File::options().write(true).open(logs.join(f)).unwrap();
+            let h = std::fs::File::options()
+                .write(true)
+                .open(logs.join(f))
+                .unwrap();
             h.set_modified(old).unwrap();
         }
         let (n, _) = prune_rotated_logs(logs);
         assert_eq!(n, 1, "only the aged session rotation is eligible");
-        assert!(!logs.join("session-a.log.1").exists(), "an aged rotation is pruned");
+        assert!(
+            !logs.join("session-a.log.1").exists(),
+            "an aged rotation is pruned"
+        );
         assert!(
             logs.join("server-rs.log.1").exists(),
             "server-rs.log.1 belongs to rotate_server_log and must survive at any age"
         );
-        assert!(logs.join("session-b.log").exists(), "a live .log is never a rotation");
+        assert!(
+            logs.join("session-b.log").exists(),
+            "a live .log is never a rotation"
+        );
         std::env::remove_var("AMUX_ROTATED_LOG_RETAIN_DAYS");
     }
 
@@ -1956,7 +2473,10 @@ mod tests {
         let (n, _) = prune_dir_by_age(dir.path(), 86_400, "AMUX_TEST");
         assert_eq!(n, 0, "a file created just now is not stale");
         let (n, _) = prune_dir_by_age(dir.path(), 0, "AMUX_TEST");
-        assert_eq!(n, 0, "0 disables the sweep entirely rather than deleting everything");
+        assert_eq!(
+            n, 0,
+            "0 disables the sweep entirely rather than deleting everything"
+        );
         assert!(dir.path().join("fresh.mp4").exists());
     }
 
@@ -1983,19 +2503,21 @@ mod tests {
         conn.execute_batch("CREATE TABLE t(v BLOB);").unwrap();
         let blob = vec![b'x'; 8192];
         for _ in 0..400 {
-            conn.execute("INSERT INTO t(v) VALUES (?1)", [&blob]).unwrap();
+            conn.execute("INSERT INTO t(v) VALUES (?1)", [&blob])
+                .unwrap();
         }
         let wal = dir.path().join("t.db-wal");
         let size = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
         let grown = size();
-        assert!(grown > 0, "the fixture must actually produce a WAL to truncate");
+        assert!(
+            grown > 0,
+            "the fixture must actually produce a WAL to truncate"
+        );
 
         // INSIDE a transaction: refused, exactly as the shipped bug was.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )
-        .unwrap();
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
         let refused = tx.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         assert!(
             refused.is_err(),
@@ -2005,13 +2527,75 @@ mod tests {
         drop(tx);
 
         // OUTSIDE one: it truncates.
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         assert!(
             size() < grown,
             "checkpoint outside a transaction must shrink the WAL: {} -> {}",
             grown,
             size()
         );
+    }
+
+    /// A backlog larger than one batch clears in ONE tick (2026-10-16: one
+    /// 256-row batch an hour left 137K rows past the 14-day bound), and the
+    /// session.* 30-day rule trims status rows while message rows of the same
+    /// age keep their 90 days.
+    #[tokio::test]
+    async fn a_saturated_table_catches_up_within_one_tick() {
+        let home = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::db::Store::open(&home.path().join("amux.db")).unwrap());
+        let now = unix_now();
+        let old = now - 40.0 * 86_400.0;
+        store.write_async(move |c| {
+            for i in 0..1000 {
+                c.execute("INSERT INTO session_events (ts, type, data) VALUES (?1, 'session.native_status', '{}')", rusqlite::params![old - i as f64])?;
+            }
+            c.execute("INSERT INTO session_events (ts, type, data) VALUES (?1, 'message.sent', '{}')", rusqlite::params![old])?;
+            c.execute("INSERT INTO session_events (ts, type, data) VALUES (?1, 'session.native_status', '{}')", rusqlite::params![now])?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        }).await.unwrap();
+        let state = AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        storage_tick(&state, home.path()).await;
+        let left: Vec<String> = store.read().unwrap()
+            .prepare("SELECT type FROM session_events ORDER BY ts").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert_eq!(left, vec!["message.sent".to_string(), "session.native_status".to_string()],
+            "all 1000 aged status rows go in one tick; the 40-day message row and today's status row stay");
+    }
+
+    #[test]
+    fn sweep_batch_deletes_only_what_sweep_one_would() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE session_events (id INTEGER PRIMARY KEY, ts REAL, type TEXT, data TEXT)").unwrap();
+        let now = unix_now();
+        let old = now - 40.0 * 86_400.0;
+        for t in ["session.idle", "chat.message", "message.queued"] {
+            c.execute("INSERT INTO session_events (ts, type) VALUES (?1, ?2)", rusqlite::params![old, t]).unwrap();
+        }
+        let spec = SPECS.iter().find(|s| s.env == "AMUX_SESSION_STATUS_EVENTS_RETAIN_DAYS").unwrap();
+        assert_eq!(sweep_batch(&c, spec, now).unwrap(), 1, "only the session.* row is past 30 days for this spec");
+        let ninety = SPECS.iter().find(|s| s.env == "AMUX_SESSION_EVENTS_RETAIN_DAYS").unwrap();
+        assert_eq!(sweep_batch(&c, ninety, now).unwrap(), 0, "40 days is inside the 90-day bound");
+    }
+
+    #[tokio::test]
+    async fn automatic_vacuum_size_guard_preserves_database_and_success_marker() {
+        let home = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::db::Store::open(&home.path().join("amux.db")).unwrap());
+        let rev = store.current_rev().unwrap();
+        assert!(!maybe_vacuum_bounded(&store, home.path(), 1).await);
+        assert!(!home.path().join(".last-vacuum").exists());
+        assert_eq!(store.current_rev().unwrap(), rev);
+        assert_eq!(store.read().unwrap().query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        assert!(!maybe_vacuum_bounded(&store, &home.path().join("missing"), u64::MAX).await,
+            "unknown size must not authorize an unbounded rewrite");
     }
 
     /// The test above proves SQLITE's rule. It does NOT prove this module obeys
@@ -2024,9 +2608,9 @@ mod tests {
     /// words "write_async" while explaining why not to use it, and a naive grep
     /// would fail on the corrected code.
     #[test]
-    fn the_maintenance_paths_call_read_async_not_write_async() {
+    fn maintenance_paths_use_the_serialized_nontransactional_writer() {
         let src = include_str!("storage.rs");
-        for func in ["async fn checkpoint_wal", "async fn maybe_vacuum"] {
+        for func in ["async fn checkpoint_wal", "async fn maybe_vacuum_bounded"] {
             let start = src.find(func).unwrap_or_else(|| panic!("{func} not found"));
             let body = &src[start..];
             let end = body.find("\n}\n").map(|i| i + 2).unwrap_or(body.len());
@@ -2042,9 +2626,26 @@ mod tests {
                  VACUUM inside one. The failure is silent unless someone reads the WARN."
             );
             assert!(
-                code.contains(".read_async("),
-                "{func} should take a pooled, non-transactional connection via read_async"
+                code.contains(".maintenance_async("),
+                "{func} must use fixed maintenance on the sole writer, never a pooled reader"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_retention_tests {
+    use super::*;
+    #[test]
+    fn chat_history_is_never_swept_with_telemetry() {
+        let spec = SPECS.iter().find(|s| s.table == "session_events").unwrap();
+        assert_eq!(retention_eligible(spec), "COALESCE(type,'') <> 'chat.message'");
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE session_events (ts INTEGER, type TEXT); \
+            INSERT INTO session_events VALUES (1,'chat.message'),(1,'status'),(9999999999,'status');").unwrap();
+        conn.execute(&format!("DELETE FROM session_events WHERE ts < 100 AND {}", retention_eligible(spec)), []).unwrap();
+        let left: Vec<String> = conn.prepare("SELECT type FROM session_events ORDER BY ts").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().flatten().collect();
+        assert_eq!(left, ["chat.message", "status"]);
     }
 }

@@ -31,8 +31,8 @@ use axum::{Json, Router};
 use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
-use p256::elliptic_curve::rand_core::{OsRng, RngCore};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::sec1::ToSec1Point;
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use p256::{PublicKey, SecretKey};
 use serde_json::{json, Value};
@@ -74,7 +74,7 @@ pub fn load_or_generate_vapid(path: &Path) -> anyhow::Result<Vapid> {
         SecretKey::from_pkcs8_pem(&std::fs::read_to_string(path)?)
             .map_err(|e| anyhow::anyhow!("unreadable VAPID key at {}: {e}", path.display()))?
     } else {
-        let sk = SecretKey::random(&mut OsRng);
+        let sk = SecretKey::generate();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -87,7 +87,7 @@ pub fn load_or_generate_vapid(path: &Path) -> anyhow::Result<Vapid> {
         }
         sk
     };
-    let public = secret.public_key().to_encoded_point(false);
+    let public = secret.public_key().to_sec1_point(false);
     Ok(Vapid {
         signing: SigningKey::from(&secret),
         public_key_b64: b64url(public.as_bytes()),
@@ -124,9 +124,9 @@ pub fn encrypt_web_push(
     auth_b64: &str,
     payload: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
-    let as_secret = SecretKey::random(&mut OsRng);
+    let as_secret = SecretKey::generate();
     let mut salt = [0u8; 16];
-    OsRng.fill_bytes(&mut salt);
+    getrandom::fill(&mut salt).expect("OS random source");
     encrypt_web_push_with(&as_secret, &salt, p256dh_b64, auth_b64, payload)
 }
 
@@ -144,7 +144,7 @@ fn encrypt_web_push_with(
     let ua_public = PublicKey::from_sec1_bytes(&ua_public_bytes)
         .map_err(|e| anyhow::anyhow!("bad p256dh subscription key: {e}"))?;
 
-    let as_public_bytes = as_secret.public_key().to_encoded_point(false);
+    let as_public_bytes = as_secret.public_key().to_sec1_point(false);
     let shared = p256::ecdh::diffie_hellman(as_secret.to_nonzero_scalar(), ua_public.as_affine());
 
     // IKM per RFC 8291 §3.3-3.4: HKDF-Extract(salt=auth_secret, ecdh_secret),
@@ -227,7 +227,10 @@ pub async fn send_one_push(
         .header("Urgency", "high") // wake the device promptly (iOS)
         .header("Content-Encoding", "aes128gcm")
         .header("Content-Type", "application/octet-stream")
-        .header("Authorization", format!("vapid t={jwt},k={}", vapid.public_key_b64))
+        .header(
+            "Authorization",
+            format!("vapid t={jwt},k={}", vapid.public_key_b64),
+        )
         .body(body)
         .send()
         .await;
@@ -253,7 +256,14 @@ struct SubRow {
 
 /// Send to every subscription; prune dead (404/410) ones like the Python
 /// server does. Returns per-endpoint {host, status, detail}.
-pub async fn send_all(state: &AppState, title: &str, body: &str, session: &str, tag: &str, url: &str) -> Vec<Value> {
+pub async fn send_all(
+    state: &AppState,
+    title: &str,
+    body: &str,
+    session: &str,
+    tag: &str,
+    url: &str,
+) -> Vec<Value> {
     let payload = serde_json::to_vec(&json!({
         "title": title, "body": body, "session": session, "tag": tag, "url": url,
     }))
@@ -271,7 +281,11 @@ pub async fn send_all(state: &AppState, title: &str, body: &str, session: &str, 
             let mut stmt = conn.prepare("SELECT endpoint, p256dh, auth FROM push_subscriptions")?;
             let rows = stmt
                 .query_map([], |r| {
-                    Ok(SubRow { endpoint: r.get(0)?, p256dh: r.get(1)?, auth: r.get(2)? })
+                    Ok(SubRow {
+                        endpoint: r.get(0)?,
+                        p256dh: r.get(1)?,
+                        auth: r.get(2)?,
+                    })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
@@ -294,7 +308,8 @@ pub async fn send_all(state: &AppState, title: &str, body: &str, session: &str, 
             .ok()
             .and_then(|u| u.host_str().map(str::to_string))
             .unwrap_or_default();
-        let (status, detail) = send_one_push(&vapid, &sub.endpoint, &sub.p256dh, &sub.auth, &payload).await;
+        let (status, detail) =
+            send_one_push(&vapid, &sub.endpoint, &sub.p256dh, &sub.auth, &payload).await;
         if status == 404 || status == 410 {
             // Subscription is gone at the push service; keeping the row only
             // manufactures a permanent failure entry in every future send.
@@ -302,8 +317,14 @@ pub async fn send_all(state: &AppState, title: &str, body: &str, session: &str, 
             let _ = state
                 .store
                 .write_async(move |conn| {
-                    let n = conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?1", [&endpoint])?;
-                    Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+                    let n = conn.execute(
+                        "DELETE FROM push_subscriptions WHERE endpoint = ?1",
+                        [&endpoint],
+                    )?;
+                    Ok(crate::db::WriteOutcome {
+                        applied: n > 0,
+                        events: vec![],
+                    })
                 })
                 .await;
         }
@@ -332,15 +353,37 @@ fn err(status: StatusCode, body: Value) -> Response {
 async fn public_key() -> Response {
     match load_or_generate_vapid(&vapid_path(&amux_home())) {
         Ok(v) => Json(json!({ "key": v.public_key_b64 })).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": e.to_string() }),
+        ),
     }
 }
 
-async fn subscribe(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
-    let endpoint = body.get("endpoint").and_then(Value::as_str).unwrap_or("").trim().to_string();
+async fn subscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let endpoint = body
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let keys = body.get("keys").cloned().unwrap_or(Value::Null);
-    let p256dh = keys.get("p256dh").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    let auth = keys.get("auth").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let p256dh = keys
+        .get("p256dh")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let auth = keys
+        .get("auth")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if endpoint.is_empty() || p256dh.is_empty() || auth.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -369,22 +412,39 @@ async fn subscribe(State(state): State<AppState>, headers: HeaderMap, Json(body)
         .await;
     match res {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": e.to_string() }),
+        ),
     }
 }
 
 async fn unsubscribe(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    let endpoint = body.get("endpoint").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let endpoint = body
+        .get("endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let res = state
         .store
         .write_async(move |conn| {
-            let n = conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?1", [&endpoint])?;
-            Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+            let n = conn.execute(
+                "DELETE FROM push_subscriptions WHERE endpoint = ?1",
+                [&endpoint],
+            )?;
+            Ok(crate::db::WriteOutcome {
+                applied: n > 0,
+                events: vec![],
+            })
         })
         .await;
     match res {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": e.to_string() }),
+        ),
     }
 }
 
@@ -398,8 +458,18 @@ async fn test_push(State(state): State<AppState>) -> Response {
         .await
         {
             Ok(Ok(n)) => n,
-            Ok(Err(e)) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+            Ok(Err(e)) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": e.to_string() }),
+                )
+            }
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": e.to_string() }),
+                )
+            }
         }
     };
     if count == 0 {
@@ -419,9 +489,9 @@ async fn test_push(State(state): State<AppState>) -> Response {
         "/",
     )
     .await;
-    let ok = results
-        .iter()
-        .any(|r| matches!(r.get("status").and_then(Value::as_u64), Some(s) if (200..300).contains(&s)));
+    let ok = results.iter().any(
+        |r| matches!(r.get("status").and_then(Value::as_u64), Some(s) if (200..300).contains(&s)),
+    );
     Json(json!({ "ok": ok, "sent_to": count, "results": results })).into_response()
 }
 
@@ -452,8 +522,14 @@ async fn subscriptions(State(state): State<AppState>) -> Response {
             Json(json!({ "count": subs.len(), "subject": vapid_subject(), "subscriptions": subs }))
                 .into_response()
         }
-        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+        Ok(Err(e)) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": e.to_string() }),
+        ),
+        Err(e) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "error": e.to_string() }),
+        ),
     }
 }
 
@@ -480,8 +556,9 @@ mod tests {
         let ciphertext = &msg[21 + idlen..];
 
         let as_public = PublicKey::from_sec1_bytes(as_public_bytes).unwrap();
-        let ua_public_bytes = ua_secret.public_key().to_encoded_point(false);
-        let shared = p256::ecdh::diffie_hellman(ua_secret.to_nonzero_scalar(), as_public.as_affine());
+        let ua_public_bytes = ua_secret.public_key().to_sec1_point(false);
+        let shared =
+            p256::ecdh::diffie_hellman(ua_secret.to_nonzero_scalar(), as_public.as_affine());
 
         let mut key_info = Vec::new();
         key_info.extend_from_slice(b"WebPush: info\x00");
@@ -493,25 +570,28 @@ mod tests {
             .unwrap();
         let hk = hkdf::Hkdf::<Sha256>::new(Some(salt), &ikm);
         let mut cek = [0u8; 16];
-        hk.expand(b"Content-Encoding: aes128gcm\x00", &mut cek).unwrap();
+        hk.expand(b"Content-Encoding: aes128gcm\x00", &mut cek)
+            .unwrap();
         let mut nonce = [0u8; 12];
-        hk.expand(b"Content-Encoding: nonce\x00", &mut nonce).unwrap();
+        hk.expand(b"Content-Encoding: nonce\x00", &mut nonce)
+            .unwrap();
 
         use aes_gcm::aead::Aead;
         use aes_gcm::KeyInit;
-        let mut record = aes_gcm::Aes128Gcm::new(aes_gcm::Key::<aes_gcm::Aes128Gcm>::from_slice(&cek))
-            .decrypt(aes_gcm::Nonce::from_slice(&nonce), ciphertext)
-            .expect("gcm tag must verify");
+        let mut record =
+            aes_gcm::Aes128Gcm::new(aes_gcm::Key::<aes_gcm::Aes128Gcm>::from_slice(&cek))
+                .decrypt(aes_gcm::Nonce::from_slice(&nonce), ciphertext)
+                .expect("gcm tag must verify");
         assert_eq!(record.pop(), Some(0x02), "last-record delimiter");
         record
     }
 
     #[test]
     fn rfc8291_encrypt_round_trips() {
-        let ua_secret = SecretKey::random(&mut OsRng);
-        let p256dh = b64url(ua_secret.public_key().to_encoded_point(false).as_bytes());
+        let ua_secret = SecretKey::generate();
+        let p256dh = b64url(ua_secret.public_key().to_sec1_point(false).as_bytes());
         let mut auth = [0u8; 16];
-        OsRng.fill_bytes(&mut auth);
+        getrandom::fill(&mut auth).expect("OS random source");
         let auth_b64 = b64url(&auth);
 
         let payload = br#"{"title":"amux","body":"round trip"}"#;
@@ -521,8 +601,8 @@ mod tests {
 
     #[test]
     fn rfc8291_rejects_tampering() {
-        let ua_secret = SecretKey::random(&mut OsRng);
-        let p256dh = b64url(ua_secret.public_key().to_encoded_point(false).as_bytes());
+        let ua_secret = SecretKey::generate();
+        let p256dh = b64url(ua_secret.public_key().to_sec1_point(false).as_bytes());
         let auth = [7u8; 16];
         let mut msg = encrypt_web_push(&p256dh, &b64url(&auth), b"x").unwrap();
         let last = msg.len() - 1;
@@ -535,14 +615,15 @@ mod tests {
     #[test]
     fn rfc8291_test_vector() {
         // RFC 8291 §5 test vector: fixed AS key, salt, UA key, auth secret.
-        let ua_secret_bytes =
-            b64url_decode("q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94").unwrap();
+        let ua_secret_bytes = b64url_decode("q1dXpw3UpT5VOmu_cf_v6ih07Aems3njxI-JWgLcM94").unwrap();
         let ua_secret = SecretKey::from_slice(&ua_secret_bytes).unwrap();
-        let as_secret_bytes =
-            b64url_decode("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw").unwrap();
+        let as_secret_bytes = b64url_decode("yfWPiYE-n46HLnH0KqZOF1fJJU3MYrct3AELtAQ-oRw").unwrap();
         let as_secret = SecretKey::from_slice(&as_secret_bytes).unwrap();
         let auth = b64url_decode("BTBZMqHH6r4Tts7J_aSIgg").unwrap();
-        let salt: [u8; 16] = b64url_decode("DGv6ra1nlYgDCS1FRnbzlw").unwrap().try_into().unwrap();
+        let salt: [u8; 16] = b64url_decode("DGv6ra1nlYgDCS1FRnbzlw")
+            .unwrap()
+            .try_into()
+            .unwrap();
         let p256dh = "BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4";
 
         let msg = encrypt_web_push_with(
@@ -559,7 +640,10 @@ mod tests {
              pK4Mqgkf1CXztLVBSt2Ks3oZwbuwXPXLWyouBWLVWGNWQexSgSxsj_Qulcy4a-fN",
         )
         .unwrap();
-        assert_eq!(msg, expected, "must reproduce the RFC 8291 §5 example message");
+        assert_eq!(
+            msg, expected,
+            "must reproduce the RFC 8291 §5 example message"
+        );
         assert_eq!(
             decrypt_web_push(&ua_secret, &auth, &msg),
             b"When I grow up, I want to be a watermelon".to_vec()
@@ -572,16 +656,19 @@ mod tests {
         let path = dir.path().join("vapid_private.pem");
         let vapid = load_or_generate_vapid(&path).unwrap();
         let exp = chrono::Utc::now().timestamp() + 3600;
-        let jwt = vapid_jwt(&vapid, "https://fcm.googleapis.com", "mailto:t@example.com", exp);
+        let jwt = vapid_jwt(
+            &vapid,
+            "https://fcm.googleapis.com",
+            "mailto:t@example.com",
+            exp,
+        );
 
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3, "compact JWS: header.claims.signature");
-        let header: Value =
-            serde_json::from_slice(&b64url_decode(parts[0]).unwrap()).unwrap();
+        let header: Value = serde_json::from_slice(&b64url_decode(parts[0]).unwrap()).unwrap();
         assert_eq!(header["alg"], "ES256");
         assert_eq!(header["typ"], "JWT");
-        let claims: Value =
-            serde_json::from_slice(&b64url_decode(parts[1]).unwrap()).unwrap();
+        let claims: Value = serde_json::from_slice(&b64url_decode(parts[1]).unwrap()).unwrap();
         assert_eq!(claims["aud"], "https://fcm.googleapis.com");
         assert_eq!(claims["sub"], "mailto:t@example.com");
         assert_eq!(claims["exp"], exp);
@@ -594,7 +681,33 @@ mod tests {
         assert_eq!(raw.len(), 64, "raw r||s signature, not DER");
         let sig = Signature::from_slice(&raw).unwrap();
         let signing_input = format!("{}.{}", parts[0], parts[1]);
-        vk.verify(signing_input.as_bytes(), &sig).expect("signature must verify");
+        vk.verify(signing_input.as_bytes(), &sig)
+            .expect("signature must verify");
+    }
+
+    /// A VAPID key already on disk (PKCS#8 PEM, written by Python's
+    /// `cryptography`) must load to the same public key, or every existing
+    /// dashboard subscription stops verifying. Header assembled at runtime
+    /// for the secret scanner, as below. Test-only key.
+    #[test]
+    fn an_existing_vapid_pem_loads_to_the_same_public_key() {
+        let pem = format!(
+            "-----BEGIN {k} KEY-----\n\
+             MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAdLDtKWWh3hpWks8\n\
+             LR4PABEiM0RVZneImaq7zN3u/wChRANCAAQNgm2BzpZhftEvRkDVWY3SH3S0IeXk\n\
+             kV6f2LoR69P4EaUKNkvW0kWTyaYoB4dfR8kaBXBwCUBp7PPetsLm4e/0\n\
+             -----END {k} KEY-----\n",
+            k = "PRIVATE"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vapid_private.pem");
+        std::fs::write(&path, &pem).unwrap();
+        let vapid = load_or_generate_vapid(&path).unwrap();
+        assert_eq!(
+            vapid.public_key_b64,
+            "BA2CbYHOlmF-0S9GQNVZjdIfdLQh5eSRXp_YuhHr0_gRpQo2S9bSRZPJpigHh19HyRoFcHAJQGns8962wubh7_Q"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), pem, "loading must not rewrite the key");
     }
 
     #[test]

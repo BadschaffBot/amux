@@ -9,6 +9,7 @@ import type { Page } from '@playwright/test';
 // not whichever bundle the installed API binary happens to contain.
 import { expect } from './fixtures';
 import { test } from './worker-lifecycle-fixture';
+import { getSessionsResilient } from './lifecycle/evidence';
 
 async function appToken(page: Page): Promise<string> {
   await page.goto('/');
@@ -55,6 +56,9 @@ for (const modelFamily of ['sonnet', 'haiku']) {
       await page.fill('#create-dir', process.env.AMUX_E2E_DIR || '/tmp');
       await page.fill('#create-prompt', prompt);
       await page.selectOption('#create-model', namedModel);
+      // A harness-driven worker: isolated workers never have a board, and the
+      // opt-in board below is about the ones that can.
+      await page.locator('#create-isolated').uncheck();
       const [created] = await Promise.all([
         page.waitForResponse(response => new URL(response.url()).pathname === '/api/sessions'
           && response.request().method() === 'POST'),
@@ -67,19 +71,73 @@ for (const modelFamily of ['sonnet', 'haiku']) {
       { timeout: 30_000 }).toBe(200);
       const cfg = await (await request.get(`/api/sessions/${worker}`, { headers: auth })).json();
       expect(cfg.flags || '', 'the selected model must reach the launch flags').toContain(modelFamily);
+      // The create-time prompt is queued durably (steering_queue) BEFORE the
+      // start and delivered once the worker boots, so it is attributed to this
+      // worker in whichever of the three stages it has reached: still queued,
+      // delivered by steering, or in message history.
       await expect.poll(async () => {
-        const history = await (await request.get(
-          `/api/history?session=${encodeURIComponent(worker)}&limit=20`, { headers: auth })).json();
-        return JSON.stringify(history);
+        const enc = encodeURIComponent(worker);
+        const [history, queued, steered] = await Promise.all([
+          request.get(`/api/history?session=${enc}&limit=20`, { headers: auth }),
+          request.get(`/api/sessions/${enc}/steer`, { headers: auth }),
+          request.get(`/api/sessions/${enc}/steer?history=1`, { headers: auth }),
+        ].map(async r => JSON.stringify(await (await r).json())));
+        return history + queued + steered;
       }, {
         message: 'the create-time prompt must be durably attributed to this worker',
         timeout: 30_000,
       }).toContain(prompt);
+      // ── NO BOARD UNTIL SOMEONE TURNS IT ON (Ethan, 2026-11-02: "the board
+      // is just getting in the models way") ─────────────────────────────────
+      // A new worker gets its prompt as plain text. Nothing files it as a card,
+      // its own board calls are refused, and its Board switch reads Off.
+      const boardUsed = async () => {
+        const rows = await getSessionsResilient(request, auth);
+        return (await rows.json()).find((s: any) => s.name === worker)?.board_used;
+      };
+      expect(await boardUsed(), 'a new worker has no board until someone turns it on').toBe(false);
+      const noBoard = await request.post('/api/board', {
+        headers: workerAuth,
+        data: { title: `[e2e] card before the board is on ${worker}`, session: worker, status: 'backlog' },
+      });
+      expect(noBoard.status(), 'a worker with no board is refused on its own board').toBe(403);
+      expect((await noBoard.json()).code).toBe('board_off');
+      const filed = await (await request.get(
+        `/api/board?all=1&session=${encodeURIComponent(worker)}`, { headers: auth })).json();
+      expect(filed.filter((c: any) => c.session === worker).map((c: any) => c.title),
+        'the create prompt must not be filed as a card').toEqual([]);
+      // The owner turns it on with the worker's one Board switch.
+      await page.evaluate(name => (window as any).openPeek(name), worker);
+      await page.locator('#peek-tab-issues').click();
+      const boardSwitch = page.locator('#peek-board-config .board-one-switch');
+      await expect(boardSwitch).toHaveText('Off');
+      await Promise.all([
+        page.waitForResponse(r => r.url().includes(`/api/sessions/${encodeURIComponent(worker)}/config`)
+          && r.request().method() === 'PATCH'),
+        boardSwitch.click(),
+      ]);
+      await expect.poll(boardUsed, { timeout: 20_000 }).toBe(true);
+      await expect(boardSwitch).toHaveText('On');
+      await page.evaluate(() => (window as any).closePeek());
+
       // Explicit negative-control invocation: fail after the real create/prompt
       // boundary and require teardown to retain this error and remove the worker.
       if (process.env.AMUX_E2E_LIFECYCLE_FAIL_AFTER_CREATE === '1') {
         throw new Error(`INJECTED_LIFECYCLE_FAILURE_AFTER_CREATE ${worker}`);
       }
+
+      // A throwaway AMUX_HOME refuses to spawn tmux (AMUX-4724) unless the
+      // server has a private tmux and fake agents, which the shared golden
+      // servers deliberately do not (live fake workers left running for the
+      // rest of the suite degraded the mobile server until every later test's
+      // page.goto timed out). Everything above holds either way; the running
+      // half needs a started worker, and says so rather than failing.
+      // Worker launch end to end is covered by e2e/chaos (fake agents, one
+      // private server per test).
+      const running = await expect.poll(async () =>
+        (await (await request.get(`/api/sessions/${worker}`, { headers: auth })).json()).running === true,
+      { timeout: 10_000 }).toBe(true).then(() => true, () => false);
+      test.skip(!running, 'this server does not spawn workers from a throwaway AMUX_HOME (AMUX-4724); the create and durable-attribution half ran');
 
       // ── VISIBLE WORKER AND STABLE TERMINAL ──────────────────────────────
       await page.reload();

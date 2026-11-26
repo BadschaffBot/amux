@@ -129,14 +129,29 @@ async fn create(body: Option<Json<CreateBody>>) -> Response {
     let res = tokio::task::spawn_blocking(move || spawn_pty(cols, rows)).await;
     match res {
         Ok(Ok(id)) => (StatusCode::OK, Json(json!({ "id": id }))).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
 fn spawn_pty(cols: u16, rows: u16) -> Result<String, String> {
-    let size = PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 };
-    let pair = native_pty_system().openpty(size).map_err(|e| e.to_string())?;
+    let size = PtySize {
+        rows: rows.max(1),
+        cols: cols.max(1),
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let pair = native_pty_system()
+        .openpty(size)
+        .map_err(|e| e.to_string())?;
     // `$SHELL` on the host, bash as the fallback the python used. Login-ish
     // interactive shell so the pane behaves like a real terminal.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
@@ -146,10 +161,17 @@ fn spawn_pty(cols: u16, rows: u16) -> Result<String, String> {
     // mutate Rust's process-global environment. Resolve the current file-backed
     // values for every new terminal so a key the UI just saved is usable from
     // the official shell as well as from a newly launched worker.
-    for (key, value) in
-        super::settings::runtime_provider_env(&super::settings::amux_home())
-    {
+    for (key, value) in super::settings::runtime_provider_env(&super::settings::amux_home()) {
         cmd.env(key, value);
+    }
+    // The amux CLI installs beside this server binary (~/.local/bin on an amux Cloud
+    // server), and only a LOGIN shell's ~/.profile puts that on PATH. This shell is not
+    // one, so `amux` was "command not found" here, and the dashboard's Connect GitHub,
+    // which runs `amux github login` in this terminal, waited forever (sandbox.amux.io,
+    // 2026-10-25).
+    let cli_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(std::path::Path::to_path_buf));
+    if let Some(path) = cli_dir.as_deref().and_then(|d| path_with_cli_dir(&std::env::var("PATH").unwrap_or_default(), d)) {
+        cmd.env("PATH", path);
     }
     if let Ok(home) = std::env::var("HOME") {
         cmd.cwd(home);
@@ -190,7 +212,13 @@ fn spawn_pty(cols: u16, rows: u16) -> Result<String, String> {
     reap_idle(&mut map);
     map.insert(
         id.clone(),
-        Session { master: pair.master, writer, child, shared, last_activity: Instant::now() },
+        Session {
+            master: pair.master,
+            writer,
+            child,
+            shared,
+            last_activity: Instant::now(),
+        },
     );
     Ok(id)
 }
@@ -208,7 +236,9 @@ async fn input(AxPath(id): AxPath<String>, body: Option<Json<InputBody>>) -> Res
             .or_else(|_| b64_std_decode(&data))
             .map_err(|_| "input data is not valid base64".to_string())?;
         let mut map = store().lock().map_err(|_| "store poisoned".to_string())?;
-        let Some(s) = map.get_mut(&id) else { return Ok(false) };
+        let Some(s) = map.get_mut(&id) else {
+            return Ok(false);
+        };
         s.writer.write_all(&bytes).map_err(|e| e.to_string())?;
         let _ = s.writer.flush();
         s.last_activity = Instant::now();
@@ -217,9 +247,17 @@ async fn input(AxPath(id): AxPath<String>, body: Option<Json<InputBody>>) -> Res
     .await;
     match res {
         Ok(Ok(true)) => Json(json!({ "ok": true })).into_response(),
-        Ok(Ok(false)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such terminal" }))).into_response(),
+        Ok(Ok(false)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such terminal" })),
+        )
+            .into_response(),
         Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -231,13 +269,24 @@ struct ResizeBody {
 
 async fn resize(AxPath(id): AxPath<String>, body: Option<Json<ResizeBody>>) -> Response {
     let Some(Json(ResizeBody { cols, rows })) = body else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "cols and rows required" }))).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "cols and rows required" })),
+        )
+            .into_response();
     };
     let res = tokio::task::spawn_blocking(move || -> Result<bool, String> {
         let mut map = store().lock().map_err(|_| "store poisoned".to_string())?;
-        let Some(s) = map.get_mut(&id) else { return Ok(false) };
+        let Some(s) = map.get_mut(&id) else {
+            return Ok(false);
+        };
         s.master
-            .resize(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize {
+                rows: rows.max(1),
+                cols: cols.max(1),
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| e.to_string())?;
         s.last_activity = Instant::now();
         Ok(true)
@@ -245,9 +294,21 @@ async fn resize(AxPath(id): AxPath<String>, body: Option<Json<ResizeBody>>) -> R
     .await;
     match res {
         Ok(Ok(true)) => Json(json!({ "ok": true })).into_response(),
-        Ok(Ok(false)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such terminal" }))).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e }))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        Ok(Ok(false)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such terminal" })),
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -293,7 +354,11 @@ async fn output(AxPath(id): AxPath<String>, Query(q): Query<OutputQ>) -> Respons
         // No such terminal -> report not-alive so the SPA clears its saved id
         // and creates a fresh pane, rather than erroring the whole tab.
         Ok(None) => Json(json!({ "alive": false, "data": "" })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -317,12 +382,24 @@ fn b64_std_encode(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -333,9 +410,29 @@ fn b64_std_decode(s: &str) -> Result<Vec<u8>, String> {
     crate::integrations::email::base64url_decode(s)
 }
 
+/// `path` with `dir` in front when `dir` holds the amux CLI and is not on it yet.
+fn path_with_cli_dir(path: &str, dir: &std::path::Path) -> Option<String> {
+    if !dir.join("amux").is_file() || path.split(':').any(|p| std::path::Path::new(p) == dir) {
+        return None;
+    }
+    Some(if path.is_empty() { dir.display().to_string() } else { format!("{}:{path}", dir.display()) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_terminal_finds_the_amux_cli_installed_beside_the_server() {
+        let bin = tempfile::tempdir().unwrap();
+        let d = bin.path();
+        assert_eq!(path_with_cli_dir("/usr/bin:/bin", d), None, "no amux CLI there: PATH untouched");
+        std::fs::write(d.join("amux"), "#!/bin/sh\n").unwrap();
+        assert_eq!(path_with_cli_dir("/usr/bin:/bin", d), Some(format!("{}:/usr/bin:/bin", d.display())));
+        let already = format!("/usr/bin:{}", d.display());
+        assert_eq!(path_with_cli_dir(&already, d), None, "already on PATH: not added twice");
+        assert_eq!(path_with_cli_dir("", d), Some(d.display().to_string()));
+    }
 
     #[test]
     fn base64_roundtrip_matches_standard_alphabet() {

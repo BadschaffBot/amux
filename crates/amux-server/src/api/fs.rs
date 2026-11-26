@@ -43,7 +43,7 @@
 //!   (max_filesize, ignored/hidden) — keep that honesty when touching it.
 
 use super::AppState;
-use axum::extract::{DefaultBodyLimit, RawQuery, Request};
+use axum::extract::{DefaultBodyLimit, RawQuery, Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -60,10 +60,12 @@ pub fn routes() -> Router<AppState> {
         .route("/open", any(open_native))
         .route("/upload", any(upload))
         .route("/rename", any(rename))
+        .route("/move", any(move_file))
         .route("/read", any(read_file))
         .route("/search", any(search))
         .route("/list", any(list_dir))
         .route("/delete", any(delete_path))
+        .route("/opened", any(opened))
         // NATIVE addition, not a Python port (AMUX-3511): existence-checked
         // resolution of a relative path a worker printed in its output.
         .route("/resolve", any(resolve_rel))
@@ -121,12 +123,14 @@ pub(crate) fn parse_body(bytes: &[u8]) -> Result<Value, String> {
             let next = chars.get(i + 1).copied();
             let valid = match next {
                 Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => true,
-                Some('u') => chars[i + 2..]
-                    .iter()
-                    .take(4)
-                    .filter(|c| c.is_ascii_hexdigit())
-                    .count()
-                    == 4,
+                Some('u') => {
+                    chars[i + 2..]
+                        .iter()
+                        .take(4)
+                        .filter(|c| c.is_ascii_hexdigit())
+                        .count()
+                        == 4
+                }
                 _ => false,
             };
             if valid {
@@ -145,7 +149,10 @@ pub(crate) fn parse_body(bytes: &[u8]) -> Result<Value, String> {
 
 /// str-typed body field with Python `.get(k) or ""` semantics.
 pub(crate) fn body_str(body: &Value, key: &str) -> String {
-    body.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    body.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Python `urllib.parse.parse_qs` equivalent: repeated keys kept, `+` is a
@@ -189,7 +196,9 @@ pub(crate) fn qs_get<'a>(qs: &'a [(String, String)], key: &str) -> Option<&'a st
 // ---------------------------------------------------------------------------
 
 fn home_dir() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"))
 }
 
 /// `Path(s).expanduser()`. `~user` forms are left untouched (Python would
@@ -244,11 +253,13 @@ pub(crate) fn pystr(p: &Path) -> String {
 /// on exhaustion remaining links pass through unresolved, which errs toward
 /// the containment check seeing the raw path (deny-safe: the blocked-set
 /// checks run on whatever comes back).
-fn resolve_nonstrict(p: &Path) -> PathBuf {
+pub(crate) fn resolve_nonstrict(p: &Path) -> PathBuf {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(p)
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(p)
     };
     let mut work: VecDeque<OsString> = abs
         .components()
@@ -323,8 +334,12 @@ const BLOCKED_SYSTEM_PATHS: &[&str] = &[
     "/var/db/sudo",
     "/private/var/db/sudo",
 ];
-const BLOCKED_SYSTEM_PREFIXES: &[&str] =
-    &["/etc/ssh/", "/private/etc/ssh/", "/var/run/secrets/", "/run/secrets/"];
+const BLOCKED_SYSTEM_PREFIXES: &[&str] = &[
+    "/etc/ssh/",
+    "/private/etc/ssh/",
+    "/var/run/secrets/",
+    "/run/secrets/",
+];
 
 /// Python `_is_path_allowed` (py:93-121). Case-INSENSITIVE on purpose:
 /// macOS/APFS is case-insensitive by default and a case-sensitive check let
@@ -354,7 +369,7 @@ async fn resolve_rel(method: Method, RawQuery(q): RawQuery) -> Response {
             .unwrap_or_default()
     };
     let cwd = get("cwd");
-    let rel = get("rel");
+    let rel = normalize_printed_rel(&get("rel"), std::env::var("HOME").ok().as_deref());
     if cwd.trim().is_empty() || rel.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -367,6 +382,66 @@ async fn resolve_rel(method: Method, RawQuery(q): RawQuery) -> Response {
     // probe existence inside paths the Files surface refuses to serve.
     let allowed_exists = |p: &Path| is_path_allowed(p) && p.exists();
     let (resolved, exists, mut tried) = resolve_rel_candidates(&cwd, &rel, &allowed_exists);
+    // An ELIDED path (`ff-capture/...FLOW-MAP.md`) names no file literally, so
+    // every candidate above fails and the caller used to fall back to a blind
+    // join that showed "not on disk" for a file that is right there.
+    if !exists {
+        let names = |d: &Path| if is_path_allowed(d) { real_list_names(d) } else { vec![] };
+        match resolve_rel_elided(&cwd, &rel, &names, &allowed_exists) {
+            Ok(Some(found)) if is_path_allowed(&found) => {
+                let s = found.display().to_string();
+                tracing::info!(rel = %rel, resolved = %s, measured = true, n_considered = 1,
+                    verdict = "fs_resolve_elided_match", "resolved an elided path to its one match");
+                tried.push(s.clone());
+                return Json(json!({ "resolved": s, "exists": true, "elided": true, "tried": tried })).into_response();
+            }
+            Err(many) => {
+                let c: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
+                tracing::info!(rel = %rel, n = c.len(), measured = true, n_considered = c.len(),
+                    verdict = "fs_resolve_elided_ambiguous", "elided path matches several files; not guessing");
+                return Json(json!({ "resolved": resolved, "exists": false, "elided": true,
+                    "ambiguous": c, "tried": tried })).into_response();
+            }
+            _ => {
+                // Not under the cwd or an ancestor: the elided path may start
+                // BELOW the cwd (`ff-capture/...FLOW-MAP.md` from
+                // customers/tubescience, where ff-capture is under parity/).
+                // Bounded breadth-first with resolve_rel_descend's skip list
+                // and limits.
+                let mut frontier = vec![PathBuf::from(cwd.trim_end_matches('/'))];
+                let mut visited = 0usize;
+                let mut found: Option<PathBuf> = None;
+                'outer: for _ in 0..DESCEND_MAX_DEPTH {
+                    let mut next = Vec::new();
+                    for dir in frontier {
+                        for child in real_list_dirs(&dir) {
+                            let name = child.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                            if DESCEND_SKIP.contains(&name) || !is_path_allowed(&child) {
+                                continue;
+                            }
+                            visited += 1;
+                            if visited > DESCEND_MAX_DIRS {
+                                break 'outer;
+                            }
+                            if let Ok(Some(f)) = resolve_rel_elided_at(&child.display().to_string(), &rel, &names, &allowed_exists, false) {
+                                found = Some(f);
+                                break 'outer;
+                            }
+                            next.push(child);
+                        }
+                    }
+                    frontier = next;
+                }
+                if let Some(f) = found.filter(|f| is_path_allowed(f)) {
+                    let s = f.display().to_string();
+                    tracing::info!(rel = %rel, resolved = %s, measured = true, n_considered = visited,
+                        verdict = "fs_resolve_elided_match", "resolved an elided path below the cwd");
+                    tried.push(s.clone());
+                    return Json(json!({ "resolved": s, "exists": true, "elided": true, "tried": tried })).into_response();
+                }
+            }
+        }
+    }
     // AMUX-4661 (Ethan's screenshots, jobs.py "does not exist here"): the
     // ancestor walk above only ever climbs — it cannot find a session
     // registered at a SCAFFOLD directory one level above where the worker
@@ -380,10 +455,40 @@ async fn resolve_rel(method: Method, RawQuery(q): RawQuery) -> Response {
     if !exists {
         let root = PathBuf::from(cwd.trim_end_matches('/'));
         let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
-        if let Some(found) = resolve_rel_descend(&root, rel_clean, &allowed_exists, &real_list_dirs) {
+        if let Some(found) = resolve_rel_descend(&root, rel_clean, &allowed_exists, &real_list_dirs)
+        {
             let s = found.display().to_string();
             tried.push(s.clone());
             return Json(json!({ "resolved": s, "exists": true, "tried": tried })).into_response();
+        }
+    }
+    // SIBLING SUBTREES (Ethan, 2026-09-27, mxp-marketing): a worker in
+    // gtm/playbooks printed `nbcuni/nbcuni-story.mp4` relative to
+    // gtm/launch-videos/prospect-videos, a directory it had named two lines
+    // earlier. The ascent tries ancestor/rel and the descent searches below
+    // the cwd, so a file in a SIBLING branch was reachable by neither and the
+    // viewer said "does not exist here". Search below each ancestor up to the
+    // repo root, nearest first, and take a match only when it is unique.
+    let mut ambiguous: Vec<String> = Vec::new();
+    if !exists {
+        let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
+        if let Some(top) = git_toplevel_of(&cwd).await {
+            let cwd_path = PathBuf::from(cwd.trim_end_matches('/'));
+            match resolve_rel_sibling(&cwd_path, Path::new(&top), rel_clean, &allowed_exists, &real_list_dirs) {
+                Ok(Some(found)) => {
+                    let s = found.display().to_string();
+                    tracing::info!(rel = %rel, resolved = %s, measured = true, n_considered = 1,
+                        verdict = "fs_resolve_sibling_match", "resolved a path in a sibling subtree of the cwd");
+                    tried.push(s.clone());
+                    return Json(json!({ "resolved": s, "exists": true, "sibling": true, "tried": tried })).into_response();
+                }
+                Err(many) => {
+                    ambiguous = many.iter().map(|p| p.display().to_string()).collect();
+                    tracing::info!(rel = %rel, n = ambiguous.len(), measured = true, n_considered = ambiguous.len(),
+                        verdict = "fs_resolve_sibling_ambiguous", "path matches several sibling files; not guessing");
+                }
+                Ok(None) => {}
+            }
         }
     }
     // Git fallback: the file may exist on origin/main even though it is not
@@ -401,6 +506,9 @@ async fn resolve_rel(method: Method, RawQuery(q): RawQuery) -> Response {
             }))
             .into_response();
         }
+    }
+    if !ambiguous.is_empty() {
+        return Json(json!({ "resolved": resolved, "exists": exists, "ambiguous": ambiguous, "tried": tried })).into_response();
     }
     Json(json!({ "resolved": resolved, "exists": exists, "tried": tried })).into_response()
 }
@@ -428,7 +536,13 @@ pub(crate) async fn git_resolve_rel(cwd: &str, rel: &str) -> Option<String> {
         let ok = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::process::Command::new("git")
-                .args(["-C", &toplevel, "cat-file", "-t", &format!("origin/main:{candidate}")])
+                .args([
+                    "-C",
+                    &toplevel,
+                    "cat-file",
+                    "-t",
+                    &format!("origin/main:{candidate}"),
+                ])
                 .output(),
         )
         .await
@@ -445,13 +559,92 @@ pub(crate) async fn git_resolve_rel(cwd: &str, rel: &str) -> Option<String> {
 
 /// Read a file's content from `origin/main` in the nearest git repo.
 pub(crate) async fn git_show_file(cwd: &str, rel: &str) -> Option<(String, Vec<u8>)> {
+    // AN ABSOLUTE PATH IS RELATIVE TO ITS OWN REPO, NOT TO "/". The dashboard
+    // sends terminal links already joined onto the worker's directory, so the
+    // old trim of the leading '/' asked git for
+    // `origin/main:Users/ethan/Dev/mixpeek/server/...`, which cannot exist.
+    // Measured 2026-09-27: gs-4's REALIZATION-LEDGER-2026-09-27.md was on
+    // origin/main (graft-push never updates the checkout), the relative form
+    // served it, and the absolute form the viewer sends said "file not found".
+    let (cwd_owned, rel_owned);
+    let (cwd, rel) = if Path::new(rel.trim()).is_absolute() {
+        let (dir, rel_to_top) = abs_to_repo_rel(Path::new(rel.trim())).await?;
+        cwd_owned = dir;
+        rel_owned = rel_to_top;
+        (cwd_owned.as_str(), rel_owned.as_str())
+    } else {
+        (cwd, rel)
+    };
     let rel_clean = rel.trim().trim_start_matches('/').trim_start_matches("./");
     if rel_clean.is_empty() {
         return None;
     }
     let toplevel = git_toplevel_of(cwd).await?;
+    if let Some(hit) = git_show_candidates(&toplevel, cwd, rel_clean).await {
+        return Some(hit);
+    }
+    // The local origin/main can lag what a worker just pushed. Fetch once and
+    // retry, at most once a minute per repo, so a burst of dead links cannot
+    // become a burst of fetches.
+    if claim_fetch_slot(&toplevel) {
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::process::Command::new("git")
+                .args(["-C", &toplevel, "fetch", "-q", "origin", "main"])
+                .output(),
+        )
+        .await
+        .is_ok_and(|o| o.is_ok_and(|o| o.status.success()));
+        tracing::info!(repo = %toplevel, path = %rel_clean, fetched,
+            verdict = "file_git_fallback_fetched",
+            "file viewer: path not on the local origin/main, fetched once and retried");
+        if fetched {
+            return git_show_candidates(&toplevel, cwd, rel_clean).await;
+        }
+    }
+    None
+}
+
+/// At most once a minute per repo.
+fn claim_fetch_slot(repo: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let mut m = LAST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    match m.get(repo) {
+        Some(t) if now.duration_since(*t) < Duration::from_secs(60) => false,
+        _ => {
+            m.insert(repo.to_string(), now);
+            true
+        }
+    }
+}
+
+/// (repo toplevel, path relative to it) for an absolute path that may not
+/// exist on disk: resolve the nearest existing ancestor, ask git for its
+/// toplevel, and re-attach the missing tail. Both sides are canonicalized so
+/// /tmp versus /private/tmp style aliases still strip.
+pub(crate) async fn abs_to_repo_rel(abs: &Path) -> Option<(String, String)> {
+    let mut anc = abs.parent()?;
+    while !anc.is_dir() {
+        anc = anc.parent()?;
+    }
+    let tail = abs.strip_prefix(anc).ok()?.to_path_buf();
+    let top = git_toplevel_of(&anc.to_string_lossy()).await?;
+    let anc_canon = std::fs::canonicalize(anc).ok()?;
+    let top_canon = std::fs::canonicalize(&top).ok()?;
+    let rel = anc_canon.strip_prefix(&top_canon).ok()?.join(tail);
+    Some((top, rel.to_string_lossy().into_owned()))
+}
+
+async fn git_show_candidates(toplevel: &str, cwd: &str, rel_clean: &str) -> Option<(String, Vec<u8>)> {
     let mut candidates = vec![rel_clean.to_string()];
-    if let Ok(cwd_rel) = Path::new(cwd).strip_prefix(&toplevel) {
+    if let Ok(cwd_rel) = Path::new(cwd).strip_prefix(toplevel) {
         let joined = cwd_rel.join(rel_clean);
         let s = joined.to_string_lossy().into_owned();
         if s != rel_clean {
@@ -462,7 +655,7 @@ pub(crate) async fn git_show_file(cwd: &str, rel: &str) -> Option<(String, Vec<u
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             tokio::process::Command::new("git")
-                .args(["-C", &toplevel, "show", &format!("origin/main:{candidate}")])
+                .args(["-C", toplevel, "show", &format!("origin/main:{candidate}")])
                 .output(),
         )
         .await;
@@ -506,7 +699,15 @@ async fn git_toplevel_of(dir: &str) -> Option<String> {
 const DESCEND_MAX_DEPTH: usize = 3;
 const DESCEND_MAX_DIRS: usize = 500;
 const DESCEND_SKIP: &[&str] = &[
-    "node_modules", ".git", "target", "__pycache__", ".venv", "venv", ".next", "dist", "build",
+    "node_modules",
+    ".git",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".next",
+    "dist",
+    "build",
 ];
 
 pub(crate) fn resolve_rel_descend(
@@ -547,7 +748,174 @@ pub(crate) fn resolve_rel_descend(
 /// `resolve_rel_candidates` uses for `exists`.
 pub(crate) fn real_list_dirs(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir)
-        .map(|entries| entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Search below each ANCESTOR of `cwd`, nearest first, up to and including
+/// `top` (the repo root), for `ancestor/.../rel`. The cwd's own subtree is
+/// skipped (the plain descent already searched it), and so is the branch just
+/// climbed out of. At the first ancestor with any match, exactly one match is
+/// returned; several come back as `Err` rather than guessed between. Bounded
+/// per ancestor by the same depth, visit cap and skip list as the descent.
+pub(crate) fn resolve_rel_sibling(
+    cwd: &Path,
+    top: &Path,
+    rel: &str,
+    exists: &dyn Fn(&Path) -> bool,
+    list_dirs: &dyn Fn(&Path) -> Vec<PathBuf>,
+) -> Result<Option<PathBuf>, Vec<PathBuf>> {
+    if rel.is_empty() || !cwd.starts_with(top) {
+        return Ok(None);
+    }
+    let mut came_from = cwd.to_path_buf();
+    let mut anc = cwd.parent();
+    while let Some(a) = anc {
+        if !a.starts_with(top) {
+            break;
+        }
+        let mut matches: Vec<PathBuf> = Vec::new();
+        let mut frontier = vec![a.to_path_buf()];
+        let mut visited = 0usize;
+        'walk: for _ in 0..DESCEND_MAX_DEPTH {
+            let mut next = Vec::new();
+            for dir in frontier {
+                for child in list_dirs(&dir) {
+                    let name = child.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if child == came_from || DESCEND_SKIP.contains(&name) || !is_path_allowed(&child) {
+                        continue;
+                    }
+                    if visited >= DESCEND_MAX_DIRS {
+                        break 'walk;
+                    }
+                    visited += 1;
+                    let cand = child.join(rel);
+                    if exists(&cand) && !matches.contains(&cand) {
+                        matches.push(cand);
+                        if matches.len() >= 5 {
+                            break 'walk;
+                        }
+                    }
+                    next.push(child);
+                }
+            }
+            frontier = next;
+        }
+        match matches.len() {
+            0 => {}
+            1 => return Ok(matches.pop()),
+            _ => return Err(matches),
+        }
+        if a == top {
+            break;
+        }
+        came_from = a.to_path_buf();
+        anc = a.parent();
+    }
+    Ok(None)
+}
+
+/// Does this path segment elide part of a name (`...FLOW-MAP.md`,
+/// `ff-capture…`)? `..` and `.` are navigation, not elision.
+pub(crate) fn segment_is_elided(seg: &str) -> bool {
+    seg != ".." && seg != "." && (seg.contains("...") || seg.contains('\u{2026}'))
+}
+
+/// Resolve a path a worker printed with part of a name elided, the way Claude
+/// Code shortens long paths (tubescience-parity, 2026-09-24:
+/// `customers/tubescience/parity/ff-capture/...FLOW-MAP.md` for
+/// `.../2026-09-24-FLAWLESS-FOOTAGE-FLOW-MAP.md`). An elided segment matches
+/// entries that start with the text before the marker and end with the text
+/// after it. Bases are the cwd, then its ancestors, nearest first. Returns the
+/// match when exactly one entry fits at the first base with any fit; several
+/// fits are returned as `Err` rather than guessed between.
+pub(crate) fn resolve_rel_elided(
+    cwd: &str,
+    rel: &str,
+    list_names: &dyn Fn(&Path) -> Vec<String>,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Result<Option<PathBuf>, Vec<PathBuf>> {
+    resolve_rel_elided_at(cwd, rel, list_names, exists, true)
+}
+
+/// `climb`: also try the cwd's ancestors. The descend fallback calls this per
+/// directory with `climb = false`.
+pub(crate) fn resolve_rel_elided_at(
+    cwd: &str,
+    rel: &str,
+    list_names: &dyn Fn(&Path) -> Vec<String>,
+    exists: &dyn Fn(&Path) -> bool,
+    climb: bool,
+) -> Result<Option<PathBuf>, Vec<PathBuf>> {
+    let rel = rel.trim().trim_start_matches("./").trim_start_matches('/');
+    let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    if !segs.iter().any(|s| segment_is_elided(s)) {
+        return Ok(None);
+    }
+    let mut base = PathBuf::from(cwd.trim_end_matches('/'));
+    for _ in 0..=4 {
+        let mut frontier = vec![base.clone()];
+        for seg in &segs {
+            let mut next = Vec::new();
+            for dir in &frontier {
+                if segment_is_elided(seg) {
+                    let marker = if seg.contains("...") { "..." } else { "\u{2026}" };
+                    let (pre, suf) = seg.split_once(marker).unwrap_or((seg, ""));
+                    for name in list_names(dir) {
+                        if name.len() >= pre.len() + suf.len() && name.starts_with(pre) && name.ends_with(suf) {
+                            next.push(dir.join(name));
+                        }
+                    }
+                } else {
+                    let cand = dir.join(seg);
+                    if exists(&cand) {
+                        next.push(cand);
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        match frontier.len() {
+            0 => {}
+            1 => return Ok(frontier.pop()),
+            _ => return Err(frontier),
+        }
+        if !climb || !base.pop() {
+            break;
+        }
+    }
+    Ok(None)
+}
+
+/// Normalise what a worker printed before resolving it (tubescience-parity's
+/// click test, 2026-09-24): `~/x` is the owner's home, and a LEADING pure
+/// ellipsis segment (`.../2026-09-24-FLOW-MAP.md`) means "somewhere below",
+/// so it is dropped and the rest is found by the ancestor walk and descent.
+pub(crate) fn normalize_printed_rel(rel: &str, home: Option<&str>) -> String {
+    let rel = rel.trim();
+    if let (Some(rest), Some(h)) = (rel.strip_prefix("~/"), home) {
+        return format!("{}/{}", h.trim_end_matches('/'), rest);
+    }
+    for lead in ["...", "\u{2026}"] {
+        if let Some(rest) = rel.strip_prefix(lead).and_then(|r| r.strip_prefix('/')) {
+            return rest.to_string();
+        }
+    }
+    rel.to_string()
+}
+
+pub(crate) fn real_list_names(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect())
         .unwrap_or_default()
 }
 
@@ -600,10 +968,16 @@ pub(crate) fn resolve_rel_candidates(
 pub fn is_path_allowed(p: &Path) -> bool {
     let resolved = resolve_nonstrict(p);
     let resolved_lower = resolved.to_string_lossy().to_lowercase();
-    if BLOCKED_SYSTEM_PATHS.iter().any(|b| resolved_lower == b.to_lowercase()) {
+    if BLOCKED_SYSTEM_PATHS
+        .iter()
+        .any(|b| resolved_lower == b.to_lowercase())
+    {
         return false;
     }
-    if BLOCKED_SYSTEM_PREFIXES.iter().any(|pfx| resolved_lower.starts_with(&pfx.to_lowercase())) {
+    if BLOCKED_SYSTEM_PREFIXES
+        .iter()
+        .any(|pfx| resolved_lower.starts_with(&pfx.to_lowercase()))
+    {
         return false;
     }
     let home = resolve_nonstrict(&home_dir());
@@ -617,7 +991,11 @@ pub fn is_path_allowed(p: &Path) -> bool {
             .collect();
         for sensitive in SENSITIVE_HOME {
             let sens: Vec<&str> = sensitive.split('/').collect();
-            if parts.len() >= sens.len() && parts[..sens.len()].iter().map(String::as_str).eq(sens.iter().copied())
+            if parts.len() >= sens.len()
+                && parts[..sens.len()]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(sens.iter().copied())
             {
                 return false;
             }
@@ -735,7 +1113,6 @@ async fn mkdir(req: Request) -> Response {
 // POST /api/fs/open (py:68339-68367) — reveal in native file manager
 // ---------------------------------------------------------------------------
 
-
 /// Is the BROWSER that sent this request running on the same machine as this
 /// server? (AF-282)
 ///
@@ -766,11 +1143,55 @@ pub(crate) fn browser_is_on_this_machine(
     peer: Option<std::net::IpAddr>,
     host_header: Option<&str>,
 ) -> bool {
-    browser_is_on_this_machine_with(peer, host_header, |h| {
-        std::net::ToSocketAddrs::to_socket_addrs(&(h, 0u16))
-            .map(|it| it.map(|a| a.ip()).collect())
-            .unwrap_or_default()
-    })
+    browser_is_on_this_machine_checked(
+        peer,
+        host_header,
+        |h| {
+            std::net::ToSocketAddrs::to_socket_addrs(&(h, 0u16))
+                .map(|it| it.map(|a| a.ip()).collect())
+                .unwrap_or_default()
+        },
+        address_is_this_host,
+    )
+}
+
+/// Whether `ip` is assigned to one of this host's own interfaces. Binding a
+/// socket to an address succeeds only for a local one (EADDRNOTAVAIL
+/// otherwise), so this needs no interface enumeration and no new dependency.
+fn address_is_this_host(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind((ip, 0)).is_ok()
+}
+
+/// THE HOST HEADER IS THE CLIENT'S OWN CLAIM. A remote peer that sends its
+/// own IP literal as Host resolves to itself and passed the pair check
+/// alone, which put the owner bearer in its dashboard shell (reported by an
+/// outside researcher, 2026-10-09). A browser on this machine connects from
+/// one of this machine's addresses, so a non-loopback peer must also be one
+/// of those. The name check still applies on top.
+fn browser_is_on_this_machine_checked(
+    peer: Option<std::net::IpAddr>,
+    host_header: Option<&str>,
+    resolve: impl Fn(&str) -> Vec<std::net::IpAddr>,
+    is_this_host: impl Fn(std::net::IpAddr) -> bool,
+) -> bool {
+    let Some(p) = peer else { return false };
+    if p.is_loopback() {
+        return true;
+    }
+    let named = browser_is_on_this_machine_with(peer, host_header, resolve);
+    if named && !is_this_host(p) {
+        // The attack signature: a foreign address that named itself as the
+        // host. A sweep counts this verdict; any hit is worth a look.
+        tracing::warn!(
+            target: "amux::auth",
+            verdict = "remote_peer_claimed_local_host",
+            peer = %p,
+            host = host_header.unwrap_or(""),
+            "a remote peer sent a Host that resolves to its own address; treated as REMOTE"
+        );
+        return false;
+    }
+    named
 }
 
 /// The decision, with DNS injected so the incident is testable offline.
@@ -802,7 +1223,6 @@ fn browser_is_on_this_machine_with(
     }
     resolve(&hostname).into_iter().any(|ip| ip == peer)
 }
-
 
 /// The authority the client addressed, from EITHER protocol version.
 ///
@@ -845,7 +1265,11 @@ async fn open_native(req: Request) -> Response {
         Ok(v) => v,
         Err(e) => return j(500, json!({"error": e})),
     };
-    let dir_path = body.get("path").and_then(|v| v.as_str()).unwrap_or("/").to_string();
+    let dir_path = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/")
+        .to_string();
     let mut target = resolve_nonstrict(&expanduser(&dir_path));
     // Same containment as the other file APIs — prevents an existence oracle
     // AND `open`-launching an arbitrary .app bundle (Python's comment).
@@ -880,10 +1304,18 @@ async fn open_native(req: Request) -> Response {
         "macos" => "open",
         "linux" => "xdg-open",
         "windows" => "explorer",
-        other => return j(400, json!({"error": format!("unsupported platform: {other}")})),
+        other => {
+            return j(
+                400,
+                json!({"error": format!("unsupported platform: {other}")}),
+            )
+        }
     };
     match std::process::Command::new(cmd).arg(&target).spawn() {
-        Ok(_) => j(200, json!({"ok": true, "path": pystr(&target), "local": true})),
+        Ok(_) => j(
+            200,
+            json!({"ok": true, "path": pystr(&target), "local": true}),
+        ),
         Err(e) => j(500, json!({"error": e.to_string()})),
     }
 }
@@ -907,7 +1339,9 @@ struct MPart {
 /// `get_param` also decodes).
 fn disposition_param(header: &str, param: &str) -> Option<String> {
     for seg in header.split(';').map(str::trim) {
-        let Some((k, v)) = seg.split_once('=') else { continue };
+        let Some((k, v)) = seg.split_once('=') else {
+            continue;
+        };
         let k = k.trim().to_ascii_lowercase();
         let v = v.trim();
         if k == format!("{param}*") {
@@ -946,8 +1380,11 @@ fn boundary_of(ctype: &str) -> Option<String> {
 fn decode_cte(cte: &str, data: &[u8]) -> Vec<u8> {
     match cte.trim().to_ascii_lowercase().as_str() {
         "base64" => {
-            let compact: Vec<u8> =
-                data.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+            let compact: Vec<u8> = data
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
             base64::engine::general_purpose::STANDARD
                 .decode(&compact)
                 .unwrap_or_else(|_| data.to_vec())
@@ -966,10 +1403,9 @@ fn decode_cte(cte: &str, data: &[u8]) -> Vec<u8> {
                         continue;
                     }
                     if i + 2 < data.len() {
-                        if let Ok(b) = u8::from_str_radix(
-                            &String::from_utf8_lossy(&data[i + 1..i + 3]),
-                            16,
-                        ) {
+                        if let Ok(b) =
+                            u8::from_str_radix(&String::from_utf8_lossy(&data[i + 1..i + 3]), 16)
+                        {
                             out.push(b);
                             i += 3;
                             continue;
@@ -989,6 +1425,16 @@ fn decode_cte(cte: &str, data: &[u8]) -> Vec<u8> {
 /// module (compat32) yields for browser/curl bodies. Returns None when the
 /// body does not decompose into parts (Python's "invalid multipart" 400:
 /// `msg.get_payload()` not a list).
+/// The folder a multipart upload targets (its `dir` field), for the capability
+/// gate, which must see the same target the upload handler writes to.
+pub(crate) fn multipart_dir(ctype: &str, body: &[u8]) -> Option<String> {
+    parse_multipart(ctype, body)?
+        .into_iter()
+        .find(|p| p.name.as_deref() == Some("dir"))
+        .map(|p| String::from_utf8_lossy(&p.data).trim().to_string())
+        .filter(|d| !d.is_empty())
+}
+
 fn parse_multipart(ctype: &str, body: &[u8]) -> Option<Vec<MPart>> {
     let boundary = boundary_of(ctype)?;
     let delim: Vec<u8> = [b"--", boundary.as_bytes()].concat();
@@ -1062,7 +1508,11 @@ fn parse_multipart(ctype: &str, body: &[u8]) -> Option<Vec<MPart>> {
                 cte = v.trim().to_string();
             }
         }
-        parts.push(MPart { name, filename, data: decode_cte(&cte, payload) });
+        parts.push(MPart {
+            name,
+            filename,
+            data: decode_cte(&cte, payload),
+        });
     }
     if parts.is_empty() {
         return None;
@@ -1119,8 +1569,7 @@ async fn upload(req: Request) -> Response {
     for part in &parts {
         match part.name.as_deref() {
             Some("dir") => {
-                target_dir =
-                    Some(String::from_utf8_lossy(&part.data).trim().to_string());
+                target_dir = Some(String::from_utf8_lossy(&part.data).trim().to_string());
             }
             Some("overwrite") => {
                 let v = String::from_utf8_lossy(&part.data).trim().to_lowercase();
@@ -1138,7 +1587,10 @@ async fn upload(req: Request) -> Response {
         return j(403, json!({"error": "access denied"}));
     }
     if !dest_dir.is_dir() {
-        return j(400, json!({"error": format!("not a directory: {target_dir}")}));
+        return j(
+            400,
+            json!({"error": format!("not a directory: {target_dir}")}),
+        );
     }
 
     let mut saved: Vec<Value> = Vec::new();
@@ -1215,7 +1667,23 @@ async fn rename(req: Request) -> Response {
     if !src.exists() {
         return j(404, json!({"error": "not found"}));
     }
-    let dst = src.parent().unwrap_or(Path::new("/")).join(&new_name);
+    // Optional `dest_dir` moves the entry into another folder (the file
+    // viewer's multi-select "Move to...", 2026-10-15). Absent, it renames in
+    // place exactly as before.
+    let dest_dir = body_str(&body, "dest_dir").trim().to_string();
+    let parent = if dest_dir.is_empty() {
+        src.parent().unwrap_or(Path::new("/")).to_path_buf()
+    } else {
+        let d = resolve_nonstrict(&expanduser(&dest_dir));
+        if !d.is_dir() {
+            return j(400, json!({"error": "destination is not a folder"}));
+        }
+        if d.starts_with(&src) {
+            return j(400, json!({"error": "cannot move a folder into itself"}));
+        }
+        d
+    };
+    let dst = parent.join(&new_name);
     if !is_path_allowed(&dst) {
         return j(403, json!({"error": "access denied"}));
     }
@@ -1263,7 +1731,9 @@ async fn read_file(method: Method, RawQuery(q): RawQuery) -> Response {
     // Python: cap = min(int(max_bytes or 1048576), 8MiB); an unparsable
     // value is Python's generic 500. Negative caps read the WHOLE file
     // (Python's file.read(negative)).
-    let raw_cap = qs_get(&qs, "max_bytes").filter(|v| !v.is_empty()).unwrap_or("1048576");
+    let raw_cap = qs_get(&qs, "max_bytes")
+        .filter(|v| !v.is_empty())
+        .unwrap_or("1048576");
     let cap: i64 = match raw_cap.parse::<i64>() {
         Ok(v) => v.min(8 * 1024 * 1024),
         Err(_) => {
@@ -1314,13 +1784,22 @@ async fn read_file(method: Method, RawQuery(q): RawQuery) -> Response {
 // ---------------------------------------------------------------------------
 
 fn search_max_results() -> i64 {
-    std::env::var("AMUX_SEARCH_MAX_RESULTS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)
+    std::env::var("AMUX_SEARCH_MAX_RESULTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
 }
 fn search_timeout_s() -> f64 {
-    std::env::var("AMUX_SEARCH_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(20.0)
+    std::env::var("AMUX_SEARCH_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20.0)
 }
 fn search_max_filesize() -> String {
-    std::env::var("AMUX_SEARCH_MAX_FILESIZE").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "20M".into())
+    std::env::var("AMUX_SEARCH_MAX_FILESIZE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "20M".into())
 }
 
 /// The rg binary. Python's error text promises "set AMUX_SEARCH_RG to its
@@ -1373,7 +1852,11 @@ pub(crate) async fn fs_search(
     out.insert("searched_hidden".into(), json!(include_ignored));
     out.insert(
         "limit".into(),
-        json!(if limit != 0 { limit } else { search_max_results() }),
+        json!(if limit != 0 {
+            limit
+        } else {
+            search_max_results()
+        }),
     );
     if q.is_empty() {
         out.insert("error".into(), json!("missing query"));
@@ -1386,7 +1869,11 @@ pub(crate) async fn fs_search(
     }
     let rp = resolve_nonstrict(&rp);
     out.insert("root".into(), json!(pystr(&rp)));
-    let cap = if limit != 0 { limit } else { search_max_results() };
+    let cap = if limit != 0 {
+        limit
+    } else {
+        search_max_results()
+    };
 
     let Some(rg) = rg_bin() else {
         // Say so rather than silently returning nothing: a search reporting
@@ -1461,13 +1948,18 @@ pub(crate) async fn fs_search(
             truncated = true;
             break;
         }
-        let Ok(ev) = serde_json::from_str::<Value>(line) else { continue };
+        let Ok(ev) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
         if ev.get("type").and_then(|t| t.as_str()) != Some("match") {
             continue;
         }
         let d = ev.get("data").cloned().unwrap_or(json!({}));
         let pth = d["path"]["text"].as_str().unwrap_or("").to_string();
-        let txt = d["lines"]["text"].as_str().unwrap_or("").trim_end_matches('\n');
+        let txt = d["lines"]["text"]
+            .as_str()
+            .unwrap_or("")
+            .trim_end_matches('\n');
         let rel = Path::new(&pth)
             .strip_prefix(&rp)
             .map(|r| r.to_string_lossy().into_owned())
@@ -1476,7 +1968,9 @@ pub(crate) async fn fs_search(
         let spans: Vec<Value> = d["submatches"]
             .as_array()
             .map(|subs| {
-                subs.iter().map(|s| json!([s.get("start"), s.get("end")])).collect()
+                subs.iter()
+                    .map(|s| json!([s.get("start"), s.get("end")]))
+                    .collect()
             })
             .unwrap_or_default();
         results.push(json!({
@@ -1508,14 +2002,19 @@ pub(crate) async fn fs_search(
     }
     if n_results == 0 {
         // Name every filter that could be responsible for the zero.
-        let mut why = vec![format!("files over {max_filesize} and binaries were skipped")];
+        let mut why = vec![format!(
+            "files over {max_filesize} and binaries were skipped"
+        )];
         if !include_ignored {
             why.insert(
                 0,
                 ".gitignore'd and hidden files were NOT searched (retry with ignored=1)".into(),
             );
         }
-        out.insert("note".into(), json!(format!("No matches. {}.", why.join("; "))));
+        out.insert(
+            "note".into(),
+            json!(format!("No matches. {}.", why.join("; "))),
+        );
     }
     out
 }
@@ -1538,12 +2037,23 @@ async fn search(method: Method, RawQuery(q): RawQuery) -> Response {
         .map(|v| v.clamp(1, 2000))
         .unwrap_or(0);
     let literal = !matches!(
-        qs_get(&qs, "literal").unwrap_or("1").to_lowercase().as_str(),
+        qs_get(&qs, "literal")
+            .unwrap_or("1")
+            .to_lowercase()
+            .as_str(),
         "0" | "false" | "no"
     );
-    let case = qs_get(&qs, "case").filter(|v| !v.is_empty()).unwrap_or("smart").to_lowercase();
-    let include_ignored =
-        matches!(qs_get(&qs, "ignored").unwrap_or("0").to_lowercase().as_str(), "1" | "true" | "yes");
+    let case = qs_get(&qs, "case")
+        .filter(|v| !v.is_empty())
+        .unwrap_or("smart")
+        .to_lowercase();
+    let include_ignored = matches!(
+        qs_get(&qs, "ignored")
+            .unwrap_or("0")
+            .to_lowercase()
+            .as_str(),
+        "1" | "true" | "yes"
+    );
     let globs: Vec<String> = qs
         .iter()
         .filter(|(k, v)| k == "glob" && !v.is_empty())
@@ -1663,7 +2173,11 @@ fn retry_eintr<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<
     f()
 }
 
-pub async fn ls(method: Method, RawQuery(q): RawQuery) -> Response {
+pub async fn ls(
+    State(state): State<AppState>,
+    method: Method,
+    RawQuery(q): RawQuery,
+) -> Response {
     if method != Method::GET {
         return not_found().await;
     }
@@ -1673,6 +2187,7 @@ pub async fn ls(method: Method, RawQuery(q): RawQuery) -> Response {
         return j(400, json!({"error": "missing path"}));
     }
     let show_hidden = qs_get(&qs, "hidden").unwrap_or("0") == "1";
+    let include_titles = qs_get(&qs, "titles").unwrap_or("0") == "1";
     let p = resolve_nonstrict(&expanduser(&ls_path));
     if !is_path_allowed(&p) {
         return j(403, json!({"error": "access denied"}));
@@ -1688,6 +2203,7 @@ pub async fn ls(method: Method, RawQuery(q): RawQuery) -> Response {
         }
         Err(e) => return j(500, json!({"error": e.to_string()})),
     };
+    let opened = opened_in_dir(&state, &pystr(&p));
     let mut items: Vec<(bool, String, String, std::fs::Metadata)> = rd
         .flatten()
         .filter_map(|e| {
@@ -1706,17 +2222,171 @@ pub async fn ls(method: Method, RawQuery(q): RawQuery) -> Response {
     let entries: Vec<Value> = items
         .into_iter()
         .map(|(not_dir, _, name, meta)| {
-            json!({
+            let mut entry = json!({
                 "name": name,
                 "type": if not_dir { "file" } else { "dir" },
                 // Python: st_size if item.is_file() else None — dirs null.
                 "size": if !not_dir { Value::Null } else { json!(meta.len()) },
                 "modified": mtime_secs(&meta),
-            })
+                // When the dashboard last opened this file; null if never.
+                "opened": opened.get(&name).copied(),
+            });
+            if include_titles && not_dir {
+                if let Some(title) = first_line_title(&p.join(&name)) {
+                    entry["title"] = json!(title);
+                }
+            }
+            entry
         })
         .collect();
     let parent = p.parent().filter(|par| *par != p).map(pystr);
-    j(200, json!({"path": pystr(&p), "parent": parent, "entries": entries}))
+    j(
+        200,
+        json!({"path": pystr(&p), "parent": parent, "entries": entries}),
+    )
+}
+
+fn first_line_title(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_lowercase();
+    if !matches!(ext.as_str(), "md" | "markdown" | "mdx" | "txt") {
+        return None;
+    }
+    let mut buf = [0u8; 512];
+    let mut f = std::fs::File::open(path).ok()?;
+    let n = std::io::Read::read(&mut f, &mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let text = std::str::from_utf8(&buf[..n]).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let title = trimmed.trim_start_matches('#').trim();
+        if !title.is_empty() {
+            return Some(title.chars().take(120).collect());
+        }
+    }
+    None
+}
+
+/// Last-opened times of `dir`'s direct children, by name. A range scan on the
+/// primary key: every path under `dir/` sorts between `dir/` and `dir0`
+/// ('0' is the byte after '/'). A read failure is an empty map, so a listing
+/// never fails over this column; it logs once per call.
+fn opened_in_dir(state: &AppState, dir: &str) -> std::collections::HashMap<String, f64> {
+    let base = format!("{}/", dir.trim_end_matches('/'));
+    let upper = format!("{}0", dir.trim_end_matches('/'));
+    let read = || -> anyhow::Result<std::collections::HashMap<String, f64>> {
+        let conn = state.store.read()?;
+        let mut stmt =
+            conn.prepare("SELECT path, opened_at FROM file_opens WHERE path >= ?1 AND path < ?2")?;
+        let rows = stmt.query_map(rusqlite::params![base, upper], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows.flatten() {
+            let rest = &row.0[base.len()..];
+            if !rest.is_empty() && !rest.contains('/') {
+                out.insert(rest.to_string(), row.1);
+            }
+        }
+        Ok(out)
+    };
+    read().unwrap_or_else(|e| {
+        tracing::warn!(target: "amux::fs", dir, error = %e, verdict = "file_opens_read_failed",
+            "listing served without last-opened times");
+        Default::default()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/fs/move — move a file or directory to a new absolute path
+// ---------------------------------------------------------------------------
+
+async fn move_file(req: Request) -> Response {
+    if req.method() != Method::POST {
+        return not_found().await;
+    }
+    let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return j(500, json!({"error": e.to_string()})),
+    };
+    let body = match parse_body(&bytes) {
+        Ok(v) => v,
+        Err(e) => return j(500, json!({"error": e})),
+    };
+    let src_path = body_str(&body, "path").trim().to_string();
+    let dest_path = body_str(&body, "dest").trim().to_string();
+    if src_path.is_empty() || dest_path.is_empty() {
+        return j(400, json!({"error": "missing 'path' or 'dest'"}));
+    }
+    let src = resolve_nonstrict(&expanduser(&src_path));
+    let dest = resolve_nonstrict(&expanduser(&dest_path));
+    if !is_path_allowed(&src) || !is_path_allowed(&dest) {
+        return j(403, json!({"error": "access denied"}));
+    }
+    if !src.exists() {
+        return j(404, json!({"error": "not found"}));
+    }
+    if dest.exists() {
+        return j(409, json!({"error": "target already exists"}));
+    }
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return j(500, json!({"error": e.to_string()}));
+        }
+    }
+    match std::fs::rename(&src, &dest) {
+        Ok(()) => j(200, json!({"ok": true, "path": pystr(&dest)})),
+        Err(e) => j(500, json!({"error": e.to_string()})),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/fs/opened {path} — the viewer records that it opened a file, which
+// is the "Opened" column of every listing. Not a fleet-state change, so it does
+// not bump the global revision.
+// ---------------------------------------------------------------------------
+
+async fn opened(State(state): State<AppState>, method: Method, body: axum::body::Bytes) -> Response {
+    if method != Method::POST {
+        return not_found().await;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&body) else {
+        return j(400, json!({"error": "invalid JSON"}));
+    };
+    let raw = v.get("path").and_then(Value::as_str).unwrap_or("");
+    if raw.is_empty() {
+        return j(400, json!({"error": "missing path"}));
+    }
+    let p = resolve_nonstrict(&expanduser(raw));
+    if !is_path_allowed(&p) {
+        return j(403, json!({"error": "access denied"}));
+    }
+    let path = pystr(&p);
+    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    let key = path.clone();
+    let res = state
+        .store
+        .write_async(move |conn| {
+            conn.execute(
+                "INSERT INTO file_opens(path, opened_at) VALUES (?1, ?2) \
+                 ON CONFLICT(path) DO UPDATE SET opened_at = excluded.opened_at",
+                rusqlite::params![key, now],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        })
+        .await;
+    match res {
+        Ok(_) => j(200, json!({"ok": true, "path": path, "opened": now})),
+        Err(e) => {
+            tracing::warn!(target: "amux::fs", path, error = %e, verdict = "file_open_record_failed",
+                "could not record a file open");
+            j(500, json!({"error": "could not record the open"}))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,8 +2399,19 @@ pub async fn ls(method: Method, RawQuery(q): RawQuery) -> Response {
 /// every depth, so `~/Library` alone does not turn a name search into a
 /// filesystem walk. Not a security boundary — `is_path_allowed` is that.
 const SCAN_SKIP: &[&str] = &[
-    "library", "applications", "node_modules", "music", "pictures", "movies",
-    "photos", ".trash", "target", "venv", ".venv", "dist", "build",
+    "library",
+    "applications",
+    "node_modules",
+    "music",
+    "pictures",
+    "movies",
+    "photos",
+    ".trash",
+    "target",
+    "venv",
+    ".venv",
+    "dist",
+    "build",
 ];
 
 /// How many directory entries one name search may look at. A budget rather
@@ -1799,7 +2480,17 @@ const AUTOCOMPLETE_WALK_TIMEOUT: std::time::Duration = std::time::Duration::from
 fn name_search_roots() -> Vec<PathBuf> {
     let home = home_dir();
     let mut roots = vec![home.clone()];
-    for c in ["Dev", "dev", "Projects", "projects", "src", "code", "Code", "Documents", "repos"] {
+    for c in [
+        "Dev",
+        "dev",
+        "Projects",
+        "projects",
+        "src",
+        "code",
+        "Code",
+        "Documents",
+        "repos",
+    ] {
         let p = home.join(c);
         if p.is_dir() {
             roots.push(p);
@@ -1861,7 +2552,9 @@ fn dirs_matching_name_budgeted(
             if budget == 0 || started.elapsed() >= time_budget {
                 return (out, true);
             }
-            let Ok(rd) = retry_eintr(|| std::fs::read_dir(&dir)) else { continue };
+            let Ok(rd) = retry_eintr(|| std::fs::read_dir(&dir)) else {
+                continue;
+            };
             // BOUND THE LISTING ITSELF, not just the loop below it. The first
             // cut of this deadline collected the whole directory first and only
             // then checked the clock per entry, so a single slow `read_dir` ran
@@ -1930,7 +2623,6 @@ fn dirs_matching_name_budgeted(
     }
     (out, false)
 }
-
 
 #[cfg(test)]
 mod name_search_tests {
@@ -2011,13 +2703,18 @@ mod name_search_tests {
         }
         let roots = [d.path().to_path_buf()];
         // TRUNCATED: the scan gave up before it could have seen everything.
-        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 5, SCAN_TIME_BUDGET);
+        let (hits, exhausted) =
+            dirs_matching_name_budgeted("zzzz", &roots, 10, 5, SCAN_TIME_BUDGET);
         assert!(hits.is_empty());
         assert!(exhausted, "a scan that ran out of budget must say so");
         // COMPLETE: same tree, same query, budget that covers it.
-        let (hits, exhausted) = dirs_matching_name_budgeted("zzzz", &roots, 10, 6000, SCAN_TIME_BUDGET);
+        let (hits, exhausted) =
+            dirs_matching_name_budgeted("zzzz", &roots, 10, 6000, SCAN_TIME_BUDGET);
         assert!(hits.is_empty());
-        assert!(!exhausted, "a complete search that found nothing must not claim truncation");
+        assert!(
+            !exhausted,
+            "a complete search that found nothing must not claim truncation"
+        );
     }
 
     /// A limit that is reached is not the same as a budget that ran out: the
@@ -2030,7 +2727,6 @@ mod name_search_tests {
         assert_eq!(hits.len(), 2);
         assert!(!exhausted);
     }
-
 
     /// Not an assertion about speed on any particular machine — a FLOOR under
     /// the thing that would make this route unusable. It runs on every keystroke
@@ -2125,7 +2821,10 @@ mod name_search_tests {
         )
         .await;
         let elapsed = started.elapsed();
-        assert!(out.is_err(), "the timeout must fire on a walk that never returns");
+        assert!(
+            out.is_err(),
+            "the timeout must fire on a walk that never returns"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "the caller waited {elapsed:?}, so it did not stop waiting"
@@ -2183,17 +2882,21 @@ mod name_search_tests {
     fn the_walk_stops_on_its_time_budget_and_says_it_was_truncated() {
         let roots = name_search_roots();
         let t0 = std::time::Instant::now();
-        let (hits, exhausted) = dirs_matching_name_budgeted(
-            "amux",
-            &roots,
-            10,
-            SCAN_BUDGET,
-            std::time::Duration::ZERO,
-        );
+        let (hits, exhausted) =
+            dirs_matching_name_budgeted("amux", &roots, 10, SCAN_BUDGET, std::time::Duration::ZERO);
         let ms = t0.elapsed().as_millis();
-        assert!(exhausted, "a walk cut short by its deadline must report exhausted");
-        assert!(hits.is_empty(), "nothing can be found before the first entry: {hits:?}");
-        assert!(ms < 1000, "a zero deadline must return at once, took {ms}ms");
+        assert!(
+            exhausted,
+            "a walk cut short by its deadline must report exhausted"
+        );
+        assert!(
+            hits.is_empty(),
+            "nothing can be found before the first entry: {hits:?}"
+        );
+        assert!(
+            ms < 1000,
+            "a zero deadline must return at once, took {ms}ms"
+        );
 
         // THE CONTROL. Without it, a function that always returns
         // (empty, true) satisfies every assertion above, and the search would be
@@ -2232,7 +2935,10 @@ mod name_search_tests {
     fn the_home_directory_is_always_a_root_and_the_missing_ones_are_skipped() {
         let roots = name_search_roots();
         assert_eq!(roots.first(), Some(&home_dir()), "home must be searched");
-        assert!(roots.iter().all(|r| r.is_dir()), "a root that does not exist was kept: {roots:?}");
+        assert!(
+            roots.iter().all(|r| r.is_dir()),
+            "a root that does not exist was kept: {roots:?}"
+        );
     }
 }
 
@@ -2279,7 +2985,9 @@ pub async fn autocomplete_dir(method: Method, RawQuery(q): RawQuery) -> Response
         let q_for_walk = query.clone();
         let (hits, exhausted) = match tokio::time::timeout(
             AUTOCOMPLETE_WALK_TIMEOUT,
-            crate::db::interactions::spawn_blocking(move || dirs_matching_name(&q_for_walk, &roots, 10)),
+            crate::db::interactions::spawn_blocking(move || {
+                dirs_matching_name(&q_for_walk, &roots, 10)
+            }),
         )
         .await
         {
@@ -2331,8 +3039,12 @@ pub async fn autocomplete_dir(method: Method, RawQuery(q): RawQuery) -> Response
         (p.clone(), String::new())
     } else {
         (
-            p.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/")),
-            p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default(),
+            p.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/")),
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default(),
         )
     };
     if !parent.is_dir() {
@@ -2346,7 +3058,10 @@ pub async fn autocomplete_dir(method: Method, RawQuery(q): RawQuery) -> Response
     names.sort();
     let mut results: Vec<String> = Vec::new();
     for item in names {
-        let name = item.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = item
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if name.starts_with('.') {
             continue;
         }
@@ -2407,6 +3122,37 @@ async fn delete_path(req: Request) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn printed_paths_are_normalised_before_resolving() {
+        assert_eq!(normalize_printed_rel("~/.amux/x.sh", Some("/Users/e")), "/Users/e/.amux/x.sh");
+        assert_eq!(normalize_printed_rel(".../2026-FLOW-MAP.md", Some("/Users/e")), "2026-FLOW-MAP.md");
+        assert_eq!(normalize_printed_rel("\u{2026}/parity/x.py", None), "parity/x.py");
+        assert_eq!(normalize_printed_rel("../x.md", None), "../x.md");
+        assert_eq!(normalize_printed_rel("a/b.md", None), "a/b.md");
+    }
+
+    #[test]
+    fn an_elided_path_resolves_to_its_one_file_from_a_repo_ancestor() {
+        let tree: std::collections::HashMap<&str, Vec<&str>> = [
+            ("/r/customers/tubescience/parity/ff-capture", vec!["2026-09-24-FLAWLESS-FOOTAGE-FLOW-MAP.md", "notes.md", "endpoint_inventory.json"]),
+        ].into_iter().collect();
+        let names = |d: &Path| tree.get(d.to_str().unwrap()).map(|v| v.iter().map(|s| s.to_string()).collect()).unwrap_or_default();
+        let exists = |p: &Path| {
+            let s = p.to_str().unwrap();
+            s == "/r/customers" || s == "/r/customers/tubescience" || s == "/r/customers/tubescience/parity" || s == "/r/customers/tubescience/parity/ff-capture"
+                || tree.values().flatten().any(|n| s.ends_with(&format!("/{n}")))
+        };
+        let got = resolve_rel_elided("/r/customers/tubescience", "customers/tubescience/parity/ff-capture/...FLOW-MAP.md", &names, &exists);
+        assert_eq!(got, Ok(Some(PathBuf::from("/r/customers/tubescience/parity/ff-capture/2026-09-24-FLAWLESS-FOOTAGE-FLOW-MAP.md"))));
+        // The unicode ellipsis works the same way.
+        let got = resolve_rel_elided("/r/customers/tubescience", "parity/ff-capture/2026-09-24\u{2026}MAP.md", &names, &exists);
+        assert!(matches!(got, Ok(Some(_))), "{got:?}");
+        // Several fits are reported, never guessed between.
+        assert!(matches!(resolve_rel_elided("/r/customers/tubescience", "parity/ff-capture/....md", &names, &exists), Err(v) if v.len() == 2));
+        // `..` is navigation, not elision.
+        assert_eq!(resolve_rel_elided("/r", "../x/y.md", &names, &exists), Ok(None));
+    }
+
 
     use std::cell::Cell;
     use std::io::{Error, ErrorKind};
@@ -2456,7 +3202,11 @@ mod tests {
             Err(Error::new(ErrorKind::Interrupted, "eintr"))
         });
         assert_eq!(got.unwrap_err().kind(), ErrorKind::Interrupted);
-        assert!(calls.get() <= 8, "retry must be bounded, got {} calls", calls.get());
+        assert!(
+            calls.get() <= 8,
+            "retry must be bounded, got {} calls",
+            calls.get()
+        );
     }
     use super::*;
     use axum::body::Body;
@@ -2465,13 +3215,13 @@ mod tests {
     fn state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
-        std::mem::forget(dir);
+        crate::test_tempdirs::keep(dir);
         AppState {
             store,
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
-        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
@@ -2490,11 +3240,47 @@ mod tests {
         if let Some(ct) = ctype {
             b = b.header("content-type", ct);
         }
-        let res = app.clone().oneshot(b.body(Body::from(body)).unwrap()).await.unwrap();
+        let res = app
+            .clone()
+            .oneshot(b.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
         let status = res.status();
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, v)
+    }
+
+    // ---- last opened (the "Opened" column) ----
+
+    #[tokio::test]
+    async fn an_opened_file_carries_its_time_in_the_listing_and_others_stay_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(d.join("a.mdai"), "x").unwrap();
+        std::fs::write(d.join("b.mdai"), "y").unwrap();
+        std::fs::create_dir(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/c.mdai"), "z").unwrap();
+        let app = Router::new()
+            .nest("/api/fs", routes())
+            .route("/api/ls", any(ls))
+            .with_state(state());
+        let dir_s = d.to_string_lossy().to_string();
+        let body = serde_json::to_vec(&json!({"path": format!("{dir_s}/a.mdai")})).unwrap();
+        let (st, v) = call(&app, "POST", "/api/fs/opened", Some("application/json"), body).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // A file one level down must not leak into the parent listing.
+        let body = serde_json::to_vec(&json!({"path": format!("{dir_s}/sub/c.mdai")})).unwrap();
+        call(&app, "POST", "/api/fs/opened", Some("application/json"), body).await;
+        let uri = format!("/api/ls?path={dir_s}");
+        let (st, v) = call(&app, "GET", &uri, None, vec![]).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let opened = |n: &str| v["entries"].as_array().unwrap().iter().find(|e| e["name"] == n).unwrap()["opened"].clone();
+        assert!(opened("a.mdai").as_f64().is_some(), "{v}");
+        assert!(opened("b.mdai").is_null(), "{v}");
+        assert!(opened("sub").is_null(), "{v}");
     }
 
     // ---- output-path resolution (AMUX-3511) ----
@@ -2513,7 +3299,10 @@ mod tests {
         let (resolved, ok, tried) = resolve_rel_candidates(cwd, "NYC/Events/Galas.md", &exists);
         assert!(ok);
         assert_eq!(resolved, format!("{vault}/NYC/Events/Galas.md"));
-        assert_eq!(tried[0], "/Users/ethan/Vault/NYC/NYC/Events/Galas.md", "the blind join was ruled out first");
+        assert_eq!(
+            tried[0], "/Users/ethan/Vault/NYC/NYC/Events/Galas.md",
+            "the blind join was ruled out first"
+        );
 
         // CONTROL — a genuinely nested NYC/NYC: the cwd join exists and WINS;
         // walking anyway would hijack real nesting.
@@ -2536,7 +3325,10 @@ mod tests {
         let (r, ok, tried) = resolve_rel_candidates(cwd, "no/such.md", &|_| false);
         assert!(!ok);
         assert_eq!(r, "/Users/ethan/Vault/NYC/no/such.md");
-        assert!(tried.len() >= 4, "the ancestor walk must have actually walked: {tried:?}");
+        assert!(
+            tried.len() >= 4,
+            "the ancestor walk must have actually walked: {tried:?}"
+        );
 
         // Absolute paths pass through untouched — no walk.
         let (r, ok, tried) = resolve_rel_candidates(cwd, "/etc/hosts", &|_| true);
@@ -2560,23 +3352,38 @@ mod tests {
         let exists = |p: &Path| {
             p == Path::new("/Users/ethan/Dev/mixpeek/homepage/public/templates/ux-session-analysis/session.webp")
         };
-        let (resolved, ok, tried) =
-            resolve_rel_candidates(cwd, "/public/templates/ux-session-analysis/session.webp", &exists);
-        assert!(ok, "the slash-stripped cwd join must be found: tried {tried:?}");
+        let (resolved, ok, tried) = resolve_rel_candidates(
+            cwd,
+            "/public/templates/ux-session-analysis/session.webp",
+            &exists,
+        );
+        assert!(
+            ok,
+            "the slash-stripped cwd join must be found: tried {tried:?}"
+        );
         assert_eq!(
             resolved,
             "/Users/ethan/Dev/mixpeek/homepage/public/templates/ux-session-analysis/session.webp"
         );
-        assert_eq!(tried[0], "/public/templates/ux-session-analysis/session.webp",
-            "the literal absolute interpretation must still be tried FIRST, not skipped");
+        assert_eq!(
+            tried[0], "/public/templates/ux-session-analysis/session.webp",
+            "the literal absolute interpretation must still be tried FIRST, not skipped"
+        );
 
         // CONTROL — a genuinely absolute path that just happens not to exist
         // must NOT be silently found somewhere else via a slash-stripped
         // reinterpretation the caller never asked for.
-        let (r, ok, tried) = resolve_rel_candidates(cwd, "/etc/does-not-exist-anywhere", &|_| false);
+        let (r, ok, tried) =
+            resolve_rel_candidates(cwd, "/etc/does-not-exist-anywhere", &|_| false);
         assert!(!ok);
-        assert_eq!(r, "/etc/does-not-exist-anywhere", "the literal path is still the honest first answer");
-        assert!(tried.len() > 1, "it still walked cwd's ancestors looking, it just found nothing: {tried:?}");
+        assert_eq!(
+            r, "/etc/does-not-exist-anywhere",
+            "the literal path is still the honest first answer"
+        );
+        assert!(
+            tried.len() > 1,
+            "it still walked cwd's ancestors looking, it just found nothing: {tried:?}"
+        );
     }
 
     /// AMUX-4661: the mirror-image case the ancestor walk cannot reach by
@@ -2585,6 +3392,64 @@ mod tests {
     /// (ai-for-smbs/smb-workspace). Rebuilt from Ethan's screenshots: the
     /// file overlay said jobs.py "does not exist here" for a file the same
     /// terminal pane had just shown being edited.
+    /// mxp-marketing, 2026-09-27: the cwd is gtm/playbooks and the file is in
+    /// gtm/launch-videos/prospect-videos, a sibling branch neither the ascent
+    /// nor the descent reaches.
+    fn sibling_tree(files: &'static [&'static str]) -> (impl Fn(&Path) -> bool, impl Fn(&Path) -> Vec<PathBuf>) {
+        let exists = move |p: &Path| files.iter().any(|f| Path::new(f) == p);
+        let list_dirs = move |d: &Path| -> Vec<PathBuf> {
+            let mut kids: Vec<PathBuf> = files
+                .iter()
+                .flat_map(|f| Path::new(f).ancestors().map(Path::to_path_buf).collect::<Vec<_>>())
+                .filter(|a| a.parent() == Some(d) && !files.iter().any(|f| Path::new(f) == a))
+                .collect();
+            kids.sort();
+            kids.dedup();
+            kids
+        };
+        (exists, list_dirs)
+    }
+
+    #[test]
+    fn sibling_search_finds_a_file_in_a_sibling_branch() {
+        let (exists, list_dirs) = sibling_tree(&[
+            "/m/gtm/launch-videos/prospect-videos/nbcuni/nbcuni-story.mp4",
+            "/m/gtm/playbooks/README.md",
+        ]);
+        let got = resolve_rel_sibling(Path::new("/m/gtm/playbooks"), Path::new("/m"),
+            "nbcuni/nbcuni-story.mp4", &exists, &list_dirs);
+        assert_eq!(got, Ok(Some(PathBuf::from("/m/gtm/launch-videos/prospect-videos/nbcuni/nbcuni-story.mp4"))));
+    }
+
+    #[test]
+    fn sibling_search_refuses_to_guess_between_two_matches() {
+        let (exists, list_dirs) = sibling_tree(&[
+            "/m/gtm/launch-videos/prospect-videos/nbcuni/nbcuni-story.mp4",
+            "/m/gtm/archive/nbcuni/nbcuni-story.mp4",
+        ]);
+        let got = resolve_rel_sibling(Path::new("/m/gtm/playbooks"), Path::new("/m"),
+            "nbcuni/nbcuni-story.mp4", &exists, &list_dirs);
+        assert_eq!(got.map_err(|v| v.len()), Err(2));
+    }
+
+    #[test]
+    fn sibling_search_prefers_the_nearest_ancestor_and_stops_at_the_repo_root() {
+        let (exists, list_dirs) = sibling_tree(&[
+            "/m/gtm/videos/nbcuni/nbcuni-story.mp4",
+            "/m/other/nbcuni/nbcuni-story.mp4",
+            "/outside/nbcuni/nbcuni-story.mp4",
+        ]);
+        // gtm/ is nearer than /m, so its one match wins over /m/other's.
+        let got = resolve_rel_sibling(Path::new("/m/gtm/playbooks"), Path::new("/m"),
+            "nbcuni/nbcuni-story.mp4", &exists, &list_dirs);
+        assert_eq!(got, Ok(Some(PathBuf::from("/m/gtm/videos/nbcuni/nbcuni-story.mp4"))));
+        // Nothing above the repo root is searched.
+        let (exists, list_dirs) = sibling_tree(&["/outside/nbcuni/nbcuni-story.mp4"]);
+        let got = resolve_rel_sibling(Path::new("/m/gtm/playbooks"), Path::new("/m"),
+            "nbcuni/nbcuni-story.mp4", &exists, &list_dirs);
+        assert_eq!(got, Ok(None));
+    }
+
     #[test]
     fn descend_finds_a_nested_workspace_the_ascent_cannot_reach() {
         let root = Path::new("/Users/ethan/Dev/ai-for-smbs");
@@ -2653,7 +3518,10 @@ mod tests {
         // With only the past-cap file present, the walk must not reach it.
         let only_too_deep = |p: &Path| p == too_deep;
         let found = resolve_rel_descend(root, "x.py", &only_too_deep, &list_dirs);
-        assert_eq!(found, None, "a match past DESCEND_MAX_DEPTH must not be found");
+        assert_eq!(
+            found, None,
+            "a match past DESCEND_MAX_DEPTH must not be found"
+        );
     }
 
     // ---- path guards ----
@@ -2664,7 +3532,9 @@ mod tests {
         assert!(!is_path_allowed(&home.join(".ssh/id_ed25519")));
         // Case-insensitive: the ~/.SSH incident from Python's docstring.
         assert!(!is_path_allowed(&home.join(".SSH/id_ed25519")));
-        assert!(!is_path_allowed(&home.join(".config/gcloud/credentials.db")));
+        assert!(!is_path_allowed(
+            &home.join(".config/gcloud/credentials.db")
+        ));
         assert!(!is_path_allowed(Path::new("/etc/shadow")));
         assert!(!is_path_allowed(Path::new("/etc/ssh/sshd_config")));
         // A non-existent tail with `..` resolves lexically over the resolved
@@ -2686,8 +3556,12 @@ mod tests {
     fn dangerous_write_matches_python_sets() {
         assert!(is_dangerous_write(Path::new("/tmp/x/.zshrc")));
         assert!(is_dangerous_write(Path::new("/tmp/Evil.PLIST")));
-        assert!(is_dangerous_write(Path::new("/tmp/repo/.git/hooks/pre-commit")));
-        assert!(is_dangerous_write(&home_dir().join("Library/LaunchAgents/com.x.plist")));
+        assert!(is_dangerous_write(Path::new(
+            "/tmp/repo/.git/hooks/pre-commit"
+        )));
+        assert!(is_dangerous_write(
+            &home_dir().join("Library/LaunchAgents/com.x.plist")
+        ));
         // `low + "/"`: a path ENDING in /bin matches the /bin/ marker.
         assert!(is_dangerous_write(Path::new("/usr/local/bin")));
         assert!(!is_dangerous_write(Path::new("/tmp/notes.md")));
@@ -2695,7 +3569,10 @@ mod tests {
 
     #[test]
     fn sanitize_matches_python_regex() {
-        assert_eq!(sanitize_upload_name("report (final).pdf"), "report _final_.pdf");
+        assert_eq!(
+            sanitize_upload_name("report (final).pdf"),
+            "report _final_.pdf"
+        );
         assert_eq!(sanitize_upload_name("../../etc/passwd"), "passwd");
         assert_eq!(sanitize_upload_name(""), "upload");
         assert_eq!(sanitize_upload_name("naïve café.txt"), "naïve café.txt"); // \w is unicode
@@ -2765,7 +3642,9 @@ mod tests {
     #[test]
     fn multipart_invalid_shapes_are_none() {
         assert!(parse_multipart("multipart/form-data", b"whatever").is_none()); // no boundary param
-        assert!(parse_multipart("multipart/form-data; boundary=QQ", b"no delimiter here").is_none());
+        assert!(
+            parse_multipart("multipart/form-data; boundary=QQ", b"no delimiter here").is_none()
+        );
     }
 
     // ---- endpoint behavior (statuses + bodies pinned to the Python source) ----
@@ -2797,7 +3676,10 @@ mod tests {
             v["saved"][1],
             json!({"name": "evil.plist", "error": "refused: could execute code"})
         );
-        assert_eq!(std::fs::read_to_string(td.path().join("a.txt")).unwrap(), "one");
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("a.txt")).unwrap(),
+            "one"
+        );
         assert!(!td.path().join("evil.plist").exists());
 
         // Second identical upload: no clobber, suffixes _1 (py:68414-68424).
@@ -2831,13 +3713,23 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["saved"][0], json!({"name": "a.txt", "size": 5}));
-        assert_eq!(std::fs::read_to_string(td.path().join("a.txt")).unwrap(), "newer");
+        assert_eq!(
+            std::fs::read_to_string(td.path().join("a.txt")).unwrap(),
+            "newer"
+        );
     }
 
     #[tokio::test]
     async fn upload_error_contract() {
         let app = app();
-        let (st, v) = call(&app, "POST", "/api/fs/upload", Some("application/json"), b"{}".to_vec()).await;
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/fs/upload",
+            Some("application/json"),
+            b"{}".to_vec(),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "expected multipart/form-data");
 
@@ -2853,7 +3745,13 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "missing 'dir' field");
 
-        let body = mp_body("XX", &[("dir", None, b"/no/such/dir-xyz"), ("file", Some("a.txt"), b"x")]);
+        let body = mp_body(
+            "XX",
+            &[
+                ("dir", None, b"/no/such/dir-xyz"),
+                ("file", Some("a.txt"), b"x"),
+            ],
+        );
         let (st, v) = call(
             &app,
             "POST",
@@ -2864,6 +3762,32 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "not a directory: /no/such/dir-xyz");
+    }
+
+    /// "Move to..." in the file viewer's multi-select: `dest_dir` moves an entry
+    /// into another folder; a file or a folder-into-itself is refused.
+    #[tokio::test]
+    async fn rename_with_dest_dir_moves_into_another_folder() {
+        let app = app();
+        let td = tempfile::tempdir().unwrap();
+        let (a, b) = (td.path().join("a"), td.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("f.txt"), "z").unwrap();
+        let post = |body: Value| serde_json::to_vec(&body).unwrap();
+        let (st, v) = call(&app, "POST", "/api/fs/rename", Some("application/json"),
+            post(json!({"path": a.join("f.txt").to_str().unwrap(), "new_name": "f.txt", "dest_dir": b.to_str().unwrap()}))).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(b.join("f.txt").exists() && !a.join("f.txt").exists());
+        let (st, v) = call(&app, "POST", "/api/fs/rename", Some("application/json"),
+            post(json!({"path": b.join("f.txt").to_str().unwrap(), "new_name": "f.txt", "dest_dir": b.join("f.txt").to_str().unwrap()}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"], "destination is not a folder");
+        std::fs::create_dir_all(a.join("inner")).unwrap();
+        let (st, v) = call(&app, "POST", "/api/fs/rename", Some("application/json"),
+            post(json!({"path": a.to_str().unwrap(), "new_name": "a", "dest_dir": a.join("inner").to_str().unwrap()}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert_eq!(v["error"], "cannot move a folder into itself");
     }
 
     #[tokio::test]
@@ -2893,9 +3817,14 @@ mod tests {
         assert_eq!(st, StatusCode::CONFLICT);
         assert_eq!(v["error"], "already exists");
         // Relative path → 400 before any containment check.
-        let (st, v) =
-            call(&app, "POST", "/api/fs/mkdir", Some("application/json"), b"{\"path\":\"rel/x\"}".to_vec())
-                .await;
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/fs/mkdir",
+            Some("application/json"),
+            b"{\"path\":\"rel/x\"}".to_vec(),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "absolute path required");
 
@@ -2992,7 +3921,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let f = td.path().join("utf8.txt");
         std::fs::write(&f, "café\n").unwrap();
-        let uri = format!("/api/fs/read?path={}&max_bytes=4", urlencode(&f.to_string_lossy()));
+        let uri = format!(
+            "/api/fs/read?path={}&max_bytes=4",
+            urlencode(&f.to_string_lossy())
+        );
         let (st, v) = call(&app, "GET", &uri, None, vec![]).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["encoding"], "base64");
@@ -3010,8 +3942,14 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert_eq!(v["error"], "missing query");
         // bad root → 200 with the named error (Python returns 200 here).
-        let (st, v) =
-            call(&app, "GET", "/api/fs/search?path=%2Fno%2Fsuch-dir-xyz&q=x", None, vec![]).await;
+        let (st, v) = call(
+            &app,
+            "GET",
+            "/api/fs/search?path=%2Fno%2Fsuch-dir-xyz&q=x",
+            None,
+            vec![],
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["error"], "access denied or not a directory");
         assert_eq!(v["root"], "");
@@ -3024,10 +3962,12 @@ mod tests {
 
 #[cfg(test)]
 mod open_native_locality_tests {
-    use super::browser_is_on_this_machine_with;
+    use super::{browser_is_on_this_machine_checked, browser_is_on_this_machine_with};
     use std::net::IpAddr;
 
-    fn ip(s: &str) -> IpAddr { s.parse().unwrap() }
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
 
     /// THE INCIDENT, 2026-08-28. Ethan opened a folder from the dashboard he
     /// reaches at `desktop.tail5ce8f5.ts.net` — his OWN machine — and got
@@ -3039,9 +3979,41 @@ mod open_native_locality_tests {
     /// LOCAL machine and the button emitted an `sftp://` URL that no macOS
     /// handler accepts. Both halves are pinned here: the same-machine pair must
     /// read local, and a different tailnet node must not.
+    /// The outside report: a remote peer naming ITSELF in Host resolves to
+    /// itself, so the pair check alone read it as this machine.
+    #[test]
+    fn a_remote_peer_naming_itself_in_host_is_not_local() {
+        let remote = ip("100.66.26.84");
+        let own = ip("100.108.219.90");
+        let host = Some("100.66.26.84:8824");
+        let dns = |h: &str| h.parse::<std::net::IpAddr>().into_iter().collect::<Vec<_>>();
+        let this_host = |p: std::net::IpAddr| p == own;
+        assert!(
+            browser_is_on_this_machine_with(Some(remote), host, dns),
+            "precondition: the name check alone is fooled"
+        );
+        assert!(
+            !browser_is_on_this_machine_checked(Some(remote), host, dns, this_host),
+            "a foreign address that names itself must stay REMOTE"
+        );
+        // The control: this machine's own address naming itself is local.
+        assert!(browser_is_on_this_machine_checked(
+            Some(own),
+            Some("100.108.219.90:8824"),
+            dns,
+            this_host
+        ));
+        assert!(browser_is_on_this_machine_checked(
+            Some(ip("127.0.0.1")),
+            None,
+            dns,
+            this_host
+        ));
+    }
+
     #[test]
     fn a_tailscale_name_for_your_own_machine_is_local_and_another_node_is_not() {
-        let own = ip("100.108.219.90");   // this host's tailnet address
+        let own = ip("100.108.219.90"); // this host's tailnet address
         let host = Some("desktop.tail5ce8f5.ts.net:8824");
         let dns = |_h: &str| vec![own];
 
@@ -3089,7 +4061,10 @@ mod open_native_locality_tests {
             .uri("https://desktop.tail5ce8f5.ts.net:8824/api/fs/open")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert!(h2.headers().get(axum::http::header::HOST).is_none(), "fixture must have NO Host");
+        assert!(
+            h2.headers().get(axum::http::header::HOST).is_none(),
+            "fixture must have NO Host"
+        );
         assert_eq!(
             super::request_authority(&h2).as_deref(),
             Some("desktop.tail5ce8f5.ts.net:8824"),
@@ -3098,7 +4073,10 @@ mod open_native_locality_tests {
         );
 
         // Neither: still None, so the caller's fail-safe (remote) applies.
-        let bare = HttpRequest::builder().uri("/api/fs/open").body(axum::body::Body::empty()).unwrap();
+        let bare = HttpRequest::builder()
+            .uri("/api/fs/open")
+            .body(axum::body::Body::empty())
+            .unwrap();
         assert_eq!(super::request_authority(&bare), None);
     }
 
@@ -3107,8 +4085,16 @@ mod open_native_locality_tests {
     #[test]
     fn loopback_is_local_without_consulting_dns() {
         let never = |_h: &str| Vec::new();
-        assert!(browser_is_on_this_machine_with(Some(ip("127.0.0.1")), Some("localhost:8824"), never));
-        assert!(browser_is_on_this_machine_with(Some(ip("::1")), None, never));
+        assert!(browser_is_on_this_machine_with(
+            Some(ip("127.0.0.1")),
+            Some("localhost:8824"),
+            never
+        ));
+        assert!(browser_is_on_this_machine_with(
+            Some(ip("::1")),
+            None,
+            never
+        ));
     }
 
     /// FAIL SAFE. No peer (ConnectInfo absent, as in router-level tests), an
@@ -3118,9 +4104,19 @@ mod open_native_locality_tests {
     #[test]
     fn unknown_reads_remote_rather_than_local() {
         let own = ip("100.108.219.90");
-        assert!(!browser_is_on_this_machine_with(None, Some("desktop:8824"), |_| vec![own]));
-        assert!(!browser_is_on_this_machine_with(Some(own), None, |_| vec![own]));
-        assert!(!browser_is_on_this_machine_with(Some(own), Some("desktop:8824"), |_| Vec::new()));
+        assert!(!browser_is_on_this_machine_with(
+            None,
+            Some("desktop:8824"),
+            |_| vec![own]
+        ));
+        assert!(!browser_is_on_this_machine_with(Some(own), None, |_| vec![
+            own
+        ]));
+        assert!(!browser_is_on_this_machine_with(
+            Some(own),
+            Some("desktop:8824"),
+            |_| Vec::new()
+        ));
     }
 
     /// The authority is parsed, not pattern-matched: a port must be stripped and
@@ -3131,10 +4127,71 @@ mod open_native_locality_tests {
     fn the_host_authority_is_parsed() {
         let own = ip("100.108.219.90");
         let seen = std::cell::RefCell::new(String::new());
-        let spy = |h: &str| { *seen.borrow_mut() = h.to_string(); vec![own] };
-        assert!(browser_is_on_this_machine_with(Some(own), Some("desktop.tail5ce8f5.ts.net:8824"), spy));
-        assert_eq!(seen.borrow().as_str(), "desktop.tail5ce8f5.ts.net", "port stripped");
-        assert!(browser_is_on_this_machine_with(Some(own), Some("[fd7a::1]:8824"), spy));
+        let spy = |h: &str| {
+            *seen.borrow_mut() = h.to_string();
+            vec![own]
+        };
+        assert!(browser_is_on_this_machine_with(
+            Some(own),
+            Some("desktop.tail5ce8f5.ts.net:8824"),
+            spy
+        ));
+        assert_eq!(
+            seen.borrow().as_str(),
+            "desktop.tail5ce8f5.ts.net",
+            "port stripped"
+        );
+        assert!(browser_is_on_this_machine_with(
+            Some(own),
+            Some("[fd7a::1]:8824"),
+            spy
+        ));
         assert_eq!(seen.borrow().as_str(), "fd7a::1", "IPv6 brackets stripped");
+    }
+}
+
+#[cfg(test)]
+mod git_fallback_tests {
+    use super::*;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let o = std::process::Command::new("git").arg("-C").arg(dir).args(args)
+            .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+            .output().unwrap();
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    }
+
+    /// The 2026-09-27 shape: a lane graft-pushes a file, the shared checkout
+    /// never receives it and has not fetched since, and the viewer asks with
+    /// the ABSOLUTE path it joined onto the worker's directory, no cwd.
+    #[tokio::test]
+    async fn an_absolute_path_pushed_but_not_fetched_is_served_from_origin_main() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let shared = tmp.path().join("shared");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "--bare", "-b", "main"]);
+        git(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), "shared"]);
+        std::fs::write(shared.join("README.md"), "x").unwrap();
+        git(&shared, &["add", "."]);
+        git(&shared, &["commit", "-q", "-m", "init"]);
+        git(&shared, &["push", "-q", "origin", "HEAD:main"]);
+        git(tmp.path(), &["clone", "-q", origin.to_str().unwrap(), "other"]);
+        std::fs::create_dir_all(other.join("server/infra/gke")).unwrap();
+        std::fs::write(other.join("server/infra/gke/LEDGER.md"), "# ledger\n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-q", "-m", "ledger"]);
+        git(&other, &["push", "-q", "origin", "HEAD:main"]);
+
+        let abs = shared.join("server/infra/gke/LEDGER.md");
+        assert!(!abs.exists(), "the precondition: not on disk in the shared checkout");
+        let (path, bytes) = git_show_file("", abs.to_str().unwrap()).await.expect("served after one fetch");
+        assert_eq!(bytes, b"# ledger\n");
+        assert!(path.ends_with("server/infra/gke/LEDGER.md"), "{path}");
+        // A path that exists nowhere is still None, not a guess.
+        let none = shared.join("server/infra/gke/NOPE.md");
+        assert!(git_show_file("", none.to_str().unwrap()).await.is_none());
     }
 }
