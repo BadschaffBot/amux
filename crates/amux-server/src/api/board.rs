@@ -6266,6 +6266,8 @@ pub async fn create_item(
         "ask_question",
         "ask_unblocks",
         "request_to",
+        // RX-7: explicit epic parent, validated above.
+        "epic",
         // AMUX-4748. Omitting this made create DROP the exact field the pickup
         // gate requires: a caller sent a good continuation, it landed in
         // `ignored_fields`, and dispatch then refused the card for not having
@@ -6295,6 +6297,36 @@ pub async fn create_item(
                 );
             }
         };
+    // RX-7: an explicit epic parent on create. Validated before any write so a
+    // bad id is refused rather than stored as a dangling epic. The key is also
+    // STRUCTURED, so semantic intake cannot fold this card into another one.
+    let epic_parent: Option<String> = match body_str(&map, "epic")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(epic_id) => {
+            let found = match state.store.read() {
+                Ok(conn) => bs::get_issue(&conn, &epic_id).ok().flatten(),
+                Err(_) => None,
+            };
+            match found {
+                Some(row) if row.item_type == "epic" => Some(epic_id),
+                Some(_) => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": format!("{epic_id} is not an epic"), "code": "epic_not_epic"}),
+                    )
+                }
+                None => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": format!("epic {epic_id} not found"), "code": "epic_not_found"}),
+                    )
+                }
+            }
+        }
+    };
     let _intake_guard = super::board_intake::lock(&session, &owner_type).await;
     let intake = super::board_intake::plan_create(&map, &item_type, || async {
         super::board_intake::plan(
@@ -6572,6 +6604,8 @@ pub async fn create_item(
             }
             let now = now_secs();
             let mut row = bs::create_issue(conn, &new, now)?;
+            // RX-7: save_patched persists `epic`, so the parent lands with the card.
+            row.epic = epic_parent.clone();
             row.log = Some(bs::append_log(
                 row.log.as_deref(),
                 &hhmm(),

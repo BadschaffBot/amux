@@ -175,7 +175,7 @@ impl Plan {
 /// this path and made no model call; the 222 that did have a p50 of 3322ms.
 /// So this list is what separates a create that returns immediately from one
 /// that waits about three seconds.
-pub(crate) const STRUCTURED_KEYS: [&str; 15] = [
+pub(crate) const STRUCTURED_KEYS: [&str; 16] = [
     "depends_on",
     "gate",
     "callback",
@@ -191,6 +191,7 @@ pub(crate) const STRUCTURED_KEYS: [&str; 15] = [
     "request_to",
     "next_action",
     "acceptance_criteria",
+    "epic",
 ];
 
 /// Explicit graph/gate metadata already determines that a new record is needed.
@@ -1126,6 +1127,7 @@ mod structured_skip_tests {
             "acceptance_criteria",
             "depends_on",
             "request_to",
+            "epic",
         ] {
             assert!(
                 STRUCTURED_KEYS.contains(&required),
