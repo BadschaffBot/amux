@@ -3187,6 +3187,9 @@
   .dict-empty { color: var(--dim); font-size: var(--fs-lg); text-align: center; padding: var(--space-8) var(--space-3); line-height: 1.7; }
   .dict-day { font-size: var(--fs-2xs); font-weight: 700; letter-spacing: 0.06em; color: var(--dim); margin: var(--space-3-5) 0 var(--space-1-5); }
   .dict-day:first-child { margin-top: 0; }
+  .dict-pending-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+  .dict-pending-acts { display: flex; gap: var(--space-1-5); flex-shrink: 0; }
+  .dict-pending-acts .btn { letter-spacing: normal; font-weight: 500; }
   .dict-row { display: flex; align-items: flex-start; gap: var(--space-2-5); padding: var(--space-2) var(--space-2-5); border: 1px solid var(--border);
     border-radius: var(--radius-lg); margin-bottom: var(--space-1-5); background: var(--card); }
   .dict-row:hover { border-color: var(--accent); }
@@ -3213,9 +3216,15 @@
   .dict-set-row span { color: var(--dim); }
   .dict-sethint { font-size: var(--fs-sm); color: var(--dim); line-height: 1.6; margin-top: var(--space-2-5); }
   @media (max-width: 600px) {
-    .dict-row { flex-wrap: wrap; }
-    .dict-time { min-width: 0; }
-    .dict-acts button { min-width: 34px; min-height: 34px; font-size: var(--fs-2xl); }
+    /* One row of time and actions, then the text at full width (owner, 2026-11-18:
+       the text was squeezed into a column of two or three words beside five
+       buttons). */
+    .dict-row { flex-wrap: wrap; align-items: center; }
+    .dict-time { min-width: 0; order: 0; }
+    .dict-row .dict-acts { order: 1; margin-left: auto; }
+    .dict-row .dict-text { order: 2; flex: 1 1 100%; }
+    .dict-acts button { min-width: 44px; min-height: 44px; font-size: var(--fs-2xl); }
+    .dict-pending-acts .btn { min-height: 44px; }
     .dict-rec { width: 58px; height: 58px; min-width: 58px; }
     .dict-search { max-width: 130px; }
     #dict-open-settings, .dict-subtabs .dict-search { min-height: 44px; }
@@ -11091,6 +11100,9 @@ body.light #file-overlay .mdx-out .file-overlay-body { background: var(--bg); co
 .worker-hovercard > .card { margin: 0; border: none; box-shadow: none; }
 .worker-hovercard .card-menu-btn { display: none; }   /* nothing in a preview takes a click */
 .worker-hovercard-none { padding: var(--space-3); color: var(--dim); font-size: var(--fs-md); }
+/* A linked file's preview in the same card: its path, then the head of the file. */
+.file-hovercard-path { padding: var(--space-2) var(--space-3); font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--dim); border-bottom: 1px solid var(--border); word-break: break-all; }
+.file-hovercard-body { margin: 0; padding: var(--space-2) var(--space-3); font-size: var(--fs-sm); overflow: hidden; max-height: min(50vh, 440px); white-space: pre-wrap; word-break: break-word; }
 
 /* Scheduled sends in the Email tab (app.js _emailSchedPaint). The reschedule
    row is the banner's own form, restyled for the page background. */
@@ -11359,7 +11371,6 @@ body.intent-simple .tab-bar-outer { padding-top: env(safe-area-inset-top); }
 }
 .peek-msg-convs:empty { display: none; }
 .peek-msg-convs { padding: var(--space-2-5) var(--space-2-5) 0; display: flex; flex-direction: column; gap: var(--space-1-5); }
-.peek-msg-convs-head { font-weight: 600; font-size: var(--fs-md); color: var(--dim); }
 
 /* Workflow wizard (#wfw-overlay) */
 .wfw-brief { white-space: pre-wrap; max-height: 40vh; overflow: auto; font-size: var(--fs-sm);

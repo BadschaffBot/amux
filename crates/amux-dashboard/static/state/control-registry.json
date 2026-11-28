@@ -1452,6 +1452,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_dictClearAll": {
+      "kind": "command._dictClearAll",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_dictClearKey": {
       "kind": "command._dictClearKey",
       "feedback_required": true,
@@ -1578,8 +1584,26 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_dictRender": {
+      "kind": "command._dictRender",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictRenderHistory": {
+      "kind": "command._dictRenderHistory",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_dictRetry": {
       "kind": "command._dictRetry",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictRetryAll": {
+      "kind": "command._dictRetryAll",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -1634,6 +1658,12 @@
     },
     "_dictTrySend": {
       "kind": "command._dictTrySend",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_dictTrySendOnce": {
+      "kind": "command._dictTrySendOnce",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"
@@ -3438,6 +3468,12 @@
       "target": "control-or-request",
       "queue_policy": "transport-declared"
     },
+    "_mdxHistStep": {
+      "kind": "command._mdxHistStep",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
     "_mdxHistoryAct": {
       "kind": "command._mdxHistoryAct",
       "feedback_required": true,
@@ -4160,6 +4196,18 @@
     },
     "_peekInsetReport": {
       "kind": "command._peekInsetReport",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekIntentList": {
+      "kind": "command._peekIntentList",
+      "feedback_required": true,
+      "target": "control-or-request",
+      "queue_policy": "transport-declared"
+    },
+    "_peekIntentTabPaint": {
+      "kind": "command._peekIntentTabPaint",
       "feedback_required": true,
       "target": "control-or-request",
       "queue_policy": "transport-declared"

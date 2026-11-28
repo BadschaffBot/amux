@@ -348,7 +348,11 @@ pub async fn dictate(
             },
         };
         if let Some(raw) = raw {
-            let (t, e) = whisper_transcribe(&raw, &mime).await;
+            let store = state.store.clone();
+            let prompt = tokio::task::spawn_blocking(move || store.read().map(|c| local_vocab_prompt(&c)).unwrap_or_default())
+                .await
+                .unwrap_or_default();
+            let (t, e, local_engine) = whisper_transcribe(&raw, &mime, &prompt).await;
             werr = e;
             let outcome = read_local_result(&t, &werr);
             let outcome_was_no_speech = outcome == LocalResult::NoSpeech;
@@ -364,7 +368,7 @@ pub async fn dictate(
                     Ok(Err(e)) => return internal(e),
                     Err(e) => return internal(e),
                 }
-                engine = "whisper";
+                engine = local_engine;
             } else if outcome_was_no_speech {
                 // THE ENGINE RAN AND HEARD NO SPEECH. That is a RESULT, not a
                 // failure, and escalating it is how silence became a sentence
@@ -388,7 +392,7 @@ pub async fn dictate(
                 //
                 // The local engine was never broken: its own worker returns
                 // {"text": "Testing 123"} on a real speech clip (AMUX-4627).
-                engine = "whisper";
+                engine = local_engine;
                 tracing::info!(
                     measured = true,
                     n_considered = 1,
@@ -460,6 +464,16 @@ pub async fn dictate(
         engine = "gemini";
     }
 
+    // Spoken lists come out as lists (owner, 2026-11-17: "the formatting stuff
+    // like Wispr Flow does, where I'm doing a list ... format the output
+    // accordingly"). Every engine's text passes here, the Mac app's included.
+    let listed = format_spoken_list(&text);
+    if listed != text {
+        tracing::info!(engine, items = listed.lines().filter(|l| l.starts_with(|c: char| c.is_ascii_digit())).count(),
+            measured = true, n_considered = 1, verdict = "dictation_list_formatted",
+            "[dictation] a spoken list was formatted as a numbered list");
+        text = listed;
+    }
     let words = text.split_whitespace().count() as i64;
     let ts = chrono::Utc::now().timestamp_millis();
     let slot: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
@@ -568,10 +582,14 @@ pub(crate) async fn transcribe_clip(state: &AppState, raw: &[u8], mime: &str) ->
     };
     let mut why = String::new();
     if pref != super::transcription::Pref::Gemini && whisper_available().await {
-        let (t, e) = whisper_transcribe(raw, mime).await;
+        let store = state.store.clone();
+        let prompt = tokio::task::spawn_blocking(move || store.read().map(|c| local_vocab_prompt(&c)).unwrap_or_default())
+            .await
+            .unwrap_or_default();
+        let (t, e, local_engine) = whisper_transcribe(raw, mime, &prompt).await;
         match read_local_result(&t, &e) {
-            LocalResult::Text(t) => return Ok((t, "whisper")),
-            LocalResult::NoSpeech => return Ok((String::new(), "whisper")),
+            LocalResult::Text(t) => return Ok((t, local_engine)),
+            LocalResult::NoSpeech => return Ok((String::new(), local_engine)),
             LocalResult::Failed(e) => why = e,
         }
     }
@@ -1433,6 +1451,163 @@ pub(crate) async fn gemini_generate(key: &str, parts: Value, timeout_s: u64) -> 
 // the module and the weights are on this box, dictation runs locally;
 // otherwise it falls through to Gemini. Same binary, both deployments.
 
+/// The preferred local engine (owner, 2026-11-18: "the cheapest, fastest, most
+/// accurate model local"): Whisper large-v3-turbo on MLX, Apple's GPU framework.
+/// Measured on the owner's own 30 saved dictations (487 s of audio, M3 Ultra):
+/// 0.89 s per clip against 1.51 s for openai-whisper `base`, which ran under
+/// an x86_64 Python (Rosetta, CPU only); 3.8% WER against full large-v3 against
+/// 10.3% for `base`; the owner's terms spelled right 16 times and wrong twice
+/// against 1 and 9; 2.3 GB resident. Parakeet TDT 0.6B was faster (0.3 s) but
+/// weaker on names and content. The worker takes one JSON line per clip,
+/// `{"path", "prompt"}`; the prompt is the dictionary as plain terms. A clip
+/// whose peak is under -60 dB is no speech, answered empty without the model:
+/// on the owner's three silent clips Whisper says "Thank you.".
+const MLX_WORKER_PY: &str = r#"
+import sys, json, os
+try:
+    import numpy as np
+    import mlx_whisper
+    from mlx_whisper.audio import load_audio
+    model = os.environ["AMUX_MLX_MODEL_DIR"]
+    mlx_whisper.transcribe(np.zeros(16000, dtype=np.float32), path_or_hf_repo=model, language="en")
+except Exception as e:
+    print(json.dumps({"fatal": str(e)[:200]}), flush=True); sys.exit(1)
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        req = json.loads(line) if line.startswith("{") else {"path": line}
+        audio = load_audio(req["path"])
+        if float(np.abs(audio).max(initial=0.0)) < 0.001:
+            print(json.dumps({"text": "", "silent": True}), flush=True); continue
+        kw = {"path_or_hf_repo": model, "language": "en", "condition_on_previous_text": False}
+        if req.get("prompt"): kw["initial_prompt"] = req["prompt"]
+        r = mlx_whisper.transcribe(audio, **kw)
+        print(json.dumps({"text": (r.get("text") or "").strip()}), flush=True)
+    except Exception as e:
+        print(json.dumps({"error": str(e)[:200]}), flush=True)
+"#;
+
+pub(crate) const MLX_DEFAULT_MODEL: &str = "mlx-community/whisper-large-v3-turbo";
+
+/// `AMUX_MLX_MODEL` (a Hugging Face repo id), or the default; `off` disables.
+fn mlx_model_name() -> String {
+    std::env::var("AMUX_MLX_MODEL")
+        .unwrap_or_else(|_| MLX_DEFAULT_MODEL.into())
+        .trim()
+        .to_string()
+}
+
+/// The model's local snapshot directory under `<home>/.amux/models/hf`, or
+/// None. Loaded from disk only: a missing model must never start a download
+/// on a request (the same rule as the openai-whisper weights, AMUX-4627).
+fn mlx_model_dir_in(home: &std::path::Path, repo: &str) -> Option<PathBuf> {
+    let snaps = home
+        .join(".amux/models/hf/hub")
+        .join(format!("models--{}", repo.replace('/', "--")))
+        .join("snapshots");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    dirs.into_iter().rev().find(|d| {
+        d.join("config.json").exists()
+            && (d.join("weights.safetensors").exists() || d.join("weights.npz").exists())
+    })
+}
+
+fn mlx_model_dir() -> Option<PathBuf> {
+    mlx_model_dir_in(&PathBuf::from(std::env::var("HOME").unwrap_or_default()), &mlx_model_name())
+}
+
+static MLX_PY: OnceLock<Option<String>> = OnceLock::new();
+
+/// An arm64 Python that can import mlx_whisper: `AMUX_MLX_PYTHON`, then the
+/// venv amux keeps at `~/.amux/models/asr-venv`.
+fn mlx_python_blocking() -> Option<String> {
+    MLX_PY
+        .get_or_init(|| {
+            let mut cands: Vec<PathBuf> = Vec::new();
+            if let Ok(v) = std::env::var("AMUX_MLX_PYTHON") {
+                if !v.trim().is_empty() {
+                    cands.push(PathBuf::from(v.trim()));
+                }
+            }
+            cands.push(PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".amux/models/asr-venv/bin/python"));
+            cands.into_iter().filter(|c| c.exists()).find_map(|c| {
+                let ok = run_with_timeout(
+                    &c.to_string_lossy(),
+                    &["-c", "import importlib.util as u,sys;sys.exit(0 if u.find_spec('mlx_whisper') else 1)"],
+                    Duration::from_secs(20),
+                )
+                .map(|s| s.success())
+                .unwrap_or(false);
+                ok.then(|| c.to_string_lossy().into_owned())
+            })
+        })
+        .clone()
+}
+
+/// The engine name local dictation runs as: "mlx-whisper" or "whisper".
+pub(crate) async fn local_engine_name() -> &'static str {
+    if mlx_available().await { "mlx-whisper" } else { "whisper" }
+}
+
+/// Whether the MLX engine is installed here: not turned off, model on disk, an
+/// interpreter with mlx_whisper. Takes no lock: `whisper_start` calls it with
+/// the WHISPER lock held (tokio's Mutex is not reentrant).
+async fn mlx_installed() -> bool {
+    #[cfg(test)]
+    if tests::WHISPER_OVERRIDE.lock().expect("whisper override").is_some() {
+        return false;
+    }
+    let name = mlx_model_name();
+    if name.is_empty() || ["off", "none", "0"].contains(&name.to_lowercase().as_str()) {
+        return false;
+    }
+    if mlx_model_dir().is_none() {
+        return false;
+    }
+    tokio::task::spawn_blocking(mlx_python_blocking).await.ok().flatten().is_some()
+}
+
+/// Installed, and its worker has not failed to start in this process.
+/// Takes the WHISPER lock: never call it while holding that lock.
+async fn mlx_available() -> bool {
+    // A local, so the guard drops here: as one `&&` expression the temporary
+    // guard lived across the install probe's await (land review F3).
+    let failed = WHISPER.lock().await.mlx_failed;
+    !failed && mlx_installed().await
+}
+
+/// The dictionary as plain terms for Whisper's prompt: correct spellings, then
+/// contact names when that source is on, then the speaker's note. Whisper
+/// copies the spelling of prompt words; an instruction sentence it would echo
+/// (measured: a "Vocabulary:" prefix turned silence into invented sentences).
+pub(crate) fn local_vocab_prompt(conn: &rusqlite::Connection) -> String {
+    let mut terms: Vec<String> = conn
+        .prepare("SELECT word, correct FROM dictation_dict ORDER BY created DESC LIMIT 100")
+        .and_then(|mut s| {
+            s.query_map([], |r| {
+                let (w, c): (String, String) = (r.get(0)?, r.get(1)?);
+                Ok(if c.trim().is_empty() { w } else { c })
+            })
+            .map(|it| it.flatten().collect())
+        })
+        .unwrap_or_default();
+    let settings = read_settings(conn);
+    if settings.contacts {
+        terms.extend(contact_names(conn).into_iter().take(40));
+    }
+    terms.retain(|t| !t.trim().is_empty());
+    terms.dedup();
+    let mut out = if terms.is_empty() { String::new() } else { format!("{}.", terms.join(", ")) };
+    if !settings.context.is_empty() {
+        out = format!("{out} {}", settings.context).trim().to_string();
+    }
+    // Whisper reads at most about 224 prompt tokens; keep the head.
+    truncate_chars(&out, 700)
+}
+
 /// py:27302 `_WHISPER_WORKER` — the inline worker script. It matched Python's
 /// byte for byte until AMUX-4627 added `download_root`, which makes the model
 /// load from the directory `whisper_weights_path` found instead of
@@ -1607,6 +1782,12 @@ struct WhisperWorker {
 #[derive(Default)]
 struct WhisperState {
     worker: Option<WhisperWorker>,
+    /// Which engine the live worker runs: "mlx-whisper" or "whisper".
+    kind: &'static str,
+    /// The MLX worker could not start: use openai-whisper until restart.
+    mlx_failed: bool,
+    /// When the worker last answered, for the idle unload.
+    last_used: Option<std::time::Instant>,
     /// py `_whisper_failed`: a worker that could not START disables the
     /// local path until restart (fall through to Gemini, don't retry-spin).
     failed: bool,
@@ -1614,6 +1795,9 @@ struct WhisperState {
 
 static WHISPER: tokio::sync::Mutex<WhisperState> = tokio::sync::Mutex::const_new(WhisperState {
     worker: None,
+    kind: "",
+    mlx_failed: false,
+    last_used: None,
     failed: false,
 });
 
@@ -1623,6 +1807,9 @@ async fn whisper_available() -> bool {
     #[cfg(test)]
     if let Some(v) = *tests::WHISPER_OVERRIDE.lock().expect("whisper override") {
         return v;
+    }
+    if mlx_available().await {
+        return true;
     }
     let name = whisper_model_name();
     if name.is_empty() || ["off", "none", "0"].contains(&name.to_lowercase().as_str()) {
@@ -1662,6 +1849,9 @@ async fn whisper_available() -> bool {
 /// Dictate's local engine for the transcription setting: `Ok(model)` when it
 /// can run, else why not.
 pub(crate) async fn local_status() -> Result<String, String> {
+    if mlx_available().await {
+        return Ok(format!("{} (MLX)", mlx_model_name()));
+    }
     if whisper_available().await {
         return Ok(whisper_model_name());
     }
@@ -1679,15 +1869,51 @@ pub(crate) async fn local_status() -> Result<String, String> {
 /// loading costs 0.6-2.6s, paying it per request would erase the latency
 /// win the local path exists for). Called with the WHISPER lock held.
 async fn whisper_start(st: &mut WhisperState) {
+    if !st.mlx_failed && mlx_installed().await {
+        if let (Some(py), Some(dir)) = (tokio::task::spawn_blocking(mlx_python_blocking).await.ok().flatten(), mlx_model_dir()) {
+            let cmd = tokio::process::Command::new(&py);
+            if spawn_worker(st, cmd, MLX_WORKER_PY, &[("AMUX_MLX_MODEL_DIR", dir.to_string_lossy().into_owned()), ("HF_HUB_OFFLINE", "1".into())], "mlx-whisper").await {
+                tracing::info!(model = %mlx_model_name(), python = %py, verdict = "dictation_engine_warm", engine = "mlx-whisper",
+                    "[dictation] MLX Whisper warm");
+                return;
+            }
+            st.mlx_failed = true;
+            tracing::warn!(model = %mlx_model_name(), verdict = "dictation_mlx_failed", engine = "mlx-whisper",
+                "[dictation] the MLX worker did not start; using openai-whisper until restart");
+        }
+    }
     let py = tokio::task::spawn_blocking(whisper_python_blocking)
         .await
         .ok()
         .flatten();
     let Some(py) = py else { return };
-    let spawned = tokio::process::Command::new(&py)
-        .args(["-u", "-c", WHISPER_WORKER_PY])
-        .env("AMUX_WHISPER_MODEL", whisper_model_name())
-        .env("AMUX_WHISPER_DIR", whisper_weights_dir())
+    let cmd = tokio::process::Command::new(&py);
+    if !spawn_worker(st, cmd, WHISPER_WORKER_PY,
+        &[("AMUX_WHISPER_MODEL", whisper_model_name()), ("AMUX_WHISPER_DIR", whisper_weights_dir())], "whisper").await {
+        st.failed = true;
+        return;
+    }
+    tracing::info!(
+        "[dictation] whisper '{}' warm via {py}, weights from {}",
+        whisper_model_name(),
+        whisper_weights_dir()
+    );
+}
+
+/// Spawn a worker script and wait for its ready line. On success the worker
+/// is in `st` with `kind`, and an idle watcher is armed.
+async fn spawn_worker(
+    st: &mut WhisperState,
+    mut cmd: tokio::process::Command,
+    script: &str,
+    envs: &[(&str, String)],
+    kind: &'static str,
+) -> bool {
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let spawned = cmd
+        .args(["-u", "-c", script])
         .env("PYTHONUNBUFFERED", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -1703,14 +1929,12 @@ async fn whisper_start(st: &mut WhisperState) {
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
-            st.failed = true;
-            tracing::warn!("[dictation] whisper worker spawn failed: {e}");
-            return;
+            tracing::warn!(engine = kind, "[dictation] local worker spawn failed: {e}");
+            return false;
         }
     };
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
-        st.failed = true;
-        return;
+        return false;
     };
     // Drain stderr into the log on its own task. It must be DRAINED whatever
     // happens: a piped stream nobody reads fills its pipe buffer and blocks the
@@ -1738,22 +1962,51 @@ async fn whisper_start(st: &mut WhisperState) {
     let ok = matches!(read, Ok(Ok(n)) if n > 0) && line.contains("\"ready\"");
     if !ok {
         let _ = child.start_kill();
-        st.failed = true;
         tracing::warn!(
-            "[dictation] whisper worker failed to start: {}",
+            engine = kind,
+            "[dictation] local worker failed to start: {}",
             truncate_chars(line.trim(), 160)
         );
-        return;
+        return false;
     }
-    tracing::info!(
-        "[dictation] whisper '{}' warm via {py}, weights from {}",
-        whisper_model_name(),
-        whisper_weights_dir()
-    );
     st.worker = Some(WhisperWorker {
         child,
         stdin,
         stdout,
+    });
+    st.kind = kind;
+    st.last_used = Some(std::time::Instant::now());
+    arm_idle_unload();
+    true
+}
+
+/// `AMUX_DICTATION_IDLE_SECS` (default 900; 0 keeps the model loaded).
+fn idle_unload_secs() -> u64 {
+    std::env::var("AMUX_DICTATION_IDLE_SECS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(900)
+}
+
+/// One watcher per process: a worker idle past `idle_unload_secs` is stopped,
+/// so its model (2.3 GB for MLX turbo) leaves memory on a machine that is
+/// often under pressure. The next clip starts it again (about 2 s).
+fn arm_idle_unload() {
+    static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if idle_unload_secs() == 0 || ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+    rt.spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let mut st = WHISPER.lock().await;
+            let idle = st.last_used.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            if st.worker.is_some() && idle >= idle_unload_secs() {
+                if let Some(mut w) = st.worker.take() {
+                    let _ = w.child.start_kill();
+                }
+                tracing::info!(engine = st.kind, idle_secs = idle, measured = true, n_considered = 1,
+                    verdict = "dictation_engine_unloaded", "[dictation] local engine unloaded after idle");
+            }
+        }
     });
 }
 
@@ -1790,7 +2043,7 @@ pub(crate) fn read_local_result(text: &str, err: &str) -> LocalResult {
     LocalResult::Failed(err.trim().to_string())
 }
 
-async fn whisper_transcribe(raw: &[u8], mime: &str) -> (String, String) {
+async fn whisper_transcribe(raw: &[u8], mime: &str, prompt: &str) -> (String, String, &'static str) {
     let ext = match mime.to_lowercase().as_str() {
         "audio/ogg" => ".ogg",
         "audio/mp4" => ".mp4",
@@ -1811,8 +2064,8 @@ async fn whisper_transcribe(raw: &[u8], mime: &str) -> (String, String) {
     .await;
     let tmp = match tmp {
         Ok(Ok(f)) => f,
-        Ok(Err(e)) => return (String::new(), truncate_chars(&e.to_string(), 200)),
-        Err(e) => return (String::new(), truncate_chars(&e.to_string(), 200)),
+        Ok(Err(e)) => return (String::new(), truncate_chars(&e.to_string(), 200), "whisper"),
+        Err(e) => return (String::new(), truncate_chars(&e.to_string(), 200), "whisper"),
     };
     let path = tmp.path().to_string_lossy().into_owned();
 
@@ -1827,19 +2080,26 @@ async fn whisper_transcribe(raw: &[u8], mime: &str) -> (String, String) {
         whisper_start(&mut st).await;
     }
     if st.worker.is_none() {
-        return (String::new(), "local transcription unavailable".into());
+        return (String::new(), "local transcription unavailable".into(), "whisper");
     }
+    let kind = st.kind;
+    let req = if kind == "mlx-whisper" {
+        json!({ "path": path, "prompt": prompt }).to_string()
+    } else {
+        path.clone()
+    };
+    let t0 = std::time::Instant::now();
     let wrote = {
         let w = st.worker.as_mut().expect("worker present");
         w.stdin
-            .write_all(format!("{path}\n").as_bytes())
+            .write_all(format!("{req}\n").as_bytes())
             .await
             .is_ok()
             && w.stdin.flush().await.is_ok()
     };
     if !wrote {
         st.worker = None;
-        return (String::new(), "local worker died".into());
+        return (String::new(), "local worker died".into(), kind);
     }
     let mut line = String::new();
     // Python's readline here has NO timeout — a wedged worker hangs the
@@ -1865,17 +2125,23 @@ async fn whisper_transcribe(raw: &[u8], mime: &str) -> (String, String) {
                 .or_else(|| d.get("fatal").and_then(Value::as_str))
                 .unwrap_or("")
                 .to_string();
-            (text, err)
+            st.last_used = Some(std::time::Instant::now());
+            let silent = d.get("silent").and_then(Value::as_bool).unwrap_or(false);
+            tracing::info!(engine = kind, secs = t0.elapsed().as_secs_f64(), words = text.split_whitespace().count(),
+                silent, error = %err,
+                measured = true, n_considered = 1, verdict = "dictation_engine_ran",
+                "[dictation] local engine answered");
+            (text, err, kind)
         }
         Ok(_) => {
             st.worker = None;
-            (String::new(), "local worker died".into())
+            (String::new(), "local worker died".into(), kind)
         }
         Err(_) => {
             if let Some(mut w) = st.worker.take() {
                 let _ = w.child.start_kill();
             }
-            (String::new(), "local worker timed out".into())
+            (String::new(), "local worker timed out".into(), kind)
         }
     }
 }
@@ -2098,6 +2364,62 @@ fn strip_core(chunk: &str) -> (String, String) {
 /// py:27558 `_dictation_fix_names` — map spoken session names back onto
 /// their exact spelling. Pure function over an explicit target list so
 /// tests can drive it hermetically; `dn_targets` supplies the live list.
+/// A spoken enumeration as a numbered list: "Two things. One is X. Two is
+/// that Y." becomes "Two things.\n1. X.\n2. Y.". A list needs at least two
+/// markers in order from one (one/first, two/second, ...), each opening a
+/// sentence, so "one of the" or a lone "first" in prose is left alone. Text
+/// before the first marker stays as the intro line; "is", "is that" and a
+/// comma or colon after a marker are dropped. Text with no such run is
+/// returned unchanged, so a transcript already formatted passes through.
+pub(crate) fn format_spoken_list(text: &str) -> String {
+    const WORDS: [(&str, usize); 30] = [
+        ("one", 1), ("two", 2), ("three", 3), ("four", 4), ("five", 5), ("six", 6), ("seven", 7), ("eight", 8), ("nine", 9), ("ten", 10),
+        ("first", 1), ("second", 2), ("third", 3), ("fourth", 4), ("fifth", 5), ("sixth", 6), ("seventh", 7), ("eighth", 8), ("ninth", 9), ("tenth", 10),
+        ("firstly", 1), ("secondly", 2), ("thirdly", 3), ("fourthly", 4), ("fifthly", 5), ("sixthly", 6), ("seventhly", 7), ("eighthly", 8), ("ninthly", 9), ("tenthly", 10),
+    ];
+    static MARK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = MARK.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:^|[.!?]\s+)(?:number\s+)?([a-z]+)(?:\s+is\s+that|\s+is|\s*[,:])?\s+").expect("list marker regex")
+    });
+    // (number, where the sentence starts, where the item text starts)
+    let mut marks: Vec<(usize, usize, usize)> = Vec::new();
+    for c in re.captures_iter(text) {
+        let (Some(all), Some(w)) = (c.get(0), c.get(1)) else { continue };
+        let Some(&(_, n)) = WORDS.iter().find(|(k, _)| k.eq_ignore_ascii_case(w.as_str())) else { continue };
+        // Bare "Two things" opens no item: a marker needs "is", a comma or a
+        // colon after it, or to be one of the -ly / "number" forms.
+        let tail = &text[w.end()..all.end()];
+        let bare = !tail.contains([',', ':']) && !tail.to_lowercase().contains("is");
+        if bare && !w.as_str().to_lowercase().ends_with("ly") && !all.as_str().to_lowercase().contains("number") {
+            continue;
+        }
+        let start = if all.start() == 0 { 0 } else { all.start() + 1 };
+        marks.push((n, start, all.end()));
+    }
+    // The run 1, 2, 3 ... in order, from the first "one".
+    let mut run: Vec<(usize, usize, usize)> = Vec::new();
+    for m in marks {
+        if m.0 == run.len() + 1 {
+            run.push(m);
+        }
+    }
+    if run.len() < 2 {
+        return text.to_string();
+    }
+    let mut out = text[..run[0].1].trim().to_string();
+    for (i, &(n, _, body)) in run.iter().enumerate() {
+        let end = run.get(i + 1).map(|r| r.1).unwrap_or(text.len());
+        let item = text[body..end].trim();
+        let mut cs = item.chars();
+        let item = cs.next().map(|f| f.to_uppercase().collect::<String>() + cs.as_str()).unwrap_or_default();
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("{n}. {item}"));
+    }
+    out
+}
+
 pub(crate) fn fix_names_with_targets(
     text: &str,
     targets: &[(String, String, String)],
@@ -2221,6 +2543,7 @@ pub async fn config(State(state): State<AppState>, req: Request) -> Response {
                 Err(e) => return internal(e),
             };
             let local = whisper_available().await;
+            let mlx = local && mlx_available().await;
             py_json_response(
                 StatusCode::OK,
                 &[
@@ -2230,13 +2553,15 @@ pub async fn config(State(state): State<AppState>, req: Request) -> Response {
                     ("local", json!(local)),
                     (
                         "local_model",
-                        json!(if local {
+                        json!(if mlx {
+                            mlx_model_name()
+                        } else if local {
                             whisper_model_name()
                         } else {
                             String::new()
                         }),
                     ),
-                    ("engine", json!(if local { "whisper" } else { "gemini" })),
+                    ("engine", json!(if mlx { "mlx-whisper" } else if local { "whisper" } else { "gemini" })),
                 ],
             )
         }
@@ -2402,6 +2727,67 @@ pub(crate) mod tests {
         assert!(save_audio(0, "audio/webm", b"x").is_none(), "no row, no clip");
         remove_audio(990_001);
         assert!(!std::path::Path::new(&path).exists());
+    }
+
+    #[test]
+    fn a_spoken_list_comes_out_as_a_numbered_list() {
+        let said = "Two things. One is we want the formatting like Wispr Flow does. So that's important. \
+                    Two is that every input should be supported. Three is when I press the button, it should close.";
+        assert_eq!(
+            super::format_spoken_list(said),
+            "Two things.\n1. We want the formatting like Wispr Flow does. So that's important.\n\
+             2. Every input should be supported.\n3. When I press the button, it should close."
+        );
+        assert_eq!(super::format_spoken_list("First, buy milk. Second, call mom."), "1. Buy milk.\n2. Call mom.");
+        assert_eq!(super::format_spoken_list("Firstly we ship. Secondly we test."), "1. We ship.\n2. We test.");
+        for prose in [
+            "One of the workers is slow.",
+            "First, check the log. Then restart it.",
+            "Two things matter here. Three people agreed.",
+            "1. Already a list.\n2. Second item.",
+            "",
+        ] {
+            assert_eq!(super::format_spoken_list(prose), prose, "left alone: {prose}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mlx_install_check_takes_no_lock() {
+        // whisper_start runs with the WHISPER lock held and asks this; a check
+        // that took the lock again deadlocked the first clip (land review F1).
+        let _held = super::WHISPER.lock().await;
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), super::mlx_installed()).await;
+        assert!(r.is_ok(), "mlx_installed waited on the WHISPER lock");
+    }
+
+    #[test]
+    fn the_mlx_model_is_found_only_as_a_complete_local_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = "mlx-community/whisper-large-v3-turbo";
+        assert_eq!(super::mlx_model_dir_in(home.path(), repo), None, "nothing on disk");
+        let snap = home.path().join(".amux/models/hf/hub/models--mlx-community--whisper-large-v3-turbo/snapshots/abc");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("config.json"), b"{}").unwrap();
+        assert_eq!(super::mlx_model_dir_in(home.path(), repo), None, "a config without weights is a partial download");
+        std::fs::write(snap.join("weights.safetensors"), b"w").unwrap();
+        assert_eq!(super::mlx_model_dir_in(home.path(), repo), Some(snap));
+        assert_eq!(super::mlx_model_dir_in(home.path(), "mlx-community/other"), None);
+    }
+
+    #[tokio::test]
+    async fn the_local_prompt_is_the_dictionary_as_plain_terms() {
+        let (app, dir) = app();
+        let conn = rusqlite::Connection::open(dir.path().join("dictation-api-test.db")).unwrap();
+        assert_eq!(super::local_vocab_prompt(&conn), "", "an empty dictionary prompts nothing");
+        conn.execute("INSERT INTO dictation_dict (word, correct, created) VALUES ('TubeScience', '', 1), ('mixed peak', 'Mixpeek', 2)", []).unwrap();
+        let body = json!({"mic": "", "context": "I run amux.", "workers": true, "contacts": false});
+        send(&app, "PUT", "/api/dictation/settings", Some(body)).await;
+        let p = super::local_vocab_prompt(&conn);
+        assert!(p.contains("Mixpeek") && p.contains("TubeScience"), "{p}");
+        assert!(!p.contains("mixed peak"), "a correction prompts its right spelling only: {p}");
+        assert!(p.ends_with("I run amux."), "{p}");
+        assert!(!p.to_lowercase().contains("vocabulary") && !p.contains("EXACTLY"),
+            "no instruction words for Whisper to echo: {p}");
     }
 
     #[test]

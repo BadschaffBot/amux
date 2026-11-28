@@ -9562,6 +9562,91 @@ document.addEventListener('mouseout', (e) => {
 });
 ['scroll', 'mousedown', 'keydown'].forEach(t => document.addEventListener(t, () => { if (_wkHoverLink) _wkHoverHide(); }, true));
 
+// HOVER PREVIEW OF A LINKED FILE (owner, 2026-11-18: "file path is clickable
+// and on mouseover shows a preview"). Any .md-file-link to a file: the head of
+// the file, rendered as markdown for .md and as text otherwise, in the same
+// inert card as an @worker preview. A click still opens the file. Pointers
+// that hover only. Reads are cached for 30 s so moving across a list of paths
+// does not refetch.
+let _fhTimer = null, _fhLink = null;
+const _fhCache = new Map();
+async function _fhRead(path) {
+  const hit = _fhCache.get(path);
+  if (hit && Date.now() - hit.at < 30000) return hit;
+  let res;
+  try {
+    const r = await fetch(API + '/api/file/raw?path=' + encodeURIComponent(path), { headers: _authHeaders(), signal: AbortSignal.timeout(6000) });
+    if (!r.ok) res = { error: r.status === 404 ? 'No file at this path' : 'Could not read it (' + r.status + ')' };
+    else {
+      const type = r.headers.get('content-type') || '';
+      if (!/^text\/|json|xml|javascript|markdown/i.test(type) && !/\.(md|txt|json|ya?ml|toml|csv|rs|js|ts|py|sh)$/i.test(path)) res = { error: 'No preview for this kind of file' };
+      else { const t = await r.text(); res = { text: t.slice(0, 6000), cut: t.length > 6000 }; }
+    }
+  } catch (e) { res = { error: 'Could not read it' }; }
+  res.at = Date.now();
+  _fhCache.set(path, res);
+  return res;
+}
+// Every file link: a markdown link carries the full path; a path in worker
+// output (Messages, Chat, a peek) is relative to the worker, so it is resolved
+// the way its context menu resolves it.
+const _FH_LINKS = '.md-file-link[data-file]:not([data-dir]), .file-link[data-path], .md-link[data-path]';
+async function _fhPath(a) {
+  if (a.classList.contains('md-file-link')) return a.dataset.file || '';
+  const raw = (a.dataset.path || '').replace(/(?::\d+){1,2}$/, '');
+  try { return (await _resolveLinkedPath(raw)) || raw; }
+  catch (e) { console.warn('[hover] could not resolve a linked path', e); return raw; }
+}
+async function _fhShow(a) {
+  const pop = _wkHoverCard();
+  const path = await _fhPath(a);
+  if (_fhLink !== a || !path) return;
+  pop.innerHTML = '<div class="worker-hovercard-none">Loading ' + esc(path.split('/').pop()) + '…</div>';
+  pop.hidden = false;
+  const res = await _fhRead(path);
+  if (_fhLink !== a) return;
+  const head = '<div class="file-hovercard-path">' + esc(path) + '</div>';
+  let body;
+  if (res.error) body = '<div class="worker-hovercard-none">' + esc(res.error) + '</div>';
+  else if (/\.md$/i.test(path)) body = '<div class="file-hovercard-body md-body">' + renderMarkdown(res.text, path) + '</div>';
+  else body = '<pre class="file-hovercard-body">' + esc(res.text) + '</pre>';
+  pop.innerHTML = head + body + (res.cut ? '<div class="worker-hovercard-none">…</div>' : '');
+  const r = a.getBoundingClientRect(), pr = pop.getBoundingClientRect();
+  const vw = window.innerWidth, vh = window.innerHeight, gap = 6;
+  let top = r.bottom + gap;
+  if (top + pr.height > vh - 8 && r.top - gap - pr.height >= 8) top = r.top - gap - pr.height;
+  pop.style.top = Math.max(8, Math.min(top, vh - pr.height - 8)) + 'px';
+  pop.style.left = Math.max(8, Math.min(r.left, vw - pr.width - 8)) + 'px';
+}
+function _fhHide() {
+  clearTimeout(_fhTimer); _fhTimer = null; _fhLink = null;
+  const pop = document.getElementById('worker-hovercard');
+  if (pop) pop.hidden = true;
+}
+document.addEventListener('mouseover', (e) => {
+  if (!window.matchMedia('(hover: hover)').matches) return;
+  const a = e.target.closest && e.target.closest(_FH_LINKS);
+  if (!a || a === _fhLink) return;
+  _fhHide();
+  _fhLink = a;
+  _fhTimer = setTimeout(() => { if (_fhLink === a && a.isConnected) _fhShow(a); }, 350);
+});
+document.addEventListener('mouseout', (e) => {
+  if (!_fhLink) return;
+  const to = e.relatedTarget;
+  if (to && _fhLink.contains(to)) return;
+  if (e.target.closest && e.target.closest(_FH_LINKS) === _fhLink) _fhHide();
+});
+['mousedown', 'keydown'].forEach(t => document.addEventListener(t, () => { if (_fhLink) _fhHide(); }, true));
+// Only a scroll that moves the link hides its card (owner, 2026-11-19: "file
+// preview mouseover not working"): any scroll anywhere used to, and a live
+// terminal or list scrolls all the time, so the card closed as it opened.
+document.addEventListener('scroll', (e) => {
+  if (!_fhLink) return;
+  const t = e.target;
+  if (t === document || t === document.documentElement || (t && t.contains && t.contains(_fhLink))) _fhHide();
+}, true);
+
 // One worker's card, as the worker list draws it. Top level so a hover
 // preview of an @worker mention draws the same card (owner, 2026-11-09).
 function _renderSessionCard(s) {
@@ -11137,12 +11222,14 @@ function _applyPeekTabVisibility() {
       // worker's cards, it adds nothing to the raw CLI (Ethan, 2026-09-24).
       const alwaysShown = PEEK_REQUIRED_TABS.has(t.id);
       // A type with no worktree has no Worktree tab to show.
-      const typeHides = t.id === 'git' && _peekType.worktree === 'unsupported';
+      const typeHides = (t.id === 'git' && _peekType.worktree === 'unsupported')
+        || (t.id === 'intent' && !(peekSession && _peekIntentList().length));
       // Schedules are shown for isolated workers too: a schedule is owner
       // configuration and delivers into them (Ethan, 2026-09-26).
       el.style.display = !alwaysShown && (peekHiddenTabs.has(t.id) || typeHides) ? 'none' : '';
     }
   });
+  _peekIntentTabPaint();
 }
 _loadPeekTabPrefs();
 // Tab-customizer geometry beacon (AF-45). Ethan reported three times that the
@@ -13137,6 +13224,8 @@ function _homeOutcomeIndexLoad(force) {
     const changed = JSON.stringify(Object.keys(by).map(k => [k, by[k].length])) !== JSON.stringify(Object.keys(_homeOutcomeIndex.by).map(k => [k, _homeOutcomeIndex.by[k].length]));
     _homeOutcomeIndex = { at: Date.now(), by, loading: false };
     if (changed && activeView === 'sessions') { try { render(); } catch (e) { console.warn('[home] card re-render failed', e); } }
+    // The worker view's Intent tab shows only when this worker has some.
+    if (peekSession) { try { _applyPeekTabVisibility(); } catch (e) { console.warn('[home] Intent tab repaint failed', e); } }
   }).catch(() => { _homeOutcomeIndex.loading = false; });
 }
 function _homeCardOutcomes(name) {
@@ -13146,9 +13235,20 @@ function _homeCardOutcomes(name) {
   const names = list.slice(0, 3).map(o => o.title).join(' · ');
   return '<div class="card-outcomes" title="Conversations from Intent routed to this worker">From Intent: ' + esc(names) + (list.length > 3 ? ' +' + (list.length - 3) : '') + '</div>';
 }
-// The conversations from Chat routed to this worker, at the top of its
-// Messages tab: conversations are organized by conversation, and a worker
-// shows the ones it owns where its messages already are. Empty shows nothing.
+// The conversations from Intent routed to this worker, in its own Intent tab
+// (owner, 2026-11-19: "These should be in a separate intent tab in the worker
+// details page"). They used to sit above the Messages list, where on a phone
+// they took the top third of the screen. The tab shows only for a worker that
+// has some (_peekIntentList), with their count.
+function _peekIntentList(name) {
+  _homeOutcomeIndexLoad(false);
+  return (_homeOutcomeIndex.by[name || peekSession] || []);
+}
+function _peekIntentTabPaint() {
+  const n = peekSession ? _peekIntentList().length : 0;
+  const c = document.getElementById('peek-tab-intent-count');
+  if (c) { c.textContent = n ? String(n) : ''; c.classList.toggle('has-count', n > 0); }
+}
 async function _peekConvsLoad() {
   const el = document.getElementById('peek-msg-convs');
   if (!el || !peekSession) return;
@@ -13157,7 +13257,7 @@ async function _peekConvsLoad() {
   try { const r = await fetch(API + '/api/intent/outcomes', { headers: _authHeaders() }); v = r.ok ? await r.json() : null; } catch (e) { console.warn('[home] conversations for the worker view did not load', e); }
   if (peekSession !== who) return;
   const mine = ((v && v.outcomes) || []).filter(o => o.worker === who);
-  el.innerHTML = !mine.length ? '' : '<div class="peek-msg-convs-head">Conversations from Intent</div><div class="home-list">'
+  el.innerHTML = !mine.length ? '<div class="dict-empty">No conversations from Intent for this worker.</div>' : '<div class="home-list">'
     + mine.slice(0, 8).map(o => '<button type="button" class="home-row" onclick="_homeOpenFromPeek(\'' + esc(o.id) + '\')">'
       + '<span class="home-row-top"><span class="home-row-title">' + esc(o.title) + '</span><span class="home-pill ' + (o.status === 'ready' ? 'ready' : 'working') + '">' + _homeStatusLabel(o.status) + '</span></span>'
       + '<span class="home-row-when">' + esc(_homeAgo(o.updated_ms)) + (o.overridden ? ' · moved here by Change' : '') + '</span></button>').join('') + '</div>';
@@ -13795,7 +13895,22 @@ async function _changeWorkerPaused(session, paused) {
 async function archiveSession(session) {
   closeAllMenus();
   const done = _cardBusy(session, 'Archiving');
-  const r = await apiCall(API + '/api/sessions/' + session + '/archive', { method: 'POST', headers: { 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') } });
+  const url = API + '/api/sessions/' + session + '/archive';
+  const post = body => fetch(url, { method: 'POST', body: JSON.stringify(body),
+    headers: _authHeaders({ 'Content-Type': 'application/json', 'X-Amux-UI-Token': (window._AMUX_UI_TOKEN || '') }) });
+  let r = null;
+  try {
+    let res = await post({});
+    let d = await res.json().catch(() => ({}));
+    // The worker Intent sends unmatched requests to: the server says what breaks, and asks.
+    if (res.status === 409 && d.code === 'intent_helper') {
+      if (!(await showConfirm(d.error, 'Archive anyway', true))) { done(); return; }
+      res = await post({ confirm_helper: true });
+      d = await res.json().catch(() => ({}));
+    }
+    if (res.ok && d.ok !== false) r = d;
+    else showToast((d && d.error) || ('Could not archive ' + session));
+  } catch (e) { showToast('Could not archive ' + session + ': ' + ((e && e.message) || e)); }
   done();
   if (r) {
     _expiredWorkerInventory.delete(session);
@@ -16066,8 +16181,14 @@ function setPeekTab(tab) {
     else tasksP.classList.remove('active');
   }
   const messages = document.getElementById('peek-messages-panel');
-  if (tab === 'messages') { messages.classList.add('active'); _peekMessagesLoad(); _peekConvsLoad(); }
+  if (tab === 'messages') { messages.classList.add('active'); _peekMessagesLoad(); }
   else { messages.classList.remove('active'); }
+  document.getElementById('peek-tab-intent')?.classList.toggle('active', tab === 'intent');
+  const intentP = document.getElementById('peek-intent-panel');
+  if (intentP) {
+    if (tab === 'intent') { intentP.classList.add('active'); _peekConvsLoad(); }
+    else intentP.classList.remove('active');
+  }
   const costPanel = document.getElementById('peek-cost-panel');
   if (tab === 'cost') { costPanel.classList.add('active'); _peekCostLoad(); }
   else { costPanel.classList.remove('active'); }
@@ -23725,11 +23846,11 @@ function peekMsgPrev(event) { _peekMsgMove(-1, event); }
 // are highlighted and up/down steps between them.
 const _PEEK_TAB_ITEMS = {
   chat: '.chat-msg', schedules: '.sx-row, .sx-fleet-run', messages: '.pm-row', logs: '.wlog-row',
-  commits: '.commits-item', shell: '.peek-shell-card', issues: '.peek-issue-item', dictation: '.dict-row',
+  commits: '.commits-item', shell: '.peek-shell-card', issues: '.peek-issue-item', dictation: '.dict-row', intent: '.home-row',
   scope: '.worker-config-row', cost: '.cost-row, .cost-day', tasks: '.board-card, .peek-issue-item',
 };
 const _PEEK_TAB_LABELS = { chat: 'chat', schedules: 'schedules and runs', messages: 'messages', logs: 'logs',
-  commits: 'commits', shell: 'shell runs', issues: 'board', dictation: 'dictation', scope: 'settings', tasks: 'tasks' };
+  commits: 'commits', shell: 'shell runs', issues: 'board', dictation: 'dictation', scope: 'settings', tasks: 'tasks', intent: 'conversations' };
 let _peekTabIdx = -1, _peekTabObs = null, _peekTabObsRoot = null, _peekTabApplying = false, _peekTabTimer = 0;
 function _peekTabName() { return document.getElementById('peek-overlay')?.dataset.peekTab || 'terminal'; }
 function _peekTabRoot(tab = _peekTabName()) {
@@ -29739,10 +29860,34 @@ async function _dictMicReveal() {
   } catch (e) { showToast('The microphone was not allowed, so its name cannot be shown.'); return; }
   _dictRenderSettings();
 }
+// The microphone is this device's own choice (owner, 2026-11-20: "dictation mic
+// settings should be client specific not server saved"): a phone, a laptop and
+// the Mac app each keep theirs in localStorage. A device that never chose one
+// starts from the server's old shared value, so nobody's pick is lost.
+const _DICT_MIC_KEY = 'amux_dict_mic';
+function _dictMic() {
+  try {
+    const own = localStorage.getItem(_DICT_MIC_KEY);
+    if (own !== null) return own;
+  } catch (e) { console.warn('dictation: could not read this device\'s microphone', e); }
+  return ((_dictSettings || {}).mic || '');
+}
+function _dictSetMic(name) {
+  const was = _dictMic();
+  try { localStorage.setItem(_DICT_MIC_KEY, name || ''); }
+  catch (e) { showToast('This browser would not save the microphone'); return; }
+  // A warm stream is the old microphone: the next take opens the new one.
+  if (was !== (name || '') && _dictStream) {
+    try { _dictStream.getTracks().forEach(t => t.stop()); } catch (e) { console.warn('dictation: could not release the previous microphone', e); }
+    _dictStream = null;
+  }
+  _dictMicWarned = '';
+  showToast(name ? 'This device dictates with ' + name : 'This device dictates with its default microphone');
+}
 // getUserMedia's audio constraint for the chosen microphone, matched by name. Not
 // connected here: the default microphone, said once rather than silently.
 async function _dictMicConstraint() {
-  const want = ((_dictSettings || {}).mic || '').trim();
+  const want = _dictMic().trim();
   if (!want || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return {};
   try {
     const dev = (await navigator.mediaDevices.enumerateDevices()).find(d => d.kind === 'audioinput' && d.label === want);
@@ -29772,12 +29917,13 @@ function _dictRenderGlobal() {
 // The Dictation tab opened: the dictionary, key source and settings, fresh.
 async function _dictGlobalLoad() {
   try {
-    const [d, c] = await Promise.all([
+    const [d, c, tx] = await Promise.all([
       fetch(API + '/api/dictation/dict', { headers: _authHeaders() }).then(r => r.json()),
       fetch(API + '/api/dictation/config', { headers: _authHeaders() }).then(r => r.json()),
+      fetch(API + '/api/transcription', { headers: _authHeaders() }).then(r => r.json()).catch(() => null),
       _dictSettingsLoad(),
     ]);
-    _dictWords = Array.isArray(d) ? d : []; _dictCfg = c || {};
+    _dictWords = Array.isArray(d) ? d : []; _dictCfg = c || {}; _dictTx = tx;
   } catch (e) { console.warn('dictation: the dictionary did not load', e); }
   _dictRenderDict();
   _dictRenderSettings();
@@ -29848,7 +29994,10 @@ async function _dictStartRec() {
   if (_dictRecording) return;
   try { _dictBus?.postMessage({ op: 'start', tab: _dictTabId }); } catch (e) { console.warn('dictation: could not tell other tabs', e); }
   const nat = _dictNativeBridge();
-  if (nat && !_dictSettings) await _dictSettingsEnsure();
+  // Never wait on the settings read here: a take that started late let a quick
+  // hold-and-release of the Globe key land before its start, so the take ran on.
+  // They load at boot (below); a first take before that uses the default mic.
+  if (nat && !_dictSettings) _dictSettingsEnsure();
   if (nat) { _dictNativeStart(nat); return; }
   if (!navigator.mediaDevices || !window.MediaRecorder) { showToast('Recording not supported in this browser'); return; }
   _dictCancelled = false;
@@ -30006,7 +30155,7 @@ function _dictNativeStart(bridge) {
   _dictRecording = true; _dictStartedAt = Date.now();
   document.getElementById('dict-rec-btn')?.classList.add('recording');
   _dictTick();
-  bridge.postMessage({ op: 'start', hints: _dictNativeHints(), input: ((_dictSettings || {}).mic || '') });
+  bridge.postMessage({ op: 'start', hints: _dictNativeHints(), input: _dictMic() });
   if (_dictSettings && _dictSettings.mic) _dictSettingsEnsure();
 }
 function _dictNativeStop() {
@@ -30274,7 +30423,23 @@ async function _dictSendDirect(blob, mime, ms) {
 // One attempt against a stored clip. Never discards audio: a failure of ANY kind
 // leaves the item in the outbox with its error, so Retry re-sends the same
 // recording instead of asking you to say it again.
-async function _dictTrySend(id, interactive) {
+// One send per clip at a time. The background pass, the sync banner and a
+// Retry can each reach the same clip; a second caller joins the send already
+// in flight, so a clip is uploaded and transcribed once (AF-1289: the stored
+// clip went out twice, [3000, 3000]). dictation_send_joined counts the joins.
+const _dictInflight = new Map();
+function _dictTrySend(id, interactive) {
+  const running = _dictInflight.get(id);
+  if (running) {
+    try { amuxTrack('dictation_send_joined', {id, interactive: !!interactive, measured: true, n_considered: 1}); }
+    catch (e) { console.warn('dictation_send_joined not tracked', e); }
+    return running;
+  }
+  const p = _dictTrySendOnce(id, interactive).finally(() => _dictInflight.delete(id));
+  _dictInflight.set(id, p);
+  return p;
+}
+async function _dictTrySendOnce(id, interactive) {
   const q = await _dictOutbox();
   const it = q.find(x => x.id === id);
   if (!it || !it.blob) return null;
@@ -30394,6 +30559,32 @@ async function _dictRetry(id) {
   await _dictPendingBadge();
 }
 
+// Try every clip that can still be sent, now, ignoring its backoff.
+async function _dictRetryAll() {
+  await _dictPendingBadge();
+  const ids = new Set(_dictPendingRows.filter(x => x.state !== 'unreadable').map(x => x.id));
+  if (!ids.size) return;
+  try { await _dictUpdate(q => q.map(x => ids.has(x.id) ? Object.assign({}, x, { attempts: 0, last: 0 }) : x)); }
+  catch (e) { showToast('This device could not update the recordings yet; try again'); return; }
+  _dictBeacon('dict_retry_all', { n: ids.size });
+  if (_dictFlushing) { showToast('Already sending queued recordings; these go next'); return; }
+  showToast('Sending ' + ids.size + ' recording' + (ids.size === 1 ? '' : 's') + '…');
+  await _dictFlushOffline();
+  if (_peekTab === 'dictation') _dictRender();
+}
+// Delete every clip that has not been transcribed, after one confirm.
+async function _dictClearAll() {
+  await _dictPendingBadge();
+  const n = _dictPendingRows.length;
+  if (!n) return;
+  const ok = await showConfirm('Delete the ' + n + ' recording' + (n === 1 ? '' : 's') + ' that ' + (n === 1 ? 'was' : 'were')
+    + ' not transcribed? The audio is removed from this device.', 'Delete ' + n, true);
+  if (!ok) return;
+  try { await _dictUpdate(q => q.filter(x => x.state === 'done')); _dictBeacon('dict_clear_all', { n }); }
+  catch (e) { showToast('This device could not delete the recordings yet; try again'); }
+  if (_peekTab === 'dictation') _dictRender();
+}
+
 // Play the stored audio back. You asked for it to feel like a recording — so the
 // clip is a thing you can hear before deciding to retry or bin it.
 async function _dictPlay(id) {
@@ -30434,7 +30625,8 @@ async function _dictPendingBadge() {
   let q = [];
   try { q = (await _idb.get('dict_pending')) || []; } catch(e) {}
   const n = q.filter(x => x.state !== 'done').length;
-  _dictPendingRows = q.filter(x => x.state !== 'done').map(({blob, bytes, ...rest}) => rest);
+  _dictPendingRows = q.filter(x => x.state !== 'done')
+    .map(({blob, bytes, ...rest}) => Object.assign(rest, { size: (bytes && bytes.byteLength) || (blob && blob.size) || 0 }));
   _dictPendingN = n;
   _dictSyncPending = n > 0;
   _dictAttentionN = _dictPendingRows.filter(x => x.error || (x.attempts || 0) >= _DICT_MAX_AUTO || _dictSendingStale(x)).length;
@@ -30469,7 +30661,12 @@ function _dictTabBadge(pending) {
 function _dictOutboxHTML(q) {
   const live = q.filter(x => x.state !== 'done');
   if (!live.length) return '';
-  let h = '<div class="dict-day">PENDING</div>';
+  // Every clip at once (owner, 2026-11-19: "I should have a way to clear, try
+  // again or whatever these"), on the heading's own row so a phone gets no new row.
+  const resend = live.filter(x => x.state !== 'unreadable').length;
+  let h = '<div class="dict-day dict-pending-head"><span>PENDING</span><span class="dict-pending-acts">'
+    + (resend ? '<button class="btn small" onclick="_dictRetryAll()">Try all again</button>' : '')
+    + '<button class="btn small" onclick="_dictClearAll()">Clear all</button></span></div>';
   for (const it of live.slice().reverse()) {
     const secs = Math.round((it.ms || 0) / 1000);
     const label = { sending: 'Sending…', offline: 'Waiting for connection', failed: 'Failed', pending: 'Queued',
@@ -30479,7 +30676,7 @@ function _dictOutboxHTML(q) {
     const attempts = (it.attempts || 0) > 1 ? ' · ' + it.attempts + ' tries' : '';
     h += '<div class="dict-item dict-item-pending">'
       +  '<div class="dict-item-head"><span class="dict-state dict-state-' + esc(it.state) + '">' + label + '</span>'
-      +  '<span class="dict-meta">' + secs + 's · ' + _dictKB((it.blob && it.blob.size) || 0) + attempts + '</span></div>'
+      +  '<span class="dict-meta">' + secs + 's · ' + _dictKB(it.size || (it.blob && it.blob.size) || 0) + attempts + '</span></div>'
       +  err
       +  '<div class="dict-actions">'
       +    (gone ? '' : '<button class="btn small" onclick="_dictPlay(\'' + it.id + '\')">▶ Play</button>'
@@ -30494,6 +30691,9 @@ function _dictOutboxHTML(q) {
 // runs on reconnect and on its backoff timer; this tick only wakes it for clips.
 window.addEventListener('online', () => { setTimeout(() => { if (_dictPendingN) runSyncBanner(true); }, 1500); });
 setInterval(() => { if ((typeof online === 'undefined' || online) && _dictPendingN) runSyncBanner(true); }, 45000);
+// The Mac app is told the saved microphone on each take's start; read it now so
+// the first take has it without waiting.
+if (typeof _dictNativeBridge === 'function' && _dictNativeBridge()) setTimeout(() => { _dictSettingsLoad(); }, 0);
 // A clip queued before this page loaded counts from the start, not from the first Dictation open.
 setTimeout(() => { _dictPendingBadge().then(() => { if (_dictPendingN && (typeof online === 'undefined' || online)) runSyncBanner(true); }); }, 2000);
 
@@ -30613,10 +30813,13 @@ function _dictRenderHistory() {
   if (!body) return;
   // Pending clips render first and out-of-band: they are the ones needing a
   // decision (retry / play / bin), and they must show even when history is empty.
-  _dictOutbox().then(ob => {
-    const strip = _dictOutboxHTML(ob);
+  // From the rows the pending count read, not a second read: on the Mac app a
+  // slow store let the count answer "4 pending" while _dictOutbox() gave up
+  // after 5 s and the list showed none (owner, 2026-11-19, with
+  // dict_storage_hung beacons from that device).
+  _dictPendingBadge().then(() => {
     const host = document.getElementById('dict-outbox-strip');
-    if (host) host.innerHTML = strip;
+    if (host) host.innerHTML = _dictOutboxHTML(_dictPendingRows);
   });
   const q = (document.getElementById('dict-search')?.value || '').trim().toLowerCase();
   const items = q ? _dictItems.filter(i => (i.text||'').toLowerCase().includes(q)) : _dictItems;
@@ -30746,12 +30949,42 @@ async function _dictDelWord(id) {
 }
 
 // ── Settings (BYO key) ──
+// What actually transcribes, from GET /api/transcription (the same status the
+// server's engine choice reads), so the page cannot claim an engine that is
+// not the one running (owner, 2026-11-18: "make sure the dictation tab ... is
+// accurate").
+var _dictTx = null;
+function _dictEngineLabel(engine, model) {
+  const m = String(model || '').replace(/^mlx-community\//, '').replace(/ \(MLX\)$/, '');
+  if (engine === 'mlx-whisper') return 'Whisper ' + m.replace(/^whisper-/, '') + ' on this Mac (MLX, GPU)';
+  if (engine === 'whisper') return 'Whisper ' + m + ' on this Mac (CPU)';
+  if (engine === 'gemini') return 'Gemini (' + (_dictTx?.gemini?.model || 'cloud') + ')';
+  return '';
+}
+function _dictEngineRows() {
+  const tx = _dictTx;
+  if (!tx || !tx.dictate) return '<div class="dict-set-row"><b>Engine</b><span>Could not read the engine status</span></div>';
+  const uses = tx.dictate.uses || {}, local = tx.dictate.local || {}, gem = tx.gemini || {};
+  const keyFrom = gem.source === 'byo' ? 'your own key' : gem.source === 'server' ? "this server's key" : '';
+  const now = uses.available
+    ? (uses.engine === 'gemini' ? 'Gemini (' + esc(gem.model || '') + ', ' + keyFrom + ')' : esc(_dictEngineLabel(uses.engine, local.model)))
+    : 'Nothing can transcribe: ' + esc(uses.why_unavailable || 'no engine');
+  let fallback = '';
+  if (uses.engine !== 'gemini' && uses.available) {
+    fallback = tx.engine === 'local' ? 'None: the setting is Local only'
+      : gem.configured ? 'Gemini (' + esc(gem.model || '') + ', ' + keyFrom + ') when the local engine cannot answer'
+      : 'None: no Gemini key is set';
+  } else if (!local.available && local.why) {
+    fallback = 'Local engine unavailable: ' + esc(local.why);
+  }
+  return '<div class="dict-set-row dict-set-gap"><b>Browser and phone</b><span id="dict-engine-now">' + now + '</span></div>'
+    + (fallback ? '<div class="dict-set-row"><b>' + (uses.engine === 'gemini' ? 'Local' : 'Fallback') + '</b><span id="dict-engine-fallback">' + fallback + '</span></div>' : '')
+    + '<div class="dict-set-row"><b>Mac app</b><span>Apple on-device speech, then the same name and dictionary pass</span></div>';
+}
 function _dictRenderSettings() {
   const body = document.getElementById('dict-set-body');
   if (!body) return;
   const c = _dictCfg || {};
-  const using = c.source === 'byo' ? 'your own Gemini key'
-    : c.source === 'server' ? "this amux server's Gemini key" : 'nothing configured';
   const ds = _dictSettings || { mic: '', context: '', workers: true, contacts: false };
   const src = _dictSources || {};
   // A repaint (the tab's background reload) keeps context typed but not saved yet.
@@ -30761,7 +30994,7 @@ function _dictRenderSettings() {
   body.innerHTML =
     '<div class="dict-settings">'
     + '<div class="dict-set-row"><b>Microphone</b><span id="dict-mic-host"><select id="dict-mic" class="input" disabled><option>Loading…</option></select></span></div>'
-    + '<div class="dict-sethint" id="dict-mic-note">Saved on the server: every device that has this microphone dictates with it, and the others use their default.</div>'
+    + '<div class="dict-sethint" id="dict-mic-note">Saved on this device only: each phone, laptop and Mac app keeps its own microphone.</div>'
     + '<div class="dict-set-row"><b>What dictation knows</b><span></span></div>'
     + '<label class="dict-set-row"><span><input type="checkbox" id="dict-src-workers"' + (ds.workers !== false ? ' checked' : '') + ' onchange="_dictSettingsSave({workers:this.checked})"> Worker names' + count(src.workers, 'worker', 'workers') + '</span></label>'
     + '<label class="dict-set-row"><span><input type="checkbox" id="dict-src-contacts"' + (ds.contacts ? ' checked' : '') + ' onchange="_dictSettingsSave({contacts:this.checked})"> CRM contact names' + count(src.contacts, 'contact', 'contacts') + '</span></label>'
@@ -30770,11 +31003,10 @@ function _dictRenderSettings() {
     + '<div class="dict-sethint">About you and what you talk about: names, products, jargon. Dictation uses it to settle unclear words.</div>'
     + '<textarea id="dict-context" class="input dict-context" rows="4" maxlength="4000" placeholder="e.g. I run Mixpeek; I talk about amux workers, Rust, GKE and our customers TubeScience and Wexus.">' + esc(ds.context || '') + '</textarea>'
     + '<div class="dict-set-actions"><button class="btn primary" id="dict-context-save" onclick="_dictSettingsSave({context:(document.getElementById(\'dict-context\')||{}).value||\'\'})">Save context</button></div>'
-    + '<div class="dict-set-row dict-set-gap"><b>Transcription</b><span>' + esc(c.model || '') + '</span></div>'
-    + '<div class="dict-set-row"><b>Currently using</b><span>' + using + '</span></div>'
+    + _dictEngineRows()
     + '<div class="dict-sethint">Which engine Dictate and Recordings use is one setting: '
     + '<button type="button" class="btn" onclick="_transcriptionOpenSettings()">Transcription settings</button></div>'
-    + '<div class="dict-sethint">Bring your own Gemini API key (optional). If set, amux uses it instead of the '
+    + '<div class="dict-sethint">Bring your own Gemini API key for the Gemini engine (optional). If set, amux uses it instead of the '
     + 'server\'s key. It is stored on the amux server and is <b>never sent back to any browser</b>. '
     + 'Get one at <span style="color:var(--accent)">aistudio.google.com/apikey</span>.</div>'
     + '<div style="display:flex;gap:var(--space-2);margin-top:var(--space-2);">'
@@ -30784,7 +31016,7 @@ function _dictRenderSettings() {
     + (c.source === 'byo' ? '<button class="btn" onclick="_dictClearKey()">Remove</button>' : '')
     + '</div>'
     + '<div class="dict-sethint" style="margin-top:var(--space-3-5);">Audio never touches this page’s JavaScript beyond the '
-    + 'recording itself — it is uploaded to your amux server, which calls Gemini and returns only text.</div>'
+    + 'recording itself: it is uploaded to your amux server, which transcribes it on this Mac (Gemini only when the engine above says so) and returns only text.</div>'
     + '</div>';
   if (typed !== null) { const ta = document.getElementById('dict-context'); if (ta) ta.value = typed; }
   _dictRenderMicPicker();
@@ -30792,11 +31024,11 @@ function _dictRenderSettings() {
 async function _dictRenderMicPicker() {
   const host = document.getElementById('dict-mic-host');
   if (!host) return;
-  const want = ((_dictSettings || {}).mic || '');
+  const want = _dictMic();
   const { names, hidden } = await _dictMicNames();
   const opts = [''].concat(names);
   if (want && !names.includes(want)) opts.push(want);
-  host.innerHTML = '<select id="dict-mic" class="input" onchange="_dictSettingsSave({mic:this.value})">'
+  host.innerHTML = '<select id="dict-mic" class="input" onchange="_dictSetMic(this.value)">'
     + opts.map(n => '<option value="' + esc(n) + '"' + (n === want ? ' selected' : '') + '>'
       + esc(n ? (names.includes(n) ? n : n + ' (not connected here)') : 'Default microphone') + '</option>').join('')
     + '</select>'
@@ -33062,6 +33294,7 @@ function _mdxShow(data, mode) {
     ta.value = data.content || '';
     // A file opens at its top, caret and scroll both.
     ta.setSelectionRange(0, 0);
+    _mdxHistReset(ta);
     ta.scrollTop = 0;
     _mdx.base = ta.value;
     _mdx.opened = ta.value;
@@ -33365,6 +33598,7 @@ async function _mdxFollow() {
   const at = ta.selectionStart;
   ta.value = text;
   try { ta.setSelectionRange(Math.min(at, text.length), Math.min(at, text.length)); } catch (e) {}
+  _mdxHistReset(ta);   // another writer's text: history starts again from it
   _fileData.content = text;
   _mdx.opened = text;
   if (etag) _fileData.etag = etag;
@@ -33380,10 +33614,58 @@ document.addEventListener('visibilitychange', () => { if (document.hidden && _md
 // ── Editing commands ──
 function _mdxIndent() { return parseInt(localStorage.getItem('amux_mdx_indent') || '2', 10) === 4 ? 4 : 2; }
 // Replace [start, end) with `text` through the browser's own editing, so ⌘Z undoes it.
+// THE EDITOR'S OWN UNDO HISTORY (owner, 2026-11-19: "Undo / redo doesnt work
+// in the markdown editor - fix it. The button should works and the
+// shortcuts"). The browser's stack undid one typed character per press in
+// Chromium and is emptied by any direct ta.value write (a file reload, the /
+// menu fallback), and the Mac app's Edit menu bypassed the page. So the editor
+// keeps the states itself: typing groups into one step until a pause or a word
+// ends, each tool is one step, and the buttons, the keys and the Edit menu
+// (beforeinput historyUndo/historyRedo) all step through it.
+const _MDX_UNDO_GAP_MS = 800, _MDX_UNDO_MAX = 300;
+function _mdxHistReset(ta) {
+  _mdx.undo = [{ v: ta.value, s: ta.selectionStart, e: ta.selectionEnd }];
+  _mdx.undoAt = 0; _mdx.undoOpen = false; _mdx.undoLast = 0;
+}
+function _mdxHistRecord(ta, e) {
+  if (!_mdx.undo) { _mdxHistReset(ta); return; }
+  const top = _mdx.undo[_mdx.undoAt];
+  if (top && top.v === ta.value) return;
+  const now = Date.now();
+  const typing = !_mdx.undoTool && e && /^(insertText|deleteContentBackward|deleteContentForward)$/.test(e.inputType || '');
+  const state = { v: ta.value, s: ta.selectionStart, e: ta.selectionEnd };
+  if (typing && _mdx.undoOpen && _mdx.undoAt > 0 && now - _mdx.undoLast < _MDX_UNDO_GAP_MS) {
+    _mdx.undo[_mdx.undoAt] = state;   // the same typing step, grown
+  } else {
+    _mdx.undo.length = _mdx.undoAt + 1;
+    _mdx.undo.push(state);
+    if (_mdx.undo.length > _MDX_UNDO_MAX) _mdx.undo.shift();
+    _mdx.undoAt = _mdx.undo.length - 1;
+  }
+  // A space or a line break ends the word, so the next key starts a new step.
+  _mdx.undoOpen = typing && !/\s$/.test((e && e.data) || '') && e.inputType !== 'insertLineBreak';
+  _mdx.undoLast = now;
+  _mdx.undoTool = false;
+}
+function _mdxHistStep(dir) {
+  const ta = document.getElementById('file-edit-ta');
+  if (!ta || ta.readOnly) return;
+  if (!_mdx.undo) _mdxHistReset(ta);
+  const to = _mdx.undoAt + dir;
+  ta.focus();
+  if (to < 0 || to >= _mdx.undo.length) { _mdxBeacon(dir < 0 ? 'undo_none' : 'redo_none', {}); return; }
+  const st = _mdx.undo[to];
+  _mdx.undoAt = to; _mdx.undoOpen = false;
+  ta.value = st.v;
+  try { ta.setSelectionRange(st.s, st.e); } catch (e) { console.warn('[mdx] undo could not place the caret', e); }
+  _mdxChanged();   // highlight, preview, and the save that undo owes the file
+  _mdxLevelSync();
+}
 function _mdxReplace(start, end, text, selStart, selEnd) {
   const ta = document.getElementById('file-edit-ta');
   if (!ta || ta.readOnly) return;
   ta.focus();
+  _mdx.undoTool = true;   // one undo step, apart from typing
   ta.setSelectionRange(start, end);
   let ok = false;
   try { ok = document.execCommand('insertText', false, text); } catch (e) {}
@@ -33542,8 +33824,8 @@ function _mdxLevelAt() {
   return m ? m[1].length : 0;
 }
 Object.assign(_mdxTools, {
-  undo() { const ta = document.getElementById('file-edit-ta'); ta.focus(); document.execCommand('undo'); },
-  redo() { const ta = document.getElementById('file-edit-ta'); ta.focus(); document.execCommand('redo'); },
+  undo() { _mdxHistStep(-1); },
+  redo() { _mdxHistStep(1); },
   strike() { _mdxWrap('~~', '~~', 'struck text'); },
   quote() {
     _mdxPrefix(ls => { const all = ls.every(l => /^\s*>/.test(l) || !l.trim()); return ls.map(l => !l.trim() ? l : all ? l.replace(/^(\s*)>\s?/, '$1') : '> ' + l); });
@@ -33753,6 +34035,8 @@ function _mdxKeydown(e) {
   if (ta.readOnly) return;
   if (_mdxSlashKey(e)) return;
   const mod = e.metaKey || e.ctrlKey;
+  if (mod && !e.altKey && e.key.toLowerCase() === 'z') { e.preventDefault(); _mdxHistStep(e.shiftKey ? 1 : -1); return; }
+  if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'y') { e.preventDefault(); _mdxHistStep(1); return; }
   if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === 'x') { e.preventDefault(); _mdxTools.strike(); return; }
   if (mod && !e.altKey && !e.shiftKey) {
     const k = e.key.toLowerCase();
@@ -33793,6 +34077,34 @@ function _mdxKeydown(e) {
     _mdxReplace(a, a, next, a + next.length);
   }
 }
+
+// Tab in the file editor for files that are not markdown (owner, 2026-11-18:
+// "make sure the editor has the same kind of formatting stuff like tabbing to
+// indent"). Markdown gets _mdxKeydown; everything else got nothing, so Tab
+// left the editor. Tab inserts two spaces or indents the selected lines;
+// Shift+Tab outdents them. Undo keeps working (execCommand insertText).
+document.addEventListener('keydown', (e) => {
+  const ta = e.target;
+  if (!ta || ta.id !== 'file-edit-ta' || ta.readOnly || e.key !== 'Tab' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (typeof _mdxActive === 'function' && _mdxActive()) return;
+  e.preventDefault();
+  const v = ta.value, a = ta.selectionStart, b = ta.selectionEnd, ind = '  ';
+  const put = (from, to, text, ca, cb) => {
+    ta.setSelectionRange(from, to);
+    if (!document.execCommand || !document.execCommand('insertText', false, text)) { ta.setRangeText(text, from, to, 'end'); ta.dispatchEvent(new Event('input', { bubbles: true })); }
+    ta.setSelectionRange(ca, cb);
+  };
+  if (a === b && !e.shiftKey) { put(a, b, ind, a + ind.length, a + ind.length); return; }
+  // A caret (no selection) outdents its whole line: wherever it sits, even
+  // inside the leading spaces (land review F1).
+  const lineEnd = v.indexOf('\n', b) < 0 ? v.length : v.indexOf('\n', b);
+  const s = v.lastIndexOf('\n', a - 1) + 1, end = a === b ? lineEnd : (v[b - 1] === '\n' ? b - 1 : b);
+  const lines = v.slice(s, end).split('\n');
+  const out = lines.map(l => e.shiftKey ? l.replace(/^( {1,2}|\t)/, '') : ind + l).join('\n');
+  const first = e.shiftKey ? (lines[0].match(/^( {1,2}|\t)/) || [''])[0].length * -1 : ind.length;
+  if (a === b) put(s, end, out, Math.max(s, a + first), Math.max(s, a + first));
+  else put(s, end, out, Math.max(s, a + first), s + out.length);
+}, true);
 
 // ── Diff ──
 // Line by line: the saved file (or a past commit) against the source now.
@@ -33856,13 +34168,14 @@ async function _mdxRenderHistory() {
   const alt = document.getElementById('mdx-alt');
   if (!alt || !_fileData) return;
   const path = _fileData.path;
-  if (_mdx.histFor && _mdx.histFor.path === path) { _mdxDrawHistory(_mdx.histFor.data); return; }
+  // Read again after 15 s: a commit or a land since the last read must show.
+  if (_mdx.histFor && _mdx.histFor.path === path && Date.now() - (_mdx.histFor.at || 0) < 15000) { _mdxDrawHistory(_mdx.histFor.data); return; }
   alt.innerHTML = '<div class="mdx-empty">Reading history…</div>';
   try {
     const r = await fetch(API + '/api/file/history?path=' + encodeURIComponent(path), { headers: _authHeaders() });
     const d = await r.json();
     if (!r.ok || d.measured === false) throw new Error(d.why_unmeasured || d.error || ('HTTP ' + r.status));
-    _mdx.histFor = { path, data: d };
+    _mdx.histFor = { path, data: d, at: Date.now() };
     if (_mdx.tab === 'history' && _fileData && _fileData.path === path) _mdxDrawHistory(d);
   } catch (e) {
     alt.innerHTML = '<div class="ui-error">History could not be read: ' + esc(e.message || String(e)) + '</div>';
@@ -33981,7 +34294,13 @@ function _mdxBind() {
   if (_mdxBound) return;
   _mdxBound = true;
   const ta = document.getElementById('file-edit-ta');
-  ta.addEventListener('input', e => { if (_mdxActive()) { if (e.isTrusted) _mdx.tickSaving = false; _mdxChanged(); _mdxSlashInput(); } });
+  ta.addEventListener('input', e => { if (_mdxActive()) { if (e.isTrusted) _mdx.tickSaving = false; _mdxHistRecord(ta, e); _mdxChanged(); _mdxSlashInput(); } });
+  // The Mac app's Edit menu and a context menu's Undo reach the page as these.
+  ta.addEventListener('beforeinput', e => {
+    if (!_mdxActive() || (e.inputType !== 'historyUndo' && e.inputType !== 'historyRedo')) return;
+    e.preventDefault();
+    _mdxHistStep(e.inputType === 'historyUndo' ? -1 : 1);
+  });
   ta.addEventListener('scroll', () => { if (_mdxActive()) _mdxSyncScroll(); });
   ['keyup', 'click', 'select'].forEach(ev => ta.addEventListener(ev, () => { if (_mdxActive()) { _mdxStatus(); _mdxLevelSync(); } }));
   ta.addEventListener('blur', () => { if (_mdxSlash) _mdxSlashClose(); });
@@ -49896,6 +50215,29 @@ function _mdUseWikiLinks() {   // and math (the same marked.use call)
       return '<a href="#peek=' + encodeURIComponent(t.name) + '" class="md-worker-link" data-worker="' + esc(t.name) + '" title="Open ' + esc(t.name) + '">@' + esc(t.name) + '</a>';
     },
   }, {
+    // A file path written as plain text in a file's preview is a link to that
+    // file (owner, 2026-11-18: "file path is clickable and on mouseover shows
+    // a preview"). Absolute or ~/ paths only; trailing punctuation stays text.
+    // Same gate as @worker: a preview asked for it.
+    name: 'filePath', level: 'inline',
+    start(src) {
+      if (!_mdWorkerLinks) return undefined;
+      const m = /(^|[\s(])(?:~|\/(?:Users|home|Volumes|private|opt|tmp|var|etc))\//.exec(src);
+      return m ? m.index + m[1].length : undefined;
+    },
+    tokenizer(src) {
+      if (!_mdWorkerLinks) return undefined;
+      const m = /^(?:~|\/(?:Users|home|Volumes|private|opt|tmp|var|etc))\/[^\s<>()\[\]"'`]+/.exec(src);
+      if (!m) return undefined;
+      const path = m[0].replace(/[.,;:!?]+$/, '');
+      if (path.split('/').filter(Boolean).length < 2) return undefined;
+      return { type: 'filePath', raw: path, path };
+    },
+    renderer(t) {
+      const isDir = t.path.endsWith('/');
+      return '<a href="#" class="md-file-link md-path-link" data-file="' + esc(t.path) + '"' + (isDir ? ' data-dir="1"' : '') + ' title="' + esc(t.path) + '">' + esc(t.path) + '</a>';
+    },
+  }, {
     // #tag in the editor's preview: a chip, and a click finds the others.
     // A heading is a block (never reaches here); #123 and URL fragments stay text.
     name: 'hashTag', level: 'inline',
@@ -58828,6 +59170,7 @@ function _vaultGroupsOf(i) { return String(i.target || '').split(',').map(g => g
 const _vault = { items: [], workers: [], groups: [], keystore: '', tab: 'secrets', q: '', scope: '', group: '',
   worker: '', sort: 'name', prov: null, revealed: {}, timers: {}, loadErr: '' };
 const _VAULT_ICONS = {
+  copy: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M16 7l3 3M13.5 9.5l2 2"/>',
   card: '<rect x="3" y="6" width="18" height="12" rx="2"/><path d="M3 10h18"/>',
   shield: '<path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
@@ -59103,7 +59446,10 @@ function _vaultTableHtml(list, idPrefix) {
       return '<tr class="vault-row" data-id="' + esc(i.id) + '">'
         + '<td data-label="Name"><div class="vault-name"><code>' + esc(i.key) + '</code>' + _vaultIdBadge(i.id) + (i.note ? '<span class="ui-help">' + esc(i.note) + '</span>' : '') + '</div></td>'
         + '<td data-label="Value"><div class="vault-value"><span class="vault-mask' + (shown ? ' revealed' : '') + '" id="' + idPrefix + esc(i.id) + '">' + (shown ? esc(_vault.revealed[i.id]) : '••••••••••••') + '</span>'
-        + '<button class="vault-icon-btn" aria-label="' + (shown ? 'Hide ' : 'Reveal ') + esc(i.key) + '" aria-pressed="' + shown + '" title="' + (shown ? 'Hide' : 'Reveal (recorded in the audit log)') + '" onclick="_vaultReveal(\'' + escJs(i.id) + '\')">' + _vaultIcon(shown ? 'eyeOff' : 'eye') + '</button></div></td>'
+        + '<button class="vault-icon-btn" aria-label="' + (shown ? 'Hide ' : 'Reveal ') + esc(i.key) + '" aria-pressed="' + shown + '" title="' + (shown ? 'Hide' : 'Reveal (recorded in the audit log)') + '" onclick="_vaultReveal(\'' + escJs(i.id) + '\')">' + _vaultIcon(shown ? 'eyeOff' : 'eye') + '</button>'
+        // Copy only while revealed (owner, 2026-11-18): it reads the value by id, never from the markup.
+        + (shown ? '<button class="vault-icon-btn vault-copy" aria-label="Copy ' + esc(i.key) + '" title="Copy the value" onclick="_vaultCopy(\'' + escJs(i.id) + '\')">' + _vaultIcon('copy') + '</button>' : '')
+        + '</div></td>'
         + '<td data-label="Scope">' + _vaultChip(i.scope) + '</td>'
         + '<td data-label="Provisioned to">' + _vaultProvisionedTo(i) + forWorker + '</td>'
         + '<td data-label="Updated"><span title="' + esc(new Date((i.updated || 0) * 1000).toLocaleString()) + '">' + esc(timeAgo(i.updated)) + '</span><span class="ui-help"> · v' + esc(String(i.version || 1)) + '</span></td>'
@@ -59145,6 +59491,11 @@ function _vaultMenu(event, id) {
 function _vaultMask(id) {
   clearTimeout(_vault.timers[id]); delete _vault.timers[id];
   delete _vault.revealed[id];
+}
+function _vaultCopy(id) {
+  if (!Object.prototype.hasOwnProperty.call(_vault.revealed, id)) { showToast('Reveal it first'); return; }
+  const item = (_vault.items || []).find(x => x.id === id);
+  _copyTextWithToast(_vault.revealed[id], 'Copied ' + ((item && item.key) || 'the value'));
 }
 function _vaultMaskAll() { for (const id of Object.keys(_vault.revealed)) _vaultMask(id); }
 async function _vaultReveal(id) {
